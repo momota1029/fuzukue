@@ -1631,6 +1631,8 @@ async fn mcp_course_tools_resume_and_do_not_duplicate_cards() -> Result<()> {
 
 #[tokio::test]
 async fn mcp_review_findings_record_close_and_reopen_per_deck() -> Result<()> {
+    use std::io::Read;
+
     let project = TempProject::new()?;
     let deck = "papers/draft";
     fs::create_dir_all(project.path().join(deck))?;
@@ -1678,6 +1680,8 @@ async fn mcp_review_findings_record_close_and_reopen_per_deck() -> Result<()> {
     assert_eq!(first["finding"]["assessment"], "confirmed");
     let first_revision = first["finding"]["revision"].clone();
 
+    let first_ledger = fs::read(&ledger)?;
+    let mut reader = fs::File::open(&ledger)?;
     let other_id = "ece8c201-f35f-418d-8975-013363d3cedc";
     let file_only = mcp_call(&app, "record_review_finding", json!({
         "deck": deck, "id": other_id, "actor": "editor",
@@ -1686,6 +1690,10 @@ async fn mcp_review_findings_record_close_and_reopen_per_deck() -> Result<()> {
             "sources": [{"kind": "human"}]}
     })).await;
     mcp_data(&file_only);
+    let mut opened_ledger = Vec::new();
+    reader.read_to_end(&mut opened_ledger)?;
+    assert_eq!(opened_ledger, first_ledger);
+    drop(reader);
     let snapshot = list().await;
     let snapshot = mcp_data(&snapshot);
     assert_eq!(snapshot["open_count"], 2);
@@ -2684,7 +2692,7 @@ async fn scoped_paper_refreshes_after_save_without_switching_other_clients() -> 
             }
         }
 
-        fs::write(root.join("review-findings.toml"), "version = 2\n")?;
+        crate::references::write_atomic(&root, crate::review_findings::FILE, b"version = 2\n")?;
         loop {
             if let ServerEvent::ReviewFindings {
                 deck: viewed, outcome: ReviewFindingsOutcome::Error { message },
