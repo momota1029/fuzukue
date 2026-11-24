@@ -40,11 +40,11 @@ body:
   - type: input
     id: version
     attributes:
-      label: Version or build ID / バージョンまたはビルド ID
+      label: fuzukue version or build SHA / バージョンまたはビルド SHA
       description: |
-        If known, share the version or build ID, or the commit ID for a source build.
+        Share the version and the build SHA if available.
 
-        分かる範囲で、バージョン、ビルド ID、またはソースからビルドしたときのコミット ID を書いてください。
+        分かる範囲で、バージョンとビルドのコミット SHA を書いてください。
   - type: dropdown
     id: component
     attributes:
@@ -74,6 +74,6 @@ body:
     attributes:
       label: Logs or screenshots (optional) / ログやスクリーンショット（任意）
       description: |
-        Include only relevant excerpts. Remove tokens, credentials, tailnet names and addresses, personal file paths, and private document contents.
+        Include only relevant excerpts. Remove tokens, credentials, tailnet names and addresses, personal file paths, email addresses, and private document contents.
 
-        問題に関係する箇所だけ添えてください。ログや画像に含まれるトークン、認証情報、tailnet の名前やアドレス、個人のファイルパス、非公開文書の内容は貼り付けないでください。
+        問題に関係する箇所だけ添えてください。ログや画像に含まれるトークン、認証情報、tailnet の名前やアドレス、個人のファイルパス、メールアドレス、非公開文書の内容は貼り付けないでください。

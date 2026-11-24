@@ -1,0 +1,62 @@
+name: CI
+
+'on':
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: '1.95.0'
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  linux:
+    name: Rust workspace tests (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+      # The shared test helper skips loopback tests if the runner cannot bind.
+      - name: Test server and shared crates
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          unset FUZUKUE_SERVICE FUZUKUE_SELF_UPDATE_READY FUZUKUE_SELF_UPDATE_SOURCE
+          cargo "+$RUST_TOOLCHAIN" test --locked --workspace
+
+  macos:
+    name: secretaire compile check (macOS)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+      - name: Check the server
+        run: cargo "+$RUST_TOOLCHAIN" check --locked -p secretaire --jobs 2
+
+# Cards run in cards.yml. Android JVM tests run manually (see android/README.md).

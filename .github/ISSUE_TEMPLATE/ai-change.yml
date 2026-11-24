@@ -1,0 +1,37 @@
+name: I asked my AI to change fuzukue / AI に変更を頼んだ
+description: Share what you asked for and what happened. / AI に頼んだことと結果を伝える。
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. Share a short summary, with personal paths, email addresses, credentials, private hostnames, and private text removed. Use [private reporting](https://github.com/momota1029/fuzukue/security/advisories/new) for vulnerabilities.
+
+        この Issue は公開されます。個人のパス、メールアドレス、認証情報、非公開のホスト名や文章を除いた短い要約を載せてください。脆弱性は [非公開の報告フォーム](https://github.com/momota1029/fuzukue/security/advisories/new) から報告してください。
+  - type: textarea
+    id: request
+    attributes:
+      label: What you asked the AI to change / AI に頼んだ変更
+      description: Describe the goal and which agent you used. / 目的と、使ったエージェントを書いてください。
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened / 起きたこと
+      description: Describe the outcome and where you got stuck. / 結果と、途中で困ったことを書いてください。
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: fuzukue version or build SHA / バージョンまたはビルド SHA
+  - type: input
+    id: os
+    attributes:
+      label: OS and version / OS とバージョン
+      description: If they differ, include both client and server. / 端末とサーバーで異なる場合は両方を書いてください。
+  - type: input
+    id: related
+    attributes:
+      label: Related PR or roadmap card / 関連する PR またはロードマップカード
+      description: Link it if one exists. / 関連する項目があればリンクを書いてください。

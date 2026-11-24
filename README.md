@@ -64,7 +64,7 @@ Android uses signed APKs and has its own in-app update check. [Android update gu
 
 ## Contributing
 
-Use [GitHub Issues](https://github.com/momota1029/fuzukue/issues) for bug reports, suggestions, and questions from users and contributors. The maintainer tracks project plans in the [roadmap deck](roadmap/README.md). See the [contribution guide](CONTRIBUTING.md) before opening an issue or pull request.
+Use [GitHub Issues](https://github.com/momota1029/fuzukue/issues) for bug reports, suggestions, and questions from users and contributors. The maintainer tracks project plans in the [roadmap deck](roadmap/README.md). See the [contribution guide](CONTRIBUTING.md) or the [guide to opening a PR with AI (Japanese)](docs/contributing-with-ai.md).
 
 ## Security
 

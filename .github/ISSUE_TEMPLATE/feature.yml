@@ -1,6 +1,12 @@
-name: Feature suggestion / 機能の提案
+name: Feature request / 機能の提案
 description: Suggest an improvement. / 使う場面や困っていることを伝える。
 body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. Remove personal paths, email addresses, credentials, private hostnames, and private text before posting.
+
+        この Issue は公開されます。個人のパス、メールアドレス、認証情報、非公開のホスト名や文章は投稿前に除いてください。
   - type: textarea
     id: use-case
     attributes:
@@ -11,6 +17,22 @@ body:
         どんな場面で何をしたいか、今どこで困っているかを教えてください。トークンなどの機密情報は載せないでください。
     validations:
       required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened / 起きたこと
+      description: Describe what fuzukue does today in this situation. / その場面で現在の fuzukue がどう動くかを書いてください。
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: fuzukue version or build SHA / バージョンまたはビルド SHA
+  - type: input
+    id: os
+    attributes:
+      label: OS and version / OS とバージョン
+      description: If they differ, include both client and server. / 端末とサーバーで異なる場合は両方を書いてください。
   - type: textarea
     id: tried
     attributes:

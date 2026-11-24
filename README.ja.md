@@ -60,7 +60,7 @@ Android 版は署名済み APK を使い、アプリ内から更新を確認で�
 
 ## 報告・質問・貢献
 
-利用者やコントリビューターからの不具合報告、提案、質問は [GitHub Issues](https://github.com/momota1029/fuzukue/issues) で受け付けます。メンテナーの開発計画は [ロードマップのデッキ](roadmap/README.md) で管理します。Issue やプルリクエストを開く前に、[貢献ガイド](CONTRIBUTING.ja.md) を参照してください。
+利用者やコントリビューターからの不具合報告、提案、質問は [GitHub Issues](https://github.com/momota1029/fuzukue/issues) で受け付けます。メンテナーの開発計画は [ロードマップのデッキ](roadmap/README.md) で管理します。Issue やプルリクエストを開く前に、[貢献ガイド](CONTRIBUTING.ja.md) と [AI と一緒に PR を送る手順](docs/contributing-with-ai.md) を参照してください。
 
 ## セキュリティ
 
