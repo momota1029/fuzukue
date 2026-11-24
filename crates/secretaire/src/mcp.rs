@@ -125,6 +125,7 @@ pub(crate) enum Tool {
     GitDiff,
     GitLog,
     GitCommit,
+    GitIntegratePatch,
     GitPush,
     GitPull,
     GitBranch,
@@ -225,8 +226,8 @@ impl Tool {
         Self::DraftMail, Self::MailJournal, Self::MailFolders,
     ];
 
-    const GIT: [Self; 11] = [
-        Self::GitRead, Self::GitStatus, Self::GitDiff, Self::GitLog, Self::GitCommit,
+    const GIT: [Self; 12] = [
+        Self::GitRead, Self::GitStatus, Self::GitDiff, Self::GitLog, Self::GitCommit, Self::GitIntegratePatch,
         Self::GitPush, Self::GitPull, Self::GitBranch,
         Self::ListBranches, Self::BranchDiff, Self::MergeBranch,
     ];
@@ -336,6 +337,7 @@ impl Tool {
             Self::GitDiff => "git_diff",
             Self::GitLog => "git_log",
             Self::GitCommit => "git_commit",
+            Self::GitIntegratePatch => git_write::integrate::NAME,
             Self::GitPush => "git_push",
             Self::GitPull => "git_pull",
             Self::GitBranch => "git_branch",
@@ -374,7 +376,7 @@ impl Tool {
             | Self::UpdateReviewPoint | Self::WriteReviewResponse | Self::SelfUpdate | Self::Watch
             | Self::ExportReadingPage | Self::GenerateReadingPage
             | Self::RecordReviewFinding | Self::UpdateReviewFinding | Self::CoursePlan | Self::CourseNext | Self::CourseCommit
-            | Self::SaveAttachment | Self::AddMemo | Self::DraftMail | Self::GitCommit | Self::GitCommitScoped | Self::GitPush | Self::GitPull | Self::MergeBranch)
+            | Self::SaveAttachment | Self::AddMemo | Self::DraftMail | Self::GitCommit | Self::GitCommitScoped | Self::GitIntegratePatch | Self::GitPush | Self::GitPull | Self::MergeBranch)
     }
 
     fn git_remote(self) -> Option<git::RemoteOperation> {
@@ -473,6 +475,7 @@ impl Tool {
             Self::Desk(tool) => tool.schema(),
             Self::GitRead => return git_read::definition(),
             Self::GitCommitScoped => return git_write::definition(),
+            Self::GitIntegratePatch => return git_write::integrate::definition(),
             Self::WorkspaceRead(tool) => return tool.definition(),
             Self::HarnessCandidates(tool) => return tool.definition(),
             Self::WorkspaceWrite(tool) => return tool.definition(),
@@ -977,7 +980,7 @@ pub(crate) fn claude_tool_names(mail: bool, confirm_writes: bool) -> impl Iterat
     Tool::available(mail)
         // These tools remain available via tools/list and go through CLI permission checks.
         .filter(move |tool| {
-            !(matches!(tool, Tool::FileInbox | Tool::CreateResearch | Tool::CreateWorkspace) || confirm_writes && tool.writes() && !matches!(tool, Tool::GitCommit | Tool::GitPush | Tool::GitPull | Tool::Desk(desk::Tool::CancelJob)))
+            !(matches!(tool, Tool::FileInbox | Tool::CreateResearch | Tool::CreateWorkspace) || confirm_writes && tool.writes() && !matches!(tool, Tool::GitCommit | Tool::GitIntegratePatch | Tool::GitPush | Tool::GitPull | Tool::Desk(desk::Tool::CancelJob)))
         })
         .map(Tool::claude_name)
 }
@@ -1660,6 +1663,29 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
     let empty = json!({});
     let args = params.get("arguments").unwrap_or(&empty);
     let project = &app.project_dir;
+    if matches!(tool, Tool::GitIntegratePatch) {
+        use git_write::integrate;
+        ensure!(claude.is_some() || codex.is_some(), "Git patch integration requires a front desk session");
+        let args: integrate::Args = parse_args(args)?;
+        let (approval, push_actor) = if let Some(claude) = claude {
+            let confirm = claude.check_mcp(false, true).await?;
+            ((confirm || args.override_privacy).then_some(Actor::Claude), args.push.then_some(Actor::Claude))
+        } else {
+            let (codex, key) = codex.context("A front desk session is required")?;
+            let approval = codex.check_mcp(session, key, true, args.override_privacy)?;
+            let push_actor = if args.push { codex.check_mcp(session, key, true, true)? } else { None };
+            (approval, push_actor)
+        };
+        return Box::pin(integrate::call(app, session, args, approval, push_actor, async {
+            if let Some(claude) = claude {
+                claude.check_mcp(false, true).await?;
+            }
+            if let Some((codex, key)) = codex {
+                codex.check_mcp(session, key, true, false)?;
+            }
+            Ok(())
+        })).await;
+    }
     let branch = matches!(tool, Tool::GitBranch).then(|| parse_args::<git::BranchArgs>(args)).transpose()?;
     let writes = tool.writes() && (!matches!(tool, Tool::SelfUpdate) || args["action"] != "status") || branch.as_ref().is_some_and(|args| args.action != git::BranchAction::List);
     let writes = if matches!(tool, Tool::Watch) { crate::watch::writes(args) } else { writes };
@@ -1779,6 +1805,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         Tool::GitDiff => json!({"diff": Box::pin(app.git_diff(parse_args(args)?)).await?}),
         Tool::GitLog => json!({"commits": Box::pin(app.git_log(parse_args(args)?)).await?}),
         Tool::GitCommitScoped => unreachable!("worker-only Git tool"),
+        Tool::GitIntegratePatch => unreachable!("handled by the patch integration approval flow"),
         Tool::GitRead => {
             let scope = workspace_read::ReadScope::new(project, &app.state_dir, None)?;
             Box::pin(git_read::call(scope, args)).await?

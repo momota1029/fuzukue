@@ -1,6 +1,6 @@
 //! Fixed-deck MCP tools for recording recurring gaps in the harness.
 
-mod sanitize;
+pub(super) mod sanitize;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

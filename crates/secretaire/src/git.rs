@@ -629,6 +629,16 @@ impl Workspace {
         actor: Actor,
         operation: RemoteOperation,
     ) -> Result<String> {
+        self.git_remote_expected(session, actor, operation, None).await
+    }
+
+    pub(crate) async fn git_remote_expected(
+        &self,
+        session: &str,
+        actor: Actor,
+        operation: RemoteOperation,
+        expected: Option<(&str, &str)>,
+    ) -> Result<String> {
         let (key, label, message) = match operation {
             RemoteOperation::Push => ("approval-git-push", "Git push", "プッシュした"),
             RemoteOperation::Pull => ("approval-git-pull", "Git pull", "取り込みが完了した"),
@@ -637,7 +647,14 @@ impl Workspace {
         let upstream = mutation.prepare(async {
             let _guard = self.git_lock.lock().await;
             let repo = Repo::open(&self.project_dir).await?;
-            repo.upstream(operation).await
+            let upstream = repo.upstream(operation).await?;
+            if let Some((branch, commit)) = expected {
+                ensure!(
+                    upstream.head == branch && upstream.tip.trim_end() == commit,
+                    "The branch or commit changed before push approval"
+                );
+            }
+            Ok(upstream)
         }).await?;
         let branch = upstream.head.trim_start_matches("refs/heads/");
         let target = upstream.target.trim_start_matches("refs/heads/");

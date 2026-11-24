@@ -485,19 +485,23 @@ pub(in crate::mcp) struct Output {
     pub(in crate::mcp) exit_code: i32,
 }
 
-pub(in crate::mcp) async fn output(mut command: Command) -> Result<Output> {
+pub(in crate::mcp) async fn output(command: Command) -> Result<Output> {
+    output_limited(command, MAX_BYTES).await
+}
+
+pub(in crate::mcp) async fn output_limited(mut command: Command, limit: usize) -> Result<Output> {
     let mut child = command.spawn().context("Could not start Git")?;
     let mut bytes = Vec::new();
     child
         .stdout
         .take()
         .context("Git stdout is unavailable")?
-        .take((MAX_BYTES + 1) as u64)
+        .take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .await?;
-    if bytes.len() > MAX_BYTES {
+    if bytes.len() > limit {
         child.kill().await?;
-        bytes.truncate(MAX_BYTES);
+        bytes.truncate(limit);
         return Ok(Output {
             bytes,
             truncated: true,

@@ -42,7 +42,7 @@ static AMBIGUOUS_SECRET: LazyLock<Regex> = LazyLock::new(|| {
 });
 static OPAQUE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z0-9_/+=-]{24,}").unwrap());
 
-pub(super) fn field(name: &str, input: &str, max: usize, required: bool) -> Result<String> {
+pub(in crate::mcp) fn field(name: &str, input: &str, max: usize, required: bool) -> Result<String> {
     ensure!(input.len() <= max, "{name} exceeds {max} UTF-8 bytes");
     ensure!(
         !required || !input.trim().is_empty(),

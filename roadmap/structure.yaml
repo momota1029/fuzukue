@@ -61,6 +61,7 @@ sections:
   - R-67
   - R-68
   - R-69
+  - R-70
 - title: 技術的負債
   items:
   - R-38

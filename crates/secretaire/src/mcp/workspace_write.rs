@@ -25,7 +25,7 @@ const FILE_LIMIT: usize = 256 * 1024;
 const PATCH_LIMIT: usize = 768 * 1024;
 const RECOVERY: &str = "delegate-recovery";
 pub(super) const AUDIT_LIMIT: IntegerRange = IntegerRange::new(1, 100);
-static COMMIT: Mutex<()> = Mutex::new(());
+pub(super) static COMMIT: Mutex<()> = Mutex::new(());
 
 pub(crate) const GUIDANCE: &str = "\n\nUse fuzukue fs_write, fs_edit, or fs_apply_patch for worktree edits. Avoid shell redirection, heredocs, and Python for writing files. Changes outside the job's touches require approval.";
 
