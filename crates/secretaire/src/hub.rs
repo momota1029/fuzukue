@@ -463,8 +463,16 @@ impl Hub {
     }
 
     fn publish_event(&self, event: ServerEvent, completed_session: Option<&str>) -> Option<(usize, String)> {
-        let mut inner = self.inner.lock().unwrap();
-        self.publish_locked(&mut inner, event, completed_session, ApprovalWaiter::Backend)
+        let mut timing = crate::send_latency::Publish::start(&event);
+        let result = {
+            let mut inner = self.inner.lock().unwrap();
+            let timing = timing.as_mut().map(|timing| (timing, Instant::now()));
+            self.publish_locked_timed(&mut inner, event, completed_session, ApprovalWaiter::Backend, timing)
+        };
+        if let Some(timing) = timing {
+            timing.log();
+        }
+        result
     }
 
     pub(crate) fn publish_local_approval(&self, event: ServerEvent, waiter: &Arc<()>) {
@@ -472,8 +480,14 @@ impl Hub {
         self.publish_locked(&mut inner, event, None, ApprovalWaiter::Local(Arc::downgrade(waiter)));
     }
 
-    fn publish_locked(&self, inner: &mut Inner, mut event: ServerEvent, completed_session: Option<&str>,
+    fn publish_locked(&self, inner: &mut Inner, event: ServerEvent, completed_session: Option<&str>,
         waiter: ApprovalWaiter,
+    ) -> Option<(usize, String)> {
+        self.publish_locked_timed(inner, event, completed_session, waiter, None)
+    }
+
+    fn publish_locked_timed(&self, inner: &mut Inner, mut event: ServerEvent, completed_session: Option<&str>,
+        waiter: ApprovalWaiter, timing: Option<(&mut crate::send_latency::Publish, Instant)>,
     ) -> Option<(usize, String)> {
         match &event {
             ServerEvent::TurnEnded { session, actor } => {
@@ -535,6 +549,7 @@ impl Hub {
         observe_question(&mut inner.questions, &env);
         observe_worker(&mut inner.workers, &env.event);
         observe_background(&mut inner.background, &env.event);
+        let journal_started_at = timing.as_ref().map(|_| Instant::now());
         if replayable {
             inner.next_seq += 1;
             if let Some(w) = inner.writer.as_mut() {
@@ -546,9 +561,23 @@ impl Hub {
             }
         }
         // 送信は lock を握ったまま行い、backlog と live の順序を揃える。
+        let journal_done_at = timing.as_ref().map(|_| Instant::now());
         let saved = inner.threads.as_mut()
             .map(|threads| threads.observe(&env.event, completed_session.is_some()));
+        let transcript_done_at = timing.as_ref().map(|_| Instant::now());
+        let seq = env.seq;
         let _ = self.tx.send(env);
+        if let Some((timing, locked_at)) = timing {
+            timing.stages = Some(crate::send_latency::Stages {
+                locked_at,
+                journal_started_at: journal_started_at.unwrap(),
+                journal_done_at: journal_done_at.unwrap(),
+                transcript_done_at: transcript_done_at.unwrap(),
+                broadcast_at: Instant::now(),
+                seq,
+                transcript_error: saved.as_ref().is_some_and(Result::is_err),
+            });
+        }
         if let Some((session, kind)) = notice {
             notifications::send_notice(inner, &session, kind);
         }

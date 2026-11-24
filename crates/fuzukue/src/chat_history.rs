@@ -175,6 +175,7 @@ impl Workbench {
             _ => {}
         }
         let Some(session) = event.transcript_session() else { return Some(true) };
+        let received = self.out.prompt_received(seq, event);
         if self.receiving_backlog {
             self.transcripts.replay.push((seq, event.clone()));
             return None;
@@ -217,6 +218,15 @@ impl Workbench {
             if missing {
                 return Some(false);
             }
+        }
+        if let Some((at, threshold)) = received.filter(|_| session == self.active) {
+            // Run after on_conn applies the event and invalidates the view.
+            cx.defer(move |_| {
+                let elapsed = at.elapsed();
+                if elapsed >= threshold {
+                    eprintln!("send_latency seq={seq} receive_to_apply_us={}", elapsed.as_micros());
+                }
+            });
         }
         Some(true)
     }

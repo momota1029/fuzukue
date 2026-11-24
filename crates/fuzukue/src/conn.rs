@@ -1,7 +1,7 @@
 //! WebSocket 接続と、接続が必要になったときのサーバー起動。専用スレッドで動く。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr, TcpStream},
     path::PathBuf,
@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures::channel::mpsc::UnboundedSender;
-use fuzukue_proto::{CachedSession, ClientMsg, Envelope, ServerEvent, PROTOCOL_VERSION};
+use fuzukue_proto::{Actor, CachedSession, ClientMsg, Envelope, ServerEvent, PROTOCOL_VERSION};
 use fuzukue_view::server::{Launch, ServerMode, ServerSettings, DEFAULT_URL};
 use tungstenite::{client::IntoClientRequest, stream::MaybeTlsStream, Message, WebSocket};
 
@@ -468,15 +468,24 @@ pub(super) struct Sender {
     out: mpsc::Sender<ClientMsg>,
     workspace: Arc<Mutex<Option<String>>>,
     transcript_resume: Arc<Mutex<Option<TranscriptCursor>>>,
+    send_latency: Option<Arc<SendLatency>>,
 }
 
 impl From<mpsc::Sender<ClientMsg>> for Sender {
     fn from(out: mpsc::Sender<ClientMsg>) -> Self {
-        Self { out, workspace: Default::default(), transcript_resume: Default::default() }
+        Self { out, workspace: Default::default(), transcript_resume: Default::default(), send_latency: None }
     }
 }
 
 impl Sender {
+    pub(super) fn prompt_received(&self, seq: u64, event: &ServerEvent) -> Option<(Instant, Duration)> {
+        let latency = self.send_latency.as_ref()?;
+        let item = prompt_item(event)?;
+        let mut received = latency.received.lock().unwrap();
+        let index = received.iter().position(|(key, id, _)| *key == seq && id == item)?;
+        received.remove(index).map(|(_, _, at)| (at, latency.threshold))
+    }
+
     pub(super) fn select_workspace(&self, id: Option<String>) {
         *self.workspace.lock().unwrap() = id;
     }
@@ -570,12 +579,14 @@ pub fn spawn(
     let (out_tx, out_rx) = mpsc::channel();
     let (control, commands) = mpsc::channel();
     let owner = Arc::new(Mutex::new(ServerOwner::default()));
-    let sender = Sender::from(out_tx);
+    let mut sender = Sender::from(out_tx);
+    sender.send_latency = SendLatency::from_env().map(Arc::new);
     let worker = Worker {
         events,
         commands,
         out_rx,
         transcript_resume: sender.transcript_resume.clone(),
+        send_latency: sender.send_latency.clone(),
         owner: owner.clone(),
         settings_path,
     };
@@ -592,11 +603,40 @@ pub fn spawn(
     )
 }
 
+struct SendLatency {
+    threshold: Duration,
+    received: Mutex<VecDeque<(u64, String, Instant)>>,
+}
+
+impl SendLatency {
+    fn from_env() -> Option<Self> {
+        let threshold = std::env::var("FUZUKUE_SEND_LATENCY_MS").ok()?.parse().ok()?;
+        Some(Self { threshold: Duration::from_millis(threshold), received: Mutex::default() })
+    }
+
+    fn record(&self, env: &Envelope, at: Instant) {
+        let Some(item) = prompt_item(&env.event) else { return };
+        let mut received = self.received.lock().unwrap();
+        if received.len() == 256 {
+            received.pop_front();
+        }
+        received.push_back((env.seq, item.to_owned(), at));
+    }
+}
+
+fn prompt_item(event: &ServerEvent) -> Option<&str> {
+    match event {
+        ServerEvent::UserPrompt { item, .. } | ServerEvent::TextDelta { item, actor: Actor::User, .. } => Some(item),
+        _ => None,
+    }
+}
+
 struct Worker {
     events: UnboundedSender<ConnEvent>,
     commands: mpsc::Receiver<Control>,
     out_rx: mpsc::Receiver<ClientMsg>,
     transcript_resume: Arc<Mutex<Option<TranscriptCursor>>>,
+    send_latency: Option<Arc<SendLatency>>,
     owner: Arc<Mutex<ServerOwner>>,
     settings_path: Option<PathBuf>,
 }
@@ -899,7 +939,12 @@ impl Worker {
             }
             match ws.read() {
                 Ok(Message::Text(t)) => {
+                    let received = self.send_latency.as_ref().filter(|_| synced)
+                        .map(|latency| (latency, Instant::now()));
                     let env: Envelope = serde_json::from_str(&t)?;
+                    if let Some((latency, at)) = received {
+                        latency.record(&env, at);
+                    }
                     match &env.event {
                         ServerEvent::Welcome { selection_scoped_transcripts, .. } => {
                             if resuming_transcripts && !selection_scoped_transcripts {

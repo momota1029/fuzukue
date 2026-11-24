@@ -11,6 +11,24 @@ pub(crate) mod shell;
 pub(crate) mod shell_rules;
 pub(crate) mod workspace_read;
 
+#[cfg(target_os = "linux")]
+pub(crate) fn lower_child_cpu_priority(command: &mut tokio::process::Command) {
+    let increment = std::env::var("FUZUKUE_WORKER_NICE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (1..=19).contains(value));
+    if let Some(increment) = increment {
+        // Only the child changes priority. Its tools inherit the new value.
+        // Keep launching workers where the host disallows changing priority.
+        unsafe {
+            command.pre_exec(move || {
+                let _ = rustix::process::nice(increment);
+                Ok(())
+            });
+        }
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct Config {
     #[serde(default)]

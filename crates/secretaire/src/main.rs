@@ -66,6 +66,7 @@ mod source_editor;
 mod self_update;
 mod service;
 mod state;
+mod send_latency;
 mod synctex;
 mod threads;
 mod tiers;
@@ -1582,6 +1583,7 @@ async fn serve_workspace(
             };
             let Some(Ok(msg)) = msg else { break };
             let Message::Text(t) = msg else { continue };
+            let received = send_latency::Received::now();
             let mut workspace_request = false;
             let msg = match serde_json::from_str::<ClientMsg>(&t) {
                 Ok(ClientMsg::InWorkspace { id, request }) if protocol >= 11 => {
@@ -2179,7 +2181,8 @@ async fn serve_workspace(
                         continue;
                     }
                     let session = session.to_owned();
-                    if let Err(e) = handle_from_client(&app, prompt, Some(&screenshot_client)).await {
+                    let handle = handle_from_client(&app, prompt, Some(&screenshot_client));
+                    if let Err(e) = send_latency::Received::scope(received, handle).await {
                         let _ = reply.send(backend_switch_notice(&session, &e)
                             .unwrap_or_else(|| ServerEvent::Error { message: format!("{e:#}") }));
                     }
@@ -2302,7 +2305,9 @@ async fn serve_workspace(
                             Some(session.clone()),
                         _ => None,
                     };
-                    match handle_from_client(&app, m, Some(&screenshot_client)).await {
+                    let received = send_latency::Received::for_message(received, &m);
+                    let handle = handle_from_client(&app, m, Some(&screenshot_client));
+                    match send_latency::Received::scope(received, handle).await {
                         Ok(()) => {
                             if let Some(event) = confirmation {
                                 let _ = reply.send(event);
@@ -3150,13 +3155,25 @@ async fn handle_from_client(
             let commands::Input::Prompt(text) = commands::parse(&text) else { unreachable!() };
             let text = text.to_owned();
             anyhow::ensure!(app.hub.has_thread(&session), "スレッドが見つからない");
-            let (prompt, images) = with_attachments(&app.project_dir, &text, &paths)?;
+            let (text, paths, prompt, images) = if paths.is_empty() {
+                let prompt = text.clone();
+                (text, paths, prompt, Vec::new())
+            } else {
+                let project = app.project_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let (prompt, images) = with_attachments(&project, &text, &paths)?;
+                    Ok::<_, anyhow::Error>((text, paths, prompt, images))
+                }).await??
+            };
+            let waiting = send_latency::before_prompt_lock();
             let _start = app.prompt_start.lock().await;
+            send_latency::after_prompt_lock(waiting);
             anyhow::ensure!(app.hub.has_thread(&session), "スレッドが見つからない");
             if let Some(job) = job {
                 let event = ServerEvent::UserPrompt {
                     session: session.clone(), item: format!("{job}:{}", user_item()), text, paths, to_worker: true,
                 };
+                send_latency::expect_echo(&event, "worker_steer");
                 app.delegates.steer(app, &session, &job, &prompt, event)?;
                 planner::goal_event(app, &session, false);
                 return Ok(());
@@ -3183,7 +3200,9 @@ async fn handle_from_client(
                     app.hub.set_github_auth_request(&session,
                         github_auth_request(TurnKind::UserConversation, "", user_event.as_ref()));
                     app.hub.mark_user_steer(&session);
-                    app.hub.publish(user_event.unwrap());
+                    let event = user_event.unwrap();
+                    send_latency::expect_echo(&event, "codex_steer");
+                    app.hub.publish(event);
                     return Ok(());
                 }
             }
@@ -3199,10 +3218,18 @@ async fn handle_from_client(
                     Some(update) => { update.hold_input(store)?; }
                     None => { store()?; }
                 }
-                app.hub.publish(user_event.unwrap());
+                let event = user_event.unwrap();
+                send_latency::expect_echo(&event, "held");
+                app.hub.publish(event);
                 return Ok(());
             }
             let _work = work?;
+            let backend = AgentBackend::for_model(settings.model.as_deref());
+            let route = match backend {
+                AgentBackend::Claude => "claude",
+                AgentBackend::Codex => "codex",
+            };
+            send_latency::expect_echo(user_event.as_ref().unwrap(), route);
             start_user_prompt(app, session, settings, prompt, user_event, images).await?;
         }
         ClientMsg::Interrupt { session } => {

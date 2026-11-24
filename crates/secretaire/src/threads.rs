@@ -2,7 +2,7 @@
 
 use fuzukue_proto::{GitHubActivity, GitHubAuthor, GitHubLink, GitHubPolicy, ThreadGitHub};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
@@ -461,8 +461,7 @@ impl Transcript {
         }
     }
 
-    fn markdown(&self) -> Result<String> {
-        let mut body = String::new();
+    fn write_markdown(&self, mut body: impl Write) -> Result<()> {
         for entry in &self.items {
             let meta = if let Some(tool) = entry.meta.tool.as_ref().filter(|_| !entry.meta.is_delegated()) {
                 // 通常のツール詳細は従来どおりジャーナルに残す。
@@ -476,7 +475,7 @@ impl Transcript {
                 serde_json::to_string(&entry.meta)?
             };
             // HTML コメントの中で "-->" が始まらないようにする。
-            body.push_str(&format!("{ENTRY}{} -->\n", meta.replace('>', "\\u003e")));
+            writeln!(body, "{ENTRY}{} -->", meta.replace('>', "\\u003e"))?;
             let role = match entry.meta.actor {
                 Actor::User => "User",
                 Actor::Claude => "Claude",
@@ -489,23 +488,23 @@ impl Transcript {
                     Some(false) => "failed",
                     None => "result unavailable",
                 };
-                body.push_str(&format!("- {role} called `{}` ({result})\n\n", tool.name));
+                write!(body, "- {role} called `{}` ({result})\n\n", tool.name)?;
             } else {
-                body.push_str(&format!("## {role}\n\n"));
+                write!(body, "## {role}\n\n")?;
                 for (i, line) in entry.text.split('\n').enumerate() {
                     if i > 0 {
-                        body.push('\n');
+                        body.write_all(b"\n")?;
                     }
                     if line.trim_start_matches('\\').starts_with(ENTRY) {
-                        body.push('\\');
+                        body.write_all(b"\\")?;
                     }
-                    body.push_str(line);
+                    body.write_all(line.as_bytes())?;
                 }
-                body.push_str(&attachment_list(&entry.meta.attachments));
-                body.push_str("\n\n");
+                body.write_all(attachment_list(&entry.meta.attachments).as_bytes())?;
+                body.write_all(b"\n\n")?;
             }
         }
-        Ok(body)
+        Ok(())
     }
 
     fn read(body: &str) -> Result<Self> {
@@ -764,12 +763,12 @@ impl Thread {
     fn save(&self) -> Result<()> {
         let dir = self.path.parent().context("missing thread directory")?;
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        write!(
-            tmp,
-            "---\n{}---\n{}",
-            serde_yaml::to_string(&self.front)?,
-            self.transcript.markdown()?
-        )?;
+        {
+            let mut output = BufWriter::new(tmp.as_file_mut());
+            write!(output, "---\n{}---\n", serde_yaml::to_string(&self.front)?)?;
+            self.transcript.write_markdown(&mut output)?;
+            output.flush()?;
+        }
         tmp.persist(&self.path)?;
         Ok(())
     }

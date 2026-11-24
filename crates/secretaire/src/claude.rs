@@ -1616,6 +1616,8 @@ pub(crate) async fn run_worker(
     let scope_settings = scope.claude_settings(&std::env::current_exe()?).to_string();
     let instructions = format!("{}{}", launch.instructions, crate::rules::worker_voice());
     let mut cmd = Command::new(program);
+    #[cfg(target_os = "linux")]
+    crate::worker_scope::lower_child_cpu_priority(&mut cmd);
     let mode = match settings.permission_mode {
         PermissionMode::BypassPermissions => PermissionMode::AcceptEdits,
         mode => mode,
