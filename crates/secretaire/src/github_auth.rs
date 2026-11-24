@@ -455,6 +455,7 @@ pub(crate) struct Auth {
     http: Box<dyn Http>,
     token: TokenFile,
     operation: Mutex<Operation>,
+    reads: read::Cache,
 }
 
 impl Auth {
@@ -463,6 +464,7 @@ impl Auth {
             http: Box::new(GitHubHttp),
             token: TokenFile(state.join("github-oauth.json")),
             operation: Mutex::default(),
+            reads: read::Cache::default(),
         }
     }
 
@@ -836,6 +838,7 @@ pub(crate) async fn handle(
 
 mod avatar;
 pub(crate) mod mcp;
+pub(crate) mod read;
 
 #[cfg(test)]
 mod tests;

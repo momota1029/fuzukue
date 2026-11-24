@@ -173,6 +173,18 @@ impl GitHubConfig {
         Ok(repo.to_ascii_lowercase())
     }
 
+    pub(crate) fn read_repo(&self, workspace_repo: Option<&str>, requested: Option<&str>) -> Result<String> {
+        let repo = requested.or(workspace_repo)
+            .context("This workspace has no GitHub repository. Specify an allowed owner/repo.")?;
+        ensure!(repo.len() <= 150 && crate::workshop::valid_repo(repo), "Use a GitHub repository in owner/repo format.");
+        ensure!(
+            workspace_repo.is_some_and(|own| own.eq_ignore_ascii_case(repo))
+                || self.issue_repos.iter().flatten().any(|allowed| allowed.eq_ignore_ascii_case(repo)),
+            "GitHub repository is outside this workspace's read allowlist (github.issue_repos)."
+        );
+        Ok(repo.to_ascii_lowercase())
+    }
+
     pub(crate) fn report_target(&self, origin: Option<&str>) -> Option<String> {
         let target = self.report_repo.as_deref().or(origin)?;
         self.creation_repo(Some(target), target).ok()

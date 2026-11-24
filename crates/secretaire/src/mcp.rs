@@ -145,6 +145,7 @@ pub(crate) enum Tool {
     Research(crate::workshop::mcp::Tool),
     GitHub(crate::issue_threads::Tool),
     GitHubAuth(crate::github_auth::mcp::Tool),
+    GitHubRead(crate::github_auth::read::Tool),
     Handoff(crate::handoff::Tool),
 }
 
@@ -239,6 +240,7 @@ impl Tool {
             .chain(crate::workshop::mcp::Tool::ALL.map(Self::Research))
             .chain(crate::issue_threads::Tool::ALL.map(Self::GitHub))
             .chain(crate::github_auth::mcp::Tool::ALL.map(Self::GitHubAuth))
+            .chain(crate::github_auth::read::Tool::ALL.map(Self::GitHubRead))
             .chain(crate::handoff::Tool::ALL.map(Self::Handoff))
             .chain(crate::lsp::Tool::ALL.map(Self::Lsp))
             .chain(Self::MAIL.into_iter().filter(move |_| mail))
@@ -355,6 +357,7 @@ impl Tool {
             Self::Handoff(tool) => tool.name(),
             Self::GitHub(tool) => tool.name(),
             Self::GitHubAuth(tool) => tool.name(),
+            Self::GitHubRead(tool) => tool.name(),
         }
     }
 
@@ -421,6 +424,7 @@ impl Tool {
             Self::Handoff(tool) => return tool.definition(),
             Self::GitHub(tool) => return tool.definition(),
             Self::GitHubAuth(tool) => return tool.definition(),
+            Self::GitHubRead(tool) => return tool.definition(),
             Self::GitStatus => (harness_text!("Show the open workspace’s branch, divergence from its upstream, and changed files.", "開いているワークスペースのブランチ、追跡先との差、変更ファイルを返す。"), json!({}), &[]),
             Self::GitDiff => (harness_text!("Show the diff, up to 64 KiB. Unstaged diffs include untracked files.", "差分を返す。unstaged には未追跡ファイルを含む。差分は最大 64 KiB。"),
                 json!({"path": {"type": "string", "description": harness_text!("Workspace-relative path. Defaults to the entire workspace.", "ワークスペース相対。省略時は全体。")},
@@ -978,7 +982,7 @@ pub(crate) fn claude_tool_names(mail: bool, confirm_writes: bool) -> impl Iterat
         .map(Tool::claude_name)
 }
 
-// Default worker tools provide internal communication, local reads, and paper builds.
+// Default worker tools provide internal communication, scoped reads, and paper builds.
 fn worker_tools() -> impl Iterator<Item = Tool> {
     Tool::available(false).filter(|tool| matches!(tool,
         Tool::Graph(graph) if !graph.writes()
@@ -987,7 +991,7 @@ fn worker_tools() -> impl Iterator<Item = Tool> {
         | Tool::ListReviewSubmissions | Tool::ReadReviewPoint | Tool::ListReviewFindings | Tool::ReadReference
         | Tool::ListLedger | Tool::ReadLedgerAttempts | Tool::GitStatus | Tool::GitDiff | Tool::GitLog
         | Tool::ListTests | Tool::Lsp(_) | Tool::LeanDocCheck | Tool::ClientScreenshot
-        | Tool::WorkspaceRead(_) | Tool::GitRead | Tool::HarnessCandidates(_) | Tool::BuildPaper
+        | Tool::WorkspaceRead(_) | Tool::GitRead | Tool::GitHubRead(_) | Tool::HarnessCandidates(_) | Tool::BuildPaper
         | Tool::ListScreenshotScenarios | Tool::CaptureScreenshot | Tool::Recipe(_)
     )).chain([Tool::AskFrontDesk])
         .chain(workspace_write::Tool::ALL.map(Tool::WorkspaceWrite).into_iter().filter(|_| !crate::canary()))
@@ -1716,6 +1720,9 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         let actor = approval.unwrap_or(if claude.is_some() { Actor::Claude } else { Actor::System });
         return Ok(data_result(Box::pin(tool.call(app, session, actor)).await?, false));
     }
+    if let Tool::GitHubRead(tool) = tool {
+        return Ok(data_result(Box::pin(tool.call(app, args)).await?, false));
+    }
     let automatic = app.issue_threads.automatic_policy(session);
     if matches!(tool, Tool::MergeBranch | Tool::Research(crate::workshop::mcp::Tool::Accept)) {
         ensure!(automatic != Some(fuzukue_proto::GitHubPolicy::Allow), "Merging is disabled during an automatic GitHub turn");
@@ -1762,7 +1769,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             json!({"deck": deck_rel, "cards": result.cards, "report": result.report.strip_prefix(project)?,
                 "verification": result.verification})
         }
-        Tool::Research(_) | Tool::GitHub(_) | Tool::GitHubAuth(_) | Tool::Handoff(_) => unreachable!("handled above"),
+        Tool::Research(_) | Tool::GitHub(_) | Tool::GitHubAuth(_) | Tool::GitHubRead(_) | Tool::Handoff(_) => unreachable!("handled above"),
         Tool::Graph(tool) => crate::graph::WorkspaceGraph::call(app.clone(), tool, args.clone()).await?,
         Tool::Lsp(tool) => json!({ "result": tool.call(&app.lsp, args).await? }),
         Tool::GitStatus => {
