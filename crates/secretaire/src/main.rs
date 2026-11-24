@@ -191,6 +191,7 @@ pub struct Workspace {
 impl Workspace {
     fn new(project_dir: PathBuf, addr: String, state_dir: PathBuf, hub: Arc<Hub>) -> Self {
         let id = workspaces::id_for(&project_dir);
+        hub.init_approval_queue(id.clone(), &state_dir);
         let research_issues = workshop::Queue::new(&project_dir, &state_dir, &id);
         let saved = hub.load_threads(&project_dir, &state_dir);
         let mut workspace = Self {
@@ -312,6 +313,7 @@ impl Workspace {
         if canary() {
             return;
         }
+        self.hub.watch_approval_expiry();
         watch::start(self);
         handoff::watch(self);
         self.check_lean();
@@ -914,6 +916,19 @@ fn supports_question_events(event: &ServerEvent, protocol: u32) -> bool {
         || !matches!(event, ServerEvent::QuestionAsked { .. } | ServerEvent::QuestionResolved { .. })
 }
 
+fn wire_welcome(event: &ServerEvent, capabilities: fuzukue_proto::WelcomeCapabilities) -> Message {
+    #[derive(serde::Serialize)]
+    struct Welcome<'a> {
+        #[serde(flatten)]
+        event: &'a ServerEvent,
+        #[serde(flatten)]
+        capabilities: fuzukue_proto::WelcomeCapabilities,
+    }
+
+    let wire = serde_json::json!({ "seq": 0, "event": Welcome { event, capabilities } });
+    Message::Text(wire.to_string().into())
+}
+
 fn wire_event(env: &Envelope, protocol: u32, workspace: Option<&str>, locale: fuzukue_i18n::Locale) -> Message {
     #[derive(serde::Serialize)]
     struct Wire<'a> {
@@ -1047,6 +1062,7 @@ async fn serve_workspace(
     let _question_client = (question_protocol >= fuzukue_proto::QUESTION_PROTOCOL)
         .then(|| app.hub.register_question_client());
     let scoped = transcripts.is_some();
+    let approval_queue = github_report_client && !canary() && protocol >= 11;
     let (initial, mut live) = app.session_stats.subscribe(
         &app.hub, resume_from, protocol >= 2, protocol >= 4, transcripts,
     );
@@ -1067,7 +1083,12 @@ async fn serve_workspace(
             protocol, server: "secretaire".into(), client_manifest, server_tailnet_url,
             selection_scoped_transcripts: scoped,
         };
-        tx.send(wire_event(&snapshot(event), protocol, None, locale_for_wire())).await.ok()?;
+        let welcome = if approval_queue {
+            wire_welcome(&event, fuzukue_proto::WelcomeCapabilities { approval_queue })
+        } else {
+            wire_event(&snapshot(event), protocol, None, locale_for_wire())
+        };
+        tx.send(welcome).await.ok()?;
     }
     if let Some(work) = &shutdown_work {
         let event = ServerEvent::ShutdownWork { work: work.clone() };
@@ -1548,7 +1569,18 @@ async fn serve_workspace(
         let mut uploads = inbox::Uploads::default();
         let mut lsp = app.lsp.connection(reply.clone());
         let mut scoped_paper = false;
-        while let Some(Ok(msg)) = rx.next().await {
+        let mut approval_updates: Option<tokio::sync::broadcast::Receiver<fuzukue_proto::ApprovalSummary>> = None;
+        loop {
+            let msg = tokio::select! {
+                msg = rx.next() => msg,
+                update = async { approval_updates.as_mut().unwrap().recv().await }, if approval_updates.is_some() => {
+                    // A lagging client reconnects and requests a fresh snapshot.
+                    let Ok(approval) = update else { break };
+                    let _ = reply.send(ServerEvent::ApprovalQueueChanged { approval });
+                    continue;
+                }
+            };
+            let Some(Ok(msg)) = msg else { break };
             let Message::Text(t) = msg else { continue };
             let mut workspace_request = false;
             let msg = match serde_json::from_str::<ClientMsg>(&t) {
@@ -1561,6 +1593,19 @@ async fn serve_workspace(
                 other => other,
             };
             match msg {
+                Ok(ClientMsg::ListPendingApprovals { request }) if approval_queue => {
+                    let result = app.hub.pending_approvals().map(|(pending, updates)| {
+                        approval_updates = Some(updates);
+                        pending
+                    }).map_err(|error| error.to_string());
+                    let _ = reply.send(ServerEvent::ApprovalQueue { request, result });
+                }
+                Ok(ClientMsg::DecideApproval { request, approval_id, decision, reason }) if approval_queue => {
+                    let result = app.hub.decide_approval(&approval_id, decision, grant_principal, reason)
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(ServerEvent::ApprovalDecisionResult { request, result });
+                }
+                Ok(ClientMsg::ListPendingApprovals { .. } | ClientMsg::DecideApproval { .. }) => {}
                 Ok(ClientMsg::ListFolderGrants { .. } | ClientMsg::AddFolderGrant { .. }
                     | ClientMsg::RevokeFolderGrant { .. } | ClientMsg::DecideFolderAccess { .. })
                     if protocol < fuzukue_proto::FOLDER_GRANTS_PROTOCOL || !github_report_client || canary() => {}
@@ -3003,6 +3048,7 @@ async fn handle_from_client(
     app: &Arc<Workspace>, msg: ClientMsg, client: Option<&screenshots::Connection<'_>>,
 ) -> anyhow::Result<()> {
     match msg {
+        ClientMsg::ListPendingApprovals { .. } | ClientMsg::DecideApproval { .. } => {}
         ClientMsg::SaveScreenshot { .. } | ClientMsg::ClientScreenshotResponse { .. }
         | ClientMsg::Trash { .. } | ClientMsg::RemoveWorkspace { .. } | ClientMsg::RewriteReply { .. }
         | ClientMsg::SelfUpdateStatus | ClientMsg::StartSelfUpdate | ClientMsg::RollbackServer
@@ -3082,6 +3128,7 @@ async fn handle_from_client(
         }
         ClientMsg::StopWorker { session, job } => {
             anyhow::ensure!(app.delegates.interrupt_job(&session, &job), "作業役のジョブは終了した");
+            app.hub.withdraw_approvals_for(&session, Some(&job), "worker job stopped")?;
         }
         prompt @ (ClientMsg::Prompt { .. } | ClientMsg::PromptWithAttachments { .. }
             | ClientMsg::RolePrompt { .. } | ClientMsg::WorkerPrompt { .. }) => {

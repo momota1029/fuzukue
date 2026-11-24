@@ -66,6 +66,8 @@ pub const REVIEW_FINDINGS_PROTOCOL: u32 = 63;
 pub const FOLDER_GRANTS_PROTOCOL: u32 = 65;
 pub const PROTOCOL_VERSION: u32 = FOLDER_GRANTS_PROTOCOL;
 
+mod approvals;
+pub use approvals::*;
 mod folder_grants;
 pub use folder_grants::*;
 pub const MAX_OPEN_FILE_BYTES: u64 = 200 * 1024 * 1024;
@@ -939,6 +941,8 @@ pub enum ClientMsg {
         build_id: Option<String>,
     },
     SetLocale { locale: String },
+    ListPendingApprovals { request: u64 },
+    DecideApproval { request: u64, approval_id: String, decision: ApprovalDecision, reason: Option<String> },
     ListWorkspaces,
     RemoveWorkspace { id: String },
     Trash { action: TrashAction },
@@ -2210,6 +2214,9 @@ pub enum ServerEvent {
         server_tailnet_url: Option<String>,
     },
     ClientUpdateAvailable,
+    ApprovalQueue { request: u64, result: Result<Vec<ApprovalSummary>, String> },
+    ApprovalQueueChanged { approval: ApprovalSummary },
+    ApprovalDecisionResult { request: u64, result: Result<ApprovalSummary, String> },
     Workspaces { workspaces: Vec<WorkspaceInfo> },
     WorkspaceSelected { id: String, replay: bool },
     WorkspaceError { message: String },
@@ -2502,6 +2509,7 @@ impl ServerEvent {
     pub fn is_live_only(&self) -> bool {
         matches!(self, Self::OpenFile { .. } | Self::OpenPaper { .. } | Self::ClientCommand { .. }
             | Self::Notify { .. } | Self::IssueIntakeMove { .. }
+            | Self::ApprovalQueue { .. } | Self::ApprovalQueueChanged { .. } | Self::ApprovalDecisionResult { .. }
             | Self::FolderGrants { .. } | Self::FolderGrantsChanged { .. }
             | Self::ThreadHistoryStart { .. } | Self::ThreadHistoryPage { .. }
             | Self::ThreadHistoryFailed { .. } | Self::ThreadTail { .. } | Self::ThreadSync { .. })

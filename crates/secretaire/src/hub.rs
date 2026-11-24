@@ -13,6 +13,8 @@ use crate::questions::{self, QuestionReply};
 
 mod notifications;
 mod folder_grants;
+mod approval_queue;
+pub(crate) mod approval_store;
 
 const BACKLOG: usize = 10_000;
 
@@ -26,6 +28,7 @@ pub struct Hub {
     inner: Mutex<Inner>,
     tx: broadcast::Sender<Envelope>,
     epoch: String,
+    approval_queue: std::sync::OnceLock<approval_store::Queue>,
 }
 
 struct Inner {
@@ -126,6 +129,7 @@ impl Hub {
         let (tx, _) = broadcast::channel(1024);
         Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
             epoch: format!("{:032x}", rand::random::<u128>()),
+            approval_queue: Default::default(),
         }
     }
 

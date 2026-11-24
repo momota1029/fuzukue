@@ -181,6 +181,7 @@ sealed interface ServerEvent {
         val protocol: Int,
         @SerialName("minimum_protocol") val minimumProtocol: Int? = null,
         @SerialName("selection_scoped_transcripts") val selectionScoped: Boolean = false,
+        @SerialName("approval_queue") val approvalQueue: Boolean = false,
     ) : ServerEvent
     @Serializable data class WorkspaceSelected(val id: String, val replay: Boolean) : ServerEvent
     @Serializable data class Workspaces(val workspaces: List<Workspace>) : ServerEvent

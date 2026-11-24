@@ -280,6 +280,7 @@ impl Hub {
     pub(crate) fn set_thread_archived(&self, session: &str, archived: bool) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if archived {
+            self.withdraw_approvals_for(session, None, "thread archived")?;
             self.end_folder_grants(&mut inner, session, false)?;
         }
         let store = inner
