@@ -43,6 +43,7 @@ sections:
   - R-44
   - R-47
   - R-49
+  - R-52
 - title: 技術的負債
   items:
   - R-38
