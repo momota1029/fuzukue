@@ -222,18 +222,36 @@ async fn read_clamps_line_numbers_and_byte_budget() -> Result<()> {
     let f = Fixture::new()?;
     let scope = f.worker()?;
     fs::write(f.worktree.join("scan"), vec![b'\n'; READ_SCAN_BYTES])?;
-    check_integer_argument(
-        Tool::Read,
-        &scope,
-        json!({"path": "scan"}),
-        "start_line",
-        [1, 16 * 1024 * 1024, 1],
-        |result, expected| {
-            let text = result["text"].as_str().unwrap();
-            assert!(text.starts_with(&format!("{expected}: \n")));
-        },
-    )
-    .await?;
+    let definition = Tool::Read.definition();
+    let start = &definition["inputSchema"]["properties"]["start_line"];
+    assert_eq!(start["minimum"], -(READ_SCAN_BYTES as i64));
+    assert_eq!(start["maximum"], READ_SCAN_BYTES);
+    assert_eq!(start["default"], 1);
+    let cases = [
+        (Value::Null, 1),
+        (json!(0), 1),
+        (json!(1), 1),
+        (json!(i64::MIN), 1),
+        (json!(-(READ_SCAN_BYTES as i64)), 1),
+        (json!(-1), READ_SCAN_BYTES),
+        (json!(READ_SCAN_BYTES), READ_SCAN_BYTES),
+        (json!(u64::MAX), READ_SCAN_BYTES),
+    ];
+    for (value, expected) in cases {
+        let mut args = json!({"path": "scan", "max_bytes": 1});
+        if !value.is_null() {
+            args["start_line"] = value;
+        }
+        let result = Tool::Read.call(scope.clone(), &args).await?;
+        assert!(result["text"].as_str().unwrap().starts_with(&format!("{expected}: \n")));
+    }
+    for value in range::tests::wrong_types() {
+        let error = Tool::Read
+            .call(scope.clone(), &json!({"path": "scan", "start_line": value}))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expected an integer"));
+    }
 
     fs::write(f.worktree.join("lines"), "text\n".repeat(450))?;
     check_integer_argument(
@@ -271,6 +289,11 @@ async fn read_clamps_line_numbers_and_byte_budget() -> Result<()> {
         .await?;
     assert_eq!(last["truncated"], true);
     assert_eq!(last["next_start_line"], Value::Null);
+    assert_eq!(last["total_lines"], Value::Null);
+    for selector in [json!({"path": "scan", "tail_lines": 1}), json!({"path": "scan", "start_line":-1})] {
+        let error = Tool::Read.call(scope.clone(), &selector).await.unwrap_err();
+        assert!(error.to_string().contains("16 MiB scan limit"));
+    }
 
     let error = Tool::Read
         .call(
@@ -280,6 +303,57 @@ async fn read_clamps_line_numbers_and_byte_budget() -> Result<()> {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("end_line must be at least start_line"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_tail_and_end_relative_ranges() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    fs::write(f.worktree.join("lines"), "one\r\ntwo\r\nthree\r\nfour")?;
+    fs::write(f.worktree.join("empty"), "")?;
+    for selector in [json!({"path": "lines", "tail_lines": 2}), json!({"path": "lines", "start_line": -2})] {
+        let result = Tool::Read.call(scope.clone(), &selector).await?;
+        assert_eq!(result["text"], "3: three\n4: four\n");
+        assert_eq!(result["total_lines"], 4);
+        assert_eq!(result["truncated"], false);
+    }
+    let range = Tool::Read.call(scope.clone(), &json!({
+        "path": "lines", "start_line": -3, "end_line": 3,
+    })).await?;
+    assert!(range["text"].as_str().unwrap().starts_with("2: two\n3: three\n"));
+    assert_eq!(range["next_start_line"], 4);
+    let error = Tool::Read.call(scope.clone(), &json!({
+        "path": "lines", "tail_lines": 2, "start_line": 1,
+    })).await.unwrap_err();
+    assert!(error.to_string().contains("tail_lines on its own"));
+
+    let empty = Tool::Read.call(scope.clone(), &json!({"path": "empty", "tail_lines": 1})).await?;
+    assert_eq!(empty["total_lines"], 0);
+    assert_eq!(empty["text"], "");
+
+    fs::write(f.worktree.join("long"), "行\n".repeat(450))?;
+    let schema = Tool::Read.definition();
+    let property = &schema["inputSchema"]["properties"]["tail_lines"];
+    assert_eq!(property["minimum"], 1);
+    assert_eq!(property["maximum"], 400);
+    for (value, count) in [(0, 1), (1, 1), (400, 400), (401, 400), (u64::MAX, 400)] {
+        let result = Tool::Read.call(scope.clone(), &json!({"path": "long", "tail_lines": value})).await?;
+        assert_eq!(result["total_lines"], 450);
+        assert_eq!(result["text"].as_str().unwrap().lines().count(), count);
+        assert!(result["text"].as_str().unwrap().starts_with(&format!("{}: 行\n", 451 - count)));
+    }
+    for value in range::tests::wrong_types() {
+        let error = Tool::Read
+            .call(scope.clone(), &json!({"path": "long", "tail_lines": value}))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expected an integer"));
+    }
+    let clipped = Tool::Read.call(scope, &json!({"path": "long", "tail_lines": 1, "max_bytes": 3})).await?;
+    assert_eq!(clipped["total_lines"], 450);
+    assert_eq!(clipped["truncated"], true);
+    assert_eq!(clipped["next_start_line"], Value::Null);
     Ok(())
 }
 
@@ -428,6 +502,14 @@ async fn listing_bounds_depth_hides_generated_entries_and_caps_results() -> Resu
     let roots = Tool::List.call(scope.clone(), &json!({})).await?;
     assert_eq!(roots["entries"].as_array().unwrap().len(), 1);
     assert_eq!(roots["entries"][0]["path"], "src");
+    let sample = f.worktree.join("src/sub/deep/sample.rs");
+    let file = fs::File::open(&sample)?;
+    let timestamp = 1_600_000_000;
+    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(timestamp))?;
+    let files = Tool::List.call(scope.clone(), &json!({"path": "src/sub/deep"})).await?;
+    assert_eq!(files["entries"][0], json!({
+        "path": "sample.rs", "type": "file", "size": 3, "mtime_unix_secs": timestamp,
+    }));
     let all = Tool::List
         .call(
             scope.clone(),
@@ -496,6 +578,42 @@ async fn search_is_bounded_and_passes_option_like_patterns_as_data() -> Result<(
     assert_eq!(all["matches"][2]["path"], "b.txt");
     assert_eq!(all["matches"][2]["line"], 1);
     assert_eq!(all["truncated"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_output_modes_limit_files_and_count_matching_lines() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    fs::write(f.worktree.join("a.txt"), "hit HIT\r\nHIT\r\nmiss")?;
+    fs::write(f.worktree.join("b.txt"), "miss\nhit")?;
+    fs::write(f.worktree.join("c.txt"), "miss\n")?;
+    fs::write(f.worktree.join("outside.md"), "hit\n")?;
+
+    for (mode, key, expected) in [
+        ("files_with_matches", "files", json!(["a.txt", "b.txt"])),
+        ("count", "counts", json!([{"path": "a.txt", "count": 2}, {"path": "b.txt", "count": 1}])),
+    ] {
+        let args = json!({
+            "pattern": "hit", "glob": "*.txt", "fixed_string": true, "ignore_case": true,
+            "output_mode": mode, "context": 2, "max_results": 2,
+        });
+        let result = Tool::Search.call(scope.clone(), &args).await?;
+        assert_eq!(result[key], expected);
+        assert!(result.get("matches").is_none());
+        assert_eq!(result["truncated"], false);
+
+        let mut limited = args;
+        limited["max_results"] = json!(0);
+        let result = Tool::Search.call(scope.clone(), &limited).await?;
+        assert_eq!(result[key], json!([expected[0]]));
+        assert_eq!(result["truncated"], true);
+    }
+
+    let empty = Tool::Search.call(scope.clone(), &json!({"pattern": "^$", "output_mode": "count"})).await?;
+    assert_eq!(empty["counts"], json!([]));
+    assert_eq!(empty["truncated"], false);
+    assert!(Tool::Search.call(scope, &json!({"pattern": "hit", "output_mode": "unknown"})).await.is_err());
     Ok(())
 }
 

@@ -43,8 +43,8 @@ pub(in crate::mcp) fn definition() -> Value {
     json!({
         "name": NAME,
         "description": harness_text!(
-            "Run a bounded read-only Git query in the assigned checkout. Pass options as separate strings. Use -- before repository-relative literal paths.",
-            "割り当てられたチェックアウトで、上限付きの読み取り専用 Git 照会を行う。引数は一つずつ文字列で渡す。リポジトリ相対のリテラルパスの前には -- を置く。"
+            "Use instead of git status, git log, git diff, or git show in the assigned checkout. Try subcommand=\"status\", subcommand=\"log\" with args=[\"-n\",\"5\"], or subcommand=\"diff\" with args=[\"--\",\"src/main.rs\"]. Pass options as separate strings and put -- before repository-relative literal paths.",
+            "割り当てられたチェックアウトで git status、git log、git diff、git show の代わりに使う。たとえば subcommand=\"status\"、subcommand=\"log\" と args=[\"-n\",\"5\"]、または subcommand=\"diff\" と args=[\"--\",\"src/main.rs\"]。引数は一つずつ文字列で渡し、リポジトリ相対のリテラルパスの前には -- を置く。"
         ),
         "annotations": {"readOnlyHint": true},
         "inputSchema": {
@@ -52,7 +52,7 @@ pub(in crate::mcp) fn definition() -> Value {
             "properties": {
                 "subcommand": {"type": "string", "enum": OPERATIONS},
                 "args": {"type": "array", "maxItems": 18, "items": {"type": "string", "maxLength": 4096},
-                    "description": "rev-parse [HEAD | --verify REV | --abbrev-ref REV | --show-toplevel | --is-inside-work-tree]; status [--porcelain]; log [-n COUNT] [REV]; diff [--cached | REV [REV]] [-- PATH ...]; show [REV] [-- PATH ...]; ls-files [-- PATH ...]; ls-tree [-r] REV [-- PATH ...]; cat-file -t|-s|-p REV; merge-base [--is-ancestor] REV REV; describe [--tags] [--always] [REV]; branch --list; tag --list; remote -v; blame -L START,END [REV] -- PATH; config --get core.filemode|core.ignorecase|core.symlinks|core.autocrlf|core.eol."}
+                    "description": "rev-parse [HEAD | --verify REV | --abbrev-ref REV | --show-toplevel | --is-inside-work-tree]; status [--porcelain]; log [-n COUNT] [REV]; diff [--stat] [--cached | REV [REV]] [-- PATH ...]; show [--stat] [REV] [-- PATH ...]; ls-files [-- PATH ...]; ls-tree [-r] REV [-- PATH ...]; cat-file -t|-s|-p REV; merge-base [--is-ancestor] REV REV; describe [--tags] [--always] [REV]; branch --list; tag --list; remote -v; blame -L START,END [REV] -- PATH; config --get core.filemode|core.ignorecase|core.symlinks|core.autocrlf|core.eol."}
             },
             "required": ["subcommand"],
             "additionalProperties": false
@@ -141,6 +141,10 @@ impl Args {
             literal_path(scope, path)?;
         }
         let subcommand = self.subcommand.as_str();
+        let (stat, options) = match (subcommand, options) {
+            ("diff" | "show", ["--stat", rest @ ..]) => (Some("--stat"), rest),
+            _ => (None, options),
+        };
         let command: Vec<&str> = match (subcommand, options) {
             ("rev-parse", ["--show-toplevel" | "--is-inside-work-tree"]) => options.to_vec(),
             ("rev-parse", ["--abbrev-ref", rev]) => vec![
@@ -181,6 +185,7 @@ impl Args {
             }
             ("diff", [] | [_] | [_, _]) => {
                 let mut command = PATCH_OPTIONS.to_vec();
+                command.extend(stat);
                 if options == ["--cached"] {
                     command.push("--cached");
                 } else {
@@ -192,6 +197,7 @@ impl Args {
             }
             ("show", [] | [_]) => {
                 let mut command = PATCH_OPTIONS.to_vec();
+                command.extend(stat);
                 command.extend([
                     "--no-notes",
                     "--no-show-signature",
@@ -257,7 +263,11 @@ impl Args {
                 ]
             }
             ("config", ["--get", key]) if SAFE_KEYS.contains(key) => vec![],
-            _ => bail!("Unsupported subcommand or arguments for git_read. See the tool schema."),
+            ("add" | "commit", _) => bail!("Use git_commit_scoped to commit named files in an eligible worker checkout"),
+            ("push" | "pull" | "fetch" | "switch" | "checkout" | "branch", _) => {
+                bail!("Ask the front desk for remote or branch changes. git_read only accepts read-only queries")
+            }
+            _ => bail!("Unsupported git_read arguments. See the allowed forms in the tool schema. Use git_show with rev and path to read a file at a revision."),
         };
         let mut command: Vec<String> = std::iter::once(subcommand)
             .chain(command)

@@ -72,6 +72,8 @@ fn only_allowlisted_queries_and_literal_paths() -> Result<()> {
         ("diff", &["--cached", "--", "tracked.txt"]),
         ("diff", &["HEAD~1", "HEAD", "--", "filename with spaces"]),
         ("show", &["HEAD", "--", "tracked.txt"]),
+        ("show", &["--stat", "HEAD", "--", "tracked.txt"]),
+        ("diff", &["--stat", "--cached", "--", "tracked.txt"]),
         ("ls-files", &[]),
         ("ls-files", &["--", "literal*[file].txt"]),
         ("ls-tree", &["-r", "HEAD"]),
@@ -104,6 +106,8 @@ fn only_allowlisted_queries_and_literal_paths() -> Result<()> {
         ("log", &["--show-signature"]),
         ("diff", &["--output=target"]),
         ("diff", &["--ext-diff"]),
+        ("diff", &["--stat", "--ext-diff"]),
+        ("show", &["--stat", "--textconv"]),
         ("diff", &["--no-index", "a", "b"]),
         ("diff", &["--", "../x"]),
         ("diff", &["--", "a/../x"]),
@@ -167,6 +171,7 @@ async fn commands_work_in_a_checkout_and_are_bounded() -> Result<()> {
         ("status", &["--porcelain"], ""),
         ("log", &["-n", "1"], "initial"),
         ("show", &["HEAD", "--", "tracked.txt"], "+first"),
+        ("show", &["--stat", "HEAD"], "1 file changed, 2 insertions(+)"),
         ("ls-files", &[], "tracked.txt"),
         ("ls-tree", &["HEAD"], "tracked.txt"),
         ("cat-file", &["-t", "HEAD"], "commit"),
@@ -199,6 +204,9 @@ async fn commands_work_in_a_checkout_and_are_bounded() -> Result<()> {
     assert_eq!(blob["truncated"], true);
     assert_eq!(blob["text"].as_str().unwrap().len(), MAX_BYTES);
     fs::write(f.repo.join("tracked.txt"), vec![b'x'; MAX_BYTES * 3])?;
+    let stat = run(&scope, "diff", &["--stat", "--", "tracked.txt"]).await?;
+    assert!(stat["text"].as_str().unwrap().contains("1 file changed"));
+    assert_eq!(stat["truncated"], false);
     let diff = run(&scope, "diff", &[]).await?;
     assert_eq!(diff["truncated"], true);
     assert_eq!(diff["text"].as_str().unwrap().len(), MAX_BYTES);

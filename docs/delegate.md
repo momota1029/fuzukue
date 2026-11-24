@@ -11,6 +11,16 @@
 
 作業役にスレッド外の資料の読み取りを渡すときは、`delegate.folder_grants` に有効な許可 ID を明示します。 [フォルダーの読み取り許可](folder-grants.md)
 
+## ファイルの読み取り・検索・一覧
+
+シェルで `head`、`tail`、`sed -n`、`cat` を使う場面では `fs_read` を使えます。たとえば `{"path":"build.log","tail_lines":30}` は末尾 30 行を返します。先頭は `{"path":"build.log"}` で最大 400 行、`end_line: 20` で 20 行までに絞れます。行番号は 1 始まりで両端を含みます。 `start_line: -5` は末尾から数えて 5 行目で、`end_line` は先頭からの行番号で指定します。 `tail_lines` は 1〜400 に丸め、範囲指定と併用できません。
+
+`fs_read` の出力は最大 400 行、本文は最大 64 KiB です。ファイル全体が 16 MiB の走査上限内なら `total_lines` を返します。上限を超えるファイルは先頭からの範囲を読み取れますが、末尾からの指定には全体の読み取りが必要です。続きがある場合は `next_start_line` を次の呼び出しに渡せます。
+
+`fs_search` は `rg` や `grep` の代わりに使えます。たとえば `{"path":"src","pattern":"TODO","glob":"*.rs","context":2}` で前後 2 行を表示します。 `output_mode: "files_with_matches"` は `rg -l` と同様に `files` に一致したファイルのパスを返し、`output_mode: "count"` は `rg -c` と同様に `counts` にファイルごとの一致行数を返します。集計モードの `max_results` はファイル数の上限で、検索対象は 1 MiB 以下の UTF-8 ファイルです。 `truncated: true` のときは、パスやパターンを絞ってください。
+
+`fs_list` は `ls` や浅い `find` の代わりに使えます。 `{"path":"src","depth":2,"glob":"*.rs"}` は各項目のパス、種類、`size`（バイト）、`mtime_unix_secs`（Unix 秒）を返します。
+
 ## ファイルの書き込みと終了時の照合
 
 作業役は作業ツリーの編集に `fs_write`、`fs_edit`、`fs_apply_patch` を使います。受付からは編集するパスを `touches` で指定して委譲します。範囲内は承認なしで実行し、範囲外や変更予定が不明な場合は、作業ツリー内の変更に限って利用者が一件ずつ承認します。承認画面にはパス、変更後の SHA-256、差分の抜粋を表示します。承認待ちの間にファイルが変わった場合は書き込まず、読み直しを求めます。
@@ -114,7 +124,7 @@ Linux では、Claude の `Bash` をサーバーが引数まで検査します�
 
 たとえば現在のブランチは `{"subcommand":"rev-parse","args":["--abbrev-ref","HEAD"]}`、リポジトリのルートは `{"subcommand":"rev-parse","args":["--show-toplevel"]}`、ファイルを絞った差分は `{"subcommand":"diff","args":["--","src/main.rs"]}` で調べられます。
 
-対応する操作は `rev-parse`、`status`、`log`、`diff`、`show`、`ls-files`、`ls-tree`、`cat-file`、`merge-base`、`describe`、`branch --list`、`tag --list`、`remote -v`、行範囲付きの `blame`、一部のキーに限った `config --get` です。使える引数はツールのスキーマで確認できます。パスは `--` に続けてリポジトリ相対のリテラルで指定します。
+対応する操作は `rev-parse`、`status`、`log`、`diff`、`show`、`ls-files`、`ls-tree`、`cat-file`、`merge-base`、`describe`、`branch --list`、`tag --list`、`remote -v`、行範囲付きの `blame`、一部のキーに限った `config --get` です。`git show --stat HEAD` に相当する照会は `{"subcommand":"show","args":["--stat","HEAD"]}` です。 `diff` でも先頭の引数に `--stat` を指定できます。使える引数はツールのスキーマで確認できます。パスは `--` に続けてリポジトリ相対のリテラルで指定します。
 
 結果には `text`、`truncated`、`exit_code` が含まれます。出力の上限は 64 KiB、Git 照会の実行時間の上限は 5 秒です。照会はインデックスを更新せず、フックや外部差分ドライバーを実行しません。リモートの URL はスキームとホスト名だけを表示するか、全体を伏せます。設定の照会はインクルードを展開せず、リポジトリ共通のローカル設定を読みます。
 

@@ -36,6 +36,17 @@ pub(super) struct Args {
     context: Option<i128>,
     #[serde(default, deserialize_with = "optional_integer")]
     max_results: Option<i128>,
+    #[serde(default)]
+    output_mode: OutputMode,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OutputMode {
+    #[default]
+    Content,
+    FilesWithMatches,
+    Count,
 }
 
 #[derive(Default)]
@@ -141,6 +152,9 @@ pub(super) async fn search(scope: ReadScope, args: Args) -> Result<Value> {
         Ok::<_, anyhow::Error>((Corpus::collect(&scope, &args, deadline)?, args))
     })
     .await??;
+    if args.output_mode != OutputMode::Content {
+        return tokio::task::spawn_blocking(move || summarize(path, &corpus, &args, limit, deadline)).await?;
+    }
     let (lines, engine) = match ripgrep("rg", &corpus.text, &args, limit + 1).await? {
         Some(lines) => (lines, "ripgrep"),
         None => {
@@ -276,15 +290,7 @@ fn builtin(
     ignore_case: bool,
     limit: usize,
 ) -> Result<(Vec<usize>, bool)> {
-    let pattern = if fixed {
-        regex::escape(pattern)
-    } else {
-        pattern.to_owned()
-    };
-    let matcher = regex::RegexBuilder::new(&pattern)
-        .case_insensitive(ignore_case)
-        .size_limit(2 * 1024 * 1024)
-        .build()?;
+    let matcher = line_matcher(pattern, fixed, ignore_case)?;
     let deadline = Instant::now() + DEADLINE;
     let mut matches = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -299,6 +305,63 @@ fn builtin(
         }
     }
     Ok((matches, false))
+}
+
+fn line_matcher(pattern: &str, fixed: bool, ignore_case: bool) -> Result<regex::Regex> {
+    let literal;
+    let pattern = if fixed {
+        literal = regex::escape(pattern);
+        &literal
+    } else {
+        pattern
+    };
+    Ok(regex::RegexBuilder::new(pattern)
+        .case_insensitive(ignore_case)
+        .size_limit(2 * 1024 * 1024)
+        .build()?)
+}
+
+// Produce one row per matching file without allocating a result for each matching line.
+fn summarize(path: PathBuf, corpus: &Corpus, args: &Args, limit: usize, deadline: Instant) -> Result<Value> {
+    let matcher = line_matcher(&args.pattern, args.fixed_string, args.ignore_case)?;
+    let count_lines = args.output_mode == OutputMode::Count;
+    let mut results = Vec::new();
+    let mut output_bytes = 0;
+    let mut truncated = corpus.incomplete;
+    let mut sources = corpus.files.iter().peekable();
+    'files: while let Some(file) = sources.next() {
+        let end = sources.peek().map_or(corpus.text.len(), |next| next.byte);
+        let mut count = 0;
+        for line in corpus.text[file.byte..end].lines() {
+            if Instant::now() >= deadline {
+                truncated = true;
+                break 'files;
+            }
+            if matcher.is_match(line) {
+                count += 1;
+                if !count_lines || results.len() == limit {
+                    break;
+                }
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        let result = if count_lines {
+            json!({"path": file.path, "count": count})
+        } else {
+            json!(file.path)
+        };
+        output_bytes += result.to_string().len();
+        if results.len() == limit || output_bytes > MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        results.push(result);
+    }
+    let field = if count_lines { "counts" } else { "files" };
+    Ok(json!({"path": path, (field): results, "engine": "builtin", "truncated": truncated,
+        "note": truncated.then(|| format!("{TRUNCATED} Narrow fs_search path, glob, or pattern."))}))
 }
 
 fn render(
@@ -364,6 +427,7 @@ mod tests {
             ignore_case: true,
             context: None,
             max_results: Some(1),
+            output_mode: OutputMode::Content,
         };
         let text = "before\n-X\r\n-x\n";
         assert!(

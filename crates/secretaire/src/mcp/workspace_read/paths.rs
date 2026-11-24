@@ -59,7 +59,7 @@ impl ReadScope {
             !path
                 .components()
                 .any(|part| part.as_os_str().as_bytes().eq_ignore_ascii_case(b".git")),
-            "Access denied to Git metadata. Use git_show for history."
+            "Access denied to Git metadata. Use git_read for status or refs, or git_show for files at a revision."
         );
         ensure!(
             !self.protected.iter().any(|root| path.starts_with(root))
@@ -67,7 +67,7 @@ impl ReadScope {
                     .scratch
                     .as_ref()
                     .is_some_and(|scratch| path.starts_with(scratch)),
-            "Access denied to Fuzukue configuration or state"
+            "Access denied to Fuzukue configuration or state. Ask the front desk to use job_status or job_write_audit for job records."
         );
         ensure!(
             !folder_grants::sensitive(path) && !self.sensitive_aliases.iter().any(|root| path.starts_with(root)),
@@ -199,6 +199,7 @@ pub(super) struct Entry {
     pub path: PathBuf,
     pub kind: &'static str,
     pub size: u64,
+    pub mtime_unix_secs: i64,
 }
 
 pub(super) struct Scan<'a> {
@@ -286,6 +287,7 @@ impl<'a> Scan<'a> {
                     path: child,
                     kind,
                     size: stat.st_size.max(0) as u64,
+                    mtime_unix_secs: stat.st_mtime as i64,
                 },
                 git,
             ));
