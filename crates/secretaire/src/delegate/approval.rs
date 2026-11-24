@@ -230,6 +230,7 @@ mod tests {
     use crate::delegate::RunningJob;
     use anyhow::Result;
     use futures_util::poll;
+    use fuzukue_proto::ClientMsg;
     use std::task::Poll;
 
     const SESSION: &str = "worker-approval-test";
@@ -271,6 +272,110 @@ mod tests {
         assert!(requests.next().is_none());
         assert!(app.hub.live_approval_threads().contains(SESSION));
         id
+    }
+
+    #[cfg(unix)]
+    async fn check_approval_resolution_retry(decision: &str, opposite: &str, behavior: &str) -> Result<()> {
+        let (_temp, app) = fixture(WorkerApprovalPolicy::Ask)?;
+        let app = Arc::new(app);
+        let mut command = tokio::process::Command::new("/usr/bin/python3");
+        command.arg("-c").arg(r#"
+import json, sys
+from pathlib import Path
+
+def emit(**fields):
+    print(json.dumps(fields), flush=True)
+
+assert json.loads(sys.stdin.readline())["type"] == "user"
+emit(type="control_request", request_id="backend", request={
+    "subtype": "can_use_tool", "tool_name": "Edit", "input": {"file_path": "README.md"},
+})
+response = json.loads(sys.stdin.readline())["response"]
+assert response["request_id"] == "backend"
+assert response["response"]["behavior"] == sys.argv[1]
+emit(type="result", is_error=False)
+assert json.loads(sys.stdin.readline())["type"] == "user", "received a duplicate backend reply"
+Path("approval-verified").touch()
+emit(type="result", is_error=False)
+sys.stdin.readline()
+"#).arg(behavior);
+        let session = crate::ClaudeSession::spawn_command(
+            command, SESSION.into(), app.project_dir.clone(), &app, Box::new(|_| {}),
+        )?;
+        app.sessions.lock().await.insert(SESSION.into(), session.clone());
+        let (_, mut events) = app.hub.subscribe(u64::MAX);
+        session.prompt("Request an approval.").await?;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let request_id = loop {
+                if let ServerEvent::ApprovalRequested { request_id, .. } = events.recv().await?.event {
+                    break request_id;
+                }
+            };
+            let resolve = |decision: &str| crate::handle(&app, ClientMsg::Resolve {
+                request_id: request_id.clone(), decision: decision.into(),
+            });
+            resolve(decision).await?;
+            let mut ended = 0;
+            loop {
+                match events.recv().await?.event {
+                    ServerEvent::ApprovalResolved { request_id: id, decision: applied, automatic } if id == request_id => {
+                        assert_eq!(applied, decision);
+                        assert!(!automatic);
+                        break;
+                    }
+                    ServerEvent::TurnEnded { .. } => ended += 1,
+                    _ => {}
+                }
+            }
+
+            for retry in [decision, decision, opposite] {
+                resolve(retry).await?;
+            }
+            session.prompt("Check that the backend received a single decision.").await?;
+            while ended < 2 {
+                match events.recv().await?.event {
+                    ServerEvent::ApprovalResolved { request_id: id, .. } if id == request_id => {
+                        anyhow::bail!("the approval resolved twice");
+                    }
+                    ServerEvent::Error { message } => anyhow::bail!("{message}"),
+                    ServerEvent::TurnEnded { .. } => ended += 1,
+                    _ => {}
+                }
+            }
+            assert!(app.project_dir.join("approval-verified").is_file());
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approval_resolution_retry_preserves_accept() -> Result<()> {
+        check_approval_resolution_retry("accept", "decline", "allow").await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approval_resolution_retry_preserves_decline() -> Result<()> {
+        check_approval_resolution_retry("decline", "accept", "deny").await
+    }
+
+    #[tokio::test]
+    async fn approval_resolution_retry_rejects_unknown_ids() -> Result<()> {
+        let (_temp, app) = fixture(WorkerApprovalPolicy::Ask)?;
+        let app = Arc::new(app);
+        for request_id in [
+            "missing".to_owned(),
+            format!("{}missing", fuzukue_proto::DELEGATE_JOB),
+            format!("{}missing", crate::codex::WORKER_APPROVAL_PREFIX),
+        ] {
+            let error = crate::handle(&app, ClientMsg::Resolve {
+                request_id: request_id.clone(), decision: "accept".into(),
+            }).await.expect_err("an unissued approval ID must be rejected");
+            assert_eq!(error.to_string(), format!("unknown approval request {request_id}"));
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

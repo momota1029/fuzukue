@@ -3326,13 +3326,11 @@ async fn resolve_approval(app: &Workspace, request_id: String, decision: String,
             }
         }
     }
-    if !handled && (request_id.starts_with(fuzukue_proto::DELEGATE_JOB)
-        || request_id.starts_with(codex::WORKER_APPROVAL_PREFIX))
-    {
-        // The worker, advisor, or another client may already have resolved it.
+    if !handled {
+        // The backend can consume its waiter before the resolution event reaches the Hub.
+        anyhow::ensure!(app.hub.has_seen_approval(&request_id), "unknown approval request {request_id}");
         return Ok(());
     }
-    anyhow::ensure!(handled, "unknown approval request {request_id}");
     app.hub.publish(ServerEvent::ApprovalResolved { request_id, decision, automatic });
     Ok(())
 }

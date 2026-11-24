@@ -45,6 +45,7 @@ struct Inner {
     notifications: notifications::State,
     activity: Option<tokio::sync::watch::Sender<()>>,
     approvals: HashMap<String, PendingApproval>,
+    resolved_approvals: HashSet<String>,
     questions: HashMap<String, PendingQuestion>,
     question_clients: usize,
     question_clients_offline_since: Instant,
@@ -123,7 +124,7 @@ pub(crate) fn worker_approval(request_id: &str, actor: &Actor) -> bool {
 impl Hub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
+        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
             epoch: format!("{:032x}", rand::random::<u128>()),
         }
     }
@@ -135,7 +136,7 @@ impl Hub {
             let mut inner = hub.inner.lock().unwrap();
             let mut workers = BTreeMap::new();
             crate::state::read_timeline(dir, |envelope| {
-                observe_approval(&mut inner.approvals, &envelope, ApprovalWaiter::Restored);
+                observe_approval(&mut inner, &envelope, ApprovalWaiter::Restored);
                 observe_question(&mut inner.questions, &envelope);
                 observe_worker(&mut workers, &envelope.event);
                 inner.next_seq = envelope.seq + 1;
@@ -242,6 +243,11 @@ impl Hub {
         if let Some(changed) = &inner.activity {
             changed.send_replace(());
         }
+    }
+
+    pub(crate) fn has_seen_approval(&self, request_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.approvals.contains_key(request_id) || inner.resolved_approvals.contains(request_id)
     }
 
     // The drain gate waits for live approvals and question replies.
@@ -521,7 +527,7 @@ impl Hub {
         let replayable = retain_replay_event(&mut event);
         let env = Envelope { workspace: None, seq: if replayable { inner.next_seq } else { 0 }, event };
         let notice = notifications::before_publish(inner, &env.event);
-        observe_approval(&mut inner.approvals, &env, waiter);
+        observe_approval(inner, &env, waiter);
         observe_question(&mut inner.questions, &env);
         observe_worker(&mut inner.workers, &env.event);
         observe_background(&mut inner.background, &env.event);
@@ -959,15 +965,16 @@ fn observe_question(questions: &mut HashMap<String, PendingQuestion>, envelope: 
     }
 }
 
-fn observe_approval(approvals: &mut HashMap<String, PendingApproval>, envelope: &Envelope, waiter: ApprovalWaiter) {
+fn observe_approval(inner: &mut Inner, envelope: &Envelope, waiter: ApprovalWaiter) {
     match &envelope.event {
         ServerEvent::ApprovalRequested { request_id, .. } => {
-            approvals.insert(request_id.clone(), PendingApproval {
+            inner.approvals.insert(request_id.clone(), PendingApproval {
                 envelope: envelope.clone(), observed: Observed::now(), waiter,
             });
         }
         ServerEvent::ApprovalResolved { request_id, .. } => {
-            approvals.remove(request_id);
+            inner.approvals.remove(request_id);
+            inner.resolved_approvals.insert(request_id.clone());
         }
         _ => {}
     }
