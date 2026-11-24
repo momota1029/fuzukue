@@ -1,6 +1,6 @@
 # 選択したスレッドの履歴取得
 
-`9a5dea3` では、サーバーは`resume_from` を省略した接続、値が 0 の接続、ワークスペース切り替えで、アーカイブ済みを含む各スレッドの末尾を先に配信する。Desktop はこれを保持し、スレッドを選び直すと手元の履歴を表示する。Desktop の `thread_history: true` は古いページの取得を有効にする。Android 62 はこのフラグを送らず、受信済みの末尾を表示する。 [初期配信](../crates/secretaire/src/hub.rs#L845) · [Desktop の選択処理](../crates/fuzukue/src/main.rs#L1328) · [Android の接続と選択](../android/app/src/main/java/dev/labgui/remote/RemoteRepository.kt#L217)
+旧履歴のプロトコル 62 では、サーバーは `resume_from` を省略した接続、値が 0 の接続、ワークスペース切り替えで、アーカイブ済みを含む各スレッドの末尾を先に配信する。Desktop はこれを保持し、スレッドを選び直すと手元の履歴を表示する。Desktop の `thread_history: true` は古いページの取得を有効にする。Android 62 はこのフラグを送らず、受信済みの末尾を表示する。 [従来の初期配信の回帰テスト](../crates/secretaire/src/integration_tests/windowed_history.rs) · [Desktop の選択処理](../crates/fuzukue/src/main.rs#L1329) · [Android の選択処理](../android/app/src/main/java/dev/labgui/remote/RemoteRepository.kt#L233)
 
 ## 接続時のメタデータと稼働状態
 
@@ -39,9 +39,9 @@
 | 接続の組み合わせ | 履歴配信 |
 | --- | --- |
 | 新方式に対応する Desktop / Android と対応サーバー（合意値 62 以上） | 履歴は選択時に要求し、取得済みのキャッシュを再利用する。 |
-| Desktop `9a5dea3` と現行または対応サーバー（合意値 62 以上） | 従来の全スレッド末尾と `ThreadHistoryStart`、要求時の古いページ。 |
-| Android `9a5dea3` または他の非対応クライアント（合意値 62 以上、`thread_history` なし） | 従来の全スレッド末尾。古いページは送らない。 |
+| 旧版の Desktop（`thread_history: true`、選択時取得には未対応）と対応サーバー（合意値 62 以上） | 従来の全スレッド末尾と `ThreadHistoryStart`、要求時の古いページ。 |
+| Android 62 または他の非対応クライアント（合意値 62 以上、`thread_history` なし） | 従来の全スレッド末尾。古いページは送らない。 |
 | 合意値 4–61 | 従来の全スレッド末尾。古いページは送らない。4 未満は従来のスレッド一覧導入前の配信に従う。 |
 | 対応クライアントと新方式の応答がないサーバー | その組み合わせで従来利用できた初期配信と再開を使う。クライアント側に新方式のキャッシュしかなく、再接続で応答を得られなかった場合は、カーソルなしで再接続して従来の初期配信を受ける。 |
 
-基準の `9a5dea3` は Rust と Android ともに 62。指摘台帳を導入した `5f4c9e5` で双方が 63 になり、`ReviewFindings` は合意値 63 以上の接続に送る。Android 62 との合意値は 62。R-17 の配布プロトコルは 64。有効化は前述の応答で判定する。Android は R-18 まで従来の配信を使う。 [配布チェッカー](../scripts/check-android-protocol.sh) · [指摘台帳](review-findings.md)
+旧履歴の基準版では Rust と Android がともに 62 だった。指摘台帳の導入で双方が 63 になり、`ReviewFindings` は合意値 63 以上の接続に送る。Android 62 との合意値は 62。R-17 の配布プロトコルは 64。有効化は前述の応答で判定する。Android は古いページ取得に対応するまで従来の配信を使う。 [Android のページ取得](../roadmap/cards/R-18.md) · [配布チェッカー](../scripts/check-android-protocol.sh) · [指摘台帳](review-findings.md)

@@ -214,6 +214,6 @@ scripts/shot.sh --workspace examples/code-pilot examples/lab tests/shots/workspa
 scripts/shot.sh examples/lab tests/shots/workshop.json
 ```
 
-`wait_research_issue` を含むシナリオは、コピーした研究室に一時 Git の `main` を作り、`tests/shots/gh` と作業役のスタブを利用します。 `--workshop` でもこの準備を明示できます。Issue #12 と Hamming 距離のカードで着手可、作業中、確認待ちを通す。出力は `workshop-list.png`（中央の一覧）、`workshop-ready.png`（本文と履歴）、`workshop-running.png`（新規スレッドと作業役）、`workshop-needs-review.png`（報告と「取り込む」）。GitHub や Lake の実環境は使用しない。
+`wait_research_issue` を含むシナリオは、コピーした研究室に一時 Git の `main` を作り、`tests/shots/gh` と作業役のスタブを利用します。 `--workshop` でもこの準備を明示できます。[作業場の撮影シナリオ](../tests/shots/workshop.json) は、スタブの Issue #12 と Hamming 距離のカードで着手可、作業中、確認待ちを通す。出力は `workshop-list.png`（中央の一覧）、`workshop-ready.png`（本文と履歴）、`workshop-running.png`（新規スレッドと作業役）、`workshop-needs-review.png`（報告と「取り込む」）。GitHub や Lake の実環境は使用しない。
 
 `review-reports.json` はサンプル投稿を使い、論文カードの査読マーカー、投稿の指摘表、状態絞り込みから開いた指摘の詳細を撮ります。PNG は `review-card-marker.png`、`review-points.png`、`review-point.png` です。

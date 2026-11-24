@@ -19,7 +19,7 @@ links:                     # 型つきのリンク
 requires: [x, y]           # 既存の論文カードとの互換（rel: requires と同じ）
 defines: [集中関数, concentration function]  # このカードが定義する語と別名
 files: [crates/fuzukue-proto/src/lib.rs, crates/secretaire/]   # リポジトリ内のファイル・ディレクトリ
-issues: ["#12"]
+issues: ["#123"]           # このリポジトリの Issue を指す書き方の例
 ```
 
 `defines` は省略できる。[[symbols]] の定義ジャンプと参照一覧には、ここに明記した語が載る。
