@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Assemble schema 1 from the three archives using secretaire's release CLI."""
+"""Assemble release metadata and checksums for the desktop or macOS assets."""
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -10,13 +11,27 @@ import tempfile
 from pathlib import Path
 
 
+def file_hash(path):
+    sha = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            sha.update(block)
+    return sha.hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tag")
     parser.add_argument("repository", help="GitHub OWNER/REPO")
     parser.add_argument("assets", type=Path)
-    parser.add_argument("secretaire", type=Path, help="packaged Linux server binary")
+    parser.add_argument("secretaire", type=Path, nargs="?", help="packaged Linux server binary")
+    parser.add_argument("--macos", action="store_true", help="generate supplemental macOS prerelease metadata")
+    parser.add_argument("--include-intel", action="store_true", help="require macOS Intel packages as well")
     args = parser.parse_args()
+    if args.macos == (args.secretaire is not None) or (args.include_intel and not args.macos):
+        parser.error("provide either the Linux server binary or --macos (optionally with --include-intel)")
+    if args.macos and "-" not in args.tag:
+        parser.error("macOS metadata requires a prerelease tag")
     root = Path(__file__).resolve().parents[2]
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", args.tag):
         parser.error("expected a v-prefixed SemVer tag")
@@ -46,27 +61,57 @@ def main():
         "min_server_protocol": protocol("DISTRIBUTION_PROTOCOL"),
         "artifacts": [],
     }
-    for kind, binary, platform, extension in (
+    packages = [
         ("server", "secretaire", "linux-x86_64", "tar.gz"),
         ("linux-client", "fuzukue", "linux-x86_64", "tar.gz"),
         ("windows-client", "fuzukue", "windows-x86_64", "zip"),
-    ):
+    ]
+    if args.macos:
+        platforms = ["macos-aarch64"]
+        if args.include_intel:
+            platforms.append("macos-x86_64")
+        packages = [
+            (kind, binary, platform, "tar.gz")
+            for platform in platforms
+            for kind, binary in (("server", "secretaire"), ("macos-client", "fuzukue"))
+        ]
+    for kind, binary, platform, extension in packages:
         name = f"{binary}-{args.tag}-{platform}.{extension}"
         spec["artifacts"].append({
             "kind": kind, "platform": platform, "path": name, "url": f"{base}/{name}",
         })
 
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=assets) as spec_file:
-        json.dump(spec, spec_file)
-        spec_file.flush()
-        manifest = subprocess.check_output(
-            [str(args.secretaire.resolve()), "release", "manifest-from-build", spec_file.name,
-             "--repo", str(root)],
-        )
+    if args.macos:
+        # The Rust release CLI has no macos-client kind. Keep this manifest separate
+        # so that existing desktop releases remain readable by installed servers.
+        commit, timestamp = subprocess.check_output(
+            ["git", "-C", str(root), "show", "-s", "--format=%H%n%cI", "HEAD"],
+            text=True,
+        ).splitlines()
+        spec.update(schema_version=1, commit=commit, commit_date=timestamp,
+                    created_at=datetime.now(timezone.utc).isoformat(), next_public_keys=[])
+        for item in spec["artifacts"]:
+            path = assets / item.pop("path")
+            if not path.is_file() or path.stat().st_size == 0:
+                parser.error(f"missing or empty package: {path}")
+            item.update(name=path.name, size=path.stat().st_size, sha256=file_hash(path),
+                        changed_since_previous=True)
+        manifest = (json.dumps(spec, indent=2) + "\n").encode("utf-8")
+        names = ("macos-release-manifest.json", "SHA256SUMS-macos")
+    else:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=assets) as spec_file:
+            json.dump(spec, spec_file)
+            spec_file.flush()
+            manifest = subprocess.check_output(
+                [str(args.secretaire.resolve()), "release", "manifest-from-build", spec_file.name,
+                 "--repo", str(root)],
+            )
+        names = ("release-manifest.json", "SHA256SUMS")
+    manifest_name, sums_name = names
     rows = [(item["sha256"], item["name"]) for item in json.loads(manifest)["artifacts"]]
-    rows.append((hashlib.sha256(manifest).hexdigest(), "release-manifest.json"))
-    (assets / "release-manifest.json").write_bytes(manifest)
-    (assets / "SHA256SUMS").write_text(
+    rows.append((hashlib.sha256(manifest).hexdigest(), manifest_name))
+    (assets / manifest_name).write_bytes(manifest)
+    (assets / sums_name).write_text(
         "".join(f"{sha}  {name}\n" for sha, name in sorted(rows, key=lambda row: row[1])),
         encoding="ascii",
     )

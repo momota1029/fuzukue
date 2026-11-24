@@ -117,12 +117,7 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  # R-29: macOS packaging is a stub and is outside the release requirements.
-  macos:
-    if: ${{ false }}
-    runs-on: macos-latest
-    steps:
-      - run: echo "macOS packaging is tracked in R-29."
+  # macOS dogfood assets use the manually dispatched macos-dogfood.yml workflow.
 
   manifest:
     needs: [source, linux, windows]

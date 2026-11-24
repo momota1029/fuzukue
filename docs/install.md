@@ -1,8 +1,8 @@
 # リリースからインストールする
 
-対象は Linux / WSL2 x86_64 のサーバーと、Windows / Linux x86_64 のデスクトップクライアントです。公開済みの対応リリースが必要です。スクリプトはこのリポジトリの信頼できるチェックアウトから実行します。Linux クライアント用のスクリプトは、同じディレクトリの `install-server.sh` を使います。
+対象は Linux / WSL2 x86_64 のサーバーと、Windows / Linux x86_64 のデスクトップクライアントです。macOS のサーバーとクライアントには [Mac のベータ版ガイド](install-mac.md) があります。公開済みの対応リリースが必要です。スクリプトはこのリポジトリの信頼できるチェックアウトか、同じリリースタグの公式ソースアーカイブから実行します。POSIX クライアント用のスクリプトは、同じディレクトリの `install-server.sh` を使います。
 
-既定の `beta` は初回にプレリリースを優先し、なければ安定版を選びます。更新では両方から最も新しい版を選びます。 `FUZUKUE_CHANNEL=stable` は安定版だけが対象です。 `FUZUKUE_VERSION` に `v` から始まる公開タグを指定すると、その版を選べます。現在より古い版を選ぶ場合もタグを指定します。ドラフトは取得対象に含まれません。
+既定の `beta` の初回選択は OS によって異なります。macOS は対応するプレリリースを選びます。Linux / WSL2 は安定版を優先し、Windows はプレリリースを優先します。Windows / Linux の更新では両方が対象です。 `FUZUKUE_CHANNEL=stable` は安定版だけが対象です。 `FUZUKUE_VERSION` に `v` から始まる公開タグを指定すると、その版を選べます。現在より古い版を選ぶ場合もタグを指定します。ドラフトは取得対象に含まれません。
 
 インストーラーは HTTPS で GitHub Releases からファイルを取得し、タグが指すコミットをマニフェストと照合します。パッケージのサイズ、SHA-256、`SHA256SUMS` の一致を確認してから実行ファイルを展開します。マニフェストへの署名は今後の対応です。ダウンロードとチェックサムの取得には、同じ配布元を信頼する必要があります。
 
@@ -29,6 +29,10 @@ sh scripts/install-client.sh --uninstall
 ```
 
 `--dry-run` は取得と検証だけを行います。 `--rollback` は現在版と直前の版を入れ替えます。アンインストールは管理下のランチャーと実行ファイルを削除し、設定・状態・プロジェクトと旧ソースビルドを保持します。
+
+### エージェント CLI の導入と確認
+
+macOS と Linux / WSL2 のサーバーインストーラーは `claude` と `codex` を探し、各 CLI が報告した版とログイン状態を表示します。足りない CLI は表示された公式コマンドを個別に承認すると導入できます。明示的にまとめて承認するには `--install-agents`（`--yes`）を使い、確認と導入を省くには `--skip-agents` を使います。導入後は自分で `claude auth login` または `codex login` を実行し、`sh scripts/install-server.sh --check-agents` で状態を再確認します。サーバーの起動に CLI は不要で、会話にはログイン済みの CLI が一つあれば足ります。Windows クライアントを使う場合は、その接続先のサーバー（例として WSL2）へ CLI を入れます。 [Claude Code](https://code.claude.com/docs/en/setup) · [Codex CLI](https://github.com/openai/codex#quickstart)
 
 ### 既存サーバーからの移行
 
@@ -62,8 +66,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-client
 
 ## 開発版とクライアントの更新
 
-[ソースからのビルド](../README.md#quick-start-from-source)と[既存のサーバー経由のクライアント更新](update.md)は引き続き使えます。サーバーからの更新はランチャーが起動した 書き込み可能なクライアント実行ファイルを既存の方式で入れ替えます。公開配布のサーバーはインストーラーの再実行で切り替えます。macOS の公開パッケージは [R-29](../roadmap/cards/R-29.md) の対象です。
+[ソースからのビルド](../README.md#quick-start-from-source)と[既存のサーバー経由のクライアント更新](update.md)は引き続き使えます。サーバーからの更新はランチャーが起動した 書き込み可能なクライアント実行ファイルを既存の方式で入れ替えます。公開配布の Linux サーバーはインストーラーの再実行で切り替えます。macOS のベータ版は LaunchAgent を使うと自動で確認・適用します。手動操作も [Mac のベータ版ガイド](install-mac.md) にあります。
 
 ## English
 
-Run `sh scripts/install-server.sh` on Linux x86_64 or WSL2, and `sh scripts/install-client.sh` for Linux desktop. On Windows x86_64, use `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-client.ps1` from a trusted checkout. Use `FUZUKUE_CHANNEL=stable` for stable releases and `FUZUKUE_VERSION` to pin a published tag. Downloads are checked against release metadata and SHA-256. The manifest is unsigned. Uninstall with `--uninstall` or `-Uninstall` to keep your data and settings.
+Run `sh scripts/install-server.sh` on Linux x86_64 or WSL2, and `sh scripts/install-client.sh` for Linux desktop. On Windows x86_64, use `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-client.ps1` from a trusted checkout. Use `FUZUKUE_CHANNEL=stable` for stable releases and `FUZUKUE_VERSION` to pin a published tag. Downloads are checked against release metadata and SHA-256. The manifest is unsigned. For a server and desktop client on the same Mac, see the [macOS beta quick start (Japanese)](install-mac.md). Uninstall with `--uninstall` or `-Uninstall` to keep your data and settings.

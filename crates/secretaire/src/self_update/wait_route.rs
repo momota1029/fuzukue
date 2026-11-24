@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,12 +37,34 @@ fn local_update<'a>(app: &'a crate::App, headers: &HeaderMap) -> Result<&'a Upda
         .ok_or((StatusCode::NOT_FOUND, "Self-update is unavailable."))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct StatusQuery {
+    #[serde(default)]
+    package_idle: bool,
+}
+
 pub(crate) async fn status(
     State(app): State<Arc<crate::App>>,
+    Query(query): Query<StatusQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, Error> {
     let update = local_update(&app, &headers)?;
     let control = *update.wait_control.lock().unwrap();
+    if query.package_idle {
+        if !cfg!(target_os = "macos") || std::env::var_os("FUZUKUE_MACOS_PACKAGE").is_none() {
+            return Err((StatusCode::NOT_FOUND, "Packaged update is unavailable."));
+        }
+        let idle = if matches!(control, WaitControl::Closed)
+            && !update.trial_pending()
+            && !*update.swapping.borrow()
+        {
+            let (gate, reason) = update.swap_gate(&app);
+            gate.is_some() && app.drain_job_count(&reason) == 0
+        } else {
+            false
+        };
+        return Ok(Json(json!({ "idle": idle, "pid": std::process::id() })));
+    }
     let Some((started_at, DrainReason::Update)) = control.owner() else {
         return Err((StatusCode::CONFLICT, "No update is draining."));
     };

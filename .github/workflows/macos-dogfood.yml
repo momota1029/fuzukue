@@ -1,0 +1,244 @@
+name: macOS dogfood prerelease
+
+'on':
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing prerelease tag to build. Leave blank to validate the selected branch.
+        type: string
+      include-intel:
+        description: Also build and smoke-test Intel macOS
+        type: boolean
+        default: false
+      attach:
+        description: Attach verified assets to an existing prerelease or prerelease draft
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: macos-dogfood-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Resolve the source commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ATTACH: ${{ inputs.attach }}
+        run: |
+          set -euo pipefail
+          if [[ -z $TAG ]]; then
+            [[ $ATTACH == false ]] || { echo 'Attachment requires an existing prerelease tag.' >&2; exit 2; }
+            tag="v0.0.0-dogfood.$GITHUB_RUN_ID"
+            commit=$GITHUB_SHA
+          else
+            number='(0|[1-9][0-9]*)'
+            identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+            [[ $TAG =~ ^v$number\.$number\.$number-$identifier(\.$identifier)*$ ]] || {
+              echo 'Expected a v-prefixed SemVer prerelease tag.' >&2
+              exit 2
+            }
+            tag=$TAG
+            ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '[.object.type, .object.sha] | @tsv')
+            for ((depth=0; depth<10; depth++)); do
+              read -r type commit <<< "$ref"
+              [[ $commit =~ ^[0-9a-f]{40}$ ]]
+              [[ $type != commit ]] || break
+              [[ $type == tag ]]
+              ref=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$commit" --jq '[.object.type, .object.sha] | @tsv')
+            done
+            [[ $type == commit ]]
+            if [[ $ATTACH == true ]]; then
+              gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease |
+                jq -e --arg tag "$tag" '.tagName == $tag and .isPrerelease'
+            fi
+          fi
+          printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >> "$GITHUB_OUTPUT"
+
+  installer-fixtures:
+    needs: source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - run: bash scripts/release/test-install-macos.sh
+
+  build:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs['include-intel'] && '["macos-latest","macos-15-intel"]' || '["macos-latest"]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: Check native architecture and prepare Xcode Metal toolchain
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_LABEL:$(uname -m)" in
+            macos-latest:arm64|macos-15-intel:x86_64) ;;
+            *) echo 'Unexpected runner architecture.' >&2; exit 2 ;;
+          esac
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          metal_works() {
+            printf 'kernel void probe() {}\n' |
+              xcrun --sdk macosx metal -x metal -c - -o "$RUNNER_TEMP/probe.air" &&
+              xcrun --sdk macosx metallib "$RUNNER_TEMP/probe.air" -o "$RUNNER_TEMP/probe.metallib"
+          }
+          if ! metal_works; then
+            xcodebuild -downloadComponent metalToolchain
+            metal_works
+          fi
+      - name: Build and package the server and desktop client
+        env:
+          TAG: ${{ needs.source.outputs.tag }}
+        run: |
+          rustup update stable --profile minimal
+          rustup default stable
+          export TMPDIR="$RUNNER_TEMP"
+          bash scripts/release/package-macos.sh "$TAG" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages-${{ matrix.runner }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  manifest:
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-packages-*
+          path: dist
+          merge-multiple: true
+      - name: Assemble and check the macOS manifest and checksums
+        env:
+          TAG: ${{ needs.source.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.source.outputs.commit }}
+          INCLUDE_INTEL: ${{ inputs['include-intel'] }}
+        run: |
+          set -euo pipefail
+          flags=(--macos)
+          if [[ $INCLUDE_INTEL == true ]]; then flags+=(--include-intel); fi
+          python3 scripts/release/make-manifest.py "$TAG" "$GITHUB_REPOSITORY" dist "${flags[@]}"
+          jq -e --arg commit "$EXPECTED_COMMIT" '.commit == $commit' dist/macos-release-manifest.json
+          (cd dist && sha256sum --strict --check SHA256SUMS-macos)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dogfood-assets
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+
+  smoke:
+    needs: [source, manifest]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs['include-intel'] && '["macos-latest","macos-15-intel"]' || '["macos-latest"]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dogfood-assets
+          path: dist
+      - name: Install into an isolated home and smoke-test launchd and loopback health
+        env:
+          TAG: ${{ needs.source.outputs.tag }}
+        run: |
+          export TMPDIR="$RUNNER_TEMP"
+          bash scripts/release/smoke-macos.sh "$PWD/dist" "$TAG"
+
+  attach:
+    if: ${{ inputs.attach }}
+    needs: [source, installer-fixtures, manifest, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dogfood-assets
+          path: dist
+      - name: Attach verified packages to the existing prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.source.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --strict --check SHA256SUMS-macos
+          jq -e --arg commit "$EXPECTED_COMMIT" --arg version "${TAG#v}" \
+            '.commit == $commit and .version == $version and .channel == "beta"' macos-release-manifest.json
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '[.object.type, .object.sha] | @tsv')
+          for ((depth=0; depth<10; depth++)); do
+            read -r type sha <<< "$ref"
+            [[ $sha =~ ^[0-9a-f]{40}$ ]]
+            [[ $type != commit ]] || break
+            [[ $type == tag ]]
+            ref=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '[.object.type, .object.sha] | @tsv')
+          done
+          [[ $type == commit && $sha == "$EXPECTED_COMMIT" && $TAG == *-* ]]
+          release_url=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl,tagName,isPrerelease |
+            jq -er --arg tag "$TAG" 'select(.tagName == $tag and .isPrerelease) | .apiUrl')
+          prefix="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/"
+          [[ $release_url == "$prefix"* && ${release_url#"$prefix"} =~ ^[0-9]+$ ]]
+          release=$(gh api "$release_url")
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .prerelease' <<< "$release"
+          # Check all names before uploading. Reuse identical assets if a previous run was interrupted.
+          pending=()
+          for asset in ./*.tar.gz ./SHA256SUMS-macos ./macos-release-manifest.json; do
+            name=${asset#./}
+            digest=$(sha256sum "$asset")
+            existing=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest // "missing"' <<< "$release")
+            if [[ -z $existing ]]; then
+              pending+=("$asset")
+            elif [[ $existing != "sha256:${digest%% *}" ]]; then
+              echo "Refusing to replace existing prerelease asset $name." >&2
+              exit 1
+            fi
+          done
+          # Upload the manifest last so installers can only select a complete package set.
+          for asset in "${pending[@]}"; do
+            gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+          done

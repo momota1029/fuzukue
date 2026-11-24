@@ -19,6 +19,8 @@ The project is early. The maintainer uses it for daily work, and setup and workf
 
 When a matching release is published, use [install-server.sh](scripts/install-server.sh) for the Linux or WSL2 server, [install-client.sh](scripts/install-client.sh) for Linux desktop, or [install-client.ps1](scripts/install-client.ps1) for Windows desktop. See the [installation guide](docs/install.md#english) for prerequisites, release channels, and migration.
 
+To run both components on the same Mac when macOS beta packages are available, see the [macOS beta quick start (Japanese)](docs/install-mac.md).
+
 ## Quick start from source
 
 Install Git and a Rust toolchain. From the repository root, build the server and start it with the sample workspace.
