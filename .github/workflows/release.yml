@@ -1,0 +1,196 @@
+name: Desktop release
+
+'on':
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed SemVer tag to build
+        required: true
+        type: string
+      dry-run:
+        description: Build and retain workflow artifacts without creating a release
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: desktop-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# TODO(R-27): Pin checkout and artifact actions to verified full commit SHAs.
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Resolve and validate the version tag
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          number='(0|[1-9][0-9]*)'
+          identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          [[ $TAG =~ ^v$number\.$number\.$number(-$identifier(\.$identifier)*)?$ ]]
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '[.object.type, .object.sha] | @tsv')
+          IFS=$'\t' read -r _ object_sha <<< "$ref"
+          for ((depth=0; depth<10; depth++)); do
+            read -r type sha <<< "$ref"
+            [[ $sha =~ ^[0-9a-f]{40}$ ]]
+            if [[ $type == commit ]]; then
+              break
+            fi
+            [[ $type == tag ]]
+            ref=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '[.object.type, .object.sha] | @tsv')
+          done
+          [[ $type == commit ]]
+          if [[ $GITHUB_EVENT_NAME == push ]]; then
+            [[ $sha == "$GITHUB_SHA" || $object_sha == "$GITHUB_SHA" ]]
+          fi
+          printf 'tag=%s\ncommit=%s\n' "$TAG" "$sha" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: Install Linux client build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libasound2-dev \
+            libfontconfig1-dev libfreetype6-dev libgl1-mesa-dev libpipewire-0.3-dev \
+            libudev-dev libvulkan-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev
+      - name: Build server and client tarballs
+        env:
+          TAG: ${{ needs.source.outputs.tag }}
+        run: |
+          rustup update stable
+          rustup default stable
+          scripts/release/package-linux.sh "$TAG" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  windows:
+    needs: source
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - name: Build Windows client ZIP
+        env:
+          TAG: ${{ needs.source.outputs.tag }}
+        run: |
+          rustup update stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/release/Package-Release.ps1 -Tag $env:TAG -OutputDirectory dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  # R-29: macOS packaging is a stub and is outside the release requirements.
+  macos:
+    if: ${{ false }}
+    runs-on: macos-latest
+    steps:
+      - run: echo "macOS packaging is tracked in R-29."
+
+  manifest:
+    needs: [source, linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release'
+          path: dist
+          merge-multiple: true
+      - name: Assemble release manifest and SHA256SUMS
+        env:
+          TAG: ${{ needs.source.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.source.outputs.commit }}
+        run: |
+          tar -xzf "dist/secretaire-$TAG-linux-x86_64.tar.gz" -C "$RUNNER_TEMP" secretaire
+          python3 scripts/release/make-manifest.py "$TAG" "$GITHUB_REPOSITORY" dist "$RUNNER_TEMP/secretaire"
+          jq -e --arg commit "$EXPECTED_COMMIT" '.commit == $commit' dist/release-manifest.json
+          (cd dist && sha256sum --strict --check SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release-assets
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+
+  draft:
+    needs: [source, manifest]
+    if: ${{ github.event_name == 'push' || inputs['dry-run'] == false }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-release-assets
+          path: dist
+      - name: Attach verified assets to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.source.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --strict --check SHA256SUMS
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '[.object.type, .object.sha] | @tsv')
+          for ((depth=0; depth<10; depth++)); do
+            read -r type sha <<< "$ref"
+            [[ $sha =~ ^[0-9a-f]{40}$ ]]
+            if [[ $type == commit ]]; then
+              break
+            fi
+            [[ $type == tag ]]
+            ref=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '[.object.type, .object.sha] | @tsv')
+          done
+          [[ $type == commit && $sha == "$EXPECTED_COMMIT" ]]
+          flags=(--draft)
+          if [[ $TAG == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag "${flags[@]}" \
+            --title "$TAG" --notes 'Draft desktop release. The release manifest is unsigned.' \
+            "secretaire-$TAG-linux-x86_64.tar.gz" "fuzukue-$TAG-linux-x86_64.tar.gz" \
+            "fuzukue-$TAG-windows-x86_64.zip" SHA256SUMS release-manifest.json

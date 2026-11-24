@@ -15,6 +15,10 @@ The project is early. The maintainer uses it for daily work, and setup and workf
 - Browse a research deck’s exploration tree to see questions and conjectures by branch or by status. [Sample exploration tree](examples/lab/research/curvature/exploration/tree.json)
 - Receive desktop update notices from the connected server and resume interrupted downloads. [Client distribution and updates](docs/update.md)
 
+## Install from a release
+
+When a matching release is published, use [install-server.sh](scripts/install-server.sh) for the Linux or WSL2 server, [install-client.sh](scripts/install-client.sh) for Linux desktop, or [install-client.ps1](scripts/install-client.ps1) for Windows desktop. See the [installation guide](docs/install.md#english) for prerequisites, release channels, and migration.
+
 ## Quick start from source
 
 Install Git and a Rust toolchain. From the repository root, build the server and start it with the sample workspace.
