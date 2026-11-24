@@ -1802,7 +1802,8 @@ async fn mcp_folder_grants_require_approval_and_audit_granted_reads() -> Result<
 #[tokio::test]
 async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> {
     let project = TempProject::new()?;
-    let listed = mcp_request(&mcp_app(&project), "tools/list", json!({})).await;
+    let app = mcp_app(&project);
+    let listed = mcp_request(&app, "tools/list", json!({})).await;
     let tools = listed["tools"].as_array().unwrap();
     let expected: &[(&str, &[(&str, &str)], &[&str])] = &[
         ("codex_run", &[("prompt", "string")], &["prompt"]),
@@ -1984,6 +1985,8 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("fs_search", &[("pattern", "string"), ("path", "string"), ("glob", "string"), ("fixed_string", "boolean"),
             ("ignore_case", "boolean"), ("context", "integer"), ("max_results", "integer")], &["pattern"]),
         ("git_show", &[("rev", "string"), ("path", "string"), ("repository", "string")], &["rev"]),
+        ("plan_status", &[("deck", "string"), ("status", "string"), ("id_prefix", "string"), ("limit", "integer"),
+            ("include_done", "boolean")], &[]),
         ("folder_grants", &[("action", "string"), ("path", "string"), ("grant_id", "string"), ("audit_before", "integer")], &["action"]),
         ("research_issue_create", &[("title", "string"), ("cards", "array"), ("kind", "string"),
             ("acceptance", "string"), ("assignee", "string"), ("producer", "string")],
@@ -2047,6 +2050,10 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
     assert_eq!(schema("delegate")["touches"]["items"]["type"], "string");
     assert_eq!(schema("list_jobs")["state"]["enum"], json!(["active", "queued", "running", "finished", "failed", "all"]));
     assert_eq!(schema("list_jobs")["limit"]["default"], 30);
+    assert_eq!(schema("plan_status")["deck"]["default"], "roadmap");
+    assert_eq!(schema("plan_status")["limit"]["default"], 50);
+    assert_eq!(schema("plan_status")["limit"]["maximum"], 100);
+    assert_eq!(schema("plan_status")["include_done"]["default"], false);
     assert_eq!(schema("job_status")["view"]["enum"], json!(["report", "summary", "full"]));
     assert_eq!(schema("job_status")["view"]["default"], "full");
     assert_eq!(schema("self_update")["verbose"]["default"], false);
@@ -2102,6 +2109,12 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         schema("request_review")["kind"]["enum"],
         json!(["style", "lean", "math", "output", "both"])
     );
+    let deck = project.path().join("roadmap");
+    fs::create_dir_all(deck.join("cards"))?;
+    fs::write(deck.join("deck.toml"), "")?;
+    fs::write(deck.join("cards/task.md"), "---\nid: task\nstatus: todo\nrequires: []\n---\n")?;
+    let result = mcp_call(&app, "plan_status", json!({})).await;
+    assert_eq!(mcp_data(&result)["ready"], json!(["task"]));
     Ok(())
 }
 

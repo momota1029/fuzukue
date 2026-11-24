@@ -45,6 +45,14 @@
 
 索引はサーバーの状態ディレクトリに `card-graph.json` として保存する。再起動や監視イベントの後は、更新時刻とサイズが同じファイルの解析結果を再利用する。ワークスペース外に登録したデッキの入力は MCP 呼び出し時に更新を確認する。
 
+## ロードマップの状態を確認する
+
+受付と作業役は、読み取り専用の `plan_status` で割り当てられた作業ツリーのロードマップを確認できる。既定の `deck` は `roadmap`。別のデッキは作業ツリー相対パスで指定する。カードの配置は `deck.toml` などのデッキ設定から読み、依存が同時に解消されたカードは構成ファイルの掲載順、構成にないカードは ID 順で並べる。
+
+`counts` はデッキ全体の状態別件数。`by_status` は `doing` や `blocked-on-user` を含む状態別の一覧で、各カードの `id`、`title`、`requires`、直接の影響先 `blocks`、Issue の `issues` を返す。`ready` は前提がすべて `done` の `todo`。`topological_order` は残作業を前提が先になる順に並べ、循環や未解決の前提のために順序を決められないカードは `unscheduled` に入る。デッキ全体の循環は `requires_cycles`、参照切れ、状態のない前提、デッキ外の前提は `unresolved_requires` で確認できる。
+
+たとえば `plan_status({"status":"blocked-on-user","id_prefix":"R-","limit":10})` で利用者待ちのカードを絞り込む。`status` は完全一致、`id_prefix` は大文字小文字を区別する前方一致。`done` のカードは、`include_done: true` または `status: "done"` で一覧に表示する。上限 `limit` は既定 50 件で、1〜100 件に収める。状態別一覧は全グループの合計に上限を適用する。状態別一覧は最大約 24 KB、着手可能なカード・残作業の順序・順序未確定のカード・各診断一覧はそれぞれ約 6 KB。件数は最大 100 状態・約 4 KB まで表示する。一件あたりの関連項目と循環の構成カードは各 16 件、題名は 240 文字まで表示する。上限に達したら、`totals` と `truncated` で省略を確認できる。`status` は `card_edit` または `fs_edit` で編集し、作業の変更と同じコミットに含める。
+
 ## 証明ステップ台帳
 
 証明を構成する各ステップを `kind: step` のカードに記録する。`id`、`title`、`requires`、`loc`、`origin`、`tier`、`role` と、本文の `## Statement`（またはフォルダ形式の `statement.tex`）が必要になる。`requires` には同じ台帳内の前提ステップの ID を並べ、前提がない場合は `requires: []` と書く。カードの `links` に `rel: requires` として書いた依存も検査対象になる。

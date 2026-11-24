@@ -440,6 +440,31 @@ impl DeckConfig {
     }
 
     fn read_config(root: &Path, rules: &[PathBuf], workspace: Option<&Path>) -> Result<Self> {
+        Self::parse_config(root, rules, |name| {
+            let path = match workspace {
+                Some(workspace) => workspace_paths::resolve(workspace, root, Path::new(name))?,
+                None => root.join(name),
+            };
+            if path.exists() {
+                Ok(Some(std::fs::read_to_string(&path)
+                    .with_context(|| format!("{} を読めない", path.display()))?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// Read a deck configuration through a caller-supplied reader. The reader
+    /// receives manifest names in precedence order and returns `None` for a missing file.
+    pub fn read_with(root: &Path, read: impl FnMut(&str) -> Result<Option<String>>) -> Result<Self> {
+        Self::parse_config(root, &[], read)
+    }
+
+    fn parse_config(
+        root: &Path,
+        rules: &[PathBuf],
+        mut read: impl FnMut(&str) -> Result<Option<String>>,
+    ) -> Result<Self> {
         #[derive(Deserialize, Default)]
         struct Raw {
             #[serde(default)]
@@ -470,13 +495,9 @@ impl DeckConfig {
         let mut raw = Raw::default();
         let mut harness = false;
         for name in ["deck.toml", "cards.toml", "harness.toml"] {
-            let p = match workspace {
-                Some(workspace) => workspace_paths::resolve(workspace, root, Path::new(name))?,
-                None => root.join(name),
-            };
-            if p.exists() {
-                raw = toml::from_str(&std::fs::read_to_string(&p)?)
-                    .with_context(|| format!("{} を読めない", p.display()))?;
+            if let Some(source) = read(name)? {
+                raw = toml::from_str(&source)
+                    .with_context(|| format!("{} を読めない", root.join(name).display()))?;
                 harness = name == "harness.toml";
                 break;
             }

@@ -1,6 +1,7 @@
 //! Workspace card graph. The disk cache stores per-file inputs; the in-memory
 //! index resolves their edges together so edits also update incoming links.
 
+mod dependencies;
 mod index;
 mod symbols;
 pub(crate) mod mcp;
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use walkdir::WalkDir;
 
+pub(crate) use self::dependencies::requires_cycles;
 use self::index::Index;
 pub(crate) use self::symbols::{card_symbols, review_symbols};
 
@@ -562,6 +564,19 @@ impl Structure {
     }
 }
 
+pub(crate) fn structure_card_order(value: serde_yaml::Value) -> Vec<String> {
+    let Structure { items, appendix, .. } = Structure::from_yaml(value);
+    let mut stack: Vec<_> = items.into_iter().chain(appendix).rev().collect();
+    let mut ids = Vec::new();
+    while let Some(item) = stack.pop() {
+        match item {
+            Item::Card(id) => ids.push(id),
+            Item::Section { items, .. } => stack.extend(items.into_iter().rev()),
+        }
+    }
+    ids
+}
+
 fn sections(value: &serde_yaml::Value) -> Vec<Item> {
     ["chapters", "sections", "subsections"]
         .into_iter()
@@ -745,7 +760,7 @@ fn one_line(text: &str, first_sentence: bool) -> String {
     clip(&clean, 180)
 }
 
-fn clip(text: &str, limit: usize) -> String {
+pub(crate) fn clip(text: &str, limit: usize) -> String {
     text.char_indices()
         .nth(limit)
         .map_or_else(|| text.to_owned(), |(end, _)| format!("{}…", &text[..end]))

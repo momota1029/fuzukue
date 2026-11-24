@@ -988,54 +988,15 @@ impl Index {
         Ok(json!({"total": issues.len(), "issues": issues}))
     }
 
-    // Kosaraju's algorithm over requires edges. Iterative DFS handles long
-    // dependency chains without using the process stack.
     fn requires_cycles(&self) -> Vec<Vec<NodeId>> {
-        let mut visited = vec![false; self.nodes.len()];
-        let mut finished = Vec::new();
-        for &start in self.qualified.values() {
-            if std::mem::replace(&mut visited[start], true) {
-                continue;
-            }
-            let mut stack = vec![(start, self.outgoing[start].iter())];
-            while let Some((node, edges)) = stack.last_mut() {
-                if let Some(edge) = edges.next().map(|&id| &self.edges[id]) {
-                    if edge.rel == "requires" && !std::mem::replace(&mut visited[edge.to], true) {
-                        stack.push((edge.to, self.outgoing[edge.to].iter()));
-                    }
-                } else {
-                    finished.push(*node);
-                    stack.pop();
-                }
-            }
-        }
-        visited.fill(false);
-        let mut cycles = Vec::new();
-        for start in finished.into_iter().rev() {
-            if std::mem::replace(&mut visited[start], true) {
-                continue;
-            }
-            let mut component = Vec::new();
-            let mut stack = vec![start];
-            while let Some(node) = stack.pop() {
-                component.push(node);
-                for edge in self.incoming[node].iter().map(|&id| &self.edges[id]) {
-                    if edge.rel == "requires" && !std::mem::replace(&mut visited[edge.from], true) {
-                        stack.push(edge.from);
-                    }
-                }
-            }
-            if component.len() > 1
-                || self.outgoing[start]
-                    .iter()
-                    .any(|&id| self.edges[id].rel == "requires" && self.edges[id].to == start)
-            {
-                component.sort_unstable();
-                cycles.push(component);
-            }
-        }
-        cycles.sort_unstable();
-        cycles
+        super::requires_cycles(
+            self.qualified.values().copied(),
+            self.nodes.len(),
+            |node| self.outgoing[node].iter().map(|&id| &self.edges[id])
+                .filter(|edge| edge.rel == "requires").map(|edge| edge.to),
+            |node| self.incoming[node].iter().map(|&id| &self.edges[id])
+                .filter(|edge| edge.rel == "requires").map(|edge| edge.from),
+        )
     }
 }
 

@@ -3,6 +3,7 @@
 pub(crate) mod git_read;
 mod history;
 mod paths;
+mod plan_status;
 pub(super) use paths::{open as open_no_symlinks, secret as secret_name};
 mod review;
 mod search;
@@ -44,10 +45,11 @@ pub(crate) enum Tool {
     List,
     Search,
     GitShow,
+    PlanStatus,
 }
 
 impl Tool {
-    pub(crate) const ALL: [Self; 4] = [Self::Read, Self::List, Self::Search, Self::GitShow];
+    pub(crate) const ALL: [Self; 5] = [Self::Read, Self::List, Self::Search, Self::GitShow, Self::PlanStatus];
 
     pub(crate) fn name(self) -> &'static str {
         match self {
@@ -55,6 +57,7 @@ impl Tool {
             Self::List => "fs_list",
             Self::Search => "fs_search",
             Self::GitShow => "git_show",
+            Self::PlanStatus => "plan_status",
         }
     }
 
@@ -101,6 +104,7 @@ impl Tool {
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100}}),
                 &["pattern"],
             ),
+            Self::PlanStatus => return plan_status::definition(self.name()),
             Self::GitShow => (
                 harness_text!(
                     "Read a commit or a UTF-8 file at that commit. For an external folder, supply the absolute repository path; the file path is relative to that repository.",
@@ -127,6 +131,10 @@ impl Tool {
             }
             Self::Search => search::search(scope, super::parse_args(args)?).await,
             Self::GitShow => history::show(scope, super::parse_args(args)?).await,
+            Self::PlanStatus => {
+                let args = super::parse_args(args)?;
+                tokio::task::spawn_blocking(move || plan_status::status(&scope, args)).await?
+            }
         }
     }
 }

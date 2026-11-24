@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
+const TOOLS: [Tool; 4] = [Tool::Read, Tool::List, Tool::Search, Tool::GitShow];
 const PREFIX: &str = "workspace-review-";
 static ACTIVE: LazyLock<Mutex<HashMap<String, Entry>>> = LazyLock::new(Mutex::default);
 
@@ -56,14 +57,18 @@ impl ReviewLease {
                 instructions: GUIDANCE.into(),
                 mcp_url: Some(url.to_string()),
                 key,
-                tools: Tool::ALL.map(|tool| tool.name().to_owned()).into(),
+                tools: TOOLS.map(|tool| tool.name().to_owned()).into(),
             },
         }))
     }
 }
 
 pub(crate) fn is_review_launch(launch: &WorkerLaunch) -> bool {
-    !launch.tools.is_empty() && launch.tools.iter().all(|name| Tool::named(name).is_some())
+    !launch.tools.is_empty() && launch.tools.iter().all(|name| review_tool(name).is_some())
+}
+
+fn review_tool(name: &str) -> Option<Tool> {
+    TOOLS.into_iter().find(|tool| tool.name() == name)
 }
 
 pub(crate) fn claude_config(launch: Option<&WorkerLaunch>) -> String {
@@ -120,9 +125,9 @@ pub(in crate::mcp) async fn dispatch(
             "serverInfo": {"name": super::super::SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
         }),
         Some("ping") => json!({}),
-        Some("tools/list") => json!({"tools": Tool::ALL.map(Tool::definition)}),
+        Some("tools/list") => json!({"tools": TOOLS.map(Tool::definition)}),
         Some("tools/call") => {
-            let tool = params["name"].as_str().and_then(Tool::named);
+            let tool = params["name"].as_str().and_then(review_tool);
             let result = match tool {
                 Some(tool) => {
                     tool.call(scope, params.get("arguments").unwrap_or(&json!({})))

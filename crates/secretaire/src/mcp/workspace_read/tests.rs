@@ -500,7 +500,7 @@ async fn read_tools_follow_allowlists_and_review_credentials() -> Result<()> {
     .await;
     let read: Value = serde_json::from_slice(&body::to_bytes(read.into_body(), 16_384).await?)?;
     assert!(read.to_string().contains("review text"));
-    for name in ["git_commit", build] {
+    for name in ["git_commit", "plan_status", build] {
         let denied = request(
             "review-math",
             Some(&key),
@@ -517,6 +517,158 @@ async fn read_tools_follow_allowlists_and_review_credentials() -> Result<()> {
             .await
             .status(),
         StatusCode::UNAUTHORIZED
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn plan_status_reads_the_worker_deck_and_reports_dependency_frontiers() -> Result<()> {
+    let f = Fixture::new()?;
+    let deck = f.worktree.join("roadmap");
+    fs::create_dir_all(deck.join("tasks"))?;
+    fs::write(
+        deck.join("deck.toml"),
+        "cards_dir = 'tasks'\nstructure = 'priorities.yaml'",
+    )?;
+    fs::write(
+        deck.join("priorities.yaml"),
+        "sections:\n- title: Priority\n  items: [R-08, R-03, R-02, R-01, R-04]\n",
+    )?;
+    for (id, status, requires) in [
+        ("R-01", "done", ""),
+        ("R-02", "todo", "'roadmap#R-01'"),
+        ("R-03", "blocked-on-user", ""),
+        ("R-04", "todo", "R-03, R-02"),
+        ("R-05", "doing", "R-02"),
+        ("R-06", "todo", "R-07"),
+        ("R-07", "todo", "R-06"),
+        ("R-08", "todo", ""),
+        ("R-09", "todo", "absent"),
+        ("R-10", "todo", "R-09"),
+        ("R-11", "todo", "R-11"),
+    ] {
+        fs::write(
+            deck.join(format!("tasks/{id}.md")),
+            format!(
+                "---\nid: {id}\nstatus: {status}\ntitle: Task {id}\nrequires: [{requires}]\nissues: ['#42']\n---\n"
+            ),
+        )?;
+    }
+    fs::create_dir_all(f.project.join("roadmap/cards"))?;
+    fs::write(f.project.join("roadmap/deck.toml"), "")?;
+    fs::write(
+        f.project.join("roadmap/cards/shared.md"),
+        "---\nid: shared\nstatus: todo\nrequires: []\n---\n",
+    )?;
+
+    let scope = f.worker()?;
+    let report = Tool::PlanStatus.call(scope.clone(), &json!({})).await?;
+    assert_eq!(report["deck"], "roadmap");
+    assert_eq!(
+        report["counts"],
+        json!({"todo": 8, "done": 1, "doing": 1, "blocked-on-user": 1})
+    );
+    assert_eq!(report["ready"], json!(["R-08", "R-02"]));
+    assert_eq!(
+        report["by_status"]["blocked-on-user"][0]["blocks"],
+        json!(["R-04"])
+    );
+    assert_eq!(report["by_status"]["doing"][0]["requires"], json!(["R-02"]));
+    assert_eq!(report["by_status"]["doing"][0]["issues"], json!(["#42"]));
+    assert_eq!(
+        report["topological_order"],
+        json!(["R-08", "R-03", "R-02", "R-04", "R-05"])
+    );
+    assert_eq!(
+        report["unscheduled"],
+        json!(["R-06", "R-07", "R-09", "R-10", "R-11"])
+    );
+    assert_eq!(
+        report["requires_cycles"][0]["cards"],
+        json!(["R-06", "R-07"])
+    );
+    assert_eq!(report["requires_cycles"][1]["cards"], json!(["R-11"]));
+    assert_eq!(
+        report["unresolved_requires"],
+        json!([
+            {"from": "R-09", "target": "absent", "type": "dangling_requires"}
+        ])
+    );
+    assert!(report["by_status"].get("done").is_none());
+    assert_eq!(report["truncated"], false);
+
+    let filtered = Tool::PlanStatus
+        .call(
+            scope.clone(),
+            &json!({
+                "deck": "./roadmap", "status": "todo", "id_prefix": "R-0", "limit": -10
+            }),
+        )
+        .await?;
+    assert_eq!(filtered["limit"], 1);
+    assert_eq!(filtered["by_status"]["todo"][0]["id"], "R-08");
+    assert_eq!(filtered["totals"]["ready"], 2);
+    assert_eq!(filtered["counts"], report["counts"]);
+    assert_eq!(filtered["truncated"], true);
+
+    let done = Tool::PlanStatus
+        .call(scope, &json!({"status": "done", "limit": 101}))
+        .await?;
+    assert_eq!(done["limit"], 100);
+    assert_eq!(done["by_status"]["done"][0]["id"], "R-01");
+    assert_eq!(done["by_status"]["done"][0]["blocks"], json!(["R-02"]));
+    assert_eq!(done["ready"], json!([]));
+    let desk = Tool::PlanStatus
+        .call(f.front_desk()?, &json!({"include_done": true}))
+        .await?;
+    assert_eq!(desk["ready"], json!(["shared"]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn plan_status_rejects_out_of_scope_deck_sources() -> Result<()> {
+    let f = Fixture::new()?;
+    let deck = f.worktree.join("custom");
+    fs::create_dir(&deck)?;
+    fs::write(deck.join("deck.toml"), "dirs = ['escape']")?;
+    symlink(&f.project, deck.join("escape"))?;
+
+    let scope = f.worker()?;
+    assert!(
+        Tool::PlanStatus
+            .call(scope.clone(), &json!({"deck": "custom"}))
+            .await
+            .is_err()
+    );
+    assert!(
+        Tool::PlanStatus
+            .call(scope.clone(), &json!({"deck": "../project"}))
+            .await
+            .is_err()
+    );
+
+    let dir = deck.join("tasks");
+    fs::create_dir(&dir)?;
+    fs::write(deck.join("deck.toml"), "dirs = ['tasks']")?;
+    fs::write(
+        dir.join("A.md"),
+        "---\nid: A\nstatus: todo\nrequires: [other:B]\n---\n",
+    )?;
+    fs::write(
+        f.outside.join("hidden.md"),
+        "---\nid: hidden\nstatus: todo\n---\n",
+    )?;
+    symlink(f.outside.join("hidden.md"), dir.join("linked.md"))?;
+    let report = Tool::PlanStatus
+        .call(scope, &json!({"deck": "custom"}))
+        .await?;
+    assert_eq!(report["counts"], json!({"todo": 1}));
+    assert_eq!(report["ready"], json!([]));
+    assert_eq!(
+        report["by_status"]["todo"][0]["unresolved_requires"],
+        json!([
+            {"target": "other:B", "type": "external_requires"}
+        ])
     );
     Ok(())
 }
