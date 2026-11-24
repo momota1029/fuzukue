@@ -1,7 +1,10 @@
 # GitHub の作業場
 
-このリポジトリの開いている Issue が、作業の単位になる。作業者は、外の dots（OpenAI の常時稼働エージェント）でも、
-secretaire が立てるローカルの Claude / Codex でもよい。どの作業者も、この文書の手順に従う。
+fuzukue リポジトリの公開 Issue は利用者やコントリビューターからの依頼を受け付ける。メンテナー自身の作業計画は [`roadmap/`](../roadmap/README.md) に置く。投稿方法は [貢献ガイド](../CONTRIBUTING.md) を参照。
+
+Public issues are for user and contributor requests. Maintainers plan in the roadmap deck.
+
+以下は、GitHub Issue を作業の単位として使うワークスペース向けの手順。作業者は、外の dots（OpenAI の常時稼働エージェント）でも、secretaire が立てるローカルの Claude / Codex でもよい。
 
 ## Issue の書き方
 

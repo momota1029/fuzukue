@@ -6,7 +6,7 @@ status: accepted
 links:
   - {to: context-selection, rel: requires}
   - {to: card-model, rel: requires}
-files: [docs/workshop.md, .github/ISSUE_TEMPLATE/task.md, crates/secretaire/src/github.rs]
+files: [docs/workshop.md, CONTRIBUTING.md, crates/secretaire/src/github.rs]
 ---
 - Issue の本文に入口カード（`cards: [id, ...]`）と受け入れ条件を書く。ラベル `dot:ready` が「拾ってよい」の印。
 - dots（OpenAI の常時稼働エージェント）は定期実行で `dot:ready` の古いものから拾い、
@@ -23,7 +23,7 @@ files: [docs/workshop.md, .github/ISSUE_TEMPLATE/task.md, crates/secretaire/src/
 ユーザー（2026-11-19）:「dotsというかGitHub作業場って感じだけどね」
 
 実装（2026-11-19）:
-- 手順の正本は [[file:docs/workshop.md]]。Issue のひな形は `.github/ISSUE_TEMPLATE/task.md`。
+- 作業場の手順は [[file:docs/workshop.md]]。fuzukue リポジトリの公開 Issue の運用は [[file:CONTRIBUTING.md]] を参照。
 - secretaire は `gh` で開いている Issue と `work/issue-<N>` ブランチを 2 分ごと（とクライアントの要求時）に読み、配る。
 - fuzukue の左ペインに Issue、右ペインに本文・入口カード・ブランチの状態と、「ローカルで取り組む」「dot:ready にする」ボタン。
 - 「ローカルで取り組む」は、入口カードから `fuzukue-cards context` で読むべきカードを並べた依頼文を作り、セッション `issue-<N>` の Claude に渡す。

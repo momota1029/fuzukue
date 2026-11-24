@@ -35,6 +35,12 @@ Windows では WSL2 の Ubuntu でサーバーを動かし、Windows 側でク�
 
 同じマシンで使う場合はループバックで接続できるので、Tailscale は不要です。tailnet 外から接続する場合は HTTPS リバースプロキシと端末トークンを使います。設定例は [リモート接続ガイド](docs/remote.md) にあります。
 
+## 報告・質問・貢献
+
+不具合報告、提案、質問は [GitHub Issues](https://github.com/momota1029/fuzukue/issues) へ。投稿やプルリクエストの前に [貢献ガイド](CONTRIBUTING.md) を参照してください。
+
+See the contribution guide before posting in Issues or sending a pull request.
+
 ## ライセンス
 
 fuzukue の自作部分は [MIT License](LICENSE-MIT) または [Apache License 2.0](LICENSE-APACHE) のいずれかを選んで利用できる形 で公開します。同梱する第三者のコードや素材には各コンポーネントのライセンスが適用されます。同梱物のライセンスは [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) に記載しています。

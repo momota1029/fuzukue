@@ -1,0 +1,29 @@
+name: 機能の提案
+description: 使う場面や困っていることを伝える / Suggest an improvement.
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: やりたいこと
+      description: |
+        どんな場面で何をしたいか、今どこで困っているかを教えてください。トークンなどの機密情報は載せないでください。
+
+        Start with your use case and what gets in the way. Leave out secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: 試したこと
+      description: |
+        すでに試した機能や回避策があれば、結果も教えてください。
+
+        What have you tried, and how did it work?
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: 改善の案（任意）
+      description: |
+        こうなると使いやすい、という案があれば教えてください。
+
+        Share a possible improvement if you have one.

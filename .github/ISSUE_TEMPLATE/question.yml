@@ -1,0 +1,27 @@
+name: 質問・相談
+description: 使い方や設定について尋ねる / Ask about usage or setup.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        この Issue は公開されます。トークンなどの機密情報は載せないでください。脆弱性の報告は、題名にも本文にも詳細を書かず、下の欄で非公開の報告窓口を尋ねてください。
+
+        This issue is public. Leave out secrets, and ask for a private reporting channel without sharing vulnerability details.
+  - type: textarea
+    id: question
+    attributes:
+      label: 聞きたいこと
+      description: |
+        知りたいことや、どこで迷っているかを教えてください。
+
+        What would you like to know?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: 環境と試したこと（任意）
+      description: |
+        必要に応じて、OS、バージョン、使っているクライアントやサーバー、読んだガイドや試した手順を教えてください。
+
+        Share your setup, guides you read, and what you tried if relevant.
