@@ -649,6 +649,9 @@ pub async fn enforce(State(access): State<Arc<Access>>, mut req: Request, next: 
             "mcp_requires_loopback",
         );
     }
+    if req.uri().path() == crate::self_update::wait_route::PATH && !local {
+        return deny(Some(peer), None, StatusCode::NOT_FOUND, "update_wait_requires_loopback");
+    }
     if req.uri().path() == crate::self_update::HEALTH_ROUTE && proxy {
         return deny(
             Some(peer),

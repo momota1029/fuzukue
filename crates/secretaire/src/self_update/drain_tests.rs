@@ -934,6 +934,208 @@ async fn force_timeout_leaves_admission_closed_and_allows_cancel() -> Result<()>
 }
 
 #[tokio::test]
+async fn stalled_update_reaps_unresponsive_claude_and_preserves_held_work() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, mut update) = tests::waiting_fixture(dir.path())?;
+    update.config = toml::from_str("wait_stall_seconds = 1")?;
+    let update = Arc::new(update);
+    assert!(app.self_update.set(update.clone()).is_ok());
+    install_desk_fixture(&app, dir.path())?;
+    fs::write(dir.path().join("mock-claude"), r#"#!/bin/sh
+case "$1" in --help) echo 'Claude'; exit 0;; esac
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture"}'
+while IFS= read -r frame; do
+    printf '%s\n' "$frame" >> prompts
+done
+"#)?;
+    let workspace = app.select(None)?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let prompt = |text: &str| ClientMsg::Prompt { session: session.clone(), text: text.into() };
+    crate::handle(&workspace, prompt("stuck active input")).await?;
+    until(|| prompt_count(&workspace, "stuck active input") == 1).await?;
+    crate::handle(&workspace, prompt("queued before drain")).await?;
+    let wait = begin(&update)?;
+    crate::handle(&workspace, prompt("held during drain")).await?;
+    let mut status = update.subscribe_drain();
+
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::try_join!(update.wait_for_idle(&app, &wait, None), async {
+            status.wait_for(|status| status.as_ref().is_some_and(|status| {
+                status.progress == DrainProgress::Forcing && status.message.as_ref()
+                    .is_some_and(|message| message.contains("no progress"))
+            })).await?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }).await??;
+    assert!(matches!(outcome, WaitOutcome::Ready(_)));
+    assert!(workspace.admit_work().is_err());
+    assert!(!workspace.hub.thread_running(&session));
+    assert_eq!(prompt_count(&workspace, r#""subtype":"interrupt""#), 1);
+    assert_eq!(prompt_count(&workspace, "queued before drain"), 0);
+    assert_eq!(prompt_count(&workspace, "held during drain"), 0);
+
+    // Read the records from disk as a replacement server would.
+    let records = drain::Journal::default().records(&workspace.state_dir)?;
+    assert_eq!(records.iter().filter(|record| record.claimed && record.review.is_some()).count(), 1);
+    let saved_inputs = records.iter().filter_map(|record| {
+        (!record.claimed && matches!(record.work, drain::Work::Claude(_) | drain::Work::Prompt { .. }))
+            .then(|| serde_json::to_string(&record.work))
+    }).collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(saved_inputs.len(), 2);
+    assert!(saved_inputs.iter().any(|input| input.contains("queued before drain")));
+    assert!(saved_inputs.iter().any(|input| input.contains("held during drain")));
+    assert!(records.iter().any(|record| matches!(&record.work, drain::Work::Checkpoint { result, .. }
+        if result.contains("Review required before resuming"))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_result_during_drain_does_not_start_a_retirement_turn_or_queued_input() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    fs::write(dir.path().join("mock-claude"), r#"#!/usr/bin/python3
+import json, sys, time
+from pathlib import Path
+
+print(json.dumps({"type":"system", "subtype":"init", "session_id":"fixture"}), flush=True)
+for line in sys.stdin:
+    with open("prompts", "a") as out:
+        out.write(line)
+    if "original active input" in line:
+        while not Path("finish-turn").exists():
+            time.sleep(0.01)
+        print(json.dumps({"type":"result","result":"checkpoint result","is_error":False}), flush=True)
+"#)?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let prompt = |text: &str| ClientMsg::Prompt { session: session.clone(), text: text.into() };
+    crate::handle(&workspace, prompt("original active input")).await?;
+    until(|| prompt_count(&workspace, "original active input") == 1).await?;
+    crate::handle(&workspace, prompt("original queued input")).await?;
+    let wait = begin(&update)?;
+    let mut status = update.subscribe_drain();
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::try_join!(update.wait_for_idle(&app, &wait, None), async {
+            status.wait_for(|status| status.as_ref().is_some_and(|status| {
+                status.blocking.blockers.iter().any(|blocker| blocker.kind == SelfUpdateBlockerKind::Turn)
+            })).await?;
+            fs::write(workspace.project_dir.join("finish-turn"), "")?;
+            Ok::<_, anyhow::Error>(())
+        })
+    }).await??;
+    assert!(matches!(outcome, WaitOutcome::Ready(_)));
+    assert_eq!(prompt_count(&workspace, r#""type":"user""#), 1);
+    assert!(!workspace.hub.thread_running(&session));
+    let records = workspace.drain.records(&workspace.state_dir)?;
+    assert!(records.iter().any(|r| matches!(&r.work, drain::Work::Checkpoint { result, .. }
+        if result.contains("Finished.") && result.contains("checkpoint result"))));
+    assert_eq!(records.iter().filter(|r| !r.claimed && matches!(r.work, drain::Work::Claude(_))).count(), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn update_progress_resets_the_timeout_and_failed_automatic_force_exits() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, mut update) = tests::waiting_fixture(dir.path())?;
+    update.config.wait_stall_seconds = 5;
+    let update = Arc::new(update);
+    assert!(app.self_update.set(update.clone()).is_ok());
+    let workspace = app.select(None)?;
+    let finished = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let stuck = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    for session in [&finished, &stuck] {
+        workspace.hub.publish(ServerEvent::TurnActivity { session: session.clone(), running: true });
+    }
+    let wait = begin(&update)?;
+    let mut status = update.subscribe_drain();
+    let action = async {
+        status.wait_for(|status| status.as_ref().is_some_and(|status| status.jobs_running == 2)).await?;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        workspace.hub.publish(ServerEvent::TurnEnded { session: finished, actor: Actor::Claude });
+        status.wait_for(|status| status.as_ref().is_some_and(|status| status.jobs_running == 1)).await?;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(status.borrow().as_ref().unwrap().progress, DrainProgress::Draining);
+        workspace.hub.publish(ServerEvent::TextDelta {
+            session: stuck.clone(), item: "in-progress".into(), actor: Actor::Claude, text: "still working".into(),
+        });
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(status.borrow().as_ref().unwrap().progress, DrainProgress::Draining);
+        workspace.hub.publish(ServerEvent::TextDelta {
+            session: stuck, item: "queued".into(), actor: Actor::System, text: "input held".into(),
+        });
+        status.wait_for(|status| status.as_ref().is_some_and(|status| status.progress == DrainProgress::Forcing)).await?;
+        tokio::time::advance(WAIT_FORCE_LIMIT + Duration::from_secs(1)).await;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (outcome, action) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(update.wait_for_idle(&app, &wait, None), action)
+    }).await?;
+    action?;
+    let Err(error) = outcome else { panic!("unsafe drain must fail at the force deadline") };
+    assert!(error.to_string().contains("Timed out draining work"));
+    drop(wait);
+    assert!(workspace.admit_work().is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_wait_control_requires_direct_loopback_current_id_and_force_confirmation() -> Result<()> {
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir()?;
+    let (app, update, _) = load(dir.path())?;
+    let access = Arc::new(crate::remote::Access::new(dir.path(), Default::default())?);
+    let router = crate::router(app.clone(), access);
+    let wait = begin(&update)?;
+    let send = |peer: &str, mode, host, origin: Option<&str>, payload: Option<serde_json::Value>| {
+        let mut request = Request::builder()
+            .uri(wait_route::PATH)
+            .header("host", host)
+            .extension(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()))
+            .extension(mode);
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        let request = if let Some(payload) = payload {
+            request.method("POST").header("content-type", "application/json").body(Body::from(payload.to_string()))
+        } else {
+            request.body(Body::empty())
+        };
+        router.clone().oneshot(request.unwrap())
+    };
+    use crate::remote::ListenMode::{Direct, Proxy};
+    let peer = "127.0.0.1:1";
+    let host = "127.0.0.1:7878";
+    let response = send(peer, Direct, host, None, None).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let status: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1024).await?)?;
+    assert_eq!(status, json!({"started_at": wait.id, "accepts_controls": true}));
+    let force = json!({"started_at": wait.id, "action": "force", "confirm": true});
+    for (peer, mode) in [("192.0.2.1:1", Direct), (peer, Proxy)] {
+        assert_eq!(send(peer, mode, host, None, Some(force.clone())).await?.status(), StatusCode::NOT_FOUND);
+    }
+    assert_eq!(send(peer, Direct, "example.invalid", None, Some(force.clone())).await?.status(), StatusCode::FORBIDDEN);
+    assert_eq!(send(peer, Direct, host, Some("https://example.invalid"), Some(force.clone())).await?.status(), StatusCode::FORBIDDEN);
+    let unconfirmed = json!({"started_at": wait.id, "action": "force"});
+    assert_eq!(send(peer, Direct, host, None, Some(unconfirmed)).await?.status(), StatusCode::BAD_REQUEST);
+    let stale = json!({"started_at": wait.id - 1, "action": "cancel"});
+    assert_eq!(send(peer, Direct, host, None, Some(stale)).await?.status(), StatusCode::CONFLICT);
+    assert_eq!(send(peer, Direct, host, None, Some(force)).await?.status(), StatusCode::ACCEPTED);
+    assert!(matches!(*update.wait_control.lock().unwrap(), WaitControl::Requested(id, DrainReason::Update, WaitAction::Force) if id == wait.id));
+
+    drop(wait);
+    let wait = begin(&update)?;
+    let cancel = json!({"started_at": wait.id, "action": "cancel"});
+    assert_eq!(send(peer, Direct, host, None, Some(cancel)).await?.status(), StatusCode::ACCEPTED);
+    assert!(matches!(update.wait_for_idle(&app, &wait, None).await?, WaitOutcome::Cancelled));
+    Ok(())
+}
+
+#[tokio::test]
 async fn status_write_failure_reopens_admission_without_losing_held_work() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (app, update, workspace) = load(dir.path())?;

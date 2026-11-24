@@ -51,7 +51,6 @@ struct TurnState {
     generation: u64,
     drain_notice: Option<i64>,
     pause_record: Option<String>,
-    retirement_inputs: usize,
     resume_requested: bool,
 }
 
@@ -71,7 +70,6 @@ struct ActiveTurn {
     interrupted: bool,
     compaction: Option<Compaction>,
     records: Vec<String>,
-    retirement: bool,
 }
 
 struct Compaction {
@@ -121,6 +119,7 @@ struct ClaudeProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     settings: ChatSettings,
+    stop_reading: Arc<crate::cancellation::Cancellation>,
 }
 
 impl ClaudeProcess {
@@ -130,7 +129,7 @@ impl ClaudeProcess {
             .kill_on_drop(true).spawn().context("failed to spawn claude")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        Ok((Self { child, stdin: Some(stdin), settings }, stdout))
+        Ok((Self { child, stdin: Some(stdin), settings, stop_reading: Arc::default() }, stdout))
     }
 
     async fn stop(&mut self) {
@@ -160,6 +159,7 @@ impl ClaudeLaunch {
 
     fn command(&self, settings: &ChatSettings, resume: Option<&str>) -> Command {
         let mut cmd = Command::new(&self.program);
+        cmd.process_group(0);
         if let Some(id) = resume {
             cmd.args(["--resume", id]);
         }
@@ -362,13 +362,14 @@ impl ClaudeSession {
 
     #[cfg(test)]
     pub(crate) fn spawn_command(
-        cmd: Command,
+        mut cmd: Command,
         id: String,
         project: PathBuf,
         app: &Arc<Workspace>,
         on_session_id: Box<dyn Fn(String) + Send + Sync>,
         ) -> Result<Arc<Self>> {
         let key = app.mail.as_ref().map(|_| crate::mail::session_key());
+        cmd.process_group(0);
         let (process, stdout) = ClaudeProcess::start(cmd, &project, ChatSettings::default())?;
         Ok(Self::spawn_inner(process, stdout, id, project, app, on_session_id, key, None, None, None))
     }
@@ -390,6 +391,7 @@ impl ClaudeSession {
             needs_seed: resume.is_none(),
         });
         let start = Self::start_mode(resume.as_deref(), recovery.as_ref());
+        let stop_reading = process.stop_reading.clone();
         let session = Arc::new(Self {
             id: id.clone(),
             project,
@@ -409,18 +411,23 @@ impl ClaudeSession {
         });
 
         app.hub.publish(ServerEvent::SessionStarted { session: id, project: session.project.to_string_lossy().into_owned() });
-        session.read_process(stdout, 0, start, app.session_stats.clone());
+        session.read_process(stdout, 0, start, app.session_stats.clone(), stop_reading);
         session
     }
 
-    fn read_process(self: &Arc<Self>, stdout: ChildStdout, generation: u64, start: ClaudeSessionStart, stats: Arc<SessionStatsStore>) {
+    fn read_process(self: &Arc<Self>, stdout: ChildStdout, generation: u64, start: ClaudeSessionStart, stats: Arc<SessionStatsStore>, stop_reading: Arc<crate::cancellation::Cancellation>) {
         let me = self.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut received_session_id = false;
             let mut saw_turn_output = false;
             let mut missing_resume = false;
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = tokio::select! {
+                    _ = stop_reading.cancelled() => break,
+                    line = lines.next_line() => line,
+                };
+                let Ok(Some(line)) = line else { break };
                 if me.process_generation.load(Ordering::Acquire) != generation {
                     return;
                 }
@@ -473,7 +480,8 @@ impl ClaudeSession {
             me.hub.cancel_questions(&me.id, &Actor::Claude, None);
             me.cancel_tool_approvals(None);
             me.stream.lock().unwrap().background_commands = Default::default();
-            if !saw_turn_output && (missing_resume || !received_session_id) {
+            let forced_stop = stop_reading.check().is_err();
+            if !forced_stop && !saw_turn_output && (missing_resume || !received_session_id) {
                 match me.recover_missing_resume(&mut turns, missing_resume).await {
                     Ok(true) => return,
                     Ok(false) => {}
@@ -533,7 +541,7 @@ impl ClaudeSession {
                     if sessions.get(&me.id).is_some_and(|session| Arc::ptr_eq(session, &me)) {
                         sessions.remove(&me.id);
                         // Retry a missing local Claude session using the portable transcript.
-                        if !received_session_id && !was_compacting {
+                        if !forced_stop && !received_session_id && !was_compacting {
                             app.record_session(&me.id, |r| r.claude_session_id = None);
                             app.hub.set_thread_session(&me.id, None);
                         }
@@ -542,7 +550,7 @@ impl ClaudeSession {
             } else if was_running && !was_compacting {
                 me.hub.publish(ServerEvent::TurnActivity { session: me.id.clone(), running: false });
             }
-            if !was_compacting {
+            if !forced_stop && !was_compacting {
                 me.hub.publish(ServerEvent::Error { message: format!("claude session {} exited", me.id) });
             }
         });
@@ -611,7 +619,7 @@ impl ClaudeSession {
         let (next, stdout) = ClaudeProcess::start(cmd, &self.project, settings)?;
         *process = next;
         self.stream.lock().unwrap().stats.last_cost = 0.0;
-        self.read_process(stdout, generation, start, app.session_stats.clone());
+        self.read_process(stdout, generation, start, app.session_stats.clone(), process.stop_reading.clone());
         Ok(())
     }
 
@@ -669,7 +677,7 @@ impl ClaudeSession {
         turns.idle_since = None;
         turns.active = Some(ActiveTurn {
             history, before, resume_prompt, kind, acted_or_asked: false, last_text: String::new(),
-            interrupted: false, compaction: None, records: prompt.records.clone(), retirement: false,
+            interrupted: false, compaction: None, records: prompt.records.clone(),
         });
         self.stream.lock().unwrap().relay_reply = matches!(kind, TurnKind::WorkerDigest).then(RelayReply::default);
         self.hub.set_github_auth_request(&self.id, prompt.github_auth);
@@ -874,7 +882,7 @@ impl ClaudeSession {
             history: None, before: None, resume_prompt: None,
             kind: TurnKind::Conversation, acted_or_asked: false, last_text: String::new(),
             interrupted: false, compaction: Some(Compaction { complete, boundary: None }),
-            records: Vec::new(), retirement: false,
+            records: Vec::new(),
         });
         // SDK slash commands use a bare string instead of the normal prompt preamble.
         self.stream.lock().unwrap().compacting = true;
@@ -904,7 +912,6 @@ impl ClaudeSession {
             turn.resume_prompt = None;
             turn.interrupted = true;
             self.interrupt_claude().await?;
-            turns.retirement_inputs = 0;
         }
         Ok(())
     }
@@ -940,29 +947,35 @@ impl ClaudeSession {
         }
         turns.drain_notice = (!cancelled).then_some(wait);
         let text = crate::self_update::drain::instruction(wait, reason, &self.id, cancelled);
-        // Send through the same stream as worker steering. Account for a separate
-        // result if Claude queues the retirement instruction behind its current input.
-        if self.launch.is_some() {
-            let frame = json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}});
-            if tokio::time::timeout(Duration::from_millis(200), self.write(frame)).await.is_ok_and(|result| result.is_ok()) {
-                turns.retirement_inputs += 1;
-            }
-        }
+        // A stream-json user frame can start a new turn after the current result.
+        // Keep the notice in the timeline and checkpoint the turn already running.
         self.hub.publish(ServerEvent::TextDelta {
             session: self.id.clone(), item: format!("drain:{wait}:{}", crate::mail::session_key()),
             actor: Actor::System, text,
         });
     }
 
-    pub(crate) async fn interrupt_for_swap(&self, wait: i64) -> Result<()> {
+    pub(crate) async fn interrupt_for_swap(&self, wait: i64, reap: bool) -> Result<()> {
         let mut turns = self.state.lock().await;
-        if let Some(turn) = turns.active.as_mut().filter(|turn| !turn.interrupted) {
+        let Some(turn) = turns.active.as_mut() else { return Ok(()) };
+        let already_interrupted = turn.interrupted;
+        turn.before = None;
+        turn.resume_prompt = None;
+        turn.interrupted = true;
+        turns.drain_notice = Some(wait);
+        if reap {
+            // EOF cleanup records the interrupted input and leaves unclaimed prompts in the journal.
+            let mut process = self.process.lock().await;
+            if let Some(group) = process.child.id().and_then(|id| rustix::process::Pid::from_raw(id as i32)) {
+                match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
+                    Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                    Err(error) => return Err(error).context("stop unresponsive Claude process group"),
+                }
+            }
+            process.child.wait().await.context("reap unresponsive Claude process")?;
+            process.stop_reading.cancel();
+        } else if !already_interrupted {
             self.interrupt_claude().await?;
-            turn.before = None;
-            turn.resume_prompt = None;
-            turn.interrupted = true;
-            turns.drain_notice = Some(wait);
-            turns.retirement_inputs = 0;
         }
         Ok(())
     }
@@ -1100,8 +1113,6 @@ impl ClaudeSession {
         }
         self.publish_relay_reply();
         let kind = active.as_ref().map_or(TurnKind::Conversation, |turn| turn.kind);
-        let retiring = active.as_ref().is_some_and(|turn| turn.retirement);
-        let retirement_pending = turns.retirement_inputs != 0;
         if let Some(history) = active.as_mut().and_then(|turn| turn.history.take()) {
             let fallback = result["result"].as_str()
                 .filter(|text| !matches!(kind, TurnKind::WorkerDigest) || !front_desk::suppress_relay_reply(text));
@@ -1121,15 +1132,13 @@ impl ClaudeSession {
                     app.drain.finish(&app.state_dir, &self.id, id, review.map(str::to_owned));
                 }
             }
-            if let Some(wait) = turns.drain_notice.filter(|_| !retirement_pending) {
-                turns.drain_notice = None;
+            if let Some(wait) = turns.drain_notice.take() {
                 let text = result["result"].as_str().filter(|text| !text.is_empty())
                     .or_else(|| active.as_ref().map(|turn| turn.last_text.as_str())).unwrap_or_default();
                 app.save_drain_checkpoint(&self.id, "claude", wait, self.project.clone(), text.into(), !interrupted && result["is_error"] != true);
             }
         }
-        let route = active.is_some()
-            && !retiring && !retirement_pending && !interrupted && result["is_error"] != true;
+        let route = active.is_some() && !interrupted && result["is_error"] != true;
         let from_github = self.app.upgrade().is_some_and(|app| app.issue_threads.automatic_policy(&self.id).is_some());
         let needs_nudge = !from_github && route && active.as_ref().is_some_and(|turn| {
             let text = result["result"].as_str().filter(|text| !text.is_empty()).unwrap_or(&turn.last_text);
@@ -1137,7 +1146,7 @@ impl ClaudeSession {
         }) && !self.app.upgrade().is_some_and(|app| {
             crate::planner::handles_desk_nudge(&app, &self.id)
         });
-        let desk_turn = active.is_some() && !retiring && !retirement_pending;
+        let desk_turn = active.is_some();
         let before = active.as_mut().and_then(|turn| {
             if turn.interrupted { None } else { turn.before.take() }
         });
@@ -1196,16 +1205,6 @@ impl ClaudeSession {
             if let (Some(before), Some(app)) = (before, self.app.upgrade()) {
                 app.schedule_turn_reviews(&self.project, &self.id, before).await;
             }
-        }
-        if retirement_pending {
-            turns.retirement_inputs -= 1;
-            turns.active = Some(ActiveTurn {
-                history: None, before: None, resume_prompt: None,
-                kind: TurnKind::Conversation, acted_or_asked: false, last_text: String::new(),
-                interrupted: false, compaction: None, records: Vec::new(), retirement: true,
-            });
-            self.hub.publish(ServerEvent::TurnActivity { session: self.id.clone(), running: true });
-            return Ok(());
         }
         if needs_nudge && turns.paused_until.is_none() && self.usage.blocked("claude").is_none() {
             if let Some(app) = self.app.upgrade().filter(|app| app.front_desk_nudge) {

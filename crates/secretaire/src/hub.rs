@@ -34,6 +34,7 @@ struct Inner {
     writer: Option<crate::state::TimelineWriter>,
     threads: Option<crate::threads::Store>,
     partner_started: HashMap<String, Observed>,
+    last_partner_progress: Option<tokio::time::Instant>,
     folder_grants: Option<crate::folder_grants::Store>,
     running: HashSet<String>,
     github_auth_requests: HashMap<String, crate::github_auth::mcp::Tool>,
@@ -122,7 +123,7 @@ pub(crate) fn worker_approval(request_id: &str, actor: &Actor) -> bool {
 impl Hub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
+        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
             epoch: format!("{:032x}", rand::random::<u128>()),
         }
     }
@@ -437,6 +438,10 @@ impl Hub {
         self.publish_event(event, None);
     }
 
+    pub(crate) fn last_partner_progress(&self) -> Option<tokio::time::Instant> {
+        self.inner.lock().unwrap().last_partner_progress
+    }
+
     pub(crate) fn partner_elapsed(&self, session: &str) -> Option<u64> {
         self.inner.lock().unwrap().partner_started.get(session)
             .map(|started| started.instant.elapsed().as_millis() as u64)
@@ -466,6 +471,12 @@ impl Hub {
                     matches!(&question.envelope.event, ServerEvent::QuestionAsked { session: owner, actor: asker, .. }
                         if session == owner && actor == asker)
                 });
+            }
+            ServerEvent::TextDelta { session, actor, .. }
+            | ServerEvent::ToolCall { session, actor, .. }
+                if inner.running.contains(session) && matches!(actor, Actor::Claude | Actor::Codex { .. }) =>
+            {
+                inner.last_partner_progress = Some(tokio::time::Instant::now());
             }
             ServerEvent::Paused { session, until, .. } => {
                 inner.chat_pauses.insert(session.clone(), *until);

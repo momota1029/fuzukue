@@ -683,6 +683,7 @@ fn router(app: Arc<App>, access: Arc<remote::Access>) -> Router {
     Router::new()
         .route("/ws", get(ws_handler))
         .route(self_update::HEALTH_ROUTE, get(self_update::health))
+        .route(self_update::wait_route::PATH, get(self_update::wait_route::status).post(self_update::wait_route::control))
         .route("/client/{platform}/manifest", get(distribution::manifest))
         .route("/client/{platform}", get(distribution::binary))
         .route("/client/notify", post(distribution::notify))

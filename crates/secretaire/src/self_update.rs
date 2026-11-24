@@ -7,6 +7,7 @@ mod registration;
 mod retry;
 pub(crate) mod service_swap;
 mod supervisor;
+pub(crate) mod wait_route;
 
 use std::fs::{self, File};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -35,6 +36,8 @@ const MAX_LOG: usize = 8192;
 const WINDOWS_PUBLISH: &str = "scripts/publish-windows.sh";
 const WINDOWS_BUILD_STATE: &str = "FUZUKUE_WINDOWS_BUILD_STATE";
 const PREBUILT: &str = "FUZUKUE_PREBUILT";
+const WAIT_FORCE_GRACE: Duration = Duration::from_secs(5);
+const WAIT_FORCE_LIMIT: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -49,6 +52,7 @@ pub(crate) struct Config {
     canary_project: Option<PathBuf>,
     canary_minutes: u32,
     orphan_approval_seconds: u64,
+    wait_stall_seconds: u32,
 }
 
 impl Default for Config {
@@ -64,6 +68,7 @@ impl Default for Config {
             canary_project: None,
             canary_minutes: 30,
             orphan_approval_seconds: drain::ORPHAN_APPROVAL_AGE.as_secs(),
+            wait_stall_seconds: 300,
         }
     }
 }
@@ -157,6 +162,7 @@ pub(crate) struct Update {
     pub(crate) swapping: watch::Sender<bool>,
     gate: Arc<RwLock<()>>,
     wait_control: std::sync::Mutex<WaitControl>,
+    wait_changed: tokio::sync::Notify,
     last_wait: std::sync::atomic::AtomicI64,
     drain_status: watch::Sender<Option<DrainStatus>>,
     pub(crate) shutdown_ready: watch::Sender<bool>,
@@ -271,6 +277,7 @@ impl Update {
             swapping: watch::channel(false).0,
             gate: Arc::default(),
             wait_control: Default::default(),
+            wait_changed: Default::default(),
             last_wait: Default::default(),
             drain_status: watch::channel(None).0,
             shutdown_ready: watch::channel(false).0,
@@ -446,6 +453,7 @@ impl Update {
         ensure!(reason != DrainReason::Shutdown || !self.shutdown_signalled.load(std::sync::atomic::Ordering::Acquire),
             "shutdown was requested by a signal");
         *control = WaitControl::Requested(id, reason, action);
+        self.wait_changed.notify_waiters();
         Ok(())
     }
 
@@ -481,6 +489,7 @@ impl Update {
             |previous| Some(now.max(previous + 1))).unwrap();
         let id = now.max(previous + 1);
         *control = WaitControl::Open(id, reason);
+        self.wait_changed.notify_waiters();
         self.drain_status.send_replace(Some(DrainStatus {
             started_at: id, reason, progress: DrainProgress::Draining, jobs_running: 0,
             blocking: SelfUpdateWaitReason::default(), can_cancel: !signal, message: None,
@@ -711,21 +720,29 @@ impl Update {
             self.report_planner_queue(app);
             self.step(Step::Wait, State::Running);
         }
-        let mut deadline = None;
+        use tokio::time::Instant;
+        let stall_limit = Duration::from_secs(u64::from(self.config.wait_stall_seconds.max(1)));
+        let mut last_progress = Instant::now();
+        let mut stall_by = (drain == DrainReason::Update).then(|| last_progress + stall_limit);
+        let mut last_blockers: Vec<fuzukue_proto::SelfUpdateBlocker> = Vec::new();
+        let mut last_jobs = 0;
+        let mut last_errors = 0;
+        let mut force_started = None;
+        let mut automatic_force = false;
         let mut force_error: Option<String> = None;
         loop {
+            let changed = self.wait_changed.notified();
+            tokio::pin!(changed);
             let control = *self.wait_control.lock().unwrap();
             if control.owner() != Some((started_at, drain)) || matches!(control, WaitControl::Ready(..)) {
                 return Ok(WaitOutcome::Cancelled);
             }
-            if !matches!(control, WaitControl::Requested(_, _, WaitAction::Cancel | WaitAction::Force)
-                | WaitControl::Forcing(..))
-            {
+            if matches!(control, WaitControl::Open(..)) {
                 let prepare = app.prepare_drain(started_at, drain);
-                if let Some(stop_by) = stop_by {
-                    let _ = tokio::time::timeout_at(stop_by, prepare).await;
-                } else {
-                    prepare.await;
+                let deadline = stop_by.or(stall_by).expect("every drain has a deadline");
+                tokio::select! {
+                    _ = tokio::time::timeout_at(deadline, prepare) => {}
+                    _ = &mut changed => {}
                 }
             } else {
                 app.retry_drain_saves();
@@ -735,6 +752,24 @@ impl Update {
                 !thread.running && !thread.worker && !thread.checking
             }) && !reason.checking_sessions && !reason.gate_held;
             let errors = app.drain_errors(&mut reason);
+            let jobs = app.drain_job_count(&reason);
+            let now = Instant::now();
+            if stall_by.is_some() {
+                let blocker_finished = jobs < last_jobs || errors.len() < last_errors
+                    || last_blockers.iter().any(|old| !reason.blockers.iter().any(|current| {
+                        (current.kind, &current.workspace, &current.id, current.started_at)
+                            == (old.kind, &old.workspace, &old.id, old.started_at)
+                    }));
+                if blocker_finished {
+                    last_progress = now;
+                } else if let Some(progress) = app.last_partner_progress() {
+                    last_progress = last_progress.max(progress);
+                }
+                stall_by = Some(last_progress + stall_limit);
+                last_jobs = jobs;
+                last_errors = errors.len();
+                last_blockers.clone_from(&reason.blockers);
+            }
             let awaiting_reply = reason.blockers.iter().any(|blocker| matches!(blocker.kind,
                 fuzukue_proto::SelfUpdateBlockerKind::Approval | fuzukue_proto::SelfUpdateBlockerKind::Question));
             let ready = ready && errors.is_empty() && !awaiting_reply;
@@ -752,7 +787,8 @@ impl Update {
                     }
                     WaitControl::Requested(_, _, WaitAction::Force) => {
                         *control = WaitControl::Forcing(started_at, drain);
-                        deadline = Some(tokio::time::Instant::now() + Duration::from_secs(15));
+                        force_started = Some(now);
+                        stall_by = None;
                         force_error = None;
                         false
                     }
@@ -762,6 +798,16 @@ impl Update {
                             self.set_drain_progress(started_at, DrainProgress::Ready, None);
                         }
                         return Ok(WaitOutcome::Ready(gate.unwrap()));
+                    }
+                    WaitControl::Open(..) if stall_by.is_some_and(|deadline| now >= deadline) => {
+                        let blocker_kinds: Vec<_> = reason.blockers.iter().map(|blocker| blocker.kind).collect();
+                        tracing::warn!(started_at, jobs, ?blocker_kinds, gate_held = reason.gate_held,
+                            save_errors = errors.len(), elapsed_secs = elapsed_wait(started_at),
+                            stalled_secs = now.saturating_duration_since(last_progress).as_secs(),
+                            "Update drain stalled; requesting force");
+                        *control = WaitControl::Requested(started_at, drain, WaitAction::Force);
+                        automatic_force = true;
+                        continue;
                     }
                     _ if expired => {
                         *control = WaitControl::Ready(started_at, drain);
@@ -791,16 +837,15 @@ impl Update {
                 return Ok(WaitOutcome::Cancelled);
             }
 
-            let forcing = deadline.is_some();
-            let mut log = errors.join("\n");
-            if drain == DrainReason::Update && elapsed_wait(started_at) >= 300 {
-                append_log(&mut log, "\nWork is still draining. You can keep waiting, cancel, or request an interruption.");
+            let forcing = force_started.is_some();
+            let mut messages: Vec<_> = errors.iter().map(String::as_str).collect();
+            if automatic_force {
+                messages.push("Drain made no progress before the timeout. Interrupting work for the server swap.");
             }
-            if let Some(error) = &force_error {
-                append_log(&mut log, error);
-            }
+            messages.extend(force_error.as_deref());
+            let log = messages.join("\n");
             let status = DrainStatus {
-                started_at, reason: drain, jobs_running: app.drain_job_count(&reason),
+                started_at, reason: drain, jobs_running: jobs,
                 progress: if forcing { DrainProgress::Forcing } else { DrainProgress::Draining },
                 blocking: reason.clone(),
                 can_cancel: !forcing && (drain == DrainReason::Update || !self.shutdown_signalled.load(std::sync::atomic::Ordering::Acquire)),
@@ -828,26 +873,38 @@ impl Update {
             }) {
                 write_status(&self.root, &self.status.borrow())?;
             }
-            if let Some(stop_by) = deadline {
-                let result = if errors.is_empty() {
-                    tokio::time::timeout_at(stop_by, app.interrupt_for_swap(started_at)).await
-                        .context("timed out stopping work for the server swap").and_then(|result| result)
-                } else {
-                    Ok(())
-                };
-                if let Some(error) = result.err().map(|error| format!("{error:#}")).or_else(||
-                    (tokio::time::Instant::now() >= stop_by).then(|| "Timed out draining work for the server swap.".into()))
-                {
-                    force_error = Some(error);
-                    deadline = None;
+            if let Some(start) = force_started {
+                let reap_at = start + WAIT_FORCE_GRACE;
+                let force_by = start + WAIT_FORCE_LIMIT;
+                if now >= force_by {
+                    let mut message = "Timed out draining work for the server swap.".to_owned();
+                    if !log.is_empty() {
+                        append_log(&mut message, &format!("\n{log}"));
+                    }
+                    if automatic_force {
+                        bail!("{message}");
+                    }
                     let mut control = self.wait_control.lock().unwrap();
                     if control.owner() == Some((started_at, drain)) {
                         *control = WaitControl::Open(started_at, drain);
                     }
+                    force_error = Some(message);
+                    force_started = None;
+                    last_progress = now;
+                    stall_by = Some(last_progress + stall_limit);
+                } else if errors.is_empty() {
+                    let reap = now >= reap_at;
+                    let deadline = if reap { force_by } else { reap_at };
+                    if let Ok(Err(error)) = tokio::time::timeout_at(deadline, app.interrupt_for_swap(started_at, reap)).await {
+                        force_error = Some(format!("{error:#}"));
+                    }
                 }
             }
-            let tick = tokio::time::Instant::now() + Duration::from_millis(250);
-            tokio::time::sleep_until(stop_by.map_or(tick, |stop_by| tick.min(stop_by))).await;
+            let tick = Instant::now() + Duration::from_millis(250);
+            tokio::select! {
+                _ = tokio::time::sleep_until(stop_by.or(stall_by).map_or(tick, |deadline| tick.min(deadline))) => {}
+                _ = &mut changed => {}
+            }
         }
     }
 

@@ -507,6 +507,10 @@ impl App {
         std::time::Duration::from_secs(self.shutdown_drain_seconds.get().copied().unwrap_or(crate::remote::DEFAULT_DRAIN_SECONDS))
     }
 
+    pub(crate) fn last_partner_progress(&self) -> Option<tokio::time::Instant> {
+        self.loaded_workspaces().into_iter().filter_map(|workspace| workspace.hub.last_partner_progress()).max()
+    }
+
     pub(crate) fn drain_job_count(&self, reason: &fuzukue_proto::SelfUpdateWaitReason) -> usize {
         let mut count = self.mutations.count() + reason.threads.iter().filter(|thread| thread.running).count();
         for workspace in self.loaded_workspaces() {
@@ -671,7 +675,7 @@ impl App {
         })).await;
     }
 
-    pub(crate) async fn interrupt_for_swap(&self, wait: i64) -> Result<()> {
+    pub(crate) async fn interrupt_for_swap(&self, wait: i64, reap: bool) -> Result<()> {
         self.mutations.interrupt().await;
         let workspaces = self.loaded_workspaces();
         futures_util::future::try_join_all(workspaces.iter().map(|workspace| async {
@@ -681,7 +685,7 @@ impl App {
             workspace.stop_reviews_for_swap();
             let sessions: Vec<_> = workspace.sessions.lock().await.values().cloned().collect();
             tokio::try_join!(
-                futures_util::future::try_join_all(sessions.iter().map(|session| session.interrupt_for_swap(wait))),
+                futures_util::future::try_join_all(sessions.iter().map(|session| session.interrupt_for_swap(wait, reap))),
                 async {
                     if let Some(codex) = workspace.running_codex().await {
                         codex.interrupt_for_swap().await?;
