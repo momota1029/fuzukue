@@ -19,7 +19,7 @@
 - 研究 curvature のカードは、研究 concentration のカード（`conc:`）を参照する。
 - 原稿 obsdiam-spheres のカードは、原稿 levy-families のカード（`lf:`）を使う。
 
-起動: `cd fuzukue && cargo run -p secretaire -- examples/lab`（クライアントは README のとおり）。
+起動: `cd fuzukue && cargo run -p secretaire -- examples/lab`（クライアントは [起動手順](../../README.ja.md#ソースから起動する) を参照）。
 
 ## カードの形
 

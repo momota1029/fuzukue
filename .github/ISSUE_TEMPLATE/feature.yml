@@ -1,29 +1,29 @@
-name: 機能の提案
-description: 使う場面や困っていることを伝える / Suggest an improvement.
+name: Feature suggestion / 機能の提案
+description: Suggest an improvement. / 使う場面や困っていることを伝える。
 body:
   - type: textarea
     id: use-case
     attributes:
-      label: やりたいこと
+      label: What you want to do / やりたいこと
       description: |
-        どんな場面で何をしたいか、今どこで困っているかを教えてください。トークンなどの機密情報は載せないでください。
+        Describe what you want to do and what gets in the way. Leave out tokens and other sensitive information.
 
-        Start with your use case and what gets in the way. Leave out secrets.
+        どんな場面で何をしたいか、今どこで困っているかを教えてください。トークンなどの機密情報は載せないでください。
     validations:
       required: true
   - type: textarea
     id: tried
     attributes:
-      label: 試したこと
+      label: What you tried / 試したこと
       description: |
-        すでに試した機能や回避策があれば、結果も教えてください。
+        Describe any features or workarounds you tried and how they worked.
 
-        What have you tried, and how did it work?
+        すでに試した機能や回避策があれば、結果も教えてください。
   - type: textarea
     id: suggestion
     attributes:
-      label: 改善の案（任意）
+      label: Suggested improvement (optional) / 改善の案（任意）
       description: |
-        こうなると使いやすい、という案があれば教えてください。
-
         Share a possible improvement if you have one.
+
+        こうなると使いやすい、という案があれば教えてください。

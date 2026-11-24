@@ -1,50 +1,71 @@
 # fuzukue
 
-fuzukue は、AI エージェントと一緒に研究資料、メモ、原稿を扱うためのデスクトップアプリです。プロジェクトのファイルを扱うサーバーが `secretaire`、接続してカードや PDF を読み、エージェントと作業するクライアントが `fuzukue` です。
+日本語: [README.ja.md](README.ja.md)
 
-開発初期のソース公開です。作者自身の環境で日常的に試しながら開発しており、設定や使い方は変わることがあります。Android ベータは今後の予定です。
+fuzukue is a workbench for writing mathematics and doing research with AI agents. The Rust server, `secretaire`, opens a project and runs agents. The GPUI desktop client brings conversations, mathematical notes, drafts, and PDFs into one workspace. The Android client lets you send instructions, follow conversations, and respond to approval requests from a phone or tablet. [Android guide](android/README.md)
 
-## ソースから起動する
+The project is early. The maintainer uses it for daily work, and setup and workflows may change.
 
-Git と Rust のビルド環境を用意し、リポジトリのルートから実行します。まずサンプルを開けます。
+## Features
+
+- Organize definitions, theorems, proofs, and notes into cards and decks. Follow references between cards and browse the sample workspace for examples. [Card graph](docs/graph.md) · [Sample workspace](examples/lab/README.md)
+- Track findings from human and agent reviews of proofs and drafts in a deck’s review findings ledger. [Review findings ledger](docs/review-findings.md)
+- Grant agents read access to a specific server-side folder for a thread, choose how long it lasts, and review or revoke access. [Folder grants](docs/folder-grants.md)
+- Render callouts, tables, and review findings from XML components embedded in Markdown replies on the desktop. [XML components](docs/xml-components.md)
+- Browse a research deck’s exploration tree to see questions and conjectures by branch or by status. [Sample exploration tree](examples/lab/research/curvature/exploration/tree.json)
+- Receive desktop update notices from the connected server and resume interrupted downloads. [Client distribution and updates](docs/update.md)
+
+## Quick start from source
+
+Install Git and a Rust toolchain. From the repository root, build the server and start it with the sample workspace.
 
 ```sh
 cargo build --locked --release -p secretaire
 ./target/release/secretaire examples/lab
 ```
 
-サーバーの既定の待ち受けは `127.0.0.1:7878` です。Linux または macOS のデスクトップでは、別のターミナルで次を実行します。GUI のビルドには OS の開発ツールが必要です。macOS でのデスクトップのビルドと動作は検証途上です。
+The server listens on `127.0.0.1:7878` by default. On Linux or macOS, use a second terminal at the repository root to build and start the desktop client. The GUI build requires platform development tools. The macOS desktop build and runtime are still being verified. [Mac guide](docs/mac.md)
 
 ```sh
 cargo build --locked --release --manifest-path crates/fuzukue/Cargo.toml
 FUZUKUE_URL=ws://127.0.0.1:7878/ws ./crates/fuzukue/target/release/fuzukue
 ```
 
-Windows では WSL2 の Ubuntu でサーバーを動かし、Windows 側でクライアントをビルドします。Windows のローカルドライブ上にクローンし、Rust の MSVC ツールチェーンと Visual Studio Build Tools の C++ ワークロードを用意してから、PowerShell で実行します。
+On Linux or macOS, you can also build and launch both processes with [`scripts/run.sh`](scripts/run.sh) by passing it `examples/lab`.
+
+On Windows, run the server in WSL2 and the desktop client on Windows. Set up Ubuntu in WSL2, clone the repository onto a local Windows drive, and install the Rust MSVC toolchain and the Visual Studio Build Tools C++ workload. From the Windows clone, use PowerShell to preview and then run setup. The script builds the server in WSL and the client on Windows, configures the connection, and creates a Start menu shortcut. [Windows guide](docs/windows.md) · [Setup script](scripts/setup-windows.ps1)
 
 ```powershell
 .\scripts\setup-windows.ps1 -WhatIf -Shortcut
 .\scripts\setup-windows.ps1 -Shortcut
 ```
 
-詳しい準備は [Windows ガイド](docs/windows.md) と [Mac ガイド](docs/mac.md) を参照してください。エージェントを使う場合は、サーバーを動かす環境で対応する CLI をインストールし、自分のアカウントで認証します。
+To work with an agent, install its CLI and sign in with your own account in the environment where `secretaire` runs.
 
-## 別の端末から接続する
+For Android source builds and signed APKs, follow the [Android guide](android/README.md). The repository includes an [Android release script](scripts/release-android.sh).
 
-リモート接続には Tailscale を推奨します。サーバーとクライアントを同じ tailnet に参加させ、サーバーの設定で Tailscale のアドレスと許可するログインを指定します。クライアントの「設定 → サーバー → リモート」でそのアドレスを使い、接続します。
+## Connect from another device
 
-同じマシンで使う場合はループバックで接続できるので、Tailscale は不要です。tailnet 外から接続する場合は HTTPS リバースプロキシと端末トークンを使います。設定例は [リモート接続ガイド](docs/remote.md) にあります。
+For local use, the desktop client can connect over loopback at `ws://127.0.0.1:7878/ws`. Tailscale is optional.
 
-## 報告・質問・貢献
+For remote use, Tailscale is recommended. Join the server and client devices to the same tailnet, configure the server to listen on its Tailscale IP, and allow the client’s Tailscale login. Use the server’s Tailscale IP in the client’s remote connection settings.
 
-不具合報告、提案、質問は [GitHub Issues](https://github.com/momota1029/fuzukue/issues) へ。投稿やプルリクエストの前に [貢献ガイド](CONTRIBUTING.md) を参照してください。
+Devices outside the tailnet can connect through an HTTPS reverse proxy using a per-device token. See the [remote connection guide](docs/remote.md) for both remote setups.
 
-See the contribution guide before posting in Issues or sending a pull request.
+## Updates
 
-## ライセンス
+A server operator can register a desktop build with `secretaire`. The server tells connected desktop clients when a build is available, and clients can download it and restart to install it. Interrupted desktop downloads can resume from the bytes already received. The updater checks the file size and SHA-256 before installation. [Desktop update guide](docs/update.md)
 
-fuzukue の自作部分は [MIT License](LICENSE-MIT) または [Apache License 2.0](LICENSE-APACHE) のいずれかを選んで利用できる形 で公開します。同梱する第三者のコードや素材には各コンポーネントのライセンスが適用されます。同梱物のライセンスは [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) に記載しています。
+Android uses signed APKs and has its own in-app update check. [Android update guide](android/README.md#配布と更新)
 
-## English
+## Contributing
 
-fuzukue is an early, dogfooded desktop workbench for research files, notes, PDFs, and AI agents. Build and start the `secretaire` server, then run the `fuzukue` desktop client with the commands above. On Windows, the PowerShell setup builds the server under WSL2 and the client on Windows. Tailscale is recommended for remote access and optional for local use. Outside a tailnet, use an HTTPS proxy and a device token. An Android beta is planned.
+Use [GitHub Issues](https://github.com/momota1029/fuzukue/issues) for bug reports, suggestions, and questions from users and contributors. The maintainer tracks project plans in the [roadmap deck](roadmap/README.md). See the [contribution guide](CONTRIBUTING.md) before opening an issue or pull request.
+
+## Security
+
+GitHub private vulnerability reporting is enabled for this repository. Submit reports through GitHub’s [private reporting form](https://github.com/momota1029/fuzukue/security/advisories/new).
+
+## License
+
+fuzukue’s own code is dual-licensed under `MIT OR Apache-2.0`. You may choose the [MIT License](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE). Bundled third-party code and assets are covered by their respective licenses. [Third-party notices](THIRD_PARTY_NOTICES)

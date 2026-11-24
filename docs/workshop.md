@@ -1,6 +1,6 @@
 # GitHub の作業場
 
-fuzukue リポジトリの公開 Issue は利用者やコントリビューターからの依頼を受け付ける。メンテナー自身の作業計画は [`roadmap/`](../roadmap/README.md) に置く。投稿方法は [貢献ガイド](../CONTRIBUTING.md) を参照。
+fuzukue リポジトリの公開 Issue は利用者やコントリビューターからの依頼を受け付ける。メンテナー自身の作業計画は [`roadmap/`](../roadmap/README.md) に置く。投稿方法は [貢献ガイド](../CONTRIBUTING.ja.md) を参照。
 
 Public issues are for user and contributor requests. Maintainers plan in the roadmap deck.
 

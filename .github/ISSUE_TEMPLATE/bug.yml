@@ -1,79 +1,79 @@
-name: 不具合報告
-description: fuzukue で起きた不具合を伝える / Report a bug.
+name: Bug report / 不具合報告
+description: Report a problem in fuzukue. / fuzukue で起きた不具合を伝える。
 body:
   - type: markdown
     attributes:
       value: |
-        この Issue は公開されます。セキュリティ上の問題は、詳細を書かずに「質問・相談」フォームで非公開の報告窓口を尋ねてください。
+        This issue is public. Report vulnerabilities using [GitHub’s private reporting form](https://github.com/momota1029/fuzukue/security/advisories/new).
 
-        This issue is public. Use the Question form to ask for a private channel without sharing vulnerability details.
+        この Issue は公開されます。脆弱性は [GitHub の非公開の報告フォーム](https://github.com/momota1029/fuzukue/security/advisories/new) から報告してください。
   - type: textarea
     id: actual
     attributes:
-      label: 起きたこと
+      label: What happened / 起きたこと
       description: |
-        実際の動作や、画面に出たメッセージを教えてください。
+        Describe what happened and include any messages you saw.
 
-        What happened?
+        実際の動作や、画面に出たメッセージを教えてください。
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
-      label: 期待した動作
+      label: Expected behavior / 期待した動作
       description: |
-        どのように動くと思っていましたか？
-
         What did you expect to happen?
+
+        どのように動くと思っていましたか？
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
-      label: 再現手順
+      label: Steps to reproduce / 再現手順
       description: |
-        問題が起きるまでに行った操作を、順番に書いてください。
+        List the steps that led to the problem, in order.
 
-        What steps led to the bug?
+        問題が起きるまでに行った操作を、順番に書いてください。
     validations:
       required: true
   - type: input
     id: version
     attributes:
-      label: バージョンまたはビルド ID
+      label: Version or build ID / バージョンまたはビルド ID
       description: |
-        分かる範囲で、バージョン、ビルド ID、またはソースからビルドしたときのコミット ID を書いてください。
+        If known, share the version or build ID, or the commit ID for a source build.
 
-        Share a version, build ID, or commit ID if known.
+        分かる範囲で、バージョン、ビルド ID、またはソースからビルドしたときのコミット ID を書いてください。
   - type: dropdown
     id: component
     attributes:
-      label: 問題が起きた場所
+      label: Affected components / 問題が起きた場所
       description: |
-        関係するクライアントやサーバーを選んでください。複数選べます。
+        Select the affected clients or server. You can select more than one.
 
-        Select the affected clients or server.
+        関係するクライアントやサーバーを選んでください。複数選べます。
       multiple: true
       options:
-        - デスクトップ（Desktop）
+        - Desktop / デスクトップ
         - Android
-        - サーバー（secretaire）
-        - 分からない（Unsure）
+        - Server (secretaire) / サーバー
+        - Unsure / 分からない
     validations:
       required: true
   - type: input
     id: os
     attributes:
-      label: OS とバージョン
+      label: OS and version / OS とバージョン
       description: |
-        クライアントとサーバーで OS が異なる場合は、分かる範囲で両方を書いてください。
+        Share the OS names and versions, for both client and server if they differ.
 
-        Share the OS names and versions, for both ends if they differ.
+        クライアントとサーバーで OS が異なる場合は、分かる範囲で両方を書いてください。
   - type: textarea
     id: logs
     attributes:
-      label: ログやスクリーンショット（任意）
+      label: Logs or screenshots (optional) / ログやスクリーンショット（任意）
       description: |
-        問題に関係する箇所だけ添えてください。ログや画像に含まれるトークン、認証情報、tailnet の名前やアドレス、個人のファイルパス、非公開文書の内容は貼り付けないでください。
+        Include only relevant excerpts. Remove tokens, credentials, tailnet names and addresses, personal file paths, and private document contents.
 
-        Omit tokens, credentials, tailnet names and addresses, personal paths, and private documents.
+        問題に関係する箇所だけ添えてください。ログや画像に含まれるトークン、認証情報、tailnet の名前やアドレス、個人のファイルパス、非公開文書の内容は貼り付けないでください。
