@@ -747,7 +747,7 @@ pub(crate) fn conversation_voice() -> String {
 }
 
 pub(crate) fn worker_voice() -> String {
-    format!("{}\n\nWrite progress messages, questions to the front desk, and the final report in English, even for assignments written in another language. The front desk turns those internal messages into user-facing updates. Conversation tone rules for speaking to the user do not apply to these internal messages. For deliverables such as cards, docs, README files, design notes, UI text, and locale files, keep the language and style appropriate to each artifact and its existing conventions. Preserve file paths, code, identifiers, logs, and quotations from the user as written.", user_instructions())
+    format!("{}\n\nWrite progress messages, questions to the front desk, and the final report in English, even for assignments written in another language. The front desk turns those internal messages into user-facing updates. Conversation tone rules for speaking to the user do not apply to these internal messages. For deliverables such as cards, docs, README files, design notes, UI text, and locale files, keep the language and style appropriate to each artifact and its existing conventions. Preserve file paths, code, identifiers, logs, and quotations from the user as written.\n\nWhen available, use the fuzukue git_read tool for read-only Git queries in the assigned checkout, such as rev-parse or status. If git_commit_scoped is available, use it to commit named files within the job's touches after the requested checks pass. Supply the full message and any requested trailers.", user_instructions())
 }
 
 fn user_instructions() -> String {

@@ -1,5 +1,6 @@
 //! Read-only workspace MCP tools. Every caller supplies its own filesystem scope.
 
+pub(crate) mod git_read;
 mod history;
 mod paths;
 pub(super) use paths::{open as open_no_symlinks, secret as secret_name};
@@ -9,6 +10,8 @@ mod search;
 mod tests;
 
 pub(crate) use paths::ReadScope;
+pub(super) use history::read_metadata as git_metadata;
+pub(super) use paths::{check_git_path, worktree_relative};
 pub(crate) use review::{ReviewLease, claude_config as review_claude_config, is_review_launch};
 pub(super) use review::{dispatch as dispatch_review, is_review};
 

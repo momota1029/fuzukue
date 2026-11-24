@@ -145,6 +145,27 @@ pub(in crate::mcp) fn secret(name: &[u8]) -> bool {
         || name.ends_with(".pfx")
 }
 
+/// Validate a literal UTF-8 path shared by checkout-scoped tools.
+pub(in crate::mcp) fn worktree_relative(path: &Path) -> bool {
+    path.components().all(|part| matches!(part, Component::Normal(_)))
+        && path.to_str().is_some_and(|path| {
+            !path.chars().any(char::is_control) && !path.contains('\\')
+                && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+        })
+}
+
+/// Check the nearest existing ancestor of a path without following aliases.
+pub(in crate::mcp) fn check_git_path(path: &Path, root: &Path) -> Result<()> {
+    for ancestor in path.ancestors().take_while(|path| *path != root) {
+        match open(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.context("Git paths cannot traverse symlinks")),
+        }
+    }
+    Ok(())
+}
+
 /// Open every component without following symlinks, including after a path check.
 pub(in crate::mcp) fn open(path: &Path) -> Result<File> {
     let mut parts = path.components().peekable();

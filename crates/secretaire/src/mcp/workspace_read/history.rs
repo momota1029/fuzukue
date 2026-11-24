@@ -220,6 +220,19 @@ impl SnapshotBudget {
 
 fn metadata_for(scope: &ReadScope) -> Result<PathBuf> {
     let (primary, common) = read_metadata(&scope.workspace)?;
+    check_objects(&common)?;
+    if scope.cwd == scope.workspace {
+        return Ok(primary);
+    }
+    let (metadata, worktree_common) = read_metadata(&scope.cwd)?;
+    ensure!(
+        worktree_common == common,
+        "Git metadata does not belong to the assigned workspace"
+    );
+    Ok(metadata)
+}
+
+pub(super) fn check_objects(common: &Path) -> Result<()> {
     let objects = common.join("objects");
     ensure!(
         paths::open(&objects)?.metadata()?.is_dir(),
@@ -233,18 +246,10 @@ fn metadata_for(scope: &ReadScope) -> Result<PathBuf> {
             ),
         }
     }
-    if scope.cwd == scope.workspace {
-        return Ok(primary);
-    }
-    let (metadata, worktree_common) = read_metadata(&scope.cwd)?;
-    ensure!(
-        worktree_common == common,
-        "Git metadata does not belong to the assigned workspace"
-    );
-    Ok(metadata)
+    Ok(())
 }
 
-fn read_metadata(root: &Path) -> Result<(PathBuf, PathBuf)> {
+pub(in crate::mcp) fn read_metadata(root: &Path) -> Result<(PathBuf, PathBuf)> {
     let dot_git = root.join(".git");
     let file = paths::open(&dot_git).context("The assigned directory has no local Git metadata")?;
     if file.metadata()?.is_dir() {

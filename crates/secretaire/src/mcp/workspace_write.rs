@@ -3,9 +3,9 @@
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail, ensure};
 use rustix::fs::{self as unix, AtFlags, Mode, OFlags};
@@ -19,7 +19,7 @@ use crate::delegate::touches::WriteSet;
 use crate::folder_grants;
 use crate::worker_scope;
 
-use super::workspace_read::open_no_symlinks;
+use super::workspace_read::{open_no_symlinks, worktree_relative};
 
 const FILE_LIMIT: usize = 256 * 1024;
 const PATCH_LIMIT: usize = 768 * 1024;
@@ -212,16 +212,43 @@ impl Scope {
         drop(COMMIT.lock().unwrap());
     }
 
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) fn check_running(&self, cancel: &Cancellation) -> Result<()> {
+        cancel.check()?;
+        self.closed.check()?;
+        Ok(())
+    }
+
+    pub(super) fn commit_guard(&self, cancel: &Cancellation) -> Result<MutexGuard<'static, ()>> {
+        let guard = COMMIT.lock().unwrap();
+        self.check_running(cancel)?;
+        Ok(guard)
+    }
+
+    pub(super) fn check_commit_path(&self, relative: &Path) -> Result<()> {
+        let (parent, name) = self.destination(relative)?;
+        ensure!(self.writes.contains(relative),
+            "Commit path {relative:?} is outside the job's touches. Ask the front desk to authorize the expanded scope.");
+        match unix::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => ensure!(unix::FileType::from_raw_mode(stat.st_mode) == unix::FileType::RegularFile
+                && stat.st_nlink == 1, "Commit paths must be regular files without links"),
+            Err(rustix::io::Errno::NOENT) => {} // Git verifies a deleted path was tracked.
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_commit_audit(&self, id: Option<&str>, record: &Value) -> Result<String> {
+        let at_ms = record["at_ms"].as_i64().context("Missing commit audit timestamp")?;
+        write_audit_record(&self.recovery, id, record, at_ms)
+    }
+
     fn destination(&self, relative: &Path) -> Result<(File, PathBuf)> {
         ensure!(
-            relative
-                .components()
-                .all(|part| matches!(part, Component::Normal(_)))
-                && relative
-                    .to_str()
-                    .is_some_and(|path| !path.chars().any(char::is_control)
-                        && !path.contains('\\')
-                        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))),
+            worktree_relative(relative),
             "Use a worktree-relative UTF-8 file path without .."
         );
         let absolute = self.root.join(relative);
@@ -283,9 +310,7 @@ impl Scope {
         cancel: &Cancellation,
         approved: bool,
     ) -> Result<Value> {
-        let _lock = COMMIT.lock().unwrap();
-        cancel.check()?;
-        self.closed.check()?;
+        let _lock = self.commit_guard(cancel)?;
         let content_hash = digest(staged.after.as_bytes());
         let changed = staged.changed();
         let (directory, name) = self.destination(&staged.path)?;
@@ -679,29 +704,35 @@ pub(crate) fn prepare_recovery(path: &Path) -> Result<()> {
 }
 
 fn write_audit(recovery: &Path, id: Option<&str>, record: &Audit<'_>) -> Result<String> {
+    write_audit_record(recovery, id, record, record.at_ms)
+}
+
+fn write_audit_record(
+    recovery: &Path, id: Option<&str>, record: &impl Serialize, at_ms: i64,
+) -> Result<String> {
     prepare_recovery(recovery)?;
     let audit = recovery.join("write-audit");
     private_dir(&audit)?;
     let mut temp = tempfile::NamedTempFile::new_in(&audit)?;
     serde_json::to_writer(&mut temp, record)?;
     temp.as_file().sync_all()?;
-    let id = id.map_or_else(
+    let name = id.map_or_else(
         || {
             let now = chrono::Utc::now()
                 .timestamp_nanos_opt()
-                .unwrap_or(record.at_ms);
+                .unwrap_or(at_ms);
             format!("{now:020}-{}", crate::mail::session_key())
         },
         str::to_owned,
     );
-    let path = audit.join(format!("{id}.json"));
-    if record.outcome == "pending" {
+    let path = audit.join(format!("{name}.json"));
+    if id.is_none() {
         temp.persist_noclobber(path)?;
     } else {
         temp.persist(path)?;
     }
     File::open(audit)?.sync_all()?;
-    Ok(id)
+    Ok(name)
 }
 
 pub(crate) fn audit_page(

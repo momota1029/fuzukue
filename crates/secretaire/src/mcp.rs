@@ -23,8 +23,10 @@ use crate::reviewers::section::blind as blind_review;
 
 mod desk;
 mod front_desk_light;
+pub(crate) mod git_write;
 pub(crate) mod workspace_read;
 pub(crate) mod workspace_write;
+use workspace_read::git_read;
 
 pub(crate) const SERVER_NAME: &str = "fuzukue";
 
@@ -115,6 +117,8 @@ pub(crate) enum Tool {
     FetchReference,
     FileInbox,
     ImportLatexBook,
+    GitRead,
+    GitCommitScoped,
     GitStatus,
     GitDiff,
     GitLog,
@@ -218,8 +222,8 @@ impl Tool {
         Self::DraftMail, Self::MailJournal, Self::MailFolders,
     ];
 
-    const GIT: [Self; 10] = [
-        Self::GitStatus, Self::GitDiff, Self::GitLog, Self::GitCommit,
+    const GIT: [Self; 11] = [
+        Self::GitRead, Self::GitStatus, Self::GitDiff, Self::GitLog, Self::GitCommit,
         Self::GitPush, Self::GitPull, Self::GitBranch,
         Self::ListBranches, Self::BranchDiff, Self::MergeBranch,
     ];
@@ -320,6 +324,8 @@ impl Tool {
             Self::FetchReference => "fetch_reference",
             Self::FileInbox => "file_inbox",
             Self::ImportLatexBook => "import_latex_book",
+            Self::GitRead => git_read::NAME,
+            Self::GitCommitScoped => git_write::NAME,
             Self::GitStatus => "git_status",
             Self::GitDiff => "git_diff",
             Self::GitLog => "git_log",
@@ -361,7 +367,7 @@ impl Tool {
             | Self::UpdateReviewPoint | Self::WriteReviewResponse | Self::SelfUpdate | Self::Watch
             | Self::ExportReadingPage | Self::GenerateReadingPage
             | Self::RecordReviewFinding | Self::UpdateReviewFinding | Self::CoursePlan | Self::CourseNext | Self::CourseCommit
-            | Self::SaveAttachment | Self::AddMemo | Self::DraftMail | Self::GitCommit | Self::GitPush | Self::GitPull | Self::MergeBranch)
+            | Self::SaveAttachment | Self::AddMemo | Self::DraftMail | Self::GitCommit | Self::GitCommitScoped | Self::GitPush | Self::GitPull | Self::MergeBranch)
     }
 
     fn git_remote(self) -> Option<git::RemoteOperation> {
@@ -457,6 +463,8 @@ impl Tool {
                 "方針役に一度だけ相談して答えを受け取る。現在の方針と直近の会話は自動で渡す。"
             ), json!({"question":{"type":"string"}, "context":{"type":"string"}}), &["question"]),
             Self::Desk(tool) => tool.schema(),
+            Self::GitRead => return git_read::definition(),
+            Self::GitCommitScoped => return git_write::definition(),
             Self::WorkspaceRead(tool) => return tool.definition(),
             Self::WorkspaceWrite(tool) => return tool.definition(),
             Self::FolderGrants => (
@@ -974,10 +982,11 @@ fn worker_tools() -> impl Iterator<Item = Tool> {
         | Tool::ListReviewSubmissions | Tool::ReadReviewPoint | Tool::ListReviewFindings | Tool::ReadReference
         | Tool::ListLedger | Tool::ReadLedgerAttempts | Tool::GitStatus | Tool::GitDiff | Tool::GitLog
         | Tool::ListTests | Tool::Lsp(_) | Tool::LeanDocCheck | Tool::ClientScreenshot
-        | Tool::WorkspaceRead(_) | Tool::BuildPaper
+        | Tool::WorkspaceRead(_) | Tool::GitRead | Tool::BuildPaper
         | Tool::ListScreenshotScenarios | Tool::CaptureScreenshot | Tool::Recipe(_)
     )).chain([Tool::AskFrontDesk])
         .chain(workspace_write::Tool::ALL.map(Tool::WorkspaceWrite).into_iter().filter(|_| !crate::canary()))
+        .chain((!crate::canary()).then_some(Tool::GitCommitScoped))
 }
 
 pub(crate) fn worker_tool_names(allow: &[String]) -> Vec<String> {
@@ -1201,6 +1210,14 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
             } else if let Some(tool) = workspace_write::Tool::named(name) {
                 Box::pin(tool.call(&app, &q.session, job, &params["arguments"])).await
                     .map(|result| data_result(result, false))
+            } else if name == git_write::NAME {
+                Box::pin(git_write::call(&app, &q.session, job, &params["arguments"])).await
+                    .map(|result| data_result(result, false))
+            } else if name == git_read::NAME {
+                async {
+                    let scope = app.delegates.workspace_read_scope(job)?;
+                    Ok(data_result(Box::pin(git_read::call(scope, &params["arguments"])).await?, false))
+                }.await
             } else if let Some(tool) = workspace_read::Tool::named(name) {
                 async {
                     let scope = app.delegates.workspace_read_scope(job)?;
@@ -1742,6 +1759,11 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         }
         Tool::GitDiff => json!({"diff": Box::pin(app.git_diff(parse_args(args)?)).await?}),
         Tool::GitLog => json!({"commits": Box::pin(app.git_log(parse_args(args)?)).await?}),
+        Tool::GitCommitScoped => unreachable!("worker-only Git tool"),
+        Tool::GitRead => {
+            let scope = workspace_read::ReadScope::new(project, &app.state_dir, None)?;
+            Box::pin(git_read::call(scope, args)).await?
+        }
         Tool::WorkspaceRead(tool) => {
             let scope = workspace_read::ReadScope::new(project, &app.state_dir, None)?
                 .with_grants(crate::folder_grants::Access { hub: app.hub.clone(), session: session.into(), worker_grants: None });
@@ -2403,6 +2425,7 @@ fn mcp_dispatch_fits_default_worker_stack() -> Result<()> {
                 ));
                 for (name, arguments, field) in [
                     ("git_status", json!({}), "branch"),
+                    (git_read::NAME, json!({"subcommand": "rev-parse", "args": ["HEAD"]}), "text"),
                     ("branch_diff", json!({"branch": "work/issue-1"}), "diff"),
                     ("graph_overview", json!({}), "decks"),
                     ("add_memo", json!({"text": "Dispatch test"}), "path"),

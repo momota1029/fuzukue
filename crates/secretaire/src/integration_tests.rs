@@ -2004,6 +2004,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("definition", &[("name", "string"), ("kind", "string")], &["name"]),
         ("references", &[("name", "string"), ("id", "string"), ("limit", "integer")], &[]),
         ("symbols", &[("query", "string"), ("kind", "string"), ("deck", "string")], &["query"]),
+        ("git_read", &[("subcommand", "string"), ("args", "array")], &["subcommand"]),
         ("git_status", &[], &[]),
         ("git_diff", &[("path", "string"), ("staged", "boolean")], &[]),
         ("git_log", &[("limit", "integer")], &[]),

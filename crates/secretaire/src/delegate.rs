@@ -691,8 +691,12 @@ async fn launch_assignment(
     }
     if worktree.is_some() {
         tools.retain(|tool| matches!(tool.as_str(), "escalate" | crate::capture::LIST | crate::capture::CAPTURE)
+            || tool == crate::mcp::workspace_read::git_read::NAME
+            || tool == crate::mcp::git_write::NAME
             || crate::mcp::workspace_read::Tool::named(tool).is_some()
             || crate::mcp::workspace_write::Tool::named(tool).is_some());
+    } else {
+        tools.retain(|tool| tool != crate::mcp::git_write::NAME);
     }
     let mcp_url = if !tools.is_empty() && !app.addr.is_empty() && adopted.is_none() {
         let mut url = url::Url::parse(&format!("http://{}/mcp", app.addr))?;
@@ -888,10 +892,13 @@ async fn launch_assignment(
             let can_search = mcp_url.is_some() && tools.iter().any(|tool| tool == "search_library");
             let can_add_memo = mcp_url.is_some() && tools.iter().any(|tool| tool == "add_memo");
             let can_read = mcp_url.is_some() && tools.iter().any(|tool| crate::mcp::workspace_read::Tool::named(tool).is_some());
+            let can_read_git = mcp_url.is_some() && tools.iter().any(|tool| tool == crate::mcp::workspace_read::git_read::NAME);
             let can_navigate = mcp_url.is_some() && crate::lsp::Tool::ALL.iter()
                 .filter(|tool| !matches!(tool, crate::lsp::Tool::LeanGoal))
                 .any(|tool| tools.iter().any(|name| name == tool.name()));
-            let can_write = mcp_url.is_some() && tools.iter().any(|tool| crate::mcp::workspace_write::Tool::named(tool).is_some());
+            let can_edit = mcp_url.is_some() && tools.iter().any(|tool| crate::mcp::workspace_write::Tool::named(tool).is_some());
+            let can_commit = mcp_url.is_some() && tools.iter().any(|tool| tool == crate::mcp::git_write::NAME);
+            let can_write = can_edit || can_commit;
             let access = crate::folder_grants::Access {
                 hub: app.hub.clone(), session: session.clone(), worker_grants: Some(folder_grants.into()),
             };
@@ -903,7 +910,7 @@ async fn launch_assignment(
                 std::fs::create_dir_all(&state)?;
                 let scratch = tempfile::Builder::new().prefix("worker-").tempdir_in(&state)?;
                 let scope = crate::worker_scope::Scope::open(&workspace, &project, scratch.path())?;
-                let read_scope = can_read.then(|| {
+                let read_scope = (can_read || can_read_git).then(|| {
                     crate::mcp::workspace_read::ReadScope::new(&workspace, &state, Some(&scope))
                         .map(|scope| scope.with_grants(access))
                 }).transpose()?;
@@ -931,7 +938,7 @@ async fn launch_assignment(
                 if can_navigate {
                     instructions.push_str("\n\nFor Rust symbols, prefer the available LSP tools for definitions, references, types, and call hierarchy. Start with a workspace-relative source path and, for position queries, a 1-based line and UTF-16 column on the identifier. Use lsp_symbols with a file path for its declarations. Use fs_search when available for literal text, configuration, and locating an identifier to query, or when LSP gives no useful answer. Use lsp_diagnostics for file feedback and run the relevant Cargo check or test to verify build changes.");
                 }
-                if can_write {
+                if can_edit {
                     instructions.push_str(crate::mcp::workspace_write::GUIDANCE);
                 }
                 instructions.push_str("\n\nIf tests are still failing after your attempt, verification rejects the change, or you lack confidence to proceed, report the reason with escalate (trigger tests, rejected, or confidence). Finish the turn after recording it. Report concrete evidence.");
