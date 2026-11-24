@@ -97,6 +97,33 @@ async fn commits_cached_patch_restores_clean_worktree_and_defaults_to_no_push() 
 }
 
 #[tokio::test]
+async fn integrates_rust_paths_and_loopback_examples_without_privacy_override() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let source = [
+        "use ::std::collections::BTreeMap;",
+        "use crate::module::Type;",
+        "pub type Map = BTreeMap<String, Type>;",
+        r#"pub const V6_URL: &str = "http://[::1]:8080";"#,
+        r#"pub const V4_URL: &str = "http://127.0.0.2:8080";"#,
+        r#"pub const LOCAL_URL: &str = "http://localhost:8080";"#,
+        r#"pub const MAPPED_URL: &str = "http://[::ffff:127.0.0.1]:8080";"#,
+    ];
+    let patch = format!(
+        "diff --git a/example.rs b/example.rs\nnew file mode 100644\n--- /dev/null\n+++ b/example.rs\n@@ -0,0 +1,{} @@\n+{}\n",
+        source.len(),
+        source.join("\n+")
+    );
+    let (app, session) = setup(&fixture, &patch)?;
+    let response = integrate(&app, &session, args()).await?;
+    assert_eq!(response["isError"], false, "{response}");
+    assert_eq!(
+        git(&fixture.repo, &["show", "HEAD:example.rs"])?,
+        source.join("\n")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn reports_actual_added_line_locations_without_exposing_values() -> Result<()> {
     let fixture = Fixture::new()?;
     let private = [
@@ -105,9 +132,12 @@ async fn reports_actual_added_line_locations_without_exposing_values() -> Result
         "device.example-tailnet.ts.net",
         "100.86.22.19",
         "ghp_synthetic_example",
+        "fd00::1234",
+        "[fe80::1%eth0]:8080",
+        "::ffff:192.168.0.1",
     ];
     let patch = format!(
-        "diff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1,2 +1,7 @@\n first\n second\n+{}\n",
+        "diff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1,2 +1,10 @@\n first\n second\n+{}\n",
         private.join("\n+")
     );
     let (app, session) = setup(&fixture, &patch)?;
@@ -132,7 +162,10 @@ async fn reports_actual_added_line_locations_without_exposing_values() -> Result
             "tracked.txt:4",
             "tracked.txt:5",
             "tracked.txt:6",
-            "tracked.txt:7"
+            "tracked.txt:7",
+            "tracked.txt:8",
+            "tracked.txt:9",
+            "tracked.txt:10"
         ])
     );
     for value in private {

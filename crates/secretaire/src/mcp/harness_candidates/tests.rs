@@ -63,8 +63,12 @@ fn sanitizes_submission_text() -> Result<()> {
             "connect <private-ip> <private-ip> <private-ip> <private-ip> <private-ip> <private-ip>",
         ),
         (
-            "connect [fd00::1]:8080 fe80::1%test0 ::1 ::ffff:192.168.0.2",
+            "connect [fd00::1234]:8080 fe80::1%eth0 ::ffff:192.168.0.1 fcad::beef",
             "connect [<private-ip>]:8080 <private-ip> <private-ip> <private-ip>",
+        ),
+        (
+            "connect http://[::1]:8080 http://localhost:8080 ::1 ::ffff:127.0.0.1",
+            "connect http://[<private-ip>]:8080 http://<private-host>:8080 <private-ip> <private-ip>",
         ),
         ("connect fd00::1.", "connect <private-ip>."),
         (
@@ -88,6 +92,27 @@ fn sanitizes_submission_text() -> Result<()> {
         let error = sanitize::field("test", unsafe_text, 1024, true).unwrap_err();
         assert!(error.to_string().contains("Replace"));
         assert!(!error.to_string().contains(unsafe_text));
+    }
+    Ok(())
+}
+
+#[test]
+fn preserves_namespace_separators_and_embedded_ipv6_fragments() -> Result<()> {
+    for input in [
+        "use ::std::collections::BTreeMap;",
+        "let value = a::b();",
+        "let values = std::vec::Vec::<u8>::new();",
+        "std::vector<int> values;",
+        "Foo::Bar.new",
+        "the :: separator",
+        "name::1 ::1suffix name_::1 ::1_suffix 值::1 ::1值",
+        "namefd00::1234 fd00::1234suffix fd00::beef::member",
+    ] {
+        assert_eq!(
+            sanitize::field("test", input, 1024, true)?,
+            input,
+            "{input}"
+        );
     }
     Ok(())
 }

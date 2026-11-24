@@ -22,7 +22,6 @@ static REDACTIONS: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
         (r#"(?i)(\b[\w-]*(?:api[-_]?key|access[-_]?key|private[-_]?key|client[-_]?secret|token|password|passwd|secret|cookie)[\w-]*["']?\s*(?:=|:)\s*|--[\w-]*(?:key|token|password|passwd|secret|cookie)[\w-]*[ \t]+)(?:"(?:\\[^\r\n]|[^"\\\r\n])*"|'[^'\r\n]*'|[^\s"'\x60&;|<>),}\]]+)"#.into(), "$1<redacted>"),
         (r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]+|xox[baprs]-[A-Za-z0-9-]+|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|hf_[A-Za-z0-9]{12,}|(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{30,}|tskey-[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)\b".into(), REDACTED),
         (r"[\p{L}\p{N}._%+'-]+@(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}".into(), "<email>"),
-        (r"(?i)\b(?:[\p{L}\p{N}_-]+\.)*(?:[\p{L}\p{N}_-]+\.ts\.net|[\p{L}\p{N}_-]+\.(?:local|lan|internal|localhost|localdomain|corp)|localhost)\b\.?".into(), "<private-host>"),
     ];
     patterns
         .into_iter()
@@ -30,9 +29,14 @@ static REDACTIONS: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
         .collect()
 });
 
+static PRIVATE_HOST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:[\p{L}\p{N}_-]+\.)*(?:[\p{L}\p{N}_-]+\.ts\.net|[\p{L}\p{N}_-]+\.(?:local|lan|internal|localhost|localdomain|corp)|localhost)\b\.?").unwrap()
+});
 static IP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:[a-f0-9.]*:){2,}[a-f0-9:.]*(?:%[\w.-]+)?|[0-9]{1,3}(?:\.[0-9]{1,3}){3}")
-        .unwrap()
+    Regex::new(
+        r"(?i)(?<v6>\b{start-half}(?:[a-f0-9]*:){2,}[a-f0-9:.]*(?:%[\w.-]+)?\b{end-half})|[0-9]{1,3}(?:\.[0-9]{1,3}){3}",
+    )
+    .unwrap()
 });
 static KEY_MATERIAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:begin|end)\b[^\r\n]{0,50}\bprivate[ _-]+key\b|\bopenssh-key-v1\b|\bssh-(?:rsa|ed25519)\s+AAAA").unwrap()
@@ -43,6 +47,22 @@ static AMBIGUOUS_SECRET: LazyLock<Regex> = LazyLock::new(|| {
 static OPAQUE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z0-9_/+=-]{24,}").unwrap());
 
 pub(in crate::mcp) fn field(name: &str, input: &str, max: usize, required: bool) -> Result<String> {
+    sanitize_field(name, input, max, required, true)
+}
+
+pub(in crate::mcp) fn patch_line_has_private_data(input: &str, max: usize) -> bool {
+    // Loopback literals and localhost are common in source code and test fixtures.
+    !sanitize_field("added line", input, max, false, false)
+        .is_ok_and(|sanitized| sanitized == input)
+}
+
+fn sanitize_field(
+    name: &str,
+    input: &str,
+    max: usize,
+    required: bool,
+    redact_loopback: bool,
+) -> Result<String> {
     ensure!(input.len() <= max, "{name} exceeds {max} UTF-8 bytes");
     ensure!(
         !required || !input.trim().is_empty(),
@@ -67,23 +87,34 @@ pub(in crate::mcp) fn field(name: &str, input: &str, max: usize, required: bool)
     for (pattern, replacement) in REDACTIONS.iter() {
         text = pattern.replace_all(&text, *replacement).into_owned();
     }
+    text = PRIVATE_HOST
+        .replace_all(&text, |caps: &Captures| {
+            let host = &caps[0];
+            if !redact_loopback && host.trim_end_matches('.').eq_ignore_ascii_case("localhost") {
+                host.to_owned()
+            } else {
+                "<private-host>".to_owned()
+            }
+        })
+        .into_owned();
     text = IP
         .replace_all(&text, |caps: &Captures| {
-            let found = &caps[0];
-            let trimmed = found.trim_end_matches('.');
-            let address = trimmed.split('%').next().unwrap_or(trimmed);
-            let private = address.parse::<Ipv4Addr>().is_ok_and(private_v4)
-                || address.parse::<Ipv6Addr>().is_ok_and(|ip| {
-                    ip.is_loopback()
-                        || ip.is_unspecified()
-                        || ip.is_unique_local()
-                        || ip.is_unicast_link_local()
-                        || ip.to_ipv4().is_some_and(private_v4)
-                });
-            if private {
-                format!("<private-ip>{}", &found[trimmed.len()..])
+            let found = caps.get(0).unwrap();
+            let trimmed = found.as_str().trim_end_matches('.');
+            let private = if caps.name("v6").is_some() {
+                // Word boundaries can leave a partial match inside a colon-delimited token.
+                let whole_token =
+                    !text[..found.start()].ends_with(':') && !text[found.end()..].starts_with(':');
+                whole_token && private_v6(trimmed, redact_loopback)
             } else {
-                found.to_owned()
+                trimmed
+                    .parse::<Ipv4Addr>()
+                    .is_ok_and(|ip| private_v4(ip, redact_loopback))
+            };
+            if private {
+                format!("<private-ip>{}", &found.as_str()[trimmed.len()..])
+            } else {
+                found.as_str().to_owned()
             }
         })
         .into_owned();
@@ -97,10 +128,33 @@ pub(in crate::mcp) fn field(name: &str, input: &str, max: usize, required: bool)
     Ok(text)
 }
 
-fn private_v4(ip: Ipv4Addr) -> bool {
+fn private_v6(token: &str, redact_loopback: bool) -> bool {
+    let address = token.split_once('%').map_or(token, |(address, _)| address);
+    // A single alphabetic group or bare `::` is too ambiguous in source code.
+    let plausible = address.bytes().any(|byte| byte.is_ascii_digit())
+        || address
+            .split(':')
+            .filter(|group| !group.is_empty())
+            .nth(1)
+            .is_some();
+    plausible
+        && address.parse::<Ipv6Addr>().is_ok_and(|ip| {
+            if ip.is_loopback() {
+                return redact_loopback;
+            }
+            ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip
+                    .to_ipv4()
+                    .is_some_and(|ip| private_v4(ip, redact_loopback))
+        })
+}
+
+fn private_v4(ip: Ipv4Addr, redact_loopback: bool) -> bool {
     let [a, b, _, _] = ip.octets();
     ip.is_private()
-        || ip.is_loopback()
+        || (redact_loopback && ip.is_loopback())
         || ip.is_link_local()
         || a == 0
         || a == 100 && (64..=127).contains(&b)

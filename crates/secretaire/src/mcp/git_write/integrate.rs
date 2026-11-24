@@ -294,9 +294,7 @@ fn scan(diff: &[u8], changes: &[Change]) -> Result<Findings> {
         } else if let Some(number) = &mut line_number {
             if let Some(text) = line.strip_prefix('+') {
                 let text = text.strip_suffix('\r').unwrap_or(text);
-                if !sanitize::field("added line", text, MAX_DIFF, false)
-                    .is_ok_and(|sanitized| sanitized == text)
-                {
+                if sanitize::patch_line_has_private_data(text, MAX_DIFF) {
                     findings.count += 1;
                     if findings.locations.len() < MAX_LOCATIONS {
                         let path = &file.context("Missing path for added line")?.path;
