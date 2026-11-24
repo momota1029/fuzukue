@@ -32,6 +32,8 @@ class MainActivity : ComponentActivity() {
     private val installError = mutableStateOf<String?>(null)
     private val openConversation = mutableStateOf(0)
     private val pendingNotice = mutableStateOf<ConversationTarget?>(null)
+    private var pendingApprovalDock = false
+    private val openApprovalDock = mutableStateOf<Pair<ConversationTarget, Int>?>(null)
     private var requestedNoticeWorkspace: String? = null
     private var openInstallerAfterDownload = false
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -49,14 +51,23 @@ class MainActivity : ComponentActivity() {
         setContent {
             val state by remote.state.collectAsState()
             val updates by app.updater.state.collectAsState()
-            LaunchedEffect(pendingNotice.value, state.phase, state.workspace, state.threads, state.changingWorkspace) {
+            LaunchedEffect(
+                pendingNotice.value, state.phase, state.workspace, state.threads, state.changingWorkspace,
+                state.approvalDock.isLoading, state.approvalDock.pending,
+            ) {
                 val target = pendingNotice.value ?: return@LaunchedEffect
                 if (!state.canSend) return@LaunchedEffect
                 if (target.workspace == state.workspace) {
+                    val knownThread = state.threads.any { it.id == target.session }
+                    val queuedThread = pendingApprovalDock && state.approvalDock.pending.values.any { it.thread == target.session }
+                    if (!knownThread && !queuedThread && pendingApprovalDock && state.approvalDock.isLoading) {
+                        return@LaunchedEffect
+                    }
                     pendingNotice.value = null
-                    if (state.threads.any { it.id == target.session }) {
+                    if (knownThread || queuedThread) {
                         remote.selectThread(target.session)
                         openConversation.value++
+                        openApprovalDock.value = if (pendingApprovalDock) target to openConversation.value else null
                     }
                 } else if (requestedNoticeWorkspace != target.workspace) {
                     requestedNoticeWorkspace = target.workspace
@@ -85,6 +96,7 @@ class MainActivity : ComponentActivity() {
                     workerNotices = workerNotices.value,
                     showPlanAboveConversation = showPlanAboveConversation.value,
                     openConversation = openConversation.value,
+                    openApprovalDock = openApprovalDock.value,
                     updates = updates,
                     installError = installError.value,
                     onCheckUpdate = {
@@ -129,6 +141,9 @@ class MainActivity : ComponentActivity() {
                     onStopTurn = remote::interrupt,
                     onStopWorker = remote::stopWorker,
                     onResolve = remote::resolve,
+                    onDecideQueuedApprovals = remote::decideQueuedApprovals,
+                    onDismissQueuedDecision = remote::dismissQueuedDecision,
+                    onRetryApprovalQueue = remote::retryApprovalQueue,
                     onRememberShellApproval = remote::rememberShellApproval,
                     onRevokeShellApproval = remote::revokeShellApproval,
                     onWorkerApprovalPolicy = remote::setWorkerApprovalPolicy,
@@ -173,6 +188,7 @@ class MainActivity : ComponentActivity() {
         val workspace = intent.getStringExtra(EXTRA_WORKSPACE) ?: return
         val thread = intent.getStringExtra(EXTRA_SESSION) ?: return
         requestedNoticeWorkspace = null
+        pendingApprovalDock = intent.getBooleanExtra(EXTRA_APPROVAL_DOCK, false)
         pendingNotice.value = ConversationTarget(workspace, thread)
         connectFromIntent()
     }

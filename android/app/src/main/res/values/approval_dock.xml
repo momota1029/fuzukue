@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="approval_dock_expand">承認ドックを展開</string>
+    <string name="approval_dock_collapse">承認ドックを折りたたむ</string>
+    <string name="approval_dock_job">ジョブ　%1$s</string>
+    <string name="approval_dock_no_target">対象の指定なし</string>
+    <string name="approval_dock_retry">再取得</string>
+    <string name="approval_dock_conflict">この依頼はすでに解決済みです。</string>
+    <string name="approval_dock_target">対象　%1$s</string>
+    <string name="approval_dock_scope">範囲　%1$s</string>
+    <string name="approval_dock_reason">理由　%1$s</string>
+    <string name="approval_dock_expires">期限　%1$s</string>
+    <string name="approval_dock_arguments">引数　%1$s</string>
+    <string name="approval_dock_diff">差分　%1$s</string>
+    <string name="approval_dock_requester">依頼元　%1$s</string>
+    <string name="approval_dock_once_scope">許可は表示された操作の一回限りで、依頼の期限まで有効。</string>
+    <string name="approval_dock_select">一括操作に選択</string>
+    <string name="approval_dock_details">詳細</string>
+    <string name="approval_dock_hide_details">詳細を閉じる</string>
+    <string name="approval_dock_allow_once">一回だけ許可</string>
+    <string name="approval_dock_action_label">%2$s を %1$s</string>
+    <string name="approval_bulk_review">一括操作の対象を確認</string>
+    <string name="approval_bulk_allow">一括許可（%1$d 件）</string>
+    <string name="approval_bulk_deny">一括拒否（%1$d 件）</string>
+    <string name="approval_risk_low">低リスク</string>
+    <string name="approval_risk_mid">中リスク</string>
+    <string name="approval_risk_high">高リスク</string>
+    <string name="approval_dock_sending">サーバーの確認待ち…</string>
+    <string name="approval_dock_result_summary">判断を受理 %1$d 件 · 未反映 %2$d 件</string>
+    <string name="approval_dock_results">判断結果</string>
+    <string name="approval_dock_unavailable">この依頼は期限切れ、解決済み、または変更済みです。</string>
+    <string name="approval_dock_interrupted">接続が切れたため、サーバーの判断結果を確認できませんでした。</string>
+    <string name="approval_outcome_granted">許可 · %1$s · %2$s</string>
+    <string name="approval_outcome_denied">拒否 · %1$s · %2$s</string>
+    <string name="approval_outcome_expired">期限切れ · %1$s · %2$s</string>
+    <string name="approval_outcome_withdrawn">撤回 · %1$s · %2$s</string>
+    <string name="approval_outcome_local">あなたの判断 · %1$s</string>
+</resources>

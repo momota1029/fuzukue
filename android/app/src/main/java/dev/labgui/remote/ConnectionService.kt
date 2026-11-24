@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 
 internal const val EXTRA_WORKSPACE = "${BuildConfig.APPLICATION_ID}.workspace"
 internal const val EXTRA_SESSION = "${BuildConfig.APPLICATION_ID}.session"
+internal const val EXTRA_APPROVAL_DOCK = "${BuildConfig.APPLICATION_ID}.approval_dock"
 
 class ConnectionService : Service() {
     private val app get() = application as RemoteApplication
@@ -119,6 +120,7 @@ class ConnectionService : Service() {
         if (notice?.target != null) {
             intent.putExtra(EXTRA_WORKSPACE, notice.target.workspace)
             intent.putExtra(EXTRA_SESSION, notice.target.session)
+            intent.putExtra(EXTRA_APPROVAL_DOCK, notice.openApprovalDock)
         }
         return PendingIntent.getActivity(this, id, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }

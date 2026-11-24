@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="approval_dock_expand">Expand approval dock</string>
+    <string name="approval_dock_collapse">Collapse approval dock</string>
+    <string name="approval_dock_job">Job · %1$s</string>
+    <string name="approval_dock_no_target">No target specified</string>
+    <string name="approval_dock_retry">Retry</string>
+    <string name="approval_dock_conflict">This request was already resolved.</string>
+    <string name="approval_dock_target">Target · %1$s</string>
+    <string name="approval_dock_scope">Scope · %1$s</string>
+    <string name="approval_dock_reason">Reason · %1$s</string>
+    <string name="approval_dock_expires">Expires · %1$s</string>
+    <string name="approval_dock_arguments">Arguments · %1$s</string>
+    <string name="approval_dock_diff">Diff · %1$s</string>
+    <string name="approval_dock_requester">Requested by · %1$s</string>
+    <string name="approval_dock_once_scope">Each grant allows the displayed action once, until its request expires.</string>
+    <string name="approval_dock_select">Select for bulk decision</string>
+    <string name="approval_dock_details">Details</string>
+    <string name="approval_dock_hide_details">Hide details</string>
+    <string name="approval_dock_allow_once">Allow once</string>
+    <string name="approval_dock_action_label">%1$s · %2$s</string>
+    <string name="approval_bulk_review">Review selected requests</string>
+    <string name="approval_bulk_allow">Allow %1$d once</string>
+    <string name="approval_bulk_deny">Deny %1$d</string>
+    <string name="approval_risk_low">Low risk</string>
+    <string name="approval_risk_mid">Medium risk</string>
+    <string name="approval_risk_high">High risk</string>
+    <string name="approval_dock_sending">Waiting for server confirmation…</string>
+    <string name="approval_dock_result_summary">%1$d accepted · %2$d unapplied</string>
+    <string name="approval_dock_results">Decision results</string>
+    <string name="approval_dock_unavailable">This request has expired, been resolved, or changed.</string>
+    <string name="approval_dock_interrupted">The connection closed before the server confirmed this decision.</string>
+    <string name="approval_outcome_granted">Granted · %1$s · %2$s</string>
+    <string name="approval_outcome_denied">Denied · %1$s · %2$s</string>
+    <string name="approval_outcome_expired">Expired · %1$s · %2$s</string>
+    <string name="approval_outcome_withdrawn">Withdrawn · %1$s · %2$s</string>
+    <string name="approval_outcome_local">Your decision · %1$s</string>
+</resources>

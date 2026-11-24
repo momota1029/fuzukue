@@ -62,7 +62,11 @@ internal fun RemoteTheme(dark: Boolean = isSystemInDarkTheme(), content: @Compos
         surfaceContainer = Color(0xFFF0EFF9), surfaceContainerHigh = Color(0xFFE7E6F4),
         outlineVariant = Color(0xFFD6D5E4),
     )
-    MaterialTheme(colorScheme = colors, content = content)
+    val mediumRisk = if (dark) ApprovalRiskColors(Color(0xFF564014), Color(0xFFFFDF9B))
+        else ApprovalRiskColors(Color(0xFFFFE5AB), Color(0xFF432D00))
+    CompositionLocalProvider(LocalApprovalMidRiskColors provides mediumRisk) {
+        MaterialTheme(colorScheme = colors, content = content)
+    }
 }
 
 @Composable
@@ -75,6 +79,7 @@ internal fun RemoteApp(
     workerNotices: Boolean = false,
     showPlanAboveConversation: Boolean = false,
     openConversation: Int = 0,
+    openApprovalDock: Pair<ConversationTarget, Int>? = null,
     showSettingsInitially: Boolean = state.workspace == null,
     updates: UpdateState = UpdateState(),
     installError: String? = null,
@@ -94,6 +99,9 @@ internal fun RemoteApp(
     onStopTurn: (String) -> Unit = {},
     onStopWorker: (String, String) -> Unit = { _, _ -> },
     onResolve: (String, Boolean) -> Unit = { _, _ -> },
+    onDecideQueuedApprovals: (ConversationTarget, List<QueuedApproval>, Boolean) -> Unit = { _, _, _ -> },
+    onDismissQueuedDecision: (ConversationTarget) -> Unit = {},
+    onRetryApprovalQueue: (ConversationTarget) -> Unit = {},
     onRememberShellApproval: (String, String?) -> Unit = { _, _ -> },
     onRevokeShellApproval: (String) -> Unit = {},
     onWorkerApprovalPolicy: (WorkerApprovalPolicy) -> Unit = {},
@@ -195,8 +203,15 @@ internal fun RemoteApp(
                         if (wide) VerticalDivider()
                         if (selected != null) {
                             drafts.SaveableStateProvider("${state.workspace.orEmpty()}/$selected") {
-                                Conversation(state, selected, onSend, onStopTurn, onStopWorker, onResolve, onRememberShellApproval,
-                                    Modifier.weight(1f), showPlanAboveConversation, openPlan, attachments, attachmentView, onOlderHistory)
+                                val target = ConversationTarget(state.workspace.orEmpty(), selected)
+                                Conversation(
+                                    state, selected, onSend, onStopTurn, onStopWorker, onResolve, onRememberShellApproval,
+                                    Modifier.weight(1f), showPlanAboveConversation, openPlan, attachments, attachmentView, onOlderHistory,
+                                    openApprovalDock = openApprovalDock?.takeIf { it.first == target }?.second,
+                                    onDecideQueuedApprovals = { requests, accept -> onDecideQueuedApprovals(target, requests, accept) },
+                                    onDismissQueuedDecision = { onDismissQueuedDecision(target) },
+                                    onRetryApprovalQueue = { onRetryApprovalQueue(target) },
+                                )
                             }
                         } else if (wide) {
                             Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
@@ -465,7 +480,12 @@ private fun Sidebar(
                 }
             }
             val listed = state.threads.mapTo(mutableSetOf()) { it.id }
-            val pending = state.approvals.values.groupingBy { it.session }.eachCount()
+            val queued = state.approvalDock.countsByThread()
+            val legacy = state.approvals.values.filterNot { it.requestId in state.approvalDock.pending }
+                .groupingBy { it.session }.eachCount()
+            val pending = (queued.keys + legacy.keys).associateWith {
+                queued.getOrDefault(it, 0) + legacy.getOrDefault(it, 0)
+            }
             LazyColumn(
                 Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -514,11 +534,19 @@ private fun Conversation(
     showPlanAboveConversation: Boolean, onOpenPlan: () -> Unit,
     attachments: Attachments?, attachmentView: AttachmentView,
     onOlderHistory: (ConversationTarget) -> Unit,
+    openApprovalDock: Int?,
+    onDecideQueuedApprovals: (List<QueuedApproval>, Boolean) -> Unit, onDismissQueuedDecision: () -> Unit,
+    onRetryApprovalQueue: () -> Unit,
 ) {
     val thread = state.threads.find { it.id == session }
     val timeline = state.timeline(session)
     val visibleRows = remember(timeline) { timeline.visibleRows.entries.toList().asReversed() }
-    val approvals = state.approvals.values.filter { it.session == session }
+    val approvals = state.approvals.values.filter {
+        it.session == session && it.requestId !in state.approvalDock.pending
+    }
+    val queuedApprovals = remember(state.approvalDock.pending, session) {
+        state.approvalDock.forThread(session)
+    }
     val pending = state.pendingPrompts(session)
     val target = ConversationTarget(state.workspace.orEmpty(), session)
     val colors = MaterialTheme.colorScheme
@@ -557,53 +585,70 @@ private fun Conversation(
     }
     Column(modifier.fillMaxHeight()) {
         if (showPlanAboveConversation && plan != null) PlanSummary(plan, onOpenPlan)
-        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
-            LazyColumn(
-                modifier = Modifier.widthIn(max = 760.dp).fillMaxSize().nestedScroll(topScroll),
-                state = listState, contentPadding = PaddingValues(16.dp), reverseLayout = true,
-                verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.Bottom),
-            ) {
-                items(pending.asReversed(), key = { "pending/${it.id}" }) { prompt ->
-                    MessageBubble(TimelineRow.Message(prompt.text, user = true, paths = prompt.paths),
-                        target, attachmentView.sent, pending = true)
-                }
-                items(approvals.asReversed(), key = { "approval/${it.requestId}" }) { request ->
-                    ApprovalPanel(request, state.canSend && request.requestId !in state.resolving, onResolve,
-                        onRememberShellApproval.takeIf { state.shellApprovalRules != null })
-                }
-                items(visibleRows, key = { "event/${it.key}" }) { entry ->
-                    when (val row = entry.value) {
-                        is TimelineRow.Message -> MessageBubble(row, target, attachmentView.sent)
-                        is TimelineRow.Job -> JobPanel(row)
-                        is TimelineRow.Note -> Text(row.text, color = colors.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 8.dp))
-                        is TimelineRow.Tool -> Text(
-                            row.label + when (row.ok) { true -> stringResource(R.string.job_done_suffix); false -> stringResource(R.string.job_failed_suffix); null -> "" },
-                            style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 8.dp),
-                        )
+        // Measure the composer first so the dock can't crowd it out when the IME opens.
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+            val maxDockHeight = minOf(420.dp, maxHeight * 0.60f)
+            Column(Modifier.fillMaxSize()) {
+                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                    LazyColumn(
+                        modifier = Modifier.widthIn(max = 760.dp).fillMaxSize().nestedScroll(topScroll),
+                        state = listState, contentPadding = PaddingValues(16.dp), reverseLayout = true,
+                        verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.Bottom),
+                    ) {
+                        items(pending.asReversed(), key = { "pending/${it.id}" }) { prompt ->
+                            MessageBubble(TimelineRow.Message(prompt.text, user = true, paths = prompt.paths),
+                                target, attachmentView.sent, pending = true)
+                        }
+                        items(approvals.asReversed(), key = { "approval/${it.requestId}" }) { request ->
+                            ApprovalPanel(request, state.canSend && request.requestId !in state.resolving, onResolve,
+                                onRememberShellApproval.takeIf { state.shellApprovalRules != null })
+                        }
+                        items(visibleRows, key = { "event/${it.key}" }) { entry ->
+                            when (val row = entry.value) {
+                                is TimelineRow.Message -> MessageBubble(row, target, attachmentView.sent)
+                                is TimelineRow.Job -> JobPanel(row)
+                                is TimelineRow.ApprovalOutcome -> ApprovalOutcomeRow(row)
+                                is TimelineRow.Note -> Text(row.text, color = colors.onSurfaceVariant,
+                                    style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 8.dp))
+                                is TimelineRow.Tool -> Text(
+                                    row.label + when (row.ok) { true -> stringResource(R.string.job_done_suffix); false -> stringResource(R.string.job_failed_suffix); null -> "" },
+                                    style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 8.dp),
+                                )
+                            }
+                        }
+                        if (visibleRows.isEmpty() && approvals.isEmpty() && pending.isEmpty()) item {
+                            Text(stringResource(R.string.conversation_empty),
+                                modifier = Modifier.padding(8.dp), color = colors.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
-                if (visibleRows.isEmpty() && approvals.isEmpty() && pending.isEmpty()) item {
-                    Text(stringResource(R.string.conversation_empty),
-                        modifier = Modifier.padding(8.dp), color = colors.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall)
+                if (thread != null) {
+                    if (state.hasHeldInput(session)) {
+                        val label = if (state.drain?.reason == "shutdown") R.string.message_held_restart
+                            else R.string.message_held_update
+                        Text(stringResource(label), Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
+                    }
+                    ActivityLine(state, session, timeline, approvals.isNotEmpty(), pending.firstOrNull()?.sentAt, onStopWorker)
+                    timeline.composerNotice?.let {
+                        Text(it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
                 }
+                ApprovalDock(
+                    queuedApprovals, state.approvalDock.decisions[session], state.canSend, maxDockHeight, openApprovalDock,
+                    jobTitle = { (timeline.rows[it] as? TimelineRow.Job)?.info?.displayTitle ?: it },
+                    onDecide = onDecideQueuedApprovals,
+                    onDismissResult = onDismissQueuedDecision,
+                    loadError = state.approvalDock.loadError,
+                    onRetry = onRetryApprovalQueue,
+                )
             }
         }
         if (thread != null) {
-            if (state.hasHeldInput(session)) {
-                val label = if (state.drain?.reason == "shutdown") R.string.message_held_restart
-                    else R.string.message_held_update
-                Text(stringResource(label), Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                    style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
-            }
-            ActivityLine(state, session, timeline, approvals.isNotEmpty(), pending.firstOrNull()?.sentAt, onStopWorker)
-            timeline.composerNotice?.let {
-                Text(it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                    style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
             Composer(target, state.isTurnRunning(session), state.canSend, attachments,
                 attachmentView.drafts[target] ?: AttachmentDraft(), onSend, onStopTurn)
         }

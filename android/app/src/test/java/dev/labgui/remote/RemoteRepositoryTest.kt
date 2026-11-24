@@ -104,6 +104,116 @@ class RemoteRepositoryTest {
         assertFalse(state.updateRequired)
     }
 
+    @Test fun approvalQueueIsFetchedOnlyWhenAdvertisedAndRefetchedAfterReconnectAndWorkspaceSwitch() {
+        val socket = finishConnect(approvalQueue = true)
+        assertCommands(socket, """{"type":"in_workspace","id":"lab","request":{"type":"list_pending_approvals","request":1}}""")
+        val original = queuedApprovalFixture("original")
+        socket.queueSnapshot(99, original)
+        assertTrue(state.approvalDock.pending.isEmpty())
+        socket.queueSnapshot(1, original)
+        assertEquals(setOf(original.id), state.approvalDock.pending.keys)
+
+        repository.selectThread("s")
+        repository.decideQueuedApprovals(ConversationTarget("lab", "s"), listOf(original), true)
+        socket.fail()
+        assertTrue(state.approvalDock.pending.isEmpty())
+        val interrupted = state.approvalDock.decisions.getValue("s")
+        assertFalse(interrupted.isSending)
+        assertEquals(original, interrupted.failures.single().approval)
+        looper.idleFor(Duration.ofSeconds(1))
+        val reconnected = finishConnect(approvalQueue = true, replay = false)
+        assertCommands(reconnected, """{"type":"in_workspace","id":"lab","request":{"type":"list_pending_approvals","request":3}}""")
+        val fresh = queuedApprovalFixture("fresh")
+        reconnected.queueSnapshot(3, fresh)
+        assertEquals(setOf(fresh.id), state.approvalDock.pending.keys)
+
+        repository.switchWorkspace("new")
+        reconnected.event("""{"type":"workspace_selected","id":"new","replay":true}""", workspace = null)
+        assertEquals(
+            Protocol.json.parseToJsonElement("""{"type":"in_workspace","id":"new","request":{"type":"list_pending_approvals","request":4}}"""),
+            Protocol.json.parseToJsonElement(reconnected.sent.last()),
+        )
+        reconnected.queueSnapshot(3, original)
+        assertTrue(state.approvalDock.pending.isEmpty())
+        reconnected.queueSnapshot(4, fresh.copy(workspace = "new"), workspace = "new")
+        assertEquals("new", state.approvalDock.pending.getValue("fresh").workspace)
+    }
+
+    @Test fun failedApprovalSnapshotCanBeRetriedWithANewRequest() {
+        val socket = finishConnect(approvalQueue = true)
+        socket.event("""{"type":"approval_queue","request":1,"result":{"Err":"queue unavailable"}}""")
+        assertEquals("queue unavailable", state.approvalDock.loadError)
+        repository.retryApprovalQueue(ConversationTarget("lab", "s"))
+        assertCommands(
+            socket,
+            """{"type":"in_workspace","id":"lab","request":{"type":"list_pending_approvals","request":1}}""",
+            """{"type":"in_workspace","id":"lab","request":{"type":"list_pending_approvals","request":2}}""",
+        )
+        socket.queueSnapshot(2, queuedApprovalFixture("a"))
+        assertNull(state.approvalDock.loadError)
+        assertEquals(setOf("a"), state.approvalDock.pending.keys)
+    }
+
+    @Test fun legacyServerNeverReceivesApprovalQueueCommands() {
+        assertCommands(finishConnect())
+    }
+
+    @Test fun bulkApprovalWaitsForTheServerAndReportsACompetingDecision() {
+        val socket = finishConnect(approvalQueue = true)
+        val a = queuedApprovalFixture("a")
+        val b = queuedApprovalFixture("b")
+        socket.event("""{"type":"approval_requested","session":"s","request_id":"a","summary":"Shared request"}""")
+        socket.queueSnapshot(1, a, b)
+        repository.selectThread("s")
+
+        val target = ConversationTarget("lab", "s")
+        repository.decideQueuedApprovals(target, listOf(a, b.copy(risk = ApprovalRisk.High)), true)
+        assertEquals(2, socket.sent.size)
+        repository.decideQueuedApprovals(target, listOf(a, b), true)
+        assertCommands(
+            socket,
+            """{"type":"in_workspace","id":"lab","request":{"type":"list_pending_approvals","request":1}}""",
+            """{"type":"in_workspace","id":"lab","request":{"type":"decide_approval","request":2,"approval_id":"a","decision":{"kind":"grant","scope":{"kind":"once"}}}}""",
+            """{"type":"in_workspace","id":"lab","request":{"type":"decide_approval","request":3,"approval_id":"b","decision":{"kind":"grant","scope":{"kind":"once"}}}}""",
+        )
+        assertEquals(setOf("a", "b"), state.approvalDock.pending.keys)
+        val denied = b.copy(state = ApprovalQueueState.Denied)
+        socket.event("""{"type":"approval_queue_changed","approval":${approvalJson(denied)}}""")
+        socket.event("""{"type":"approval_decision_result","request":3,"result":{"Err":"already decided"}}""")
+        val granted = a.copy(state = ApprovalQueueState.Granted)
+        socket.event("""{"type":"approval_decision_result","request":2,"result":{"Ok":${approvalJson(granted)}}}""")
+        socket.event("""{"type":"approval_queue_changed","approval":${approvalJson(granted)}}""")
+
+        assertTrue(state.approvalDock.pending.isEmpty())
+        assertTrue(state.approvals.isEmpty())
+        val decision = state.approvalDock.decisions.getValue("s")
+        assertEquals(1, decision.succeeded)
+        assertEquals(listOf(ApprovalDecisionFailure(b, "already decided")), decision.failures)
+        assertFalse(decision.isSending)
+        assertEquals(
+            listOf(TimelineRow.ApprovalOutcome(denied, false), TimelineRow.ApprovalOutcome(granted, true)),
+            state.timeline("s").rows.values.toList(),
+        )
+    }
+
+    @Test fun aBulkReviewOnlySendsRequestsThatAreStillPendingAndMatchTheReviewedAction() {
+        val socket = finishConnect(approvalQueue = true)
+        val a = queuedApprovalFixture("a")
+        val b = queuedApprovalFixture("b")
+        val expired = queuedApprovalFixture("expired", expiresAt = 1)
+        socket.queueSnapshot(1, a, b, expired)
+        socket.event("""{"type":"approval_queue_changed","approval":${approvalJson(b.copy(state = ApprovalQueueState.Withdrawn))}}""")
+        socket.event("""{"type":"approval_queue_changed","approval":${approvalJson(expired.copy(state = ApprovalQueueState.Expired))}}""")
+        repository.selectThread("s")
+        repository.decideQueuedApprovals(ConversationTarget("lab", "s"), listOf(a, b, expired), false)
+        assertCommands(
+            socket,
+            """{"type":"in_workspace","id":"lab","request":{"type":"list_pending_approvals","request":1}}""",
+            """{"type":"in_workspace","id":"lab","request":{"type":"decide_approval","request":2,"approval_id":"a","decision":{"kind":"deny"}}}""",
+        )
+        assertEquals(listOf(b, expired), state.approvalDock.decisions.getValue("s").failures.map { it.approval })
+    }
+
     @Test fun shellRuleChangesUseTheCurrentWorkspaceAndServerCapability() {
         val socket = finishConnect()
         socket.event("""{"type":"approval_requested","session":"s","request_id":"live","summary":"Bash: pwd","shell_directory":"/work"}""")
@@ -545,15 +655,25 @@ class RemoteRepositoryTest {
         vararg initial: String,
         drainProgress: String? = null,
         protocol: Int = PROTOCOL_VERSION,
+        approvalQueue: Boolean = false,
+        replay: Boolean = true,
     ): TestSocket {
         val socket = sockets.opened.last()
         socket.open()
-        socket.event("""{"type":"welcome","protocol":$protocol}""", workspace = null)
+        socket.event("""{"type":"welcome","protocol":$protocol,"approval_queue":$approvalQueue}""", workspace = null)
         if (drainProgress != null) socket.event(drain(drainProgress), workspace = null)
-        socket.event("""{"type":"workspace_selected","id":"lab","replay":true}""", workspace = null)
+        socket.event("""{"type":"workspace_selected","id":"lab","replay":$replay}""", workspace = null)
         initial.forEach { socket.event(it) }
         socket.event("""{"type":"threads","threads":[{"id":"s","title":"Thread","updated":0}]}""")
         return socket
+    }
+
+    private fun approvalJson(approval: QueuedApproval) =
+        Protocol.json.encodeToString(QueuedApproval.serializer(), approval)
+
+    private fun TestSocket.queueSnapshot(request: Int, vararg approvals: QueuedApproval, workspace: String = "lab") {
+        val items = approvals.joinToString(",") { approvalJson(it) }
+        event("""{"type":"approval_queue","request":$request,"result":{"Ok":[$items]}}""", workspace)
     }
 
     private fun echo(item: String, text: String) =

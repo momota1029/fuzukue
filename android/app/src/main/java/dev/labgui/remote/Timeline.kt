@@ -34,6 +34,7 @@ sealed interface TimelineRow {
         val text: String, val user: Boolean, val userItem: String? = null, val paths: List<String> = emptyList(),
     ) : TimelineRow
     data class Note(val text: String) : TimelineRow
+    data class ApprovalOutcome(val approval: QueuedApproval, val decidedHere: Boolean) : TimelineRow
     data class Tool(val label: String, val ok: Boolean? = null) : TimelineRow
     data class Job(
         val info: JobInfo,
@@ -153,7 +154,21 @@ data class Timeline(
         return copy(rows = updated.rows, streamingSilencePrefixes = updated.streamingSilencePrefixes)
     }
 
-    internal fun clearHistory() = copy(rows = emptyMap(), streamingSilencePrefixes = emptySet())
+    internal fun recordApproval(approval: QueuedApproval, decidedHere: Boolean): Timeline {
+        val id = "async-approval/${approval.id}/${approval.state}"
+        val latest = rows.values.lastOrNull { it is TimelineRow.ApprovalOutcome && it.approval.id == approval.id }
+            as? TimelineRow.ApprovalOutcome
+        if (latest != null && latest.approval.updatedAt > approval.updatedAt) return this
+        val previous = rows[id] as? TimelineRow.ApprovalOutcome
+        if (previous != null && (!decidedHere || previous.decidedHere)) return this
+        return withRow(id, TimelineRow.ApprovalOutcome(approval, decidedHere))
+    }
+
+    // Queue outcomes arrive on the live subscription, outside paged transcript history.
+    internal fun clearHistory() = copy(
+        rows = rows.filterValues { it is TimelineRow.ApprovalOutcome },
+        streamingSilencePrefixes = emptySet(),
+    )
 
     internal fun prependHistory(page: Timeline, sparseWorkers: List<String>): Timeline {
         // A sparse worker can sit between rows from the same page. Its live

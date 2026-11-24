@@ -1,14 +1,17 @@
 package dev.labgui.remote
 
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -16,9 +19,12 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextInput
 import com.github.takahirom.roborazzi.captureRoboImage
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -49,6 +55,82 @@ class AppShotTest {
     @Test fun runningDark() = capture("running-dark", progress, dark = true, state = running)
     @Test fun approvalLight() = capture("approval-light", approval.summary, state = withApproval)
     @Test fun approvalDark() = capture("approval-dark", approval.summary, dark = true, state = withApproval)
+
+    @Test fun approvalDockOpensAboveTheComposerAndReviewsAnExplicitBulkSelection() {
+        val a = queuedApprovalFixture("a", risk = ApprovalRisk.Mid)
+        val b = queuedApprovalFixture("b")
+        val high = queuedApprovalFixture("sensitive", risk = ApprovalRisk.High, job = "another-job")
+        val state = mutableStateOf(running.copy(
+            approvalDock = ApprovalDockState().replace("lab", listOf(a, b, high)),
+        ))
+        val submitted = mutableListOf<Pair<List<String>, Boolean>>()
+        compose.setContent {
+            RemoteTheme {
+                RemoteApp(state.value, onDecideQueuedApprovals = { target, approvals, allow ->
+                    assertEquals(ConversationTarget("lab", "s"), target)
+                    submitted.add(approvals.map { it.id } to allow)
+                })
+            }
+        }
+        val toggle = compose.onNodeWithTag("approval-dock-toggle")
+        val list = compose.onNodeWithTag("approval-dock-list")
+        toggle.assertIsDisplayed()
+        val composer = compose.onNodeWithContentDescription("メッセージ")
+        composer.assertIsDisplayed()
+        assertTrue(toggle.fetchSemanticsNode().boundsInRoot.bottom <= composer.fetchSemanticsNode().boundsInRoot.top)
+        list.assertDoesNotExist()
+        compose.onRoot().captureRoboImage("build/shots/approval-dock-collapsed.png")
+
+        toggle.performClick()
+        list.assertIsDisplayed()
+        compose.onNodeWithText("中リスク").assertIsDisplayed()
+        composer.assertIsDisplayed()
+        assertTrue(list.fetchSemanticsNode().boundsInRoot.bottom <= composer.fetchSemanticsNode().boundsInRoot.top)
+        compose.onRoot().captureRoboImage("build/shots/approval-dock-expanded.png")
+
+        val highRisk = hasText("高リスク")
+        list.performScrollToNode(highRisk)
+        compose.onNode(highRisk).assertIsDisplayed()
+        compose.onNode(hasAnyAncestor(hasTestTag("approval-row-sensitive")) and hasText("一括操作に選択"))
+            .assertDoesNotExist()
+
+        for (id in listOf("a", "b")) {
+            val checkbox = hasContentDescription("fs_write · notes/$id.md を 一括操作に選択")
+            list.performScrollToNode(checkbox)
+            compose.onNode(checkbox).performClick()
+        }
+        compose.onNodeWithText("一括許可（2 件）")
+            .assertIsDisplayed()
+            .performSemanticsAction(SemanticsActions.OnClick)
+        val inDialog = hasAnyAncestor(isDialog())
+        compose.onNode(inDialog and hasText("一括操作の対象を確認"), useUnmergedTree = true).assertIsDisplayed()
+        for (id in listOf("a", "b")) {
+            val target = RuntimeEnvironment.getApplication().getString(R.string.approval_dock_target, "notes/$id.md")
+            compose.onNode(inDialog and hasText(target), useUnmergedTree = true)
+                .performScrollTo().assertIsDisplayed()
+        }
+        compose.runOnIdle { assertEquals(emptyList<Pair<List<String>, Boolean>>(), submitted) }
+        compose.onNode(inDialog and hasText("一括許可（2 件）"), useUnmergedTree = true).performClick()
+        compose.runOnIdle {
+            assertEquals(listOf(listOf("a", "b") to true), submitted)
+            state.value = state.value.copy(approvalDock = ApprovalDockState())
+        }
+        toggle.assertDoesNotExist()
+        compose.onNodeWithContentDescription("メッセージ").assertIsDisplayed()
+    }
+
+    @Test fun approvalNoticeExpandsTheTargetThreadsDockWhenTheSnapshotArrives() {
+        val approval = queuedApprovalFixture("from-notice")
+        val state = mutableStateOf(running)
+        compose.setContent {
+            RemoteTheme {
+                RemoteApp(state.value, openApprovalDock = ConversationTarget("lab", "s") to 1)
+            }
+        }
+        compose.onNodeWithTag("approval-dock-toggle").assertDoesNotExist()
+        compose.runOnIdle { state.value = state.value.copy(approvalDock = ApprovalDockState().update(approval)) }
+        compose.onNodeWithTag("approval-dock-list").assertIsDisplayed()
+    }
 
     @Test fun savingAnApprovalRequiresShowingTheExactCommandAndDirectory() {
         val request = ServerEvent.ApprovalRequested("s", "shell", "Bash: cat notes.md", "/worktree/notes")

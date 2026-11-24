@@ -6,6 +6,8 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import kotlinx.serialization.json.decodeFromJsonElement
 
 const val PROTOCOL_VERSION = 65
@@ -73,6 +75,16 @@ sealed interface ClientMessage {
     data class DecideFolderAccess(
         @SerialName("request_id") val requestId: String,
         val expiry: String?,
+    ) : ClientMessage
+
+    @Serializable @SerialName("list_pending_approvals")
+    data class ListPendingApprovals(val request: ULong) : ClientMessage
+
+    @Serializable @SerialName("decide_approval")
+    data class DecideApproval(
+        val request: ULong,
+        @SerialName("approval_id") val approvalId: String,
+        val decision: QueuedApprovalDecision,
     ) : ClientMessage
 
     @Serializable @SerialName("resolve")
@@ -173,6 +185,56 @@ enum class WorkerApprovalPolicy {
 }
 
 @Serializable
+enum class ApprovalRisk {
+    @SerialName("low") Low,
+    @SerialName("mid") Mid,
+    @SerialName("high") High,
+}
+
+@Serializable
+enum class ApprovalQueueState {
+    @SerialName("pending") Pending,
+    @SerialName("granted") Granted,
+    @SerialName("denied") Denied,
+    @SerialName("withdrawn") Withdrawn,
+    @SerialName("expired") Expired,
+}
+
+@Serializable
+data class QueuedApprovalAction(val tool: String, val args: JsonElement, val scope: JsonElement)
+
+@Serializable
+data class QueuedApproval(
+    @SerialName("approval_id") val id: String,
+    val workspace: String,
+    val thread: String,
+    val job: String,
+    val requester: String,
+    val risk: ApprovalRisk,
+    val unattended: String,
+    val reason: String,
+    @SerialName("created_at") val createdAt: Long,
+    @SerialName("expires_at") val expiresAt: Long,
+    @SerialName("updated_at") val updatedAt: Long,
+    val state: ApprovalQueueState,
+    val action: QueuedApprovalAction,
+)
+
+@Serializable
+data class QueuedApprovalDecision private constructor(val kind: String, val scope: JsonObject? = null) {
+    companion object {
+        val AllowOnce = QueuedApprovalDecision("grant", buildJsonObject { put("kind", "once") })
+        val Deny = QueuedApprovalDecision("deny")
+    }
+}
+
+@Serializable
+data class ApprovalReply<T>(
+    @SerialName("Ok") val value: T? = null,
+    @SerialName("Err") val error: String? = null,
+)
+
+@Serializable
 data class ShellApprovalRule(val id: String, val directory: String, val command: String, val prefix: String? = null)
 
 sealed interface ServerEvent {
@@ -182,6 +244,15 @@ sealed interface ServerEvent {
         @SerialName("minimum_protocol") val minimumProtocol: Int? = null,
         @SerialName("selection_scoped_transcripts") val selectionScoped: Boolean = false,
         @SerialName("approval_queue") val approvalQueue: Boolean = false,
+    ) : ServerEvent
+    @Serializable data class ApprovalQueue(
+        val request: ULong,
+        val result: ApprovalReply<List<QueuedApproval>>,
+    ) : ServerEvent
+    @Serializable data class ApprovalQueueChanged(val approval: QueuedApproval) : ServerEvent
+    @Serializable data class ApprovalDecisionResult(
+        val request: ULong,
+        val result: ApprovalReply<QueuedApproval>,
     ) : ServerEvent
     @Serializable data class WorkspaceSelected(val id: String, val replay: Boolean) : ServerEvent
     @Serializable data class Workspaces(val workspaces: List<Workspace>) : ServerEvent
@@ -297,6 +368,9 @@ object Protocol {
         val type = (event["type"] as? JsonPrimitive)?.takeIf { it.isString }?.content
         return when (type) {
             "welcome" -> json.decodeFromJsonElement<ServerEvent.Welcome>(event)
+            "approval_queue" -> json.decodeFromJsonElement<ServerEvent.ApprovalQueue>(event)
+            "approval_queue_changed" -> json.decodeFromJsonElement<ServerEvent.ApprovalQueueChanged>(event)
+            "approval_decision_result" -> json.decodeFromJsonElement<ServerEvent.ApprovalDecisionResult>(event)
             "workspace_selected" -> json.decodeFromJsonElement<ServerEvent.WorkspaceSelected>(event)
             "workspaces" -> json.decodeFromJsonElement<ServerEvent.Workspaces>(event)
             "chat_activity" -> json.decodeFromJsonElement<ServerEvent.ChatActivity>(event)

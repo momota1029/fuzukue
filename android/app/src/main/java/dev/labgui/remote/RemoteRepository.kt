@@ -47,6 +47,7 @@ internal data class RemoteState(
     val threads: List<ThreadInfo> = emptyList(),
     val timelines: Map<String, Timeline> = emptyMap(),
     val approvals: Map<String, ServerEvent.ApprovalRequested> = emptyMap(),
+    val approvalDock: ApprovalDockState = ApprovalDockState(),
     val workerApprovalPolicy: WorkerApprovalPolicy? = null,
     val shellApprovalRules: List<ShellApprovalRule>? = null,
     val resolving: Set<String> = emptySet(),
@@ -84,6 +85,7 @@ internal data class EventNotice(
     val threadTitle: String,
     val target: ConversationTarget?,
     val approval: ApprovalNotice? = null,
+    val openApprovalDock: Boolean = false,
 )
 
 // Notification buttons are reserved for short, server-checked Bash requests whose
@@ -97,7 +99,7 @@ internal fun ServerEvent.ApprovalRequested.notificationDetails(): String? {
 }
 
 internal fun RemoteState.notificationApproval(approval: ApprovalNotice): ServerEvent.ApprovalRequested? {
-    if (!canSend || workspace != approval.target.workspace) return null
+    if (!canSend || workspace != approval.target.workspace || approval.requestId in approvalDock.pending) return null
     return approvals[approval.requestId]?.takeIf {
         it.session == approval.target.session && it.notificationDetails() != null
     }
@@ -134,6 +136,10 @@ internal class RemoteRepository(
     private var transcriptEpoch: String? = null
     private var transcriptThrough = 0uL
     private var nextHistoryRequest = 0uL
+    private var approvalQueueSupported = false
+    private var nextApprovalRequest = 0uL
+    private var approvalSnapshotRequest: ULong? = null
+    private var approvalQueueReady = false
     private val histories = mutableMapOf<String, TranscriptHistory>()
     private val transcriptReplay = mutableListOf<TranscriptUpdate>()
     private var initialThreads: ServerEvent.Threads? = null
@@ -346,6 +352,98 @@ internal class RemoteRepository(
         resolve(id, message)
     }
 
+    fun decideQueuedApprovals(
+        target: ConversationTarget, selected: List<QueuedApproval>, accept: Boolean,
+    ) {
+        val current = state.value
+        val dock = current.approvalDock
+        if (!current.canSend || !approvalQueueReady || current.workspace != target.workspace ||
+            current.selection != target.session || dock.decisions[target.session]?.isSending == true
+        ) return
+        val first = selected.firstOrNull() ?: return
+        if (selected.any { it.workspace != target.workspace || it.thread != target.session } ||
+            (selected.size > 1 && selected.any { !first.canBatchWith(it) })
+        ) return
+
+        val (ready, unavailable) = selected.distinctBy { it.id }.partition { it == dock.pending[it.id] }
+        val requests = ready.associateBy { ++nextApprovalRequest }
+        val progress = ApprovalDecisionProgress(
+            requests = requests,
+            failures = unavailable.map {
+                ApprovalDecisionFailure(it, context.getString(R.string.approval_dock_unavailable))
+            },
+        )
+        mutableState.value = current.copy(
+            approvalDock = dock.copy(decisions = dock.decisions + (target.session to progress)),
+        )
+        val decision = if (accept) QueuedApprovalDecision.AllowOnce else QueuedApprovalDecision.Deny
+        for ((request, approval) in requests) {
+            if (!sendToWorkspace(ClientMessage.DecideApproval(request, approval.id, decision))) break
+        }
+    }
+
+    fun dismissQueuedDecision(target: ConversationTarget) {
+        val current = state.value
+        val dock = current.approvalDock
+        if (current.workspace != target.workspace || dock.decisions[target.session]?.isSending != false) return
+        mutableState.value = current.copy(approvalDock = dock.copy(decisions = dock.decisions - target.session))
+    }
+
+    fun retryApprovalQueue(target: ConversationTarget) {
+        val current = state.value
+        if (!current.canSend || current.workspace != target.workspace || current.approvalDock.loadError == null) return
+        requestApprovalQueue(target.workspace)
+    }
+
+    private fun requestApprovalQueue(workspace: String) {
+        if (!approvalQueueSupported || approvalSnapshotRequest != null) return
+        val request = ++nextApprovalRequest
+        if (send(ClientMessage.InWorkspace(workspace, ClientMessage.ListPendingApprovals(request)))) {
+            approvalSnapshotRequest = request
+            val current = state.value
+            mutableState.value = current.copy(approvalDock = current.approvalDock.copy(loadError = null, isLoading = true))
+        }
+    }
+
+    private fun applyQueuedApproval(current: RemoteState, approval: QueuedApproval, decidedHere: Boolean = false): RemoteState {
+        if (approval.workspace != current.workspace) return current
+        val dock = current.approvalDock
+        val next = dock.update(approval)
+        if (approval.state == ApprovalQueueState.Pending) {
+            if (approval.id in resolved) return current
+            if (approval.id !in dock.pending) {
+                notifyThread(current, approval.workspace, approval.thread, null, R.string.approval_pending,
+                    urgent = true, openApprovalDock = true)
+            }
+            return current.copy(approvalDock = next)
+        }
+        if (approval.id in next.pending) return current
+        resolved.add(approval.id)
+        return current.copy(
+            approvalDock = next,
+            approvals = current.approvals - approval.id,
+            resolving = current.resolving - approval.id,
+        ).withTimeline(approval.thread, current.timeline(approval.thread).recordApproval(approval, decidedHere))
+    }
+
+    private fun finishQueuedDecision(current: RemoteState, event: ServerEvent.ApprovalDecisionResult): RemoteState {
+        val dock = current.approvalDock
+        val entry = dock.decisions.entries.firstOrNull { event.request in it.value.requests } ?: return current
+        val request = entry.value.requests.getValue(event.request)
+        val approval = event.result.value?.takeIf {
+            it.id == request.id && it.workspace == request.workspace && it.thread == request.thread &&
+                it.state != ApprovalQueueState.Pending
+        }
+        val error = if (approval != null) null else when (val message = event.result.error) {
+            "approval request has already been decided or consumed" -> context.getString(R.string.approval_dock_conflict)
+            null -> context.getString(R.string.approval_dock_unavailable)
+            else -> message
+        }
+        val progress = entry.value.complete(event.request, error)
+        val next = current.copy(approvalDock = dock.copy(decisions = dock.decisions + (entry.key to progress)))
+        return if (approval == null) next else applyQueuedApproval(next, approval, decidedHere = true)
+    }
+
     fun resolveNotification(approval: ApprovalNotice, accept: Boolean) {
         if (state.value.notificationApproval(approval) != null) resolve(approval.requestId, accept)
     }
@@ -371,7 +469,7 @@ internal class RemoteRepository(
 
     private fun resolve(id: String, message: ClientMessage) {
         val current = state.value
-        if (id !in current.approvals || id in current.resolving) return
+        if (id !in current.approvals || id in current.resolving || id in current.approvalDock.pending) return
         if (sendToWorkspace(message)) {
             mutableState.value = current.copy(resolving = current.resolving + id)
         }
@@ -411,6 +509,15 @@ internal class RemoteRepository(
         handler.removeCallbacks(retry)
         handler.removeCallbacks(helloTimeout)
         serverProtocol = 0
+        approvalQueueSupported = false
+        approvalSnapshotRequest = null
+        approvalQueueReady = false
+        val current = state.value
+        mutableState.value = current.copy(approvalDock = ApprovalDockState(
+            decisions = current.approvalDock.decisions.mapValues { (_, progress) ->
+                progress.interrupt(context.getString(R.string.approval_dock_interrupted))
+            },
+        ))
         sentTranscriptResume = false
         selectionScoped = false
         clearTranscriptReplay()
@@ -519,6 +626,7 @@ internal class RemoteRepository(
                     return
                 }
                 serverProtocol = agreed
+                approvalQueueSupported = event.approvalQueue
                 welcomed = true
                 receivedDrainStatus = false
                 updateLocale()
@@ -554,6 +662,10 @@ internal class RemoteRepository(
             }
             is ServerEvent.WorkspaceSelected -> {
                 val changed = event.id != current.workspace
+                if (changed || event.replay) {
+                    approvalSnapshotRequest = null
+                    approvalQueueReady = false
+                }
                 if (changed) selectionToRestore = null
                 if (changed || event.replay) {
                     clearTranscripts()
@@ -577,6 +689,25 @@ internal class RemoteRepository(
                     )
                 } else current.copy(changingWorkspace = false, error = null)
             }
+            is ServerEvent.ApprovalQueue -> {
+                val workspace = current.workspace ?: return
+                if (!approvalQueueSupported || event.request != approvalSnapshotRequest) return
+                approvalSnapshotRequest = null
+                val approvals = event.result.value
+                approvalQueueReady = approvals != null
+                val dock = current.approvalDock
+                current.copy(approvalDock = if (approvals == null) {
+                    dock.copy(
+                        loadError = event.result.error ?: context.getString(R.string.approval_dock_unavailable),
+                        isLoading = false,
+                    )
+                } else dock.replace(workspace, approvals.filterNot { it.id in resolved }))
+            }
+            is ServerEvent.ApprovalQueueChanged -> {
+                if (!approvalQueueReady) return
+                applyQueuedApproval(current, event.approval)
+            }
+            is ServerEvent.ApprovalDecisionResult -> finishQueuedDecision(current, event)
             is ServerEvent.Workspaces -> current.copy(workspaces = event.workspaces)
             is ServerEvent.WorkerApprovalPolicyChanged -> current.copy(
                 workerApprovalPolicy = event.policy, shellApprovalRules = event.shellRules,
@@ -724,7 +855,11 @@ internal class RemoteRepository(
             }
             is ServerEvent.ApprovalResolved -> {
                 resolved.add(event.requestId)
-                current.copy(approvals = current.approvals - event.requestId, resolving = current.resolving - event.requestId)
+                current.copy(
+                    approvals = current.approvals - event.requestId,
+                    resolving = current.resolving - event.requestId,
+                    approvalDock = current.approvalDock.copy(pending = current.approvalDock.pending - event.requestId),
+                )
             }
             is ServerEvent.InThread -> {
                 val before = current.timeline(event.session)
@@ -767,8 +902,12 @@ internal class RemoteRepository(
                 }
                 requestSelectionTail()
             }
+            is ServerEvent.WorkspaceSelected -> {
+                if (!approvalQueueReady && approvalSnapshotRequest == null) requestApprovalQueue(event.id)
+                requestSelectionTail()
+            }
             is ServerEvent.Threads, is ServerEvent.ThreadCreated, is ServerEvent.ThreadHistoryInvalidated,
-            is ServerEvent.WorkspaceSelected, is ServerEvent.Error -> requestSelectionTail()
+            is ServerEvent.Error -> requestSelectionTail()
             is ServerEvent.ThreadHistoryFailed -> if (event.reason == "stale") requestSelectionTail()
             else -> Unit
         }
@@ -860,7 +999,7 @@ internal class RemoteRepository(
 
     private fun notifyThread(
         current: RemoteState, workspace: String, session: String, title: String?, message: Int, urgent: Boolean,
-        approval: ApprovalNotice? = null,
+        approval: ApprovalNotice? = null, openApprovalDock: Boolean = false,
     ) {
         val sameWorkspace = current.workspace == workspace
         if (replaying || (visible && sameWorkspace && current.selection == session)) return
@@ -869,17 +1008,18 @@ internal class RemoteRepository(
             thread?.untitled == true -> context.getString(R.string.thread_untitled)
             else -> thread?.title ?: title ?: context.getString(R.string.thread)
         }
-        notify(ConversationTarget(workspace, session), message, threadTitle, urgent, approval)
+        notify(ConversationTarget(workspace, session), message, threadTitle, urgent, approval, openApprovalDock)
     }
 
     private fun notify(
-        target: ConversationTarget?, message: Int, threadTitle: String, urgent: Boolean, approval: ApprovalNotice? = null,
+        target: ConversationTarget?, message: Int, threadTitle: String, urgent: Boolean,
+        approval: ApprovalNotice? = null, openApprovalDock: Boolean = false,
     ) {
         if (!serviceRunning) return
         val now = SystemClock.elapsedRealtime()
         recentNotices.entries.removeAll { now - it.value.first >= 20_000L }
         if (recentNotices[target]?.let { it.second || !urgent } == true) return
-        if (mutableNotices.tryEmit(EventNotice(context.getString(message), threadTitle, target, approval))) {
+        if (mutableNotices.tryEmit(EventNotice(context.getString(message), threadTitle, target, approval, openApprovalDock))) {
             recentNotices[target] = now to urgent
         }
     }
