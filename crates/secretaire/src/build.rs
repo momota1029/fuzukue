@@ -893,6 +893,7 @@ mod tests {
                 "-latex=uplatex -synctex=1 -interaction=nonstopmode -halt-on-error %O %S",
                 "-e",
                 "$dvipdf = q/dvipdfmx %O -o %D %S/",
+                "-file-line-error",
                 "paper.tex",
             ],
         );
