@@ -253,6 +253,7 @@ mod tests {
             input: Default::default(), cancel: Default::default(), started: true.into(),
             drain_notice: Default::default(), capture_scope: Default::default(),
             workspace_read_scope: Default::default(),
+            workspace_write_scope: Default::default(),
             approval_scope: std::sync::Mutex::new(Some(Arc::new(JobScope {
                 title: "Read project notes".into(), prompt: "Inspect README.md.".into(), root, writes,
             }))),

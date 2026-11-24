@@ -24,6 +24,7 @@ use crate::reviewers::section::blind as blind_review;
 mod desk;
 mod front_desk_light;
 pub(crate) mod workspace_read;
+pub(crate) mod workspace_write;
 
 pub(crate) const SERVER_NAME: &str = "fuzukue";
 
@@ -49,6 +50,7 @@ pub(crate) enum Tool {
     Consult,
     Desk(desk::Tool),
     WorkspaceRead(workspace_read::Tool),
+    WorkspaceWrite(workspace_write::Tool),
     FolderGrants,
     ListAgents,
     AgentStats,
@@ -253,6 +255,7 @@ impl Tool {
             Self::Consult => "consult",
             Self::Desk(tool) => tool.name(),
             Self::WorkspaceRead(tool) => tool.name(),
+            Self::WorkspaceWrite(tool) => tool.name(),
             Self::FolderGrants => "folder_grants",
             Self::ListAgents => "list_agents",
             Self::AgentStats => "agent_stats",
@@ -351,6 +354,7 @@ impl Tool {
         if let Self::GitHub(tool) = self { return tool.writes(); }
         if let Self::GitHubAuth(tool) = self { return tool.writes(); }
         if let Self::Research(tool) = self { return tool.writes(); }
+        matches!(self, Self::WorkspaceWrite(_)) ||
         matches!(self, Self::Graph(tool) if tool.writes()) ||
         matches!(self, Self::CreateWorkspace | Self::CreateResearch | Self::AttachThread | Self::RenameThread | Self::OpenPaper | Self::DetachThread | Self::CodexRun | Self::Delegate | Self::BuildPaper | Self::BuildPapers | Self::RunTests | Self::RequestReview | Self::RegisterSectionReviewFinding
             | Self::RefreshReferences | Self::FetchReference | Self::ProposeLedger | Self::FetchLedger | Self::FileInbox | Self::ImportLatexBook | Self::UpdateRules
@@ -454,6 +458,7 @@ impl Tool {
             ), json!({"question":{"type":"string"}, "context":{"type":"string"}}), &["question"]),
             Self::Desk(tool) => tool.schema(),
             Self::WorkspaceRead(tool) => return tool.definition(),
+            Self::WorkspaceWrite(tool) => return tool.definition(),
             Self::FolderGrants => (
                 harness_text!(
                     "Request read-only folder access for this thread (requires user approval), list active grants and read audit entries, or revoke a grant by ID.",
@@ -972,6 +977,7 @@ fn worker_tools() -> impl Iterator<Item = Tool> {
         | Tool::WorkspaceRead(_) | Tool::BuildPaper
         | Tool::ListScreenshotScenarios | Tool::CaptureScreenshot | Tool::Recipe(_)
     )).chain([Tool::AskFrontDesk])
+        .chain(workspace_write::Tool::ALL.map(Tool::WorkspaceWrite).into_iter().filter(|_| !crate::canary()))
 }
 
 pub(crate) fn worker_tool_names(allow: &[String]) -> Vec<String> {
@@ -1000,6 +1006,7 @@ pub(crate) fn codex_tool_policy(allow: Option<&[String]>) -> Value {
     let tools = worker_tools().filter(|tool| !matches!(tool, Tool::Recipe(_)))
         .chain(PLANNER_TOOLS).chain([Tool::Escalate, Tool::Consult])
         .chain(allow.is_none().then_some(Tool::Desk(desk::Tool::Queue)))
+        .chain(allow.is_none().then_some(Tool::Desk(desk::Tool::JobWriteAudit)))
         .chain(allow.is_none().then_some(Tool::FolderGrants));
     for tool in tools {
         let name = tool.name();
@@ -1153,8 +1160,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
         })),
         "tools/list" => {
             let mut list = match &worker {
-                Some((_, allow)) => Tool::available(false).chain([Tool::AskFrontDesk, Tool::Escalate])
-                    .filter(|tool| !matches!(tool, Tool::Desk(_)))
+                Some((_, allow)) => worker_tools().chain([Tool::Escalate, Tool::AddMemo])
                     .filter(|tool| allow.iter().any(|name| name == tool.name()))
                     .map(Tool::definition).collect(),
                 None => Tool::available(app.mail.is_some()).map(Tool::definition).collect::<Vec<_>>(),
@@ -1192,6 +1198,9 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
             let name = params["name"].as_str().unwrap_or_default();
             let result = if name == Tool::FolderGrants.name() || !allow.iter().any(|tool| tool == name) {
                 Err(anyhow::anyhow!("作業役にツール {name} は許可されていない"))
+            } else if let Some(tool) = workspace_write::Tool::named(name) {
+                Box::pin(tool.call(&app, &q.session, job, &params["arguments"])).await
+                    .map(|result| data_result(result, false))
             } else if let Some(tool) = workspace_read::Tool::named(name) {
                 async {
                     let scope = app.delegates.workspace_read_scope(job)?;
@@ -1738,6 +1747,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 .with_grants(crate::folder_grants::Access { hub: app.hub.clone(), session: session.into(), worker_grants: None });
             Box::pin(call_read_tool(app, session, tool, scope, args)).await?
         }
+        Tool::WorkspaceWrite(_) => unreachable!("Workspace writes use the authenticated worker route"),
         Tool::FolderGrants => {
             // The front desk branch has already authenticated the session in dispatch.
             match parse_args(args)? {

@@ -7,7 +7,10 @@ mod jobs;
 pub(crate) use jobs::{Filter as JobFilter, View as JobView};
 use admission::WaitReason;
 mod relay;
-mod touches;
+pub(crate) mod touches;
+mod quarantine;
+#[cfg(test)]
+mod workspace_write_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -123,6 +126,7 @@ struct RunningJob {
     capture_scope: Mutex<Option<crate::capture::WorkerStorage>>,
     workspace_read_scope: Mutex<Option<crate::mcp::workspace_read::ReadScope>>,
     approval_scope: Mutex<Option<Arc<approval::JobScope>>>,
+    workspace_write_scope: Mutex<Option<Arc<crate::mcp::workspace_write::Scope>>>,
 }
 
 struct Question {
@@ -345,6 +349,14 @@ impl Workers {
         job.cancel.check()?;
         let scope = job.workspace_read_scope.lock().unwrap().clone();
         scope.context("Worker workspace read scope is unavailable")
+    }
+
+    pub(crate) fn workspace_write_scope(&self, session: &str, id: &str) -> Result<(Arc<crate::mcp::workspace_write::Scope>, Arc<Cancellation>)> {
+        let jobs = self.running.lock().unwrap();
+        let job = jobs.get(id).filter(|job| job.session == session).context("Job not found")?;
+        job.cancel.check()?;
+        let scope = job.workspace_write_scope.lock().unwrap().clone();
+        Ok((scope.context("Worker workspace write scope is unavailable")?, job.cancel.clone()))
     }
 
     fn approval_scope(&self, session: &str, id: &str) -> Option<Arc<approval::JobScope>> {
@@ -679,7 +691,8 @@ async fn launch_assignment(
     }
     if worktree.is_some() {
         tools.retain(|tool| matches!(tool.as_str(), "escalate" | crate::capture::LIST | crate::capture::CAPTURE)
-            || crate::mcp::workspace_read::Tool::named(tool).is_some());
+            || crate::mcp::workspace_read::Tool::named(tool).is_some()
+            || crate::mcp::workspace_write::Tool::named(tool).is_some());
     }
     let mcp_url = if !tools.is_empty() && !app.addr.is_empty() && adopted.is_none() {
         let mut url = url::Url::parse(&format!("http://{}/mcp", app.addr))?;
@@ -696,6 +709,7 @@ async fn launch_assignment(
         started: false.into(), drain_notice: Default::default(),
         capture_scope: Default::default(),
         workspace_read_scope: Default::default(),
+        workspace_write_scope: Default::default(),
         approval_scope: Default::default(),
     });
     let app = app.clone();
@@ -877,6 +891,7 @@ async fn launch_assignment(
             let can_navigate = mcp_url.is_some() && crate::lsp::Tool::ALL.iter()
                 .filter(|tool| !matches!(tool, crate::lsp::Tool::LeanGoal))
                 .any(|tool| tools.iter().any(|name| name == tool.name()));
+            let can_write = mcp_url.is_some() && tools.iter().any(|tool| crate::mcp::workspace_write::Tool::named(tool).is_some());
             let access = crate::folder_grants::Access {
                 hub: app.hub.clone(), session: session.clone(), worker_grants: Some(folder_grants.into()),
             };
@@ -916,6 +931,9 @@ async fn launch_assignment(
                 if can_navigate {
                     instructions.push_str("\n\nFor Rust symbols, prefer the available LSP tools for definitions, references, types, and call hierarchy. Start with a workspace-relative source path and, for position queries, a 1-based line and UTF-16 column on the identifier. Use lsp_symbols with a file path for its declarations. Use fs_search when available for literal text, configuration, and locating an identifier to query, or when LSP gives no useful answer. Use lsp_diagnostics for file feedback and run the relevant Cargo check or test to verify build changes.");
                 }
+                if can_write {
+                    instructions.push_str(crate::mcp::workspace_write::GUIDANCE);
+                }
                 instructions.push_str("\n\nIf tests are still failing after your attempt, verification rejects the change, or you lack confidence to proceed, report the reason with escalate (trigger tests, rejected, or confidence). Finish the turn after recording it. Report concrete evidence.");
                 instructions.push_str(worker_tests());
                 instructions.push_str(crate::references::ledger::worker_hint());
@@ -928,7 +946,7 @@ async fn launch_assignment(
                 if can_ask {
                     instructions.push_str(worker_prompt());
                 }
-                Ok::<_, anyhow::Error>((Files::read(&project), instructions, scope, read_scope, scratch))
+                Ok::<_, anyhow::Error>((Files::read(&scope.cwd), instructions, scope, read_scope, scratch))
             }).await??;
             *input.job.workspace_read_scope.lock().unwrap() = read_scope;
             *input.job.capture_scope.lock().unwrap() = Some(crate::capture::WorkerStorage {
@@ -943,6 +961,12 @@ async fn launch_assignment(
                 let deck = app.thread_context(&session).await?;
                 format!("{deck}\n\n{prompt}")
             };
+            let recovery = crate::mcp::workspace_write::recovery_dir(&app.state_dir, &job)?;
+            let write_scope = can_write.then(|| crate::mcp::workspace_write::Scope::new(
+                scope.cwd.clone(), writes.clone(), &app.state_dir, &job,
+            )).transpose()?.map(Arc::new);
+            *input.job.workspace_write_scope.lock().unwrap() = write_scope.clone();
+            let checkout = scope.cwd.clone();
             let launch = WorkerLaunch { instructions, mcp_url, key, tools, scope: Some(scope) };
             let relay_active = relay::enabled();
             let progress = if relay_active {
@@ -1027,8 +1051,13 @@ async fn launch_assignment(
                 history.finish(result.as_ref().ok().cloned(), Vec::new()).await;
             }
             input.job.input.lock().unwrap().take();
-            let project = cwd.to_path_buf();
-            let changes = tokio::task::spawn_blocking(move || before.changes(&Files::read(&project))).await;
+            let writes_to_check = writes.clone();
+            let changes = tokio::task::spawn_blocking(move || {
+                if let Some(scope) = write_scope {
+                    scope.close();
+                }
+                before.review(&checkout, &recovery, &writes_to_check)
+            }).await;
             if input.job.drain_notice.lock().unwrap().is_some() || app.admit_work().is_err() {
                 let scratch = _scratch.keep();
                 let mut summary = input.job.summary.lock().unwrap();
@@ -1039,28 +1068,17 @@ async fn launch_assignment(
         }.await;
         let (timer, mut result, changes) = result.unwrap_or_else(|error| (timer, Err(error), None));
         let render_changes = |japanese| match &changes {
-            Some(Ok(changes)) => {
+            Some(Ok((changes, quarantine))) => {
                 let mut details = changes.render(japanese);
-                let outside = writes.outside(&changes.paths);
-                if !outside.is_empty() {
-                    let paths = outside.iter().take(10).map(|path| format!("{path:?}")).collect::<Vec<_>>().join(", ");
-                    let extra = if outside.len() > 10 { format!(" (+{})", outside.len() - 10) } else { String::new() };
-                    let warning = if japanese {
-                        format!("注意: 変更予定外のファイルを検出した（{paths}{extra}）")
-                    } else {
-                        format!("Warning: observed changes outside the write set ({paths}{extra})")
-                    };
-                    details.push('\n');
-                    details.push_str(&warning);
-                }
+                details.push_str(&quarantine.render(japanese));
                 details
             }
-            Some(Err(_)) if japanese => "変更一覧を取得できなかった。".into(),
-            Some(Err(_)) => "Unable to list changes.".into(),
+            Some(Err(error)) if japanese => format!("変更一覧を取得できなかった。\n\n## 範囲外の書き込み\n検査を完了できなかった（{error}）。"),
+            Some(Err(error)) => format!("Unable to list changes.\n\n## Out-of-scope writes\nThe check failed ({error})."),
             None => String::new(),
         };
         let files = (claimed && !blind).then(|| writes.observation(
-            changes.as_ref().and_then(|result| result.as_ref().ok()).map(|changes| changes.paths.as_slice())
+            changes.as_ref().and_then(|result| result.as_ref().ok()).map(|(changes, _)| changes.paths.as_slice())
         ));
         let elapsed_ms = timer.elapsed().as_millis() as u64;
         let changes_ja = render_changes(true);
@@ -1871,24 +1889,34 @@ async fn summarize_progress(
 }
 
 struct Files {
-    entries: BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
+    entries: BTreeMap<PathBuf, quarantine::Fingerprint>,
     cards: BTreeMap<PathBuf, BTreeSet<String>>,
+    incomplete: bool,
 }
 
 impl Files {
     fn read(project: &Path) -> Self {
         let threads = project.join("threads");
-        let entries = walkdir::WalkDir::new(project).into_iter()
+        let mut incomplete = false;
+        let mut entries = BTreeMap::new();
+        for entry in walkdir::WalkDir::new(project).into_iter()
             .filter_entry(|entry| !matches!(entry.file_name().to_str(),
-                Some(".git" | ".fuzukue" | ".labo" | "target" | ".lake" | "node_modules" | ".temp"))
+                Some(".git" | ".fuzukue" | ".labo"))
                 && entry.path() != threads)
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-            .filter_map(|entry| {
-                let metadata = entry.metadata().ok()?;
-                Some((entry.path().strip_prefix(project).ok()?.to_owned(), (metadata.len(), metadata.modified().ok())))
-            })
-            .collect();
+        {
+            let Ok(entry) = entry else {
+                incomplete = true;
+                continue;
+            };
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            let (Ok(path), Ok(metadata)) = (entry.path().strip_prefix(project), entry.metadata()) else {
+                incomplete = true;
+                continue;
+            };
+            entries.insert(path.to_owned(), quarantine::Fingerprint::from(&metadata));
+        }
         let mut cards = BTreeMap::<_, BTreeSet<_>>::new();
         for deck in fuzukue_cards::find_decks(project) {
             let Ok(graph) = fuzukue_cards::Graph::open_local(&deck) else { continue };
@@ -1900,7 +1928,7 @@ impl Files {
                 }
             }
         }
-        Self { entries, cards }
+        Self { entries, cards, incomplete }
     }
 
     fn changes(&self, after: &Self) -> ChangedFiles {
@@ -1913,6 +1941,15 @@ impl Files {
             paths: paths.into_iter().cloned().collect(),
             cards: cards.into_iter().map(str::to_owned).collect(),
         }
+    }
+
+    fn review(&self, root: &Path, recovery: &Path, writes: &touches::WriteSet) -> (ChangedFiles, quarantine::Review) {
+        let after = Self::read(root);
+        let changes = self.changes(&after);
+        let quarantine = quarantine::review(
+            root, recovery, writes, &changes.paths, &after.entries, self.incomplete || after.incomplete,
+        );
+        (changes, quarantine)
     }
 }
 
@@ -1954,8 +1991,9 @@ pub async fn run_legacy_codex(
 ) -> Result<String> {
     let _accept = app.admit_work()?;
     let id = format!("{DELEGATE_JOB}{}", mail::session_key());
-    let writes = touches::WriteSet::new(&app.project_dir, None, prompt, || None)?;
-    let admission = app.worker_admission().register(id.clone(), id, Arc::new(writes));
+    let writes = Arc::new(touches::WriteSet::new(&app.project_dir, None, prompt, || None)?);
+    let recovery = crate::mcp::workspace_write::recovery_dir(&app.state_dir, &id)?;
+    let admission = app.worker_admission().register(id.clone(), id, writes.clone());
     let (app, session, prompt) = (app.clone(), session.to_owned(), prompt.to_owned());
     let run = tokio::spawn(async move {
         let _worker = admission.acquire(|_| {}).await;
@@ -1963,12 +2001,29 @@ pub async fn run_legacy_codex(
         let codex = app.codex().await?;
         let thread = codex.start_thread(&session, parent.clone()).await?;
         let history = app.history.turn(&app.project_dir, "agent:codex".into(), &session, parent).await;
+        let before_project = app.project_dir.clone();
+        let before = tokio::task::spawn_blocking(move || Files::read(&before_project)).await;
         let result = codex.run_turn(&thread, &prompt).await;
         if let Some(history) = history {
             history.finish(result.as_ref().ok().cloned(), Vec::new()).await;
         }
         codex.close_worker(&thread).await;
-        result
+        let project = app.project_dir.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            before.map(|before| before.review(&project, &recovery, &writes).1.render(false))
+        }).await;
+        let details = match report {
+            Ok(Ok(details)) => details,
+            _ => "\n\n## Out-of-scope writes\nThe worktree check failed.".into(),
+        };
+        if details.is_empty() {
+            result
+        } else {
+            match result {
+                Ok(answer) => Ok(format!("{answer}{details}")),
+                Err(error) => Err(error.context(details.trim().to_owned())),
+            }
+        }
     });
     drop(_accept);
     run.await?
@@ -2098,6 +2153,14 @@ pub(crate) async fn request_worker_approval(
     app: &App, session: &str, job: &str, backend_id: &str, tool: &str, input: &serde_json::Value, human_only: bool,
 ) -> Result<String> {
     approval::request(app, approval::Owner::new(session, job, backend_id), tool, input, human_only).await
+}
+
+pub(crate) async fn request_workspace_write_approval(
+    app: &App, session: &str, job: &str, summary: fuzukue_proto::LocalizedMessage,
+) -> Result<String> {
+    let owner = approval::Owner::new(session, job, &mail::session_key());
+    let (_wait, reply) = open_approval(app, session, job, Actor::System, summary.into(), Some(owner));
+    Ok(reply.await?.decision)
 }
 
 pub(crate) async fn request_shell_approval(
@@ -2272,6 +2335,7 @@ async fn mcp_review_findings_respect_authenticated_worker_access() -> Result<()>
             drain_notice: Default::default(),
             capture_scope: Default::default(),
             workspace_read_scope: Default::default(),
+            workspace_write_scope: Default::default(),
             approval_scope: Default::default(),
         }),
     );
@@ -2383,6 +2447,7 @@ async fn mcp_reading_tools_respect_authenticated_worker_access() -> Result<()> {
             drain_notice: Default::default(),
             capture_scope: Default::default(),
             workspace_read_scope: Default::default(),
+            workspace_write_scope: Default::default(),
             approval_scope: Default::default(),
         }),
     );

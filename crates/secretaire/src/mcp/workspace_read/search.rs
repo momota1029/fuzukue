@@ -29,7 +29,7 @@ pub(super) struct Args {
     ignore_case: bool,
     #[serde(default)]
     context: usize,
-    max_results: Option<usize>,
+    max_results: Option<i64>,
 }
 
 #[derive(Default)]
@@ -123,11 +123,7 @@ impl Corpus {
 }
 
 pub(super) async fn search(scope: ReadScope, args: Args) -> Result<Value> {
-    let limit = args.max_results.unwrap_or(100);
-    ensure!(
-        (1..=200).contains(&limit),
-        "max_results must be between 1 and 200"
-    );
+    let limit = args.max_results.unwrap_or(100).clamp(1, 200) as usize;
     ensure!(args.context <= 5, "context must be at most 5");
     ensure!(
         args.pattern.len() <= 4096 && !args.pattern.contains(['\r', '\n', '\0']),

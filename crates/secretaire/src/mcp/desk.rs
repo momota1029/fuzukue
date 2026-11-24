@@ -20,13 +20,14 @@ pub(crate) enum Tool {
     BlockStep,
     ListJobs,
     JobStatus,
+    JobWriteAudit,
     CancelJob,
     Queue,
     Redeliver,
 }
 
 impl Tool {
-    pub(super) const ALL: [Self; 13] = [
+    pub(super) const ALL: [Self; 14] = [
         Self::ListThreads,
         Self::ArchiveThread,
         Self::PinThread,
@@ -37,6 +38,7 @@ impl Tool {
         Self::BlockStep,
         Self::ListJobs,
         Self::JobStatus,
+        Self::JobWriteAudit,
         Self::CancelJob,
         Self::Queue,
         Self::Redeliver,
@@ -54,6 +56,7 @@ impl Tool {
             Self::BlockStep => "block_step",
             Self::ListJobs => "list_jobs",
             Self::JobStatus => "job_status",
+            Self::JobWriteAudit => "job_write_audit",
             Self::CancelJob => "cancel_job",
             Self::Queue => "desk_queue",
             Self::Redeliver => "desk_redeliver",
@@ -63,7 +66,7 @@ impl Tool {
     pub(super) fn writes(self) -> bool {
         !matches!(
             self,
-            Self::ListThreads | Self::GetServerSettings | Self::ListJobs | Self::JobStatus | Self::Queue
+            Self::ListThreads | Self::GetServerSettings | Self::ListJobs | Self::JobStatus | Self::JobWriteAudit | Self::Queue
         )
     }
 
@@ -131,6 +134,14 @@ impl Tool {
                 "Read one job's state and timings. Use report for the final report, summary for the change summary, or full for activity and files.",
                 "委譲ジョブの状態と時刻を読む。完了報告は report、変更の要約は summary、動きやファイルも見るには full を使う。"
             ), json!({"job": job(), "view": {"type": "string", "enum": ["report", "summary", "full"], "default": "full"}}), &["job"]),
+            Self::JobWriteAudit => (harness_text!(
+                "Read a delegated job's persisted file-write audit, newest first. Use next_before to page back. The limit defaults to 30 and is clamped to 1–100.",
+                "委譲ジョブのファイル書き込み監査を新しい順に読む。次のページは next_before を指定。limit は既定で 30、範囲は 1〜100。"
+            ), json!({
+                "job": {"type": "string", "description": harness_text!("Full delegate job ID.", "委譲ジョブの完全な ID。")},
+                "before": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 30}
+            }), &["job"]),
             Self::CancelJob => (harness_text!(
                 "Use when the user asks to stop a queued or running delegated job. Record why it was stopped.",
                 "利用者が待機中または実行中の委譲ジョブの停止を頼んだときに使う。停止した理由を記録する。"
@@ -160,6 +171,17 @@ impl Tool {
             Self::JobStatus => {
                 let Job { job, view } = parse_args(args)?;
                 app.delegates.job_status(app, &job, view)?
+            }
+            Self::JobWriteAudit => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct AuditPage {
+                    job: String,
+                    before: Option<String>,
+                    limit: Option<i64>,
+                }
+                let args: AuditPage = parse_args(args)?;
+                super::workspace_write::audit_page(&app.state_dir, &args.job, args.before.as_deref(), args.limit.unwrap_or(30))?
             }
             Self::Queue => front_desk_light::queue(app, args)?,
             Self::Redeliver => front_desk_light::redeliver(app, session, args)?,

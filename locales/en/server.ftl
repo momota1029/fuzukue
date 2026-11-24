@@ -12,6 +12,7 @@ approval-run-command = Run command: { $command }{ $reason }
 approval-change-files = Change files{ $reason }
 approval-grant-turn-permissions = Grant permissions for this turn: { $permissions }{ $reason }
 approval-git-push = Git push · { $source } → { $destination }{ "\u000A" }{ $urls }
+approval-worker-write = { $tool } outside touches · { $path }{ "\u000A" }SHA-256: { $hash }{ "\u000A" }{ $diff }
 approval-git-pull = Git pull (fast-forward only) · { $source } → { $destination }{ "\u000A" }{ $urls }
 approval-create-issue = Create an issue in { $repo }{ "\u000A\u000A" }{ $title }{ "\u000A\u000A" }{ $body }
 approval-mark-issue-ready = Add dot:ready to { $repo }#{ $number }

@@ -287,7 +287,8 @@ async fn listing_bounds_depth_hides_generated_entries_and_caps_results() -> Resu
         .await?;
     assert_eq!(capped["entries"].as_array().unwrap().len(), 500);
     assert!(capped["note"].as_str().unwrap().contains(TRUNCATED));
-    assert!(Tool::List.call(scope, &json!({"depth": 4})).await.is_err());
+    let max_depth = Tool::List.call(scope.clone(), &json!({"depth": 3})).await?;
+    assert_eq!(Tool::List.call(scope, &json!({"depth": 4})).await?, max_depth);
     Ok(())
 }
 

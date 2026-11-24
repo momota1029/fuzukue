@@ -2,6 +2,7 @@
 
 mod history;
 mod paths;
+pub(super) use paths::{open as open_no_symlinks, secret as secret_name};
 mod review;
 mod search;
 #[cfg(test)]
@@ -219,7 +220,7 @@ fn read(scope: &ReadScope, args: ReadArgs) -> Result<Value> {
 struct ListArgs {
     #[serde(default = "dot")]
     path: PathBuf,
-    depth: Option<usize>,
+    depth: Option<i64>,
     glob: Option<String>,
     #[serde(default)]
     include_hidden: bool,
@@ -228,8 +229,7 @@ struct ListArgs {
 }
 
 fn list(scope: &ReadScope, args: ListArgs) -> Result<Value> {
-    let depth = args.depth.unwrap_or(1);
-    ensure!((1..=3).contains(&depth), "depth must be between 1 and 3");
+    let depth = args.depth.unwrap_or(1).clamp(1, 3) as usize;
     let path = scope.resolve(&args.path)?;
     let file = paths::open(&path)?;
     ensure!(file.metadata()?.is_dir(), "Select a directory to list");

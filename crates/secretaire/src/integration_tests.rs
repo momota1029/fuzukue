@@ -1977,6 +1977,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("block_step", &[("step", "string"), ("reason", "string"), ("needs", "string")], &["step", "reason"]),
         ("list_jobs", &[("state", "string"), ("thread", "string"), ("limit", "integer")], &[]),
         ("job_status", &[("job", "string"), ("view", "string")], &["job"]),
+        ("job_write_audit", &[("job", "string"), ("before", "string"), ("limit", "integer")], &["job"]),
         ("cancel_job", &[("job", "string"), ("reason", "string")], &["job", "reason"]),
         ("desk_queue", &[("job_ids", "array"), ("offset", "integer"), ("limit", "integer")], &[]),
         ("desk_redeliver", &[("id", "string"), ("confirm", "boolean")], &["id", "confirm"]),
@@ -2081,7 +2082,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
     assert_eq!(schema("desk_queue")["job_ids"]["items"]["type"], "string");
     assert_eq!(schema("desk_queue")["limit"]["maximum"], 100);
     assert_eq!(mcp::codex_tool_policy(None)["desk_queue"]["approval_mode"], "approve");
-    for name in ["desk_queue", "desk_redeliver", "server_log"] {
+    for name in ["desk_queue", "desk_redeliver", "job_write_audit", "server_log"] {
         let explicit = [name.to_owned()];
         assert!(!mcp::worker_tool_names(&[]).iter().any(|tool| tool == name));
         assert!(!mcp::worker_tool_names(&explicit).iter().any(|tool| tool == name));
@@ -5764,7 +5765,9 @@ async fn mcp_delegate_returns_immediately_and_jobs_run_concurrently() -> Result<
                     assert_eq!(files.source, if item == first_id { Declared } else { PreviousJob });
                     assert_eq!(files.touches, Some(vec!["planned.md".into()]));
                     assert!(files.changed_files.context("missing changed files")?.iter().any(|path| path == "finish-workers"));
-                    assert!(report.changes.contains("変更予定外") && report.changes.contains("finish-workers"), "{output}");
+                    assert!(report.changes.contains("## 範囲外の書き込み") && report.changes.contains("finish-workers"), "{output}");
+                    let recovery = mcp::workspace_write::recovery_dir(&app.state_dir, &item)?;
+                    assert!(recovery.join("quarantine/manifest.json").is_file(), "{output}");
                     finished += 1;
                 }
             }

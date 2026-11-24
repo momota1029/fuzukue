@@ -138,6 +138,17 @@ impl WriteSet {
         self.patterns.is_some()
     }
 
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn contains(&self, relative: &Path) -> bool {
+        let full = self.root.join(relative);
+        self.patterns.as_ref().is_some_and(|patterns| {
+            patterns.iter().any(|pattern| pattern.matches(&full))
+        })
+    }
+
     pub(crate) fn globs(&self) -> Option<Vec<String>> {
         self.patterns.as_ref().map(|patterns| {
             patterns
@@ -166,17 +177,15 @@ impl WriteSet {
             .map(|pattern| Some(pattern.relative.as_str()))
     }
 
-    pub(crate) fn outside<'a>(&self, paths: &'a [PathBuf]) -> Vec<&'a Path> {
-        let Some(patterns) = &self.patterns else {
+    #[cfg(test)]
+    fn outside<'a>(&self, paths: &'a [PathBuf]) -> Vec<&'a Path> {
+        if !self.known() {
             return Vec::new();
-        };
+        }
         paths
             .iter()
             .map(PathBuf::as_path)
-            .filter(|path| {
-                let full = self.root.join(path);
-                !patterns.iter().any(|pattern| pattern.matches(&full))
-            })
+            .filter(|path| !self.contains(path))
             .collect()
     }
 

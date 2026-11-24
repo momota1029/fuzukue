@@ -12,6 +12,7 @@ approval-run-command = コマンドの実行: { $command }{ $reason }
 approval-change-files = ファイルの変更{ $reason }
 approval-grant-turn-permissions = このターンに権限を付与: { $permissions }{ $reason }
 approval-git-push = Git プッシュ · { $source } → { $destination }{ "\u000A" }{ $urls }
+approval-worker-write = 変更予定外の { $tool } · { $path }{ "\u000A" }SHA-256: { $hash }{ "\u000A" }{ $diff }
 approval-git-pull = Git 取り込み（早送りのみ） · { $source } → { $destination }{ "\u000A" }{ $urls }
 approval-create-issue = { $repo } に Issue を作成{ "\u000A\u000A" }{ $title }{ "\u000A\u000A" }{ $body }
 approval-mark-issue-ready = { $repo }#{ $number } に dot:ready を付ける

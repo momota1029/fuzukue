@@ -131,7 +131,7 @@ impl ReadScope {
     }
 }
 
-fn secret(name: &[u8]) -> bool {
+pub(in crate::mcp) fn secret(name: &[u8]) -> bool {
     let name = String::from_utf8_lossy(name).to_ascii_lowercase();
     matches!(
         name.as_str(),
@@ -146,7 +146,7 @@ fn secret(name: &[u8]) -> bool {
 }
 
 /// Open every component without following symlinks, including after a path check.
-pub(super) fn open(path: &Path) -> Result<File> {
+pub(in crate::mcp) fn open(path: &Path) -> Result<File> {
     let mut parts = path.components().peekable();
     ensure!(
         parts.next() == Some(Component::RootDir),
