@@ -86,7 +86,8 @@ impl Workbench {
         self.translation_save_request = None;
         self.notice = match outcome {
             CardSaveOutcome::Saved => None,
-            CardSaveOutcome::TranslationConflict | CardSaveOutcome::Conflict { .. } => {
+            CardSaveOutcome::TranslationConflict | CardSaveOutcome::Conflict { .. }
+            | CardSaveOutcome::TexUnavailable { .. } | CardSaveOutcome::TexInvalid { .. } => {
                 Some(tr!("workbench-translation-conflict").into())
             }
             CardSaveOutcome::Error { message } => {

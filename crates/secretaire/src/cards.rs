@@ -8,12 +8,15 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use fuzukue_cards::{Card, DeckConfig, Severity};
 use fuzukue_proto::{CardDiagnostic, CardEditPart, CardEditSource, CardSaveOutcome, CardView, DocItem, DocSection, MathMacro, ServerEvent, TranslationRevision};
+use fuzukue_proto::card_tex::{self, Access};
 use sha2::{Digest, Sha256};
 use notify::{RecursiveMode, Watcher};
 
 use crate::{build_jobs, Workspace};
 
 mod translation;
+#[cfg(test)]
+mod r81_tests;
 #[cfg(test)]
 mod translation_tests;
 
@@ -34,6 +37,7 @@ pub(crate) fn snapshot_for_deck(project: &Path, deck: &Path) -> ServerEvent {
     let prefix = deck.strip_prefix(project).map(Path::to_path_buf).unwrap_or_default();
     match crate::rules::open_graph(project, deck) {
         Ok(g) => {
+            let tex = tex_access(project, deck, &g);
             let mut sources = translation::Sources::new(project, &g);
             let cards = g
                 .cards
@@ -55,8 +59,8 @@ pub(crate) fn snapshot_for_deck(project: &Path, deck: &Path) -> ServerEvent {
                     issues: c.issues.clone(),
                     files: c.files.clone(),
                     body: c.body.clone(),
-                    edit_body: edit_source(deck, c, CardEditPart::Body).ok(),
-                    edit_proof: edit_source(deck, c, CardEditPart::Proof).ok(),
+                    edit_body: edit_source(deck, c, CardEditPart::Body, tex).ok(),
+                    edit_proof: edit_source(deck, c, CardEditPart::Proof, tex).ok(),
                     external: c.external,
                     source: c.source.clone(),
                     translation: sources.check(c),
@@ -256,11 +260,30 @@ fn document_items(items: &serde_yaml::Value, harness: bool) -> Vec<DocItem> {
     }).collect()
 }
 
+fn tex_access(project: &Path, deck: &Path, graph: &fuzukue_cards::Graph) -> Access {
+    let Ok(cfg) = DeckConfig::read_in_workspace(deck, project) else {
+        return Access::Unavailable;
+    };
+    if cfg.meta.imported_latex {
+        // There is no recorded switch to card ownership for imported decks yet.
+        Access::ImportedManuscript
+    } else if cfg.meta.build.as_ref().is_some_and(|build| build.tex_root.is_some()) {
+        Access::ManuscriptBuild
+    } else if matches!(cfg.meta.kind.as_str(), "paper" | "book")
+        && deck.join(&cfg.structure).is_file()
+        && !crate::build::uses_harness(&cfg, graph)
+    {
+        Access::Editable
+    } else {
+        Access::Unavailable
+    }
+}
+
 fn edit_path(deck: &Path, card: &Card, part: CardEditPart) -> Result<(PathBuf, bool)> {
     anyhow::ensure!(!card.external, "外部デッキのカードはここで編集できない");
     let name = match part {
-        CardEditPart::Body => "statement.tex",
-        CardEditPart::Proof => "proof.tex",
+        CardEditPart::Body | CardEditPart::TexBody => "statement.tex",
+        CardEditPart::Proof | CardEditPart::TexProof => "proof.tex",
     };
     let tex = card.tex.iter().find(|path| path.ends_with(name));
     let (relative, frontmatter) = match (tex, part) {
@@ -288,20 +311,26 @@ fn source_version(path: &Path, text: &str) -> String {
     format!("{:x}", hash.finalize())
 }
 
-fn edit_source(deck: &Path, card: &Card, part: CardEditPart) -> Result<CardEditSource> {
+fn edit_source(deck: &Path, card: &Card, part: CardEditPart, tex: Access) -> Result<CardEditSource> {
     let (path, frontmatter) = edit_path(deck, card, part)?;
-    read_edit_source(&path, frontmatter, &std::fs::read_to_string(&path)?)
+    let mut source = read_edit_source(&path, frontmatter, &std::fs::read_to_string(&path)?)?;
+    if !frontmatter && card.path.ends_with("card.md") {
+        source.tex = tex;
+    }
+    Ok(source)
 }
 
 fn read_edit_source(path: &Path, frontmatter: bool, text: &str) -> Result<CardEditSource> {
     Ok(CardEditSource {
         body: source_parts(text, frontmatter)?.1.to_owned(),
         base_hash: source_version(path, text),
+        tex: Access::Unavailable,
     })
 }
 
 pub(crate) static CARD_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(test)]
 pub(crate) fn save_card(
     project: &Path,
     deck: &str,
@@ -311,7 +340,32 @@ pub(crate) fn save_card(
     base_hash: &str,
     human: Option<&Arc<Workspace>>,
 ) -> Result<CardSaveOutcome> {
+    save_card_with_build(project, deck, id, part, body, base_hash, human).map(|(outcome, _)| outcome)
+}
+
+pub(crate) fn save_card_with_build(
+    project: &Path,
+    deck: &str,
+    id: &str,
+    part: CardEditPart,
+    body: &str,
+    base_hash: &str,
+    human: Option<&Arc<Workspace>>,
+) -> Result<(CardSaveOutcome, Option<SavedCardTex>)> {
     save_card_edit(project, deck, id, CardEdit::Body { part, body, base_hash }, human)
+}
+
+pub(crate) struct SavedCardTex {
+    pub(crate) deck: String,
+    path: PathBuf,
+    hash: String,
+}
+
+impl SavedCardTex {
+    pub(crate) fn is_current(&self) -> bool {
+        std::fs::read_to_string(&self.path)
+            .is_ok_and(|text| source_version(&self.path, &text) == self.hash)
+    }
 }
 
 pub(crate) fn record_source_fingerprint(
@@ -321,7 +375,7 @@ pub(crate) fn record_source_fingerprint(
     revision: &TranslationRevision,
     human: Option<&Arc<Workspace>>,
 ) -> Result<CardSaveOutcome> {
-    save_card_edit(project, deck, id, CardEdit::Translation(revision), human)
+    save_card_edit(project, deck, id, CardEdit::Translation(revision), human).map(|(outcome, _)| outcome)
 }
 
 enum CardEdit<'a> {
@@ -335,8 +389,9 @@ fn save_card_edit(
     id: &str,
     edit: CardEdit<'_>,
     human: Option<&Arc<Workspace>>,
-) -> Result<CardSaveOutcome> {
+) -> Result<(CardSaveOutcome, Option<SavedCardTex>)> {
     let _write = CARD_WRITE_LOCK.lock().unwrap();
+    let tex_edit = matches!(edit, CardEdit::Body { part, .. } if part.is_tex());
     let recording_fingerprint = matches!(edit, CardEdit::Translation(_));
     let deck = if deck.is_empty() { "." } else { deck };
     let deck = crate::workspace::deck_path(project, deck)?;
@@ -344,9 +399,19 @@ fn save_card_edit(
     let graph = crate::rules::open_graph(project, &root)?;
     let card = match graph.cards.get(id) {
         Some(card) => card,
-        None if recording_fingerprint => return Ok(CardSaveOutcome::TranslationConflict),
+        None if recording_fingerprint => return Ok((CardSaveOutcome::TranslationConflict, None)),
         None => anyhow::bail!("カードが見つからない"),
     };
+    if tex_edit {
+        let access = if card.external || !card.path.ends_with("card.md") {
+            Access::Unavailable
+        } else {
+            tex_access(project, &root, &graph)
+        };
+        if access != Access::Editable {
+            return Ok((CardSaveOutcome::TexUnavailable { access }, None));
+        }
+    }
     let (path, frontmatter, base_hash) = match edit {
         CardEdit::Body { part, base_hash, .. } => {
             let (path, frontmatter) = edit_path(&root, card, part)?;
@@ -356,31 +421,39 @@ fn save_card_edit(
     };
     let read = || -> Result<_> { Ok((std::fs::metadata(&path)?, std::fs::read_to_string(&path)?)) };
     let (info, current) = match read() {
-        Err(_) if recording_fingerprint => return Ok(CardSaveOutcome::TranslationConflict),
+        Err(_) if recording_fingerprint => return Ok((CardSaveOutcome::TranslationConflict, None)),
         result => result?,
     };
     let matches_version = |text: &str| match edit {
         CardEdit::Body { .. } => source_version(&path, text) == base_hash,
         CardEdit::Translation(_) => translation::version(project, &path, text).is_ok_and(|hash| hash == base_hash),
     };
-    let conflict = |text| {
-        if recording_fingerprint {
-            Ok(CardSaveOutcome::TranslationConflict)
+    let conflict = |text: &str| -> Result<_> {
+        let outcome = if recording_fingerprint {
+            CardSaveOutcome::TranslationConflict
         } else {
-            Ok(CardSaveOutcome::Conflict { latest: read_edit_source(&path, frontmatter, text)? })
-        }
+            CardSaveOutcome::Conflict { latest: read_edit_source(&path, frontmatter, text)? }
+        };
+        Ok((outcome, None))
     };
     if !matches_version(&current) {
         return conflict(&current);
     }
     let (text, source) = match edit {
-        CardEdit::Body { body, .. } => (replace_body(&current, frontmatter, body)?, None),
+        CardEdit::Body { part, body, .. } => {
+            if part.is_tex() {
+                if let Err(issue) = card_tex::validate(body) {
+                    return Ok((CardSaveOutcome::TexInvalid { issue }, None));
+                }
+            }
+            (replace_body(&current, frontmatter, body)?, None)
+        }
         CardEdit::Translation(revision) => {
             let latest = fuzukue_cards::parse_card(&root, &path, &current)?;
             let mut sources = translation::Sources::new(project, &graph);
             let Some(source) = latest.source_id.as_deref().and_then(|id| sources.get(id))
                 .filter(|source| source.fingerprint == revision.source_fingerprint) else {
-                return Ok(CardSaveOutcome::TranslationConflict);
+                return Ok((CardSaveOutcome::TranslationConflict, None));
             };
             let text = fuzukue_cards::with_source_fingerprint(&current, &source.fingerprint)?;
             (text, Some(source))
@@ -389,21 +462,33 @@ fn save_card_edit(
     if text != current {
         let tmp = replacement_file(&path, info.permissions(), &text)?;
         let baseline = human.and_then(|app| app.before_human_card_save(&graph, card, &path));
-        // Recheck after staging the replacement, in case an external writer
-        // changed the source while the new file was being prepared.
-        let latest = match std::fs::read_to_string(&path) {
-            Err(_) if recording_fingerprint => return Ok(CardSaveOutcome::TranslationConflict),
-            result => result?,
+        let mut rejected = None;
+        // Check inside the history operation, after its baseline has been read.
+        let replace = || -> Result<()> {
+            let latest = match std::fs::read_to_string(&path) {
+                Err(error) if recording_fingerprint => {
+                    rejected = Some((CardSaveOutcome::TranslationConflict, None));
+                    return Err(error.into());
+                }
+                result => result?,
+            };
+            if latest != current
+                || source.as_ref().is_some_and(|source| !matches_version(&latest) || !source.is_current(project))
+            {
+                rejected = Some(conflict(&latest)?);
+                anyhow::bail!("card source changed before replacement");
+            }
+            tmp.persist(&path)?;
+            Ok(())
         };
-        if latest != current
-            || source.as_ref().is_some_and(|source| !matches_version(&latest) || !source.is_current(project))
-        {
-            return conflict(&latest);
+        let result = match human {
+            Some(app) => app.history.write("human".into(), &path, replace),
+            None => replace(),
+        };
+        if let Some(rejected) = rejected {
+            return Ok(rejected);
         }
-        match human {
-            Some(app) => app.history.write("human".into(), &path, || tmp.persist(&path))?,
-            None => tmp.persist(&path)?,
-        };
+        result?;
         if let Some(baseline) = baseline {
             baseline.record();
         }
@@ -412,10 +497,15 @@ fn save_card_edit(
             crate::extensions::card_saved(app, &path);
         }
     }
-    if let Some(app) = human {
-        app.schedule_folder_paper_build(deck, &path);
-    }
-    Ok(CardSaveOutcome::Saved)
+    let build = if tex_edit {
+        Some(SavedCardTex { deck, hash: source_version(&path, &text), path })
+    } else {
+        if let Some(app) = human {
+            app.schedule_folder_paper_build(deck, &path);
+        }
+        None
+    };
+    Ok((CardSaveOutcome::Saved, build))
 }
 
 fn replace_body(current: &str, frontmatter: bool, body: &str) -> Result<String> {

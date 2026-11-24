@@ -1145,12 +1145,24 @@ pub enum ClientMsg {
 pub enum CardEditPart {
     Body,
     Proof,
+    TexBody,
+    TexProof,
 }
+
+impl CardEditPart {
+    pub fn is_tex(self) -> bool {
+        matches!(self, Self::TexBody | Self::TexProof)
+    }
+}
+
+pub mod card_tex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardEditSource {
     pub body: String,
     pub base_hash: String,
+    #[serde(default, skip_serializing_if = "card_tex::Access::is_unavailable")]
+    pub tex: card_tex::Access,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1159,6 +1171,8 @@ pub enum CardSaveOutcome {
     Saved,
     Conflict { latest: CardEditSource },
     TranslationConflict,
+    TexInvalid { issue: card_tex::Issue },
+    TexUnavailable { access: card_tex::Access },
     Error { message: String },
 }
 
@@ -2444,6 +2458,7 @@ pub enum ServerEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pdf_audit: Vec<PdfAudit>,
     },
+    CardTexBuildResult { request: u64, outcome: card_tex::BuildOutcome },
     PaperPdfMap { deck: String, pdf: String, digest: String, regions: Vec<PdfCardRegion>, rebuilt: bool },
     PaperJobsReset,
     ReviewDecksPruned { decks: Vec<String> },

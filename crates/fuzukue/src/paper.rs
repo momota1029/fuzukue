@@ -683,6 +683,9 @@ impl Workbench {
                                 .children(card.and_then(|card| card.edit_body.as_ref())
                                     .filter(|_| this.protocol >= 9 && this.card_editor(id, false).is_none())
                                     .map(|source| Self::card_edit_button(id, false, source, &entity)))
+                                .children(card.and_then(|card| card.edit_body.as_ref())
+                                    .filter(|_| this.card_editor(id, false).is_none())
+                                    .and_then(|source| Self::card_tex_button(id, false, source, &entity)))
                                 .children(card.filter(|card| !card.external && this.card_editor(id, false).is_none() && this.card_editor(id, true).is_none())
                                     .and_then(|_| this.card_history_button(format!("paper-history-{id}"), id, entity.downgrade()))),
                         );
@@ -761,7 +764,10 @@ impl Workbench {
                                 }),
                             ).children(card.and_then(|card| card.edit_proof.as_ref())
                                 .filter(|_| this.protocol >= 9 && open && this.card_editor(id, true).is_none())
-                                .map(|source| Self::card_edit_button(id, true, source, &entity))),
+                                .map(|source| Self::card_edit_button(id, true, source, &entity)))
+                              .children(card.and_then(|card| card.edit_proof.as_ref())
+                                .filter(|_| open && this.card_editor(id, true).is_none())
+                                .and_then(|source| Self::card_tex_button(id, true, source, &entity))),
                         );
                         if open {
                             col = if let Some(editor) = this.card_editor(id, true) {
@@ -975,7 +981,7 @@ impl Workbench {
         } else {
             pane.child(toolbar_row.id("paper-pane-header").children(close))
         };
-        pane.child(if reviews {
+        pane.children(self.render_card_tex_build(cx)).child(if reviews {
                 self.render_reviews(cx).into_any_element()
             } else if pdf {
                 self.render_paper_pdf(cx).into_any_element()

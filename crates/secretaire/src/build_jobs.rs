@@ -253,11 +253,7 @@ impl Workspace {
         });
     }
 
-    pub(crate) fn cancel_build(&self, deck: &str) {
-        let root = safe_join(&self.project_dir, deck).ok();
-        let relative = root
-            .as_ref()
-            .and_then(|path| path.strip_prefix(&self.project_dir).ok());
+    fn cancel_pending_build(&self, deck: &str, relative: Option<&Path>) {
         let mut pending = self.builds.pending.lock().unwrap();
         let queued = pending
             .remove(deck)
@@ -274,6 +270,12 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    pub(crate) fn cancel_build(&self, deck: &str) {
+        let root = safe_join(&self.project_dir, deck).ok();
+        let relative = root.as_ref().and_then(|path| path.strip_prefix(&self.project_dir).ok());
+        self.cancel_pending_build(deck, relative);
         if let Some((running, cancel)) = &*self.builds.active.lock().unwrap() {
             if running == deck
                 || root.as_ref().is_some_and(|root| {
@@ -309,6 +311,37 @@ impl Workspace {
             app.start_build(&deck, cancel.clone());
             app.finish_build(deck, &cancel, false).await
         })
+    }
+
+    pub(crate) async fn build_saved_card_tex(
+        self: &Arc<Self>,
+        saved: cards::SavedCardTex,
+    ) -> fuzukue_proto::card_tex::BuildOutcome {
+        use fuzukue_proto::card_tex::BuildOutcome;
+
+        let _serial = self.builds.serial.lock().await;
+        let _work = match self.admit_work() {
+            Ok(work) => work,
+            Err(error) => return BuildOutcome::Failed { log: format!("{error:#}"), log_path: None },
+        };
+        if !saved.is_current() {
+            return BuildOutcome::Superseded;
+        }
+        let deck = saved.deck.clone();
+        let relative = if deck == "." { Path::new("") } else { Path::new(&deck) };
+        // The explicit check consumes a queued auto-build for these inputs.
+        self.cancel_pending_build(&deck, Some(relative));
+        let cancel = Arc::new(Cancellation::default());
+        self.start_build(&deck, cancel.clone());
+        let result = self.finish_build(deck, &cancel, false).await;
+        if !saved.is_current() {
+            return BuildOutcome::Superseded;
+        }
+        match result {
+            Ok(built) if built.ok => BuildOutcome::Built { pdf: built.pdf },
+            Ok(built) => BuildOutcome::Failed { log: built.log, log_path: built.log_path },
+            Err(error) => BuildOutcome::Failed { log: format!("{error:#}"), log_path: None },
+        }
     }
 
     pub(crate) fn build_papers(

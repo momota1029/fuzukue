@@ -1,0 +1,24 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1000},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "build_paper"},
+    {"action": "wait_event", "event": "build_result", "timeout_ms": 60000},
+    {"action": "scroll_to_card", "id": "thm-sphere-concentration"},
+    {"action": "click", "id": "edit-tex-statement-thm-sphere-concentration"},
+    {"action": "key", "key": "Ctrl+a"},
+    {"action": "type", "text": "For every $r>0$,\n\\begin{align}\ny &\\le e^{-r}.\n\\end{align}\n% Retain the line break.\n"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_element", "id": "paper-tex-preview"},
+    {"action": "screenshot", "name": "card-tex-preview"},
+    {"action": "click", "id": "confirm-paper-tex"},
+    {"action": "wait_event", "event": "card_save_result"},
+    {"action": "wait_paper_card", "deck": "papers/levy-families", "card": "thm-sphere-concentration", "text": "For every"},
+    {"action": "wait_event", "event": "card_tex_build_result", "timeout_ms": 60000},
+    {"action": "wait_element", "id": "paper-tex-built-pdf"},
+    {"action": "screenshot", "name": "card-tex-build-result"}
+  ]
+}

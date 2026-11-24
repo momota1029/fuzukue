@@ -480,6 +480,9 @@ fn latexmk_command(cwd: &Path, source: &Path, mode: &LatexMode<'_>, extra: &[Str
                 .arg(outdir);
         }
     }
+    if matches!(mode, LatexMode::Generated(_)) {
+        command.arg("-file-line-error");
+    }
     command.args(extra).arg(source).current_dir(cwd);
     command
 }
@@ -568,8 +571,20 @@ impl BuildLog {
         let stderr = String::from_utf8_lossy(&run.stderr);
         let log = stdout.into_owned() + &stderr;
         writeln!(self.full, "{log}").unwrap();
+        // Keep the TeX source line even when latexmk's summary pushes it out of the tail.
+        let diagnostic = (!run.status.success()).then(|| {
+            log.lines().find(|line| {
+                line.split_once(".tex:").is_some_and(|(_, rest)| {
+                    rest.split_once(':').is_some_and(|(number, _)| number.parse::<usize>().is_ok())
+                })
+            })
+        }).flatten();
         // The two header lines count toward the 15-line log excerpt.
-        let lines: Vec<_> = log.lines().rev().take(13).collect();
+        let mut lines: Vec<_> = log.lines().rev().take(13).collect();
+        if let Some(line) = diagnostic.filter(|line| !lines.contains(line)) {
+            lines.pop();
+            lines.push(line);
+        }
         for line in lines.into_iter().rev() {
             writeln!(self.tail, "{line}").unwrap();
         }
@@ -764,6 +779,7 @@ async fn build_deck(
     log.engine = Some(mode.engine().name());
     let (name, tex) = deck_tex(project, deck_rel)?;
     let out = deck.join("build");
+    ensure!(!out.is_symlink(), "build/ には実ディレクトリが必要");
     let filename = format!("{name}.tex");
     let root = Path::new("build").join(&filename);
     log.start(&Path::new(deck_rel).join(&root), mode.engine());
@@ -771,7 +787,35 @@ async fn build_deck(
     tokio::fs::write(out.join(&filename), tex).await?;
     let mut command = latexmk_command(&out, Path::new(&filename), &mode, extra);
     let log_path = out.join(&filename).with_extension("log");
-    let run = log.run(&mut command, &log_path, cancel).await?;
+    let previous = tempfile::tempdir_in(&out)?;
+    let artifacts = [format!("{name}.pdf"), format!("{name}.synctex.gz")];
+    for artifact in &artifacts {
+        match tokio::fs::symlink_metadata(out.join(artifact)).await {
+            Ok(info) => {
+                ensure!(info.is_file(), "build artifact is not a regular file: {artifact}");
+                let backup = previous.path().join(format!("{artifact}.previous"));
+                tokio::fs::copy(out.join(artifact), &backup).await?;
+                std::fs::File::open(backup)?.set_modified(info.modified()?)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let run = log.run(&mut command, &log_path, cancel).await;
+    if !run.as_ref().is_ok_and(|run| run.status.success()) {
+        for artifact in &artifacts {
+            let path = out.join(artifact);
+            let backup = previous.path().join(format!("{artifact}.previous"));
+            if backup.is_file() {
+                tokio::fs::rename(backup, path).await?;
+            } else if let Err(error) = tokio::fs::remove_file(path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+    let run = run?;
     log.diagnose(&run, &log_path);
     Ok(BuildOutputs {
         ok: run.status.success(),

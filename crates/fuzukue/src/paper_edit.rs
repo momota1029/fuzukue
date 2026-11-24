@@ -1,5 +1,10 @@
 //! Inline editing of the on-disk sources of paper cards.
 
+#[cfg(all(test, feature = "headless-shot", target_os = "linux"))]
+#[path = "paper_edit_test.rs"]
+mod tests;
+
+use fuzukue_proto::card_tex::{self, Access, BuildOutcome, Issue, IssueKind};
 use fuzukue_proto::{CardEditPart, CardEditSource, CardSaveOutcome, ClientMsg};
 use gpui_kit::base::{
     input::{Enter, Escape},
@@ -9,9 +14,10 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::EditorState,
+    scroll::ScrollableElement as _,
     v_flex, ActiveTheme as _, Sizable as _,
 };
-use gpui_kit::{div, prelude::*, Entity, Focusable, Pixels, SharedString};
+use gpui_kit::{div, prelude::*, px, Entity, Focusable, Pixels, SharedString};
 
 use super::{
     focused_composition, icons::Symbol, source::editing, App, Context, ReadPart, Window, Workbench,
@@ -30,6 +36,57 @@ pub(super) struct CardEditor {
     pending: Option<u64>,
     conflict: Option<CardEditSource>,
     error: Option<String>,
+    tex: bool,
+    preview: Option<TexPreview>,
+}
+
+struct TexPreview {
+    draft: String,
+    diff: String,
+    validation: Result<(), Issue>,
+}
+
+pub(super) struct CardTexBuild {
+    request: u64,
+    deck: String,
+    outcome: Option<BuildOutcome>,
+}
+
+fn tex_access_notice(access: Access) -> &'static str {
+    match access {
+        Access::ImportedManuscript => tr!("paper-tex-imported-manuscript"),
+        Access::ManuscriptBuild => tr!("paper-tex-manuscript-build"),
+        _ => tr!("paper-tex-unavailable"),
+    }
+}
+
+fn tex_issue_text(issue: Issue) -> String {
+    let detail = match issue.kind {
+        IssueKind::NullByte => tr!("paper-tex-null-byte"),
+        IssueKind::UnbalancedGroup => tr!("paper-tex-unbalanced-group"),
+        IssueKind::UnbalancedEnvironment => tr!("paper-tex-unbalanced-environment"),
+        IssueKind::UnterminatedVerb => tr!("paper-tex-unterminated-verb"),
+        IssueKind::DocumentCommand => tr!("paper-tex-document-command"),
+    };
+    tr!("paper-tex-invalid", line = issue.line.to_string(), detail = detail.to_string())
+}
+
+impl CardEditor {
+    fn preview(&self, cx: &App) -> Option<&TexPreview> {
+        self.preview.as_ref().filter(|preview| {
+            !editing::is_dirty(&preview.draft, self.input.read(cx).text())
+        })
+    }
+
+    fn prepare_preview(&mut self, cx: &App) {
+        let draft = self.input.read(cx).text().to_string();
+        let base = self.conflict.as_ref().map_or(&self.base, |latest| &latest.body);
+        self.preview = Some(TexPreview {
+            diff: editing::conflict_diff(base, &draft),
+            validation: card_tex::validate(&draft),
+            draft,
+        });
+    }
 }
 
 impl Workbench {
@@ -46,12 +103,28 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_card_editor(part, source, false, window, cx);
+    }
+
+    fn open_card_editor(
+        &mut self,
+        part: ReadPart,
+        source: CardEditSource,
+        tex: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tex && source.tex != Access::Editable {
+            self.notice = Some(tex_access_notice(source.tex).into());
+            cx.notify();
+            return;
+        }
         if self.card_editor.is_some() {
             self.notice = Some(tr!("paper-finish-edit-before-opening-card").into());
             cx.notify();
             return;
         }
-        let language = if part.proof {
+        let language = if tex || part.proof {
             "tex"
         } else {
             self.cards
@@ -68,11 +141,23 @@ impl Workbench {
         };
         let input =
             cx.new(|cx| editing::editor_state(language, &source.body, window, cx).folding(false));
-        let observe = cx.observe(&input, |_, _, cx| cx.notify());
+        let observe = cx.observe(&input, |this, _, cx| {
+            if let Some(editor) = &mut this.card_editor {
+                if editor.preview.is_some() && editor.preview(cx).is_none() {
+                    editor.preview = None;
+                    let id = editor.part.card.clone();
+                    this.remeasure_card(&id);
+                }
+            }
+            cx.notify();
+        });
         input.read(cx).focus_handle(cx).focus(window, cx);
         self.remeasure_card(&part.card);
         self.comment_popup = None;
         self.comment_selection = None;
+        if tex {
+            self.notice = None;
+        }
         self.card_editor = Some(CardEditor {
             deck: self.deck.clone(),
             part,
@@ -86,7 +171,25 @@ impl Workbench {
             pending: None,
             conflict: None,
             error: None,
+            tex,
+            preview: None,
         });
+        cx.notify();
+    }
+
+    fn request_save_card_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.card_editor else { return };
+        if !editor.tex {
+            self.save_card_edit(false, window, cx);
+            return;
+        }
+        if editor.pending.is_some() || focused_composition(&editor.input, window, cx) {
+            return;
+        }
+        editor.error = None;
+        editor.prepare_preview(cx);
+        let id = editor.part.card.clone();
+        self.remeasure_card(&id);
         cx.notify();
     }
 
@@ -97,6 +200,7 @@ impl Workbench {
         if editor.deck != self.deck
             || editor.pending.is_some()
             || editor.conflict.is_some() != overwrite
+            || (editor.tex && !editor.preview(cx).is_some_and(|preview| preview.validation.is_ok()))
             || focused_composition(&editor.input, window, cx)
         {
             return;
@@ -107,10 +211,11 @@ impl Workbench {
             request,
             deck: editor.deck.clone(),
             card: editor.part.card.clone(),
-            part: if editor.part.proof {
-                CardEditPart::Proof
-            } else {
-                CardEditPart::Body
+            part: match (editor.tex, editor.part.proof) {
+                (true, true) => CardEditPart::TexProof,
+                (true, false) => CardEditPart::TexBody,
+                (false, true) => CardEditPart::Proof,
+                (false, false) => CardEditPart::Body,
             },
             body: editor.input.read(cx).text().to_string(),
             base_hash: editor
@@ -204,10 +309,33 @@ impl Workbench {
         };
         editor.pending = None;
         match outcome {
-            CardSaveOutcome::Saved => self.cancel_card_edit(cx),
+            CardSaveOutcome::Saved => {
+                if editor.tex {
+                    self.card_tex_build = Some(CardTexBuild {
+                        request,
+                        deck: editor.deck.clone(),
+                        outcome: None,
+                    });
+                }
+                self.cancel_card_edit(cx);
+            }
             CardSaveOutcome::Conflict { latest } => {
                 editor.conflict = Some(latest);
                 editor.diff = None;
+                if editor.tex {
+                    editor.input.update(cx, |input, cx| input.set_readonly(false, cx));
+                    editor.prepare_preview(cx);
+                }
+            }
+            CardSaveOutcome::TexInvalid { issue } => {
+                editor.error = Some(tex_issue_text(issue));
+                editor.preview = None;
+                editor.input.update(cx, |input, cx| input.set_readonly(false, cx));
+            }
+            CardSaveOutcome::TexUnavailable { access } => {
+                editor.error = Some(tex_access_notice(access).into());
+                editor.preview = None;
+                editor.input.update(cx, |input, cx| input.set_readonly(false, cx));
             }
             CardSaveOutcome::TranslationConflict => {
                 editor.error = Some(tr!("workbench-translation-conflict").into());
@@ -216,7 +344,7 @@ impl Workbench {
             CardSaveOutcome::Error { message } => {
                 editor.error = Some(tr!("paper-cannot-save", message = message.to_string()));
                 editor.input.update(cx, |input, cx| {
-                    input.set_readonly(editor.conflict.is_some(), cx)
+                    input.set_readonly(!editor.tex && editor.conflict.is_some(), cx)
                 });
             }
         }
@@ -227,6 +355,12 @@ impl Workbench {
     }
 
     pub(super) fn disconnect_card_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(build) = self.card_tex_build.as_mut().filter(|build| build.outcome.is_none()) {
+            build.outcome = Some(BuildOutcome::Failed {
+                log: tr!("paper-tex-build-interrupted").into(),
+                log_path: None,
+            });
+        }
         if let Some(request) = self.card_editor.as_ref().and_then(|editor| editor.pending) {
             self.on_card_save_result(
                 request,
@@ -236,6 +370,86 @@ impl Workbench {
                 cx,
             );
         }
+    }
+
+    pub(super) fn on_card_tex_build_result(&mut self, request: u64, outcome: BuildOutcome) {
+        if let Some(build) = self.card_tex_build.as_mut().filter(|build| build.request == request) {
+            build.outcome = Some(outcome);
+        }
+    }
+
+    pub(super) fn render_card_tex_build(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let build = self.card_tex_build.as_ref().filter(|build| build.deck == self.deck)?;
+        let theme = cx.theme();
+        let (message, action, log) = match &build.outcome {
+            None => (tr!("paper-tex-building"), None, None),
+            Some(BuildOutcome::Built { pdf }) => {
+                let deck = build.deck.clone();
+                let pdf = pdf.clone();
+                (tr!("paper-tex-build-succeeded"), Some(
+                    Button::new("paper-tex-built-pdf").ghost().xsmall().label(tr!("paper-tex-open-pdf"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_paper_pdf_artifact(deck.clone(), pdf.clone(), cx);
+                        })),
+                ), None)
+            }
+            Some(BuildOutcome::Failed { log, log_path }) => {
+                let action = log_path.clone().map(|path|
+                    Button::new("paper-tex-build-log").ghost().xsmall().label(tr!("paper-tex-open-log"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_source_file(path.clone(), None, window, cx);
+                        })),
+                );
+                (tr!("paper-tex-build-failed"), action, Some(log.clone()))
+            }
+            Some(BuildOutcome::Superseded) => (tr!("paper-tex-build-superseded"), None, None),
+        };
+        Some(v_flex()
+            .id("paper-tex-build-result")
+            .flex_none()
+            .px_4()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .child(h_flex().gap_2().child(message).children(action).child(
+                Button::new("paper-tex-dismiss-build").ghost().xsmall().icon(Symbol::X.icon())
+                    .tooltip(tr!("paper-close")).accessibility_label(tr!("paper-close"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.card_tex_build = None;
+                        cx.notify();
+                    })),
+            ))
+            .children(log.map(|log| {
+                div().id("paper-tex-build-diagnostics").max_h(px(80.)).overflow_y_scrollbar()
+                    .font(crate::appearance::code_font(cx))
+                    .children(log.lines().map(|line| div().child(line.to_owned())))
+            })))
+    }
+
+    pub(super) fn card_tex_button(
+        id: &str,
+        proof: bool,
+        source: &CardEditSource,
+        view: &Entity<Self>,
+    ) -> Option<Button> {
+        if source.tex.is_unavailable() {
+            return None;
+        }
+        let part = ReadPart { card: id.into(), proof };
+        let label = tr!("paper-tex-edit");
+        let source = source.clone();
+        let view = view.clone();
+        let group = if proof { "proof" } else { "statement" };
+        Some(Button::new(SharedString::from(format!("edit-tex-{group}-{id}")))
+            .ghost()
+            .xsmall()
+            .label(label)
+            .on_click(move |_, window, cx| {
+                view.update(cx, |this, cx| {
+                    this.open_card_editor(part.clone(), source.clone(), true, window, cx);
+                });
+            }))
     }
 
     pub(super) fn card_edit_button(
@@ -285,6 +499,8 @@ impl Workbench {
     ) -> gpui_kit::Div {
         let pending = editor.pending.is_some();
         let conflict = editor.conflict.is_some();
+        let preview = (!pending).then(|| editor.preview(cx)).flatten();
+        let confirm = view.clone();
         let dirty = editing::is_dirty(&editor.base, editor.input.read(cx).text());
         let save_key = view.clone();
         let save_action = view.clone();
@@ -313,7 +529,7 @@ impl Workbench {
         v_flex()
             .on_key_down(move |event, window, cx| {
                 if editing::is_save_key(event) {
-                    save_key.update(cx, |this, cx| this.save_card_edit(false, window, cx));
+                    save_key.update(cx, |this, cx| this.request_save_card_edit(window, cx));
                     cx.stop_propagation();
                 }
             })
@@ -324,7 +540,7 @@ impl Workbench {
                     && !action.shift
                     && enter_input.read(cx).focus_handle(cx).is_focused(window)
                 {
-                    save_action.update(cx, |this, cx| this.save_card_edit(false, window, cx));
+                    save_action.update(cx, |this, cx| this.request_save_card_edit(window, cx));
                     cx.stop_propagation();
                 }
             })
@@ -352,13 +568,15 @@ impl Workbench {
                             .xsmall()
                             .label(if pending {
                                 tr!("editor-saving")
+                            } else if editor.tex {
+                                tr!("paper-tex-preview")
                             } else {
                                 tr!("editor-save")
                             })
-                            .tooltip(tr!("editor-save-shortcut"))
-                            .disabled(pending || conflict)
+                            .tooltip(if editor.tex { tr!("paper-tex-preview-shortcut") } else { tr!("editor-save-shortcut") })
+                            .disabled(pending || (conflict && !editor.tex))
                             .on_click(move |_, window, cx| {
-                                save.update(cx, |this, cx| this.save_card_edit(false, window, cx));
+                                save.update(cx, |this, cx| this.request_save_card_edit(window, cx));
                             }),
                     )
                     .child(
@@ -419,7 +637,7 @@ impl Workbench {
                     .text_color(theme.danger)
                     .child(error.clone())
             }))
-            .when(conflict, |pane| {
+            .when(conflict && !editor.tex, |pane| {
                 pane.child(editing::conflict_banner(
                     [
                         Button::new("reload-paper-card")
@@ -471,12 +689,35 @@ impl Workbench {
                     cx,
                 ))
             })
+            .when(editor.tex && conflict, |pane| {
+                pane.child(div().text_xs().px_2().py_1().text_color(theme.warning)
+                    .child(tr!("paper-tex-conflict")))
+            })
+            .children(preview.map(|preview| {
+                let validation = match preview.validation {
+                    Ok(()) => tr!("paper-tex-validation-passed").into(),
+                    Err(issue) => tex_issue_text(issue),
+                };
+                let color = if preview.validation.is_ok() { theme.muted_foreground } else { theme.danger };
+                v_flex().id("paper-tex-preview").gap_1().px_2().py_1().bg(theme.secondary).text_xs()
+                    .child(h_flex().flex_wrap().gap_2()
+                        .child(div().text_color(color).child(validation))
+                        .child(Button::new("confirm-paper-tex").ghost().xsmall()
+                            .label(tr!("paper-tex-confirm"))
+                            .disabled(preview.validation.is_err())
+                            .on_click(move |_, window, cx| {
+                                confirm.update(cx, |this, cx| this.save_card_edit(conflict, window, cx));
+                            })))
+                    .when(!preview.diff.is_empty(), |panel| {
+                        panel.child(editing::diff_view("paper-tex-diff", preview.diff.clone(), cx))
+                    })
+            }))
             .child(div().w_full().h(height).min_w_0().child(editing::surface(
                 &editor.input,
                 &self.appearance,
                 editor.language,
                 tr!("editor-source-editor"),
-                pending || conflict,
+                pending || (conflict && !editor.tex),
             )))
             .child(editing::status(
                 &editor.input,

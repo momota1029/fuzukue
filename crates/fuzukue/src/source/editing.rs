@@ -527,15 +527,17 @@ pub(crate) fn conflict_banner(
                 .child(tr!("editor-the-file-on-disk-changed")),
         )
         .child(h_flex().gap_1().flex_wrap().children(actions))
-        .children(diff.map(|diff| {
-            div()
-                .h_auto()
-                .max_h(px(160.))
-                .overflow_y_scrollbar()
-                .id("source-conflict-diff")
-                .font(crate::appearance::code_font(cx))
-                .children(diff.lines().map(|line| div().child(line.to_owned())))
-        }))
+        .children(diff.map(|diff| diff_view("source-conflict-diff", diff, cx)))
+}
+
+pub(crate) fn diff_view(id: &'static str, diff: String, cx: &App) -> impl IntoElement {
+    div()
+        .h_auto()
+        .max_h(px(160.))
+        .overflow_y_scrollbar()
+        .id(id)
+        .font(crate::appearance::code_font(cx))
+        .children(diff.lines().map(|line| div().child(line.to_owned())))
 }
 
 #[cfg(test)]

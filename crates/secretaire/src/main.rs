@@ -2143,12 +2143,12 @@ async fn serve_workspace(
                     let edited_deck = deck.clone();
                     let noting = app.clone();
                     let saved = tokio::task::spawn_blocking(move || {
-                        cards::save_card(&noting.project_dir, &edited_deck, &card, part, &body, &base_hash, Some(&noting))
+                        cards::save_card_with_build(&noting.project_dir, &edited_deck, &card, part, &body, &base_hash, Some(&noting))
                     }).await;
-                    let outcome = match saved {
-                        Ok(Ok(outcome)) => outcome,
-                        Ok(Err(e)) => CardSaveOutcome::Error { message: format!("{e:#}") },
-                        Err(e) => CardSaveOutcome::Error { message: e.to_string() },
+                    let (outcome, build) = match saved {
+                        Ok(Ok(saved)) => saved,
+                        Ok(Err(e)) => (CardSaveOutcome::Error { message: format!("{e:#}") }, None),
+                        Err(e) => (CardSaveOutcome::Error { message: e.to_string() }, None),
                     };
                     if matches!(outcome, CardSaveOutcome::Saved) {
                         // 保存するとカードの編集画面が閉じる。編集をやめた区切りとして扱う。
@@ -2157,6 +2157,14 @@ async fn serve_workspace(
                         }
                     }
                     let _ = reply.send(ServerEvent::CardSaveResult { request, outcome });
+                    if let Some(saved) = build {
+                        let app = app.clone();
+                        let reply = reply.clone();
+                        tokio::spawn(async move {
+                            let outcome = app.build_saved_card_tex(saved).await;
+                            let _ = reply.send(ServerEvent::CardTexBuildResult { request, outcome });
+                        });
+                    }
                 }
                 Ok(ClientMsg::RecordSourceFingerprint { request, deck, card, revision })
                     if protocol >= fuzukue_proto::TRANSLATION_DRIFT_PROTOCOL =>

@@ -207,6 +207,7 @@ struct Workbench {
     pending_paper_open: Option<(String, Option<String>, bool)>,
     paper_highlight: Option<(String, gpui_kit::Task<()>)>,
     card_editor: Option<paper_edit::CardEditor>,
+    card_tex_build: Option<paper_edit::CardTexBuild>,
     card_save_request: u64,
     translation_save_request: Option<u64>,
     paper_jobs: std::collections::BTreeMap<(String, Option<String>), String>,
@@ -726,6 +727,7 @@ impl Workbench {
             pending_paper_open: None,
             paper_highlight: None,
             card_editor: None,
+            card_tex_build: None,
             card_save_request: 0,
             translation_save_request: None,
             paper_jobs: Default::default(),
@@ -1629,6 +1631,7 @@ impl Workbench {
         self.pending_paper_open = None;
         self.paper_highlight = None;
         self.card_editor = None;
+        self.card_tex_build = None;
         self.active_tab = None;
         self.deck.clear();
         self.tabs.clear();
@@ -1827,6 +1830,7 @@ impl Workbench {
             ServerEvent::OpenPaper { session, deck, card } if session == self.active => {
                 self.open_paper_from_chat(deck, card, cx);
             }
+            ServerEvent::CardTexBuildResult { request, outcome } => self.on_card_tex_build_result(request, outcome),
             ServerEvent::CardSaveResult { request, outcome } => {
                 if self.translation_save_request == Some(request) {
                     self.on_translation_save_result(outcome);
