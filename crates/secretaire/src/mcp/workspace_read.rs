@@ -40,11 +40,13 @@ const READ_SCAN_BYTES: usize = 16 * 1024 * 1024;
 const LINE_WINDOW: usize = 400;
 const DEFAULT_START_LINE: usize = 1;
 const DEFAULT_DEPTH: usize = 1;
+const DEFAULT_LIST_RESULTS: usize = 500;
 // At least one scanned byte is needed per line.
 const READ_LINE: IntegerRange = IntegerRange::new(1, READ_SCAN_BYTES);
 const TAIL_LINES: IntegerRange = IntegerRange::new(1, LINE_WINDOW);
 const READ_BYTES: IntegerRange = IntegerRange::new(1, MAX_BYTES);
 const LIST_DEPTH: IntegerRange = IntegerRange::new(1, paths::SCAN_DEPTH);
+const LIST_RESULTS: IntegerRange = IntegerRange::new(1, DEFAULT_LIST_RESULTS);
 const DEADLINE: Duration = Duration::from_secs(5);
 const TRUNCATED: &str = "… [truncated]";
 
@@ -114,11 +116,12 @@ impl Tool {
             }
             Self::List => (
                 harness_text!(
-                    "Use instead of ls, ls -R, or find. Lists paths, types, sizes in bytes, and mtimes in Unix seconds without following symlinks. Use recursive=true for up to 64 levels, or specify depth. Try path=\"src\", depth=2, glob=\"*.rs\" to find Rust files.",
-                    "ls、ls -R、find の代わりに使う。パス、種類、バイト数、更新時刻（Unix 秒）を一覧する。シンボリックリンクはたどらない。recursive=true では 64 階層まで一覧し、depth で階層数を指定できる。たとえば path=\"src\"、depth=2、glob=\"*.rs\" で Rust ファイルを探す。"
+                    "Use instead of ls, ls -R, or find. Lists paths, types, sizes in bytes, and mtimes in Unix seconds without following symlinks. Use recursive=true for up to 64 levels, or specify depth. Try path=\"src\", depth=2, glob=\"*.rs\" to find Rust files. Use max_results or its alias limit to cap returned entries.",
+                    "ls、ls -R、find の代わりに使う。パス、種類、バイト数、更新時刻（Unix 秒）を一覧する。シンボリックリンクはたどらない。recursive=true では 64 階層まで一覧し、depth で階層数を指定できる。たとえば path=\"src\"、depth=2、glob=\"*.rs\" で Rust ファイルを探す。返す項目数の上限は max_results または別名の limit で指定する。"
                 ),
                 json!({"path": {"type": "string", "default": ".", "description": scoped_path}, "depth": LIST_DEPTH.property(DEFAULT_DEPTH),
                     "glob": {"type": "string"}, "recursive": {"type": "boolean", "default": false},
+                    "max_results": LIST_RESULTS.property(DEFAULT_LIST_RESULTS), "limit": LIST_RESULTS.schema(),
                     "include_hidden": {"type": "boolean", "default": false},
                     "include_ignored": {"type": "boolean", "default": false,
                         "description": harness_text!("Include target, node_modules, and the .git entry. Git metadata stays protected.",
@@ -285,6 +288,10 @@ struct ListArgs {
     path: PathBuf,
     #[serde(default, deserialize_with = "optional_integer")]
     depth: Option<i128>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    max_results: Option<i128>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    limit: Option<i128>,
     #[serde(default)]
     recursive: bool,
     glob: Option<String>,
@@ -297,6 +304,8 @@ struct ListArgs {
 fn list(scope: &ReadScope, args: ListArgs) -> Result<Value> {
     let default_depth = if args.recursive { paths::SCAN_DEPTH } else { DEFAULT_DEPTH };
     let depth = LIST_DEPTH.resolve(args.depth, default_depth);
+    ensure!(args.max_results.is_none() || args.limit.is_none(), "Use either max_results or limit (an alias for max_results)");
+    let max_results = LIST_RESULTS.resolve(args.max_results.or(args.limit), DEFAULT_LIST_RESULTS);
     let path = scope.resolve(&args.path).context("Invalid path")?;
     let file = paths::open(&path)?;
     ensure!(file.metadata()?.is_dir(), "Use fs_read to read a UTF-8 file. fs_list expects a directory.");
@@ -319,7 +328,7 @@ fn list(scope: &ReadScope, args: ListArgs) -> Result<Value> {
             let data = json!({"path": relative.to_string_lossy(), "type": entry.kind,
                 "size": entry.size, "mtime_unix_secs": entry.mtime_unix_secs});
             output_bytes += data.to_string().len();
-            if entries.len() >= 500 || output_bytes > MAX_BYTES {
+            if entries.len() >= max_results || output_bytes > MAX_BYTES {
                 return false;
             }
             entries.push(data);

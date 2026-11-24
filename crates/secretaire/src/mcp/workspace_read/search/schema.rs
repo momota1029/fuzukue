@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 
 use super::filters::{MAX_FILTERS, MAX_GLOB_BYTES, TYPES};
 use super::matcher::{MAX_PATTERNS, MAX_PATTERN_BYTES};
-use super::{CONTEXT, COUNT, DEFAULT_CONTEXT, DEFAULT_RESULTS, RESULTS};
+use super::{CONTEXT, COUNT, DEFAULT_CONTEXT, DEFAULT_RESULTS, MAX_PATHS, RESULTS};
 
 pub(in crate::mcp::workspace_read) fn definition(
     scoped_path: &str,
@@ -25,7 +25,15 @@ pub(in crate::mcp::workspace_read) fn definition(
     (
         description,
         json!({
-            "path": {"type": "string", "default": ".", "description": scoped_path},
+            "path": {"type": "string", "description": scoped_path},
+            "paths": {
+                "type": "array", "maxItems": MAX_PATHS,
+                "items": {"type": "string", "description": scoped_path},
+                "description": harness_text!(
+                    "Additional search roots, processed in order after path. Defaults to the working directory when no roots are supplied. With paths, results are grouped by root and include root-qualified paths. max_results applies to each root; byte and time limits apply to the whole search.",
+                    "追加の検索起点。path の後に指定順で検索する。起点を指定しない場合は作業ディレクトリを検索する。paths を指定すると、結果を起点順にまとめ、パスに起点を含める。max_results は起点ごと、バイト数と時間の上限は検索全体に適用する。"
+                )
+            },
             "pattern": pattern,
             "patterns": array(MAX_PATTERNS, pattern),
             "glob": glob,
@@ -71,8 +79,8 @@ pub(in crate::mcp::workspace_read) fn definition(
             "output_mode": {
                 "type": "string", "enum": ["content", "files_with_matches", "files_without_matches", "count", "files"], "default": "content",
                 "description": harness_text!(
-                    "Content returns matching lines and context, or substrings with only_matching. Count returns matching-line counts per matching file. The files modes return paths. Use files without a pattern. max_results caps returned rows.",
-                    "content は一致行と前後の行を返し、only_matching では一致部分を返す。count は一致したファイルごとの一致行数を返す。files 系モードはパスを返す。files ではパターンを省略する。max_results は返す行数の上限。"
+                    "Content returns matching lines and context, or substrings with only_matching. Count returns matching-line counts per matching file. The files modes return paths. Use files without a pattern. max_results caps returned rows per root.",
+                    "content は一致行と前後の行を返し、only_matching では一致部分を返す。count は一致したファイルごとの一致行数を返す。files 系モードはパスを返す。files ではパターンを省略する。max_results は起点ごとに返す行数の上限。"
                 )
             }
         }),

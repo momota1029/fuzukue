@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 
+const MAX_PATHS: usize = 16;
 const FILE_BYTES: usize = 1024 * 1024;
 const SEARCH_BYTES: usize = 32 * FILE_BYTES;
 const MATCH_TEXT_BYTES: usize = 1000;
@@ -34,8 +35,10 @@ pub(super) struct Args {
     pattern: Option<String>,
     #[serde(default)]
     patterns: Vec<String>,
-    #[serde(default = "dot")]
-    path: PathBuf,
+    #[serde(default, deserialize_with = "optional_string")]
+    path: Option<String>,
+    #[serde(default)]
+    paths: Vec<PathBuf>,
     glob: Option<String>,
     #[serde(default)]
     globs: Vec<String>,
@@ -134,10 +137,12 @@ fn candidates(
     scope: &ReadScope,
     args: &Args,
     filters: &Filters,
+    root: &Path,
+    base: PathBuf,
+    handle: File,
+    qualify: bool,
     deadline: Instant,
 ) -> Result<(Vec<Candidate>, Option<File>, bool)> {
-    let base = scope.resolve(&args.path).context("Invalid path")?;
-    let handle = paths::open(&base).context("Could not open path")?;
     let mut candidates = Vec::new();
     if !handle.metadata()?.is_dir() {
         if filters.matches(Path::new(
@@ -145,12 +150,12 @@ fn candidates(
         )) {
             paths::regular(&handle)?;
             if args.output_mode != OutputMode::Files {
-                paths::media(&args.path)?;
+                paths::media(root)?;
                 paths::media(&base)?;
             }
             candidates.push(Candidate {
                 path: base,
-                label: args.path.clone(),
+                label: root.to_path_buf(),
                 modified: (0, 0),
             });
         }
@@ -165,7 +170,7 @@ fn candidates(
             .strip_prefix(&base)
             .expect("scan returns descendants");
         if entry.kind == "file" && filters.matches(relative) {
-            let label = relative.into();
+            let label = if qualify { root.join(relative) } else { relative.into() };
             candidates.push(Candidate {
                 path: entry.path,
                 label,
@@ -226,13 +231,14 @@ struct Results {
     rows: Vec<Value>,
     bytes: usize,
     limit: usize,
+    root_start: usize,
     full: bool,
     truncated: bool,
 }
 
 impl Results {
     fn push(&mut self, make_row: impl FnOnce() -> Value) {
-        if self.full || self.rows.len() == self.limit {
+        if self.full || self.rows.len() - self.root_start == self.limit {
             self.full = true;
             self.truncated = true;
             return;
@@ -344,112 +350,144 @@ fn run(scope: &ReadScope, args: &Args) -> Result<Value> {
     } else {
         Some(Matcher::new(args)?)
     };
-    let (candidates, direct, complete) = candidates(scope, args, &filters, deadline)?;
+    ensure!(args.paths.len() <= MAX_PATHS, "paths accepts at most {MAX_PATHS} entries");
+    let mut roots: Vec<_> = args.path.iter().map(PathBuf::from)
+        .chain(args.paths.iter().cloned())
+        .collect();
+    if roots.is_empty() {
+        roots.push(dot());
+    }
+    // Check every explicit root before scanning so truncation cannot hide an invalid path.
+    let opened = roots.iter().map(|root| {
+        let base = scope.resolve_checked(root, false)
+            .with_context(|| format!("Invalid path {}", root.display()))?;
+        let handle = paths::open(&base)
+            .with_context(|| format!("Could not open path {}", root.display()))?;
+        Ok((base, handle))
+    }).collect::<Result<Vec<_>>>()?;
     let mut output = Results {
         rows: Vec::new(),
         bytes: 0,
         limit: RESULTS.resolve(args.max_results, DEFAULT_RESULTS),
+        root_start: 0,
         full: false,
-        truncated: !complete,
+        truncated: false,
     };
     let content = Content::new(args);
     let max_count = args
         .max_count
         .map_or(usize::MAX, |count| COUNT.clamp(count));
     let mut stats = Stats::default();
-    for candidate in candidates {
+    for (root, (base, handle)) in roots.iter().zip(opened) {
         if Instant::now() >= deadline {
             output.truncated = true;
             break;
         }
-        let label = candidate.label.to_string_lossy();
-        let Some(matcher) = &matcher else {
-            output.push(|| json!(label));
-            if output.full {
-                break;
-            }
-            continue;
-        };
-        if paths::media(&candidate.path).is_err() {
-            continue;
-        }
-        let read = if let Some(file) = &direct {
-            read_file(file, &mut stats.bytes_scanned).context("Could not read path")?
-        } else {
-            match scope
-                .audit_read(&candidate.path)
-                .and_then(|()| paths::open(&candidate.path))
-                .and_then(|file| read_file(&file, &mut stats.bytes_scanned))
-            {
-                Ok(read) => read,
-                Err(_) => {
-                    output.truncated = true;
-                    continue;
-                }
-            }
-        };
-        let bytes = match read {
-            FileRead::Skipped => continue,
-            FileRead::BudgetExceeded => {
+        scope.audit_read(&base)
+            .with_context(|| format!("Invalid path {}", root.display()))?;
+        let (candidates, direct, complete) =
+            candidates(scope, args, &filters, root, base, handle, !args.paths.is_empty(), deadline)
+                .with_context(|| format!("Could not search path {}", root.display()))?;
+        output.truncated |= !complete;
+        output.root_start = output.rows.len();
+        output.full = false;
+        for candidate in candidates {
+            if Instant::now() >= deadline {
                 output.truncated = true;
                 break;
             }
-            FileRead::Bytes(bytes) => bytes,
-        };
-        let Ok(text) = paths::text(&bytes) else {
-            continue;
-        };
-        stats.files_searched += 1;
-        let file = FileText::new(text);
-        let mut count = 0;
-        let mut last_counted = None;
-        let complete = matcher.visit(&file, deadline, |hit| {
-            if last_counted.is_none_or(|last| last < hit.first) {
-                if count == max_count {
+            let label = candidate.label.to_string_lossy();
+            let Some(matcher) = &matcher else {
+                output.push(|| json!(label));
+                if output.full {
+                    break;
+                }
+                continue;
+            };
+            if paths::media(&candidate.path).is_err() {
+                continue;
+            }
+            let read = if let Some(file) = &direct {
+                read_file(file, &mut stats.bytes_scanned).context("Could not read path")?
+            } else {
+                match scope
+                    .audit_read(&candidate.path)
+                    .and_then(|()| paths::open(&candidate.path))
+                    .and_then(|file| read_file(&file, &mut stats.bytes_scanned))
+                {
+                    Ok(read) => read,
+                    Err(_) => {
+                        output.truncated = true;
+                        continue;
+                    }
+                }
+            };
+            let bytes = match read {
+                FileRead::Skipped => continue,
+                FileRead::BudgetExceeded => {
                     output.truncated = true;
-                    return false;
+                    break;
                 }
-                count += 1;
-            }
-            last_counted = Some(last_counted.map_or(hit.last, |last| hit.last.max(last)));
-            if args.output_mode == OutputMode::Content
-                && (!args.only_matching || hit.text.is_some_and(|text| !text.is_empty()))
-            {
-                content.push(&mut output, &candidate.label, hit, &file.lines);
-            }
-            !matches!(
-                args.output_mode,
-                OutputMode::FilesWithMatches | OutputMode::FilesWithoutMatches
-            ) && (!output.full || args.stats)
-        });
-        output.truncated |= !complete;
-        stats.files_matched += usize::from(count != 0);
-        match args.output_mode {
-            OutputMode::FilesWithMatches if count != 0 => output.push(|| json!(label)),
-            OutputMode::FilesWithoutMatches if complete && count == 0 => {
-                output.push(|| json!(label))
-            }
-            OutputMode::Count if count != 0 => output.push(|| {
-                let mut row = json!({"count": count});
-                if args.with_path {
-                    row["path"] = json!(label);
+                FileRead::Bytes(bytes) => bytes,
+            };
+            let Ok(text) = paths::text(&bytes) else {
+                continue;
+            };
+            stats.files_searched += 1;
+            let file = FileText::new(text);
+            let mut count = 0;
+            let mut last_counted = None;
+            let complete = matcher.visit(&file, deadline, |hit| {
+                if last_counted.is_none_or(|last| last < hit.first) {
+                    if count == max_count {
+                        output.truncated = true;
+                        return false;
+                    }
+                    count += 1;
                 }
-                row
-            }),
-            _ => {}
-        }
-        if !complete || (output.full && !args.stats) {
-            break;
+                last_counted = Some(last_counted.map_or(hit.last, |last| hit.last.max(last)));
+                if args.output_mode == OutputMode::Content
+                    && (!args.only_matching || hit.text.is_some_and(|text| !text.is_empty()))
+                {
+                    content.push(&mut output, &candidate.label, hit, &file.lines);
+                }
+                !matches!(
+                    args.output_mode,
+                    OutputMode::FilesWithMatches | OutputMode::FilesWithoutMatches
+                ) && (!output.full || args.stats)
+            });
+            output.truncated |= !complete;
+            stats.files_matched += usize::from(count != 0);
+            match args.output_mode {
+                OutputMode::FilesWithMatches if count != 0 => output.push(|| json!(label)),
+                OutputMode::FilesWithoutMatches if complete && count == 0 => {
+                    output.push(|| json!(label))
+                }
+                OutputMode::Count if count != 0 => output.push(|| {
+                    let mut row = json!({"count": count});
+                    if args.with_path {
+                        row["path"] = json!(label);
+                    }
+                    row
+                }),
+                _ => {}
+            }
+            if !complete || (output.full && !args.stats) {
+                break;
+            }
         }
     }
 
     let mut response = json!({
-        "path": args.path,
+        "path": roots[0],
         (args.output_mode.result_key()): output.rows,
         "engine": "builtin",
         "truncated": output.truncated,
         "note": output.truncated.then_some(format!("{TRUNCATED} Narrow path, globs, pattern, or context.")),
     });
+    if !args.paths.is_empty() {
+        response["paths"] = json!(roots);
+    }
     if args.stats {
         stats.elapsed_ms = start.elapsed().as_millis();
         response["stats"] = json!(stats);

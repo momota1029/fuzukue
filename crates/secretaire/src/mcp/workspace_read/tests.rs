@@ -554,6 +554,71 @@ async fn listing_bounds_depth_hides_generated_entries_and_caps_results() -> Resu
 }
 
 #[tokio::test]
+async fn listing_accepts_and_clamps_both_result_limit_names() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    for i in 0..501 {
+        fs::write(f.worktree.join(format!("{i:03}.txt")), "")?;
+    }
+    for key in ["max_results", "limit"] {
+        for (value, expected) in [(json!(-1), 1), (json!(2), 2), (json!(u64::MAX), 500)] {
+            let result = Tool::List.call(scope.clone(), &json!({(key): value})).await?;
+            assert_eq!(result["entries"].as_array().unwrap().len(), expected);
+            assert_eq!(result["truncated"], true);
+            assert!(result["note"].as_str().unwrap().contains(TRUNCATED));
+        }
+        let result = Tool::List.call(scope.clone(), &json!({(key): 1, "glob": "000.txt"})).await?;
+        assert_eq!(result["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(result["truncated"], false);
+        let error = Tool::List.call(scope.clone(), &json!({(key): "1"})).await.unwrap_err();
+        assert!(format!("{error:#}").contains(&format!("Invalid {key}")));
+    }
+    let error = Tool::List.call(scope, &json!({"limit": 1, "max_results": 2})).await.unwrap_err();
+    assert!(format!("{error:#}").contains("Use either max_results or limit"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_merges_roots_with_independent_row_limits() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    for dir in ["first", "second"] {
+        fs::create_dir(f.worktree.join(dir))?;
+        fs::write(f.worktree.join(dir).join("a.txt"), "hit\nhit\n")?;
+    }
+    fs::write(f.worktree.join("third.txt"), "hit\n")?;
+
+    let merged = Tool::Search.call(scope.clone(), &json!({
+        "path": "first", "paths": ["second", "third.txt"],
+        "pattern": "hit", "max_results": 1, "stats": true,
+    })).await?;
+    assert_eq!(merged["paths"], json!(["first", "second", "third.txt"]));
+    let labels: Vec<_> = merged["matches"].as_array().unwrap().iter()
+        .map(|row| row["path"].as_str().unwrap()).collect();
+    assert_eq!(labels, ["first/a.txt", "second/a.txt", "third.txt"]);
+    assert_eq!(merged["truncated"], true);
+    assert!(merged["note"].as_str().unwrap().contains(TRUNCATED));
+    assert_eq!(merged["stats"]["files_searched"], 3);
+
+    let files = Tool::Search.call(scope.clone(), &json!({
+        "paths": ["second"], "output_mode": "files", "max_results": 1,
+    })).await?;
+    assert_eq!(files["files"], json!(["second/a.txt"]));
+    assert_eq!(files["truncated"], false);
+
+    let error = Tool::Search.call(scope.clone(), &json!({
+        "paths": vec!["first"; 17], "output_mode": "files",
+    })).await.unwrap_err();
+    assert!(format!("{error:#}").contains("paths accepts at most 16"));
+
+    let error = Tool::Search.call(scope, &json!({
+        "path": "first", "paths": ["../"], "output_mode": "files", "max_results": 1,
+    })).await.unwrap_err();
+    assert!(format!("{error:#}").contains("Invalid path ../"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn search_is_bounded_and_passes_option_like_patterns_as_data() -> Result<()> {
     let f = Fixture::new()?;
     fs::write(f.worktree.join("a.txt"), "above\r\n-HIT\r\nbelow\r\n-hit")?;
