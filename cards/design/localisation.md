@@ -1,3 +1,15 @@
+---
+id: localisation
+kind: design
+title: 多言語対応
+status: accepted
+files:
+  - crates/fuzukue-i18n
+  - crates/fuzukue/src/i18n.rs
+  - locales/ja
+  - locales/en
+---
+
 # 多言語対応
 
 デスクトップの既定言語は日本語。外観設定の「言語」で「システムに合わせる」「日本語」「English」を選べる。選択は同じ `settings.toml` の `locale` に保存する。キーのない設定ファイルも日本語で開く。OS 追従は `sys-locale` で Windows、macOS、Linux の優先言語を調べ、地域付きタグは親の言語も試す。一致する言語がない場合は日本語に戻る。選択を変えると開いている画面を再描画し、入力欄と gpui-kit の表示言語も更新する。

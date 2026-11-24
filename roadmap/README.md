@@ -1,6 +1,6 @@
 # fuzukue 開発ロードマップ
 
-受付は作業を始める前に、`graph_overview` でデッキ `roadmap` を開き、章「作業の優先順」を `depth: 2` と `chapter` で指定して上から読む。`next_offset` があれば続きを開く。各カードの `requires` は `graph_neighbors` の出方向（`edge_types: ["requires"]`）で確認できる。依存をたどるときは、たとえば `graph_path` で `roadmap#R-25` から `roadmap#R-07` への経路を見る。
+受付は作業を始める前に、`graph_overview` でデッキ `roadmap` を開き、章「作業の優先順」に続いて章「技術的負債」を読む。`depth: 2` と `chapter` を指定し、それぞれ上から確認する。`next_offset` があれば続きを開く。各カードの `requires` は `graph_neighbors` の出方向（`edge_types: ["requires"]`）で確認できる。依存をたどるときは、たとえば `graph_path` で `roadmap#R-25` から `roadmap#R-07` への経路を見る。
 
 次の候補は、未完了で `requires` の参照先がすべて `done` のカード。前提が空ならこの条件を満たす。候補のうち `doing` は進行中、`todo` は着手できる作業。保留の `hold` と利用者の結果・操作待ちの `blocked-on-user` は、待ちの理由が解消してから進める。
 
