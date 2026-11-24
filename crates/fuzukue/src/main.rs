@@ -10,6 +10,7 @@ mod i18n;
 mod agent_management;
 mod agent_models;
 mod appearance;
+mod approval_dock;
 mod notifications;
 mod card_reading;
 mod chat;
@@ -124,6 +125,7 @@ struct Workbench {
     shot_activity: Option<shot::Activity>,
     appearance: Appearance,
     notifications: notifications::Notifications,
+    approvals: approval_dock::ApprovalDock,
     settings_open: bool,
     trash_items: Option<Vec<fuzukue_proto::TrashItem>>,
     trash_error: Option<String>,
@@ -619,6 +621,7 @@ impl Workbench {
             shot_activity: None,
             appearance,
             notifications,
+            approvals: Default::default(),
             settings_open: false,
             trash_items: None,
             trash_error: None,
@@ -1329,6 +1332,7 @@ impl Workbench {
     fn switch_session(&mut self, session: String, cx: &mut Context<Self>) {
         self.chat(&session, cx);
         if self.active != session {
+            self.approvals.clear_controls();
             self.pending_paper_open = None;
             self.github.unread.remove(&self.active);
             if let Some(chat) = self.chats.get_mut(&self.active) {
@@ -1343,6 +1347,9 @@ impl Workbench {
                     chat.discard_transcript_layout();
                 }
             }
+        }
+        if !self.transcripts.scoped && self.active != session {
+            self.restore_approval_notices(&session, cx);
         }
         self.active = session;
         self.request_thread_tail();
@@ -1364,9 +1371,11 @@ impl Workbench {
                     self.status = ConnectionStatus::Connected;
                 }
             }
+            ConnEvent::ApprovalQueueAvailable(available) => self.approvals.available = available,
             ConnEvent::AdvertisedTranscriptCache(cached) => self.advertised_transcript_cache(cached),
             ConnEvent::OwnedServerStopped => self.owned_server_stopped(window, cx),
             ConnEvent::Disconnected(e) => {
+                self.approvals.disconnect();
                 self.agent_models.disconnect();
                 self.chat_waiting = Default::default();
                 for chat in self.chats.values_mut() {
@@ -1404,6 +1413,7 @@ impl Workbench {
             ConnEvent::Status(message) => self.status = ConnectionStatus::Detail(message),
             ConnEvent::Reset(http) => {
                 self.notifications.reset_connection();
+                self.approvals = Default::default();
                 self.question_drafts.clear();
                 self.workspaces = Default::default();
                 self.out.select_workspace(None);
@@ -1480,8 +1490,16 @@ impl Workbench {
                             if replay || self.workspaces.active.as_deref() != Some(id.as_str()) {
                                 self.receiving_backlog = true;
                             }
+                            let changed = self.workspaces.active.as_ref() != Some(&id);
                             self.workspace_selected(id, replay, window, cx);
+                            if changed || !self.approvals.ready() {
+                                self.approvals.clear_controls();
+                                self.refresh_approvals();
+                            }
                         }
+                        ServerEvent::ApprovalQueue { request, result } => self.approvals.snapshot(request, result),
+                        ServerEvent::ApprovalQueueChanged { approval } => self.approval_changed(approval, false, window, cx),
+                        ServerEvent::ApprovalDecisionResult { request, result } => self.approval_result(request, result, window, cx),
                         ServerEvent::Workspaces { workspaces } => self.workspaces.entries = workspaces,
                         ServerEvent::WorkspaceDirectory { request, result } => self.workspace_directory(request, result, window, cx),
                         ServerEvent::FileList { request, result } => self.on_file_list(request, result),
@@ -2236,6 +2254,7 @@ impl Render for Workbench {
                         .text_sm().text_color(theme.muted_foreground).child(tr!("workbench-loading")))
                     .when(!loading, |pane| pane.child(self.render_chat(window, cx))))
                 .child(self.render_chat_footer(window, cx))
+                .children(self.render_approval_dock(window, cx))
                 .child(
                     chat::chat_column().pt_2().pb_5()
                         .child(self.render_composer(window, cx))

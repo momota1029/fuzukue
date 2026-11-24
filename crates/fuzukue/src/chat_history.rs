@@ -95,6 +95,7 @@ impl Workbench {
             chat.restore_transcript_position(position);
         }
         self.out.cache_transcript(&session, Some(generation));
+        self.restore_approval_notices(&session, cx);
         if session == self.active {
             self.github_view();
         }

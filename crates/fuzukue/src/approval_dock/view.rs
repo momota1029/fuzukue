@@ -1,0 +1,332 @@
+use gpui_kit::{
+    component::{h_flex, scroll::Scrollbar, v_flex, ActiveTheme as _, Theme},
+    div, prelude::*, px, AnyElement, Context, Div, FontWeight, Pixels, Role, ScrollHandle, SharedString,
+    Stateful, Window,
+};
+
+use super::*;
+use crate::{appearance::ThemeSurfaces, chat::chat_column};
+
+const ROW_BUTTONS: [&str; 4] = ["details", "select", "allow", "deny"];
+const DOCK_BUTTONS: [&str; 8] = [
+    "toggle", "retry", "bulk-allow", "bulk-deny", "back", "confirm", "dismiss", "cancel-selection",
+];
+
+#[derive(Clone, Copy)]
+enum Tone {
+    Default,
+    Primary,
+}
+
+fn risk_badge(risk: ApprovalRisk, theme: &Theme) -> Div {
+    let (ja, en) = risk_labels(risk);
+    let color = match risk {
+        ApprovalRisk::Low => theme.muted_foreground,
+        ApprovalRisk::Mid => theme.warning,
+        ApprovalRisk::High => theme.danger,
+    };
+    div().flex_none().px_1().rounded_md().bg(theme.secondary)
+        .text_xs().text_color(color).child(label(ja, en))
+}
+
+fn field(title: &str, value: String, theme: &Theme) -> Div {
+    div().min_w_0().text_sm().whitespace_normal().child(
+        div().text_color(theme.muted_foreground).child(title.to_owned()),
+    ).child(value)
+}
+
+fn decision_count(count: usize, ja: &str, en: &str) -> String {
+    if crate::i18n::current() == fuzukue_i18n::Locale::JAPANESE {
+        format!("{count}件{ja}")
+    } else {
+        format!("{count} {en}")
+    }
+}
+
+fn feedback_text(feedback: &Feedback) -> Option<String> {
+    let mut parts = Vec::new();
+    if feedback.bulk {
+        parts.push(decision_count(feedback.applied, "反映", "applied"));
+    }
+    if feedback.conflicts > 0 {
+        parts.push(decision_count(feedback.conflicts, "はすでに解決済み", "already resolved"));
+    }
+    if feedback.interrupted > 0 {
+        parts.push(decision_count(feedback.interrupted, "は送信結果を確認できず", "could not be confirmed"));
+    }
+    parts.extend(feedback.errors.iter().cloned());
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+impl Workbench {
+    pub(crate) fn render_approval_dock(
+        &mut self, window: &mut Window, cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.active.is_empty() || !self.approvals.available {
+            return None;
+        }
+        let feedback = self.approvals.feedback.get(&self.active).and_then(feedback_text);
+        let ids: Vec<_> = self.approvals.thread(&self.active).map(|item| item.approval_id.clone()).collect();
+        if ids.is_empty() && self.approvals.queue_error.is_none() && self.approvals.review.is_none()
+            && self.approvals.submitted.as_ref().is_none_or(|submission| submission.thread != self.active)
+            && feedback.is_none()
+        {
+            return None;
+        }
+
+        for action in DOCK_BUTTONS {
+            self.approval_focus("", action, cx);
+        }
+        for id in &ids {
+            for action in ROW_BUTTONS {
+                self.approval_focus(id, action, cx);
+            }
+        }
+
+        let groups = self.approvals.groups(&self.active);
+        let focused = window.focused(cx);
+
+        let theme = cx.theme();
+        let heading = decision_count(ids.len(), "の承認待ち", "pending");
+        let first = self.approvals.thread(&self.active).next();
+        let expanded = !self.approvals.collapsed;
+        let reviewing = self.approvals.review.is_some();
+        let header = h_flex().w_full().min_w_0().gap_2().items_center().flex_wrap()
+            .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_sm().child(heading))
+            .children(first.map(|item| div().min_w_0().flex_1().truncate().text_sm()
+                .text_color(theme.muted_foreground).child(format!("{} · {}", item.action.tool, target(item)))))
+            .when(!ids.is_empty() && !reviewing, |header| header.child(self.dock_button(
+                "", "toggle", if expanded { label("折りたたむ", "Collapse") } else { label("展開", "Expand") },
+                true, Tone::Default, cx,
+                |this, _, cx| { this.approvals.collapsed = !this.approvals.collapsed; cx.notify(); },
+            ).aria_expanded(expanded)));
+
+        let body_height = (window.viewport_size().height * 0.34).min(px(252.));
+        let mut dock = v_flex().id("approval-dock").w_full().min_w_0().gap_1().p_2().flex_none()
+            .rounded_md().border_1().border_color(theme.border).bg(theme.secondary)
+            .role(Role::Region).aria_label(label("承認ドック", "Approval dock"))
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                if event.keystroke.key != "escape" || event.keystroke.modifiers.number_of_modifiers() != 0 {
+                    return;
+                }
+                if !this.cancel_batch(window, cx) {
+                    let Some(id) = this.approvals.detail.take() else { return };
+                    let focus = this.approval_focus(&id, "details", cx);
+                    focus.focus(window, cx);
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }))
+            .child(header);
+
+        if let Some(review) = &self.approvals.review {
+            dock = dock.child(self.render_review(review, body_height, cx));
+        } else if expanded && !ids.is_empty() {
+            let selected = self.approvals.selected_requests(&self.active);
+            let mut rows = Self::dock_scroll(&self.approvals.scroll, body_height);
+            for group in groups {
+                for (index, item) in group.into_iter().enumerate() {
+                    rows = rows.child(self.render_request(item, index == 0, selected.first().copied(), cx));
+                }
+            }
+            dock = dock
+                .child(self.scrollbar(rows))
+                .children((selected.len() >= 2).then(|| self.render_bulk_controls(selected.len(), cx)));
+        }
+        if let Some(error) = &self.approvals.queue_error {
+            dock = dock.child(h_flex().gap_2().flex_wrap()
+                .child(div().min_w_0().text_sm().text_color(theme.danger).child(error.clone()))
+                .child(self.dock_button("", "retry", label("再取得", "Retry"), true, Tone::Default, cx,
+                    |this, _, cx| { this.refresh_approvals(); cx.notify(); })));
+        }
+        if let Some(submission) = self.approvals.submitted.as_ref().filter(|item| item.thread == self.active) {
+            let count = submission.outstanding.len();
+            dock = dock.child(div().text_sm().text_color(theme.muted_foreground)
+                .child(decision_count(count, "の結果を待機中", "awaiting a result")));
+        }
+        if let Some(feedback) = feedback {
+            dock = dock.child(h_flex().gap_2().items_start().flex_wrap()
+                .child(div().min_w_0().text_sm().text_color(theme.muted_foreground).child(feedback))
+                .child(self.dock_button("", "dismiss", label("閉じる", "Dismiss"), true, Tone::Default, cx,
+                    |this, _, cx| { this.approvals.feedback.remove(&this.active); cx.notify(); })));
+        }
+        self.approvals.last_focus = focused;
+        Some(chat_column().pt_1().flex_none().child(dock).into_any_element())
+    }
+
+    fn dock_scroll(scroll: &ScrollHandle, height: Pixels) -> Stateful<Div> {
+        v_flex().id("approval-dock-scroll").w_full().min_w_0().max_h(height)
+            .overflow_y_scroll().track_scroll(scroll).gap_1().pr_3()
+    }
+
+    fn scrollbar(&self, rows: Stateful<Div>) -> Div {
+        div().relative().w_full().min_w_0().child(rows)
+            .child(Scrollbar::vertical(&self.approvals.scroll))
+    }
+
+    fn render_request(
+        &self, item: &ApprovalSummary, first_in_job: bool, selected_kind: Option<&ApprovalSummary>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let id = &item.approval_id;
+        let detail = self.approvals.detail.as_ref() == Some(id);
+        let selected = self.approvals.selected.contains(id);
+        let allow = id.clone();
+        let deny = id.clone();
+        let disclosure = id.clone();
+        let select = id.clone();
+        let scope = json(&item.action.scope);
+        let surface = ThemeSurfaces::for_mode(theme.mode);
+
+        let controls = h_flex().gap_1().items_center().flex_wrap()
+            .child(self.dock_button(
+                id, "details", label("詳細", "Details"), true, Tone::Default, cx,
+                move |this, _, cx| {
+                    this.approvals.detail = (this.approvals.detail.as_ref() != Some(&disclosure)).then(|| disclosure.clone());
+                    cx.notify();
+                },
+            ).aria_expanded(detail))
+            .children((same_batch(item, item) && selected_kind.is_none_or(|first| same_batch(first, item))).then(|| {
+                self.dock_button(
+                    id, "select", if selected { label("選択解除", "Deselect") } else { label("選択", "Select") },
+                    self.can_decide(), Tone::Default, cx,
+                    move |this, _, cx| { this.toggle_selection(&select); cx.notify(); },
+                ).aria_selected(selected)
+            }))
+            .child(self.dock_button(
+                id, "allow", decision_label(ALLOW), self.can_decide(), Tone::Primary, cx,
+                move |this, _, cx| {
+                    this.decide_one(&allow, ALLOW);
+                    cx.notify();
+                },
+            ))
+            .child(self.dock_button(
+                id, "deny", decision_label(DENY), self.can_decide(), Tone::Default, cx,
+                move |this, _, cx| {
+                    this.decide_one(&deny, DENY);
+                    cx.notify();
+                },
+            ));
+
+        let args = &item.action.args;
+        let details = detail.then(|| {
+            let diff = args.get("diff").or_else(|| item.action.scope.get("diff"));
+            v_flex().id("approval-request-details").w_full().gap_1().p_2().rounded_md().bg(surface.code)
+                .child(field(label("依頼元", "Requester"), item.owner.requester.clone(), theme))
+                .child(field(label("許可の有効範囲", "Grant scope"), label("この操作を一度だけ", "This action once").to_owned(), theme))
+                .child(field(label("範囲", "Scope"), scope.clone(), theme))
+                .child(field(label("引数", "Arguments"), serde_json::to_string_pretty(args).unwrap_or_else(|_| json(args)), theme))
+                .children(diff.map(|diff| field(label("差分", "Diff"), json(diff), theme)))
+        });
+
+        v_flex().w_full().min_w_0().gap_1()
+            .children(first_in_job.then(|| div().text_sm().font_weight(FontWeight::SEMIBOLD).min_w_0().truncate()
+                .text_color(theme.muted_foreground)
+                .child(format!("{} · {}", label("ジョブ", "Job"), item.owner.job))))
+            .child(
+                v_flex().id(SharedString::from(format!("approval-row-{id}")))
+                    .role(Role::Group).aria_label(format!("{} · {}", item.action.tool, target(item)))
+                    .w_full().min_w_0().gap_1().p_2().rounded_md()
+                    .border_1().border_color(if selected { theme.ring } else { theme.border }).bg(theme.popover)
+                    .child(h_flex().min_w_0().justify_between().items_start().gap_2()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).min_w_0().truncate().child(item.action.tool.clone()))
+                        .child(risk_badge(item.risk, theme)))
+                    .child(div().text_sm().min_w_0().whitespace_normal().child(target(item)))
+                    .child(div().text_xs().min_w_0().truncate().text_color(theme.muted_foreground)
+                        .child(format!("{} · {scope}", label("範囲", "Scope"))))
+                    .child(div().text_sm().min_w_0().whitespace_normal().child(item.reason.clone()))
+                    .child(div().text_xs().text_color(theme.muted_foreground)
+                        .child(format!("{} · {}", label("期限", "Expires"), expiry(item))))
+                    .child(controls)
+                    .children(details),
+            )
+    }
+
+    fn decide_one(&mut self, id: &str, decision: ApprovalDecision) {
+        if self.approvals.thread(&self.active).any(|item| item.approval_id == id) {
+            self.submit_approvals(vec![id.to_owned()], decision, Feedback::default());
+        }
+    }
+
+    fn render_bulk_controls(&self, count: usize, cx: &Context<Self>) -> impl IntoElement {
+        h_flex().gap_1().items_center().flex_wrap()
+            .child(div().text_sm().child(decision_count(count, "を選択中", "selected")))
+            .child(self.dock_button("", "bulk-allow", label("一括許可", "Allow selected"), self.can_decide(),
+                Tone::Default, cx, |this, window, cx| { this.review_batch(ALLOW, window, cx); cx.notify(); }))
+            .child(self.dock_button("", "bulk-deny", label("一括拒否", "Deny selected"), self.can_decide(),
+                Tone::Default, cx, |this, window, cx| { this.review_batch(DENY, window, cx); cx.notify(); }))
+            .child(self.dock_button("", "cancel-selection", label("選択を解除", "Clear selection"), true,
+                Tone::Default, cx, |this, _, cx| { this.approvals.selected.clear(); cx.notify(); }))
+    }
+
+    fn render_review(&self, review: &Review, height: Pixels, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let rows = Self::dock_scroll(&self.approvals.scroll, height).children(review.requests.iter().map(|item| {
+            let still_pending = self.approvals.thread(&self.active).any(|current| current.approval_id == item.approval_id);
+            v_flex().gap_1().p_2().rounded_md().bg(theme.popover)
+                .child(field(label("対象", "Target"), target(item), theme))
+                .child(field(label("範囲", "Scope"), json(&item.action.scope), theme))
+                .children((!still_pending).then(|| div().text_sm().text_color(theme.warning)
+                    .child(label("解決済み", "Already resolved"))))
+        }));
+        v_flex().id("approval-bulk-review").gap_1()
+            .child(div().font_weight(FontWeight::SEMIBOLD).text_sm().child(format!("{} · {} · {}",
+                decision_label(review.decision), review.requests[0].action.tool,
+                decision_count(review.requests.len(), "の依頼", "requests"))))
+            .child(self.scrollbar(rows))
+            .child(h_flex().gap_1().flex_wrap()
+                .child(self.dock_button("", "back", label("戻る", "Back"), true, Tone::Default, cx,
+                    |this, window, cx| { this.cancel_batch(window, cx); cx.notify(); }))
+                .child(self.dock_button("", "confirm", label("確定", "Confirm"), self.can_decide(),
+                    Tone::Primary, cx, |this, window, cx| { this.confirm_batch(window, cx); cx.notify(); })))
+    }
+
+    fn dock_button(
+        &self, item: &str, action: &'static str, title: &'static str, enabled: bool, tone: Tone,
+        cx: &Context<Self>, on_click: impl Fn(&mut Workbench, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let theme = cx.theme();
+        let id = if item.is_empty() { format!("approval-{action}") } else { format!("approval-{action}-{item}") };
+        let (fill, text, hover) = match tone {
+            Tone::Primary => (theme.button_primary, theme.button_primary_foreground, theme.button_primary_hover),
+            Tone::Default => (theme.button, theme.button_foreground, theme.button_hover),
+        };
+        let focus = &self.approvals.focus[&(item.to_owned(), action)];
+        let mut button = div();
+        if enabled && !item.is_empty() && self.approvals.last_focus.as_ref() != Some(focus) {
+            let focus = focus.clone();
+            let scroll = self.approvals.scroll.clone();
+            button = button.on_children_prepainted(move |children, window, cx| {
+                if !focus.is_focused(window) {
+                    return;
+                }
+                let [label] = children.as_slice() else { return };
+                let bounds = scroll.bounds();
+                let top = label.top() - px(4.);
+                let bottom = label.bottom() + px(4.);
+                let delta = (bounds.top() - top).max(px(0.)) + (bounds.bottom() - bottom).min(px(0.));
+                if delta != px(0.) {
+                    let scroll = scroll.clone();
+                    window.defer(cx, move |window, _| {
+                        let mut offset = scroll.offset();
+                        offset.y += delta;
+                        scroll.set_offset(offset);
+                        window.refresh();
+                    });
+                }
+            });
+        }
+        button.id(SharedString::from(id)).role(Role::Button).aria_label(title).flex_none()
+            .rounded_md().border_1().border_color(theme.border).bg(fill).text_color(text)
+            .px_2().py_0p5().text_xs().child(title)
+            .when(!enabled, |button| button.opacity(0.5))
+            .when(enabled, |button| {
+                let ring = theme.ring;
+                button.track_focus(focus).tab_index(0).cursor_pointer()
+                    .focus_visible(move |style| style.border_color(ring))
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+            })
+    }
+}

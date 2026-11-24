@@ -21,6 +21,7 @@ type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 pub enum ConnEvent {
     Connected,
     AdvertisedTranscriptCache(Vec<CachedSession>),
+    ApprovalQueueAvailable(bool),
     Disconnected(String),
     OwnedServerStopped,
     Status(String),
@@ -837,6 +838,10 @@ impl Worker {
         }
 
         let mut welcomed = false;
+        let mut approval_queue = false;
+        let mut approvals_armed = false;
+        let mut approval_snapshot = None;
+        let mut approval_workspace_seen = false;
         let mut scoped = false;
         let mut synced = false;
         loop {
@@ -853,6 +858,20 @@ impl Worker {
                             ClientMsg::InWorkspace { request, .. } => request.as_ref(),
                             request => request,
                         };
+                        // Decisions left in the channel by a broken connection must not be
+                        // sent before this connection's fresh pending snapshot request.
+                        let selected_workspace = matches!(&msg,
+                            ClientMsg::InWorkspace { id, .. } if Some(id) == cursor.workspace.as_ref());
+                        match request {
+                            ClientMsg::ListPendingApprovals { request }
+                                if approval_queue && approval_workspace_seen && selected_workspace =>
+                            {
+                                approval_snapshot = Some(*request);
+                            }
+                            ClientMsg::ListPendingApprovals { .. } => continue,
+                            ClientMsg::DecideApproval { .. } if !approvals_armed || !selected_workspace => continue,
+                            _ => {}
+                        }
                         if matches!(request, ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { generation: Some(_), .. })
                             && !synced
                         {
@@ -861,7 +880,7 @@ impl Worker {
                         #[cfg(all(target_os = "linux", feature = "headless-shot"))]
                         if _target.shot_read_only == Some(true) && !matches!(
                             request,
-                            ClientMsg::SetLocale { .. } | ClientMsg::SelfUpdateStatus | ClientMsg::ListExtensions | ClientMsg::ListTests | ClientMsg::LookupSymbol { .. } | ClientMsg::SearchDecks { .. } | ClientMsg::SearchLibrary { .. } | ClientMsg::GetThreadArtifacts { .. } | ClientMsg::ListWorkspaces | ClientMsg::BrowseWorkspace { .. } | ClientMsg::ListFiles { .. } | ClientMsg::FindFiles { .. } | ClientMsg::ResolveFile { .. } | ClientMsg::ListAgents | ClientMsg::GetAgentStats | ClientMsg::GetAgentHistory { .. } | ClientMsg::GetPaperPdfMap { .. }
+                            ClientMsg::ListPendingApprovals { .. } | ClientMsg::SetLocale { .. } | ClientMsg::SelfUpdateStatus | ClientMsg::ListExtensions | ClientMsg::ListTests | ClientMsg::LookupSymbol { .. } | ClientMsg::SearchDecks { .. } | ClientMsg::SearchLibrary { .. } | ClientMsg::GetThreadArtifacts { .. } | ClientMsg::ListWorkspaces | ClientMsg::BrowseWorkspace { .. } | ClientMsg::ListFiles { .. } | ClientMsg::FindFiles { .. } | ClientMsg::ResolveFile { .. } | ClientMsg::ListAgents | ClientMsg::GetAgentStats | ClientMsg::GetAgentHistory { .. } | ClientMsg::GetPaperPdfMap { .. }
                                 | ClientMsg::ReviewReports { action: fuzukue_proto::ReviewReportsAction::List, .. }
                                 | ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { .. }
                                  | ClientMsg::GitHubReport { action: fuzukue_proto::GitHubReportAction::Status, .. }
@@ -889,6 +908,10 @@ impl Worker {
                                 cursor.seq = None;
                                 return Ok(Transfer::RetryLegacy);
                             }
+                            approval_queue = welcome_capabilities(&t)?.approval_queue;
+                            if !self.emit(ConnEvent::ApprovalQueueAvailable(approval_queue)) {
+                                return Ok(Transfer::Control(Control::Stop));
+                            }
                             welcomed = true;
                             scoped = *selection_scoped_transcripts;
                             if scoped {
@@ -897,6 +920,9 @@ impl Worker {
                                     return Ok(Transfer::Control(Control::Stop));
                                 }
                             }
+                        }
+                        ServerEvent::ApprovalQueue { request, result: Ok(_) } if approval_snapshot == Some(*request) => {
+                            approvals_armed = true;
                         }
                         ServerEvent::ThreadSync { .. } => synced = scoped,
                         ServerEvent::ServerSwapNotice => {
@@ -914,6 +940,11 @@ impl Worker {
                         _ => {}
                     }
                     if let ServerEvent::WorkspaceSelected { id, replay } = &env.event {
+                        if !approval_workspace_seen || cursor.workspace.as_ref() != Some(id) {
+                            approvals_armed = false;
+                            approval_snapshot = None;
+                        }
+                        approval_workspace_seen = true;
                         if *replay || cursor.workspace.as_deref() != Some(id) {
                             synced = false;
                         }
@@ -1033,6 +1064,14 @@ mod tests {
             }).detach();
         });
     }
+}
+
+fn welcome_capabilities(frame: &str) -> serde_json::Result<fuzukue_proto::WelcomeCapabilities> {
+    #[derive(serde::Deserialize)]
+    struct Welcome {
+        event: fuzukue_proto::WelcomeCapabilities,
+    }
+    serde_json::from_str::<Welcome>(frame).map(|welcome| welcome.event)
 }
 
 fn send(ws: &mut Socket, msg: &ClientMsg) -> anyhow::Result<()> {

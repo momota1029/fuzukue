@@ -615,9 +615,11 @@ impl Workbench {
 
         let indicator_id = id.clone();
         let intake = self.intake_badge(thread, cx);
-        let indicators = (thread.github.unread > 0 || goal.is_some() || intake.is_some()).then(|| h_flex()
+        let approvals = self.approval_count(&thread.id);
+        let indicators = (approvals > 0 || thread.github.unread > 0 || goal.is_some() || intake.is_some()).then(|| h_flex()
             .id("thread-indicators")
             .flex_none().gap(SIDEBAR_ICON_GAP).cursor_pointer()
+            .children((approvals > 0).then(|| self.approval_badge(approvals, cx)))
             .children((thread.github.unread > 0).then(|| {
                 div().flex_none().px_1().rounded_md().bg(theme.secondary).text_xs()
                     .child(tr!("github-unread", count = thread.github.unread))
@@ -627,6 +629,9 @@ impl Workbench {
             .on_click(cx.listener(move |this, _, window, cx| {
                 focus.focus(window, cx);
                 this.select_thread(indicator_id.clone(), cx);
+                if approvals > 0 {
+                    this.reveal_approval_dock();
+                }
             })));
 
         let view = cx.weak_entity();

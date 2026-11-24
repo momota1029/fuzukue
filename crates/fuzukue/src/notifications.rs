@@ -20,22 +20,22 @@ use policy::{Action, Destination, Kind, Policy, Settings, Thread};
 #[derive(Default)]
 struct Routes {
     next: u64,
-    active: VecDeque<(u64, Destination)>,
+    active: VecDeque<(u64, Destination, Kind)>,
 }
 
 impl Routes {
-    fn insert(&mut self, target: Destination) -> u64 {
+    fn insert(&mut self, target: Destination, kind: Kind) -> u64 {
         self.next += 1;
         if self.active.len() >= 64 {
             self.active.pop_front();
         }
-        self.active.push_back((self.next, target));
+        self.active.push_back((self.next, target, kind));
         self.next
     }
 
-    fn take(&mut self, id: u64) -> Option<Destination> {
-        let index = self.active.iter().position(|(key, _)| *key == id)?;
-        self.active.remove(index).map(|(_, target)| target)
+    fn take(&mut self, id: u64) -> Option<(Destination, Kind)> {
+        let index = self.active.iter().position(|(key, _, _)| *key == id)?;
+        self.active.remove(index).map(|(_, target, kind)| (target, kind))
     }
 }
 
@@ -44,7 +44,7 @@ pub(super) struct Notifications {
     settings: Settings,
     policy: Policy,
     routes: Routes,
-    pending: Option<Thread>,
+    pending: Option<(Thread, Kind)>,
     backend: Platform,
     sender: mpsc::UnboundedSender<Event>,
     isolated: bool,
@@ -177,7 +177,7 @@ impl Workbench {
         }
         if !state.isolated {
             let id = if outputs.banner {
-                state.routes.insert(target)
+                state.routes.insert(target, kind)
             } else {
                 0
             };
@@ -198,25 +198,25 @@ impl Workbench {
     fn notification_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Clicked(id) => {
-                let Some(target) = self.notifications.routes.take(id) else {
+                let Some((target, kind)) = self.notifications.routes.take(id) else {
                     return;
                 };
                 window.activate_window();
                 if let Destination::Thread(thread) = &target {
                     if self.workspaces.pending {
-                        self.notifications.pending = Some(thread.clone());
+                        self.notifications.pending = Some((thread.clone(), kind));
                         return;
                     }
                 }
                 match target.action(self.workspaces.active.as_deref()) {
-                    Action::Select(session) => self.select_notification_thread(session, cx),
+                    Action::Select(session) => self.select_notification_thread(session, kind, cx),
                     Action::Switch(workspace) => {
                         let Destination::Thread(thread) = target.clone() else {
                             return;
                         };
                         self.switch_workspace(workspace.to_owned(), cx);
                         if self.workspaces.pending {
-                            self.notifications.pending = Some(thread);
+                            self.notifications.pending = Some((thread, kind));
                         }
                     }
                     Action::Update => {
@@ -233,13 +233,16 @@ impl Workbench {
         cx.notify();
     }
 
-    fn select_notification_thread(&mut self, session: &str, cx: &mut Context<Self>) {
+    fn select_notification_thread(&mut self, session: &str, kind: Kind, cx: &mut Context<Self>) {
         if self
             .threads
             .iter()
             .any(|thread| thread.id == session && !thread.archived)
         {
             self.select_thread(session.to_owned(), cx);
+            if kind == Kind::Thread(NotificationKind::Approval) {
+                self.reveal_approval_dock();
+            }
         }
     }
 
@@ -247,15 +250,15 @@ impl Workbench {
         if self.workspaces.pending {
             return;
         }
-        let Some(thread) = self.notifications.pending.take() else {
+        let Some((thread, kind)) = self.notifications.pending.take() else {
             return;
         };
         if self.workspaces.active.as_deref() == Some(&thread.workspace) {
-            self.select_notification_thread(&thread.session, cx);
+            self.select_notification_thread(&thread.session, kind, cx);
         } else {
             self.switch_workspace(thread.workspace.clone(), cx);
             if self.workspaces.pending {
-                self.notifications.pending = Some(thread);
+                self.notifications.pending = Some((thread, kind));
             }
         }
     }
@@ -429,11 +432,12 @@ mod tests {
             workspace: "lab".into(),
             session: "a".into(),
         });
-        let thread_id = routes.insert(target.clone());
-        let test_id = routes.insert(Destination::Test);
-        assert_eq!(routes.take(thread_id), Some(target));
+        let kind = Kind::Thread(NotificationKind::Approval);
+        let thread_id = routes.insert(target.clone(), kind);
+        let test_id = routes.insert(Destination::Test, Kind::Test);
+        assert_eq!(routes.take(thread_id), Some((target, kind)));
         assert_eq!(routes.take(thread_id), None);
-        assert_eq!(routes.take(test_id), Some(Destination::Test));
+        assert_eq!(routes.take(test_id), Some((Destination::Test, Kind::Test)));
     }
 
     #[cfg(all(target_os = "linux", feature = "headless-shot"))]
@@ -472,12 +476,13 @@ mod tests {
                                         view.notifications.feedback,
                                         Some("notifications-test-sent")
                                     );
-                                    let id = view.notifications.routes.insert(Destination::Thread(
-                                        Thread {
+                                    let id = view.notifications.routes.insert(
+                                        Destination::Thread(Thread {
                                             workspace: "second".into(),
                                             session: "requested".into(),
-                                        },
-                                    ));
+                                        }),
+                                        Kind::Thread(NotificationKind::Approval),
+                                    );
                                     view.notification_event(Event::Clicked(id), window, cx);
                                     assert!(matches!(
                                         messages.try_recv().unwrap(),

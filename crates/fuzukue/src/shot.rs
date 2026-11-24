@@ -25,6 +25,8 @@ mod deck_overview_test;
 #[cfg(test)]
 mod agent_models_test;
 #[cfg(test)]
+mod approval_dock_test;
+#[cfg(test)]
 mod file_browser_test;
 #[cfg(test)]
 mod github_report_test;
@@ -97,6 +99,9 @@ enum Step {
         timeout_ms: Option<u64>,
     },
     ResolveApproval { decision: String },
+    SeedApprovalDock,
+    AssertApprovalDockScrolled,
+    ResolveApprovalDock,
     WaitResearchIssue { number: u64, state: fuzukue_proto::ResearchIssueState },
     WaitGit {
         path: Option<String>,
@@ -249,6 +254,7 @@ enum ShotTheme {
 enum Pane {
     Paper,
     Chat,
+    ApprovalDock,
 }
 
 enum ClickTarget {
@@ -574,6 +580,17 @@ impl Runner {
                 })
                 .await?;
                 self.seen.insert(event, count + 1);
+            }
+            Step::SeedApprovalDock => {
+                ensure!(!self.read_only, "approval dock needs an isolated fixture");
+                self.update(cx, |view, window, cx| view.seed_approval_dock_fixture(window, cx))?;
+            }
+            Step::AssertApprovalDockScrolled => {
+                self.wait_for(cx, "approval dock scroll", TIMEOUT_MS, |view, _| view.approval_dock_scrolled()).await?;
+            }
+            Step::ResolveApprovalDock => {
+                ensure!(!self.read_only, "approval dock needs an isolated fixture");
+                self.update(cx, |view, window, cx| view.resolve_approval_dock_fixture(window, cx))?;
             }
             Step::ResolveApproval { decision } => {
                 ensure!(!self.read_only, "resolving approvals needs an isolated fixture");
@@ -999,6 +1016,7 @@ impl Runner {
                             &view.read_list
                         }
                         Pane::Chat => &view.chats[&view.active].scroller,
+                        Pane::ApprovalDock => bail!("use the wheel action for the approval dock"),
                     };
                     list.scroll_by(px(pixels));
                     cx.notify();
@@ -1008,7 +1026,11 @@ impl Runner {
             Step::Wheel { pane, pixels, lines, pages } => {
                 use gpui_kit::{ScrollDelta, ScrollEvent};
                 self.update(cx, |_, window, cx| {
-                    let id = match pane { Pane::Paper => "paper-centre-column", Pane::Chat => "paper-chat-column" };
+                    let id = match pane {
+                        Pane::Paper => "paper-centre-column",
+                        Pane::Chat => "paper-chat-column",
+                        Pane::ApprovalDock => "approval-dock-scroll",
+                    };
                     let position = window.shot_element_bounds(id)
                         .map(|b| b.center())
                         .unwrap_or_else(|| point(window.viewport_size().width / 2., window.viewport_size().height / 2.));

@@ -1,0 +1,19 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 900},
+    {"action": "theme", "theme": "dark"},
+    {"action": "locale", "locale": "en"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "approval_queue"},
+    {"action": "new_thread"},
+    {"action": "seed_approval_dock"},
+    {"action": "wait_element", "id": "approval-row-fixture-0"},
+    {"action": "assert_order", "above": "approval-dock", "below": "chat-input"},
+    {"action": "screenshot", "name": "approval-dock-many"},
+    {"action": "wheel", "pane": "approval_dock", "pixels": -360},
+    {"action": "assert_approval_dock_scrolled"},
+    {"action": "screenshot", "name": "approval-dock-scrolled"},
+    {"action": "resolve_approval_dock"},
+    {"action": "screenshot", "name": "approval-dock-resolved"}
+  ]
+}
