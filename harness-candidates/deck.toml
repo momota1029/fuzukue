@@ -1,0 +1,4 @@
+kind = "notes"
+title = "ハーネス候補"
+summary = "繰り返し現れた道具の不足と、採用・見送りの判断を記録する。"
+dirs = ["cards"]

@@ -891,6 +891,7 @@ async fn launch_assignment(
             let can_ask = mcp_url.is_some() && tools.iter().any(|tool| tool == "ask_front_desk");
             let can_search = mcp_url.is_some() && tools.iter().any(|tool| tool == "search_library");
             let can_add_memo = mcp_url.is_some() && tools.iter().any(|tool| tool == "add_memo");
+            let can_propose_harness = mcp_url.is_some() && tools.iter().any(|tool| tool == "propose_harness");
             let can_read = mcp_url.is_some() && tools.iter().any(|tool| crate::mcp::workspace_read::Tool::named(tool).is_some());
             let can_read_git = mcp_url.is_some() && tools.iter().any(|tool| tool == crate::mcp::workspace_read::git_read::NAME);
             let can_navigate = mcp_url.is_some() && crate::lsp::Tool::ALL.iter()
@@ -934,6 +935,9 @@ async fn launch_assignment(
                 crate::worker_scope::append_environment_notes(&mut instructions, &workspace)?;
                 if can_read {
                     instructions.push_str(crate::mcp::workspace_read::GUIDANCE);
+                }
+                if can_propose_harness {
+                    instructions.push_str("\n\nIf you had to improvise a script or pipeline because no tool covered a recurring task, call propose_harness with a generic script shape and the gap it filled. Skip trivial one-offs and omit private details from the proposal.");
                 }
                 if can_navigate {
                     instructions.push_str("\n\nFor Rust symbols, prefer the available LSP tools for definitions, references, types, and call hierarchy. Start with a workspace-relative source path and, for position queries, a 1-based line and UTF-16 column on the identifier. Use lsp_symbols with a file path for its declarations. Use fs_search when available for literal text, configuration, and locating an identifier to query, or when LSP gives no useful answer. Use lsp_diagnostics for file feedback and run the relevant Cargo check or test to verify build changes.");

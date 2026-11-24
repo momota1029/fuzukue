@@ -364,8 +364,8 @@ pub(crate) fn denied(path: &Path) -> bool {
 }
 
 #[derive(PartialEq, Eq)]
-struct Existing {
-    text: String,
+pub(super) struct Existing {
+    pub(super) text: String,
     device: u64,
     inode: u64,
     mode: u32,
@@ -377,7 +377,7 @@ fn identity(file: &File) -> Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
-fn read(parent: &File, name: &Path) -> Result<Option<Existing>> {
+pub(super) fn read(parent: &File, name: &Path) -> Result<Option<Existing>> {
     let file = match unix::openat(
         parent,
         name,
@@ -461,13 +461,14 @@ fn edit(text: &str, old: &str, new: &str) -> Result<String> {
     Ok(text.replacen(old, new, 1))
 }
 
-fn replace(
+pub(super) fn replace(
     parent: &File,
     name: &Path,
     before: Option<&Existing>,
     content: &str,
     check_cancelled: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    check_text(content)?;
     let temporary = format!(".fuzukue-write-{}", crate::mail::session_key());
     let flags = OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC;
     let mut file = File::from(unix::openat(

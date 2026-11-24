@@ -38,6 +38,7 @@ sections:
   - R-34
   - R-35
   - R-36
+  - R-46
 - title: 技術的負債
   items:
   - R-38

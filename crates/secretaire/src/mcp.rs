@@ -24,6 +24,7 @@ use crate::reviewers::section::blind as blind_review;
 mod desk;
 mod front_desk_light;
 pub(crate) mod git_write;
+mod harness_candidates;
 pub(crate) mod workspace_read;
 pub(crate) mod workspace_write;
 use workspace_read::git_read;
@@ -53,6 +54,7 @@ pub(crate) enum Tool {
     Desk(desk::Tool),
     WorkspaceRead(workspace_read::Tool),
     WorkspaceWrite(workspace_write::Tool),
+    HarnessCandidates(harness_candidates::Tool),
     FolderGrants,
     ListAgents,
     AgentStats,
@@ -231,6 +233,7 @@ impl Tool {
     fn available(mail: bool) -> impl Iterator<Item = Self> {
         Self::ALL.into_iter().chain(desk::Tool::ALL.map(Self::Desk))
             .chain(crate::recipes::Tool::ALL.map(Self::Recipe))
+            .chain(harness_candidates::Tool::ALL.map(Self::HarnessCandidates))
             .chain(crate::graph::mcp::Tool::ALL.map(Self::Graph)).chain(Self::GIT)
             .chain(workspace_read::Tool::ALL.map(Self::WorkspaceRead)).chain([Self::FolderGrants])
             .chain(crate::workshop::mcp::Tool::ALL.map(Self::Research))
@@ -259,6 +262,7 @@ impl Tool {
             Self::Consult => "consult",
             Self::Desk(tool) => tool.name(),
             Self::WorkspaceRead(tool) => tool.name(),
+            Self::HarnessCandidates(tool) => tool.name(),
             Self::WorkspaceWrite(tool) => tool.name(),
             Self::FolderGrants => "folder_grants",
             Self::ListAgents => "list_agents",
@@ -360,7 +364,7 @@ impl Tool {
         if let Self::GitHub(tool) = self { return tool.writes(); }
         if let Self::GitHubAuth(tool) = self { return tool.writes(); }
         if let Self::Research(tool) = self { return tool.writes(); }
-        matches!(self, Self::WorkspaceWrite(_)) ||
+        matches!(self, Self::WorkspaceWrite(_) | Self::HarnessCandidates(harness_candidates::Tool::Propose)) ||
         matches!(self, Self::Graph(tool) if tool.writes()) ||
         matches!(self, Self::CreateWorkspace | Self::CreateResearch | Self::AttachThread | Self::RenameThread | Self::OpenPaper | Self::DetachThread | Self::CodexRun | Self::Delegate | Self::BuildPaper | Self::BuildPapers | Self::RunTests | Self::RequestReview | Self::RegisterSectionReviewFinding
             | Self::RefreshReferences | Self::FetchReference | Self::ProposeLedger | Self::FetchLedger | Self::FileInbox | Self::ImportLatexBook | Self::UpdateRules
@@ -466,6 +470,7 @@ impl Tool {
             Self::GitRead => return git_read::definition(),
             Self::GitCommitScoped => return git_write::definition(),
             Self::WorkspaceRead(tool) => return tool.definition(),
+            Self::HarnessCandidates(tool) => return tool.definition(),
             Self::WorkspaceWrite(tool) => return tool.definition(),
             Self::FolderGrants => (
                 harness_text!(
@@ -982,7 +987,7 @@ fn worker_tools() -> impl Iterator<Item = Tool> {
         | Tool::ListReviewSubmissions | Tool::ReadReviewPoint | Tool::ListReviewFindings | Tool::ReadReference
         | Tool::ListLedger | Tool::ReadLedgerAttempts | Tool::GitStatus | Tool::GitDiff | Tool::GitLog
         | Tool::ListTests | Tool::Lsp(_) | Tool::LeanDocCheck | Tool::ClientScreenshot
-        | Tool::WorkspaceRead(_) | Tool::GitRead | Tool::BuildPaper
+        | Tool::WorkspaceRead(_) | Tool::GitRead | Tool::HarnessCandidates(_) | Tool::BuildPaper
         | Tool::ListScreenshotScenarios | Tool::CaptureScreenshot | Tool::Recipe(_)
     )).chain([Tool::AskFrontDesk])
         .chain(workspace_write::Tool::ALL.map(Tool::WorkspaceWrite).into_iter().filter(|_| !crate::canary()))
@@ -1224,6 +1229,9 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
                     Ok(data_result(call_read_tool(&app, &q.session, tool, scope, &args).await?, false))
                 }.await
+            } else if let Some(tool) = harness_candidates::Tool::named(name) {
+                let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                Box::pin(tool.call(&app, Some(job), &args)).await.map(|data| data_result(data, false))
             } else if name == Tool::Escalate.name() {
                 (|| {
                     let args: EscalateArgs = parse_args(&params["arguments"])?;
@@ -1719,7 +1727,11 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         return Ok(data_result(data, false));
     }
     if let Some(actor) = approval {
-        let summary = format!("MCP {name}: {}", args.to_string().chars().take(300).collect::<String>());
+        let summary = if matches!(tool, Tool::HarnessCandidates(harness_candidates::Tool::Propose)) {
+            "MCP propose_harness (harness-candidates deck)".into()
+        } else {
+            format!("MCP {name}: {}", args.to_string().chars().take(300).collect::<String>())
+        };
         let prefix = if git_write { fuzukue_proto::GIT_APPROVAL } else if import.is_some() { "latex-import" } else if cancel_job { "cancel-job" } else { "codex-mcp" };
         let decision = crate::delegate::request_approval(app, session, prefix, actor, summary).await?;
         ensure!(decision == "accept", "利用者が承認しなかった");
@@ -1769,6 +1781,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 .with_grants(crate::folder_grants::Access { hub: app.hub.clone(), session: session.into(), worker_grants: None });
             Box::pin(call_read_tool(app, session, tool, scope, args)).await?
         }
+        Tool::HarnessCandidates(tool) => Box::pin(tool.call(app, None, args)).await?,
         Tool::WorkspaceWrite(_) => unreachable!("Workspace writes use the authenticated worker route"),
         Tool::FolderGrants => {
             // The front desk branch has already authenticated the session in dispatch.
