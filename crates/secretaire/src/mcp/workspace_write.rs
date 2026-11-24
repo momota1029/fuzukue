@@ -122,6 +122,20 @@ impl Tool {
         };
         let needs_approval = staged.changed() && !scope.writes.contains(&staged.path);
         if needs_approval {
+            scope.check_running(&cancel)?;
+        }
+        if needs_approval && !crate::full_approval::authorize(
+            &app.hub,
+            fuzukue_proto::ApprovalOwner { thread: session.into(), job: job.into(), requester: "worker".into() },
+            self.name(),
+            fuzukue_proto::ApprovalRisk::Mid,
+            json!({
+                "before": staged.before.as_ref().map(|before| digest(before.text.as_bytes())),
+                "after": digest(staged.after.as_bytes()),
+                "parent": staged.parent,
+            }),
+            json!({"worktree": scope.root, "path": staged.path}),
+        )? {
             let mut preview: String = staged.diff.chars().take(1500).collect();
             if preview.len() < staged.diff.len() {
                 preview.push_str("\n…");

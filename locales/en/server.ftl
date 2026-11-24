@@ -55,6 +55,9 @@ server-resume-error = Couldn’t resume: { $detail }
 server-auto-approval-error = Automatic approval failed: { $detail }
 server-invalid-message = Invalid request: { $detail }
 server-codex-error = Codex error: { $detail }
+server-full-approval-until = Full approval is on until { $at }
+server-full-approval-until-disabled = Full approval is on until turned off
+server-full-approval-off = Full approval is off
 
 server-parallel-limit = Parallel limit reached ({ $running } of { $limit } running; this thread's setting: { $setting ->
     [normal] normal

@@ -620,7 +620,30 @@ impl DeviceSession {
 #[derive(Clone)]
 pub(crate) struct ReviewEditor(pub(crate) String);
 
+/// Explicit client credential. The local transport and worker MCP keys do not create this.
+#[derive(Clone)]
+pub(crate) struct SettingsPrincipal(String);
+
+impl SettingsPrincipal {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self("fixture".into())
+    }
+}
+
 impl Identity {
+    fn settings_principal(&self) -> Option<SettingsPrincipal> {
+        match self {
+            Self::Device(device) => Some(SettingsPrincipal(format!("device:{}", device.id))),
+            Self::SharedToken => Some(SettingsPrincipal("shared_token_user".into())),
+            _ => None,
+        }
+    }
+
     fn review_editor(&self) -> Option<ReviewEditor> {
         match self {
             Self::Device(device) => Some(ReviewEditor(format!("editor:device:{}", device.id))),
@@ -661,17 +684,33 @@ pub async fn enforce(State(access): State<Arc<Access>>, mut req: Request, next: 
         );
     }
     let editor_route = req.uri().path() == crate::reviewers::section::blind::editor::ROUTE;
+    let settings_route = matches!(req.uri().path(), "/ws" | crate::full_approval::SETTINGS_PATH | crate::full_approval::EXECUTION_PATH);
     if local {
-        if editor_route {
-            let tokens = bearer(req.headers()).map(str::to_owned).into_iter().collect();
-            match access.token_identity(tokens).await {
-                Ok(Some(identity)) => {
-                    if let Some(editor) = identity.review_editor() {
-                        req.extensions_mut().insert(editor);
+        if editor_route || settings_route {
+            let tokens: Vec<_> = bearer(req.headers()).map(str::to_owned).into_iter().collect();
+            if !tokens.is_empty() {
+                match access.token_identity(tokens).await {
+                    Ok(Some(identity)) => {
+                        if editor_route {
+                            if let Some(editor) = identity.review_editor() {
+                                req.extensions_mut().insert(editor);
+                            }
+                        }
+                        if settings_route {
+                            if let Some(principal) = identity.settings_principal() {
+                                req.extensions_mut().insert(principal);
+                            }
+                            if let Identity::Device(device) = identity {
+                                req.extensions_mut().insert(DeviceSession {
+                                    store: access.devices.clone(),
+                                    id: device.id,
+                                });
+                            }
+                        }
                     }
+                    Ok(None) => {}
+                    Err(_) => return deny(Some(peer), Some(peer_ip), StatusCode::SERVICE_UNAVAILABLE, "authentication_busy"),
                 }
-                Ok(None) => {}
-                Err(_) => return deny(Some(peer), Some(peer_ip), StatusCode::SERVICE_UNAVAILABLE, "authentication_busy"),
             }
         }
         audit(Some(peer), Some(peer_ip), Some(&Identity::Local), "allowed");
@@ -829,6 +868,11 @@ pub async fn enforce(State(access): State<Arc<Access>>, mut req: Request, next: 
     if editor_route {
         if let Some(editor) = identity.review_editor() {
             req.extensions_mut().insert(editor);
+        }
+    }
+    if settings_route {
+        if let Some(principal) = identity.settings_principal() {
+            req.extensions_mut().insert(principal);
         }
     }
     req.extensions_mut().insert(ClientIp(client));

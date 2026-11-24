@@ -118,7 +118,7 @@ struct RunningJob {
     approach: String,
     summary: Mutex<Option<String>>,
     retry: Mutex<Option<crate::tiers::Retry>>,
-    tools: Vec<String>,
+    tools: Mutex<Vec<String>>,
     input: Mutex<Option<mpsc::UnboundedSender<String>>>,
     cancel: Arc<Cancellation>,
     started: std::sync::atomic::AtomicBool,
@@ -333,7 +333,7 @@ impl Workers {
     pub fn worker_tools(&self, session: &str, id: &str, key: &str) -> Option<Vec<String>> {
         let jobs = self.running.lock().unwrap();
         jobs.get(id).filter(|job| job.session == session && !key.is_empty() && job.key == key && job.cancel.check().is_ok())
-            .map(|job| job.tools.clone())
+            .map(|job| job.tools.lock().unwrap().clone())
     }
 
     pub(crate) fn capture_scope(&self, id: &str) -> Result<crate::capture::WorkerStorage> {
@@ -471,6 +471,7 @@ pub async fn set_settings(app: &App, settings: DelegateSettings) -> Result<()> {
 }
 
 pub struct WorkerLaunch {
+    pub execution: Option<crate::worker_execution::Policy>,
     pub scope: Option<crate::worker_scope::Scope>,
     pub instructions: String,
     pub mcp_url: Option<String>,
@@ -707,7 +708,7 @@ async fn launch_assignment(
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let control = Arc::new(RunningJob {
-        session: session.into(), key: key.clone(), tools: tools.clone(),
+        session: session.into(), key: key.clone(), tools: Mutex::new(tools.clone()),
         approach: prompt.chars().take(1600).collect(), summary: Mutex::default(), retry: Mutex::default(),
         input: Mutex::new((!blind).then(|| tx.clone())), cancel: Arc::default(),
         started: false.into(), drain_notice: Default::default(),
@@ -885,6 +886,15 @@ async fn launch_assignment(
                 attempts.push(attempt);
                 return Ok((timer, result, None));
             }
+            let lease = if crate::canary() { None } else { app.hub.full_approval_lease()? };
+            let execution = if crate::canary() {
+                None
+            } else {
+                crate::worker_execution::settings(&app)?.lock().unwrap().effective(lease.is_some())
+            };
+            let read_only = execution.is_some_and(|policy| policy.sandbox == crate::worker_execution::Sandbox::ReadOnly);
+            let tools = if read_only { crate::mcp::read_only_worker_tools(tools) } else { tools };
+            *input.job.tools.lock().unwrap() = tools.clone();
             let cwd = worktree.as_deref().unwrap_or(&app.project_dir);
             crate::issue_threads::attach_worktree(&app, &session, cwd)?;
             let project = cwd.to_path_buf();
@@ -978,7 +988,7 @@ async fn launch_assignment(
             )).transpose()?.map(Arc::new);
             *input.job.workspace_write_scope.lock().unwrap() = write_scope.clone();
             let checkout = scope.cwd.clone();
-            let launch = WorkerLaunch { instructions, mcp_url, key, tools, scope: Some(scope) };
+            let launch = WorkerLaunch { execution, instructions, mcp_url, key, tools, scope: Some(scope) };
             let relay_active = relay::enabled();
             let progress = if relay_active {
                 let (_, events) = app.hub.subscribe(u64::MAX);
@@ -1004,9 +1014,21 @@ async fn launch_assignment(
                 input.attempt_cancel = attempt_cancel.clone();
                 let (_, events) = app.hub.subscribe(u64::MAX);
                 let run = async {
-                    match model.selection.backend {
-                        AgentBackend::Codex => app.codex().await?.run_worker(cwd, &session, &job, settings, &task, &mut input, &launch, &mut metadata, adopted.as_ref().map(|worker| worker.thread_id.as_str())).await,
-                        AgentBackend::Claude => claude::run_worker(&app, cwd, &session, &job, settings, &task, &mut input, &launch, &mut metadata).await,
+                    let backend = async {
+                        match model.selection.backend {
+                            AgentBackend::Codex => app.worker_codex(&launch).await?.run_worker(cwd, &session, &job, settings, &task, &mut input, &launch, &mut metadata, adopted.as_ref().map(|worker| worker.thread_id.as_str())).await,
+                            AgentBackend::Claude => claude::run_worker(&app, cwd, &session, &job, settings, &task, &mut input, &launch, &mut metadata).await,
+                        }
+                    };
+                    tokio::pin!(backend);
+                    tokio::select! {
+                        biased;
+                        _ = crate::full_approval::wait_for_end(lease.clone()) => {
+                            attempt_cancel.cancel();
+                            let _ = tokio::time::timeout(Duration::from_secs(5), &mut backend).await;
+                            anyhow::bail!("Full approval ended. Start a new worker to continue.");
+                        }
+                        result = &mut backend => result,
                     }
                 };
                 let (mut result, transcript) = monitor_attempt(
@@ -1067,7 +1089,11 @@ async fn launch_assignment(
                 if let Some(scope) = write_scope {
                     scope.close();
                 }
-                before.review(&checkout, &recovery, &writes_to_check)
+                if lease.is_some() {
+                    (before.changes(&Files::read(&checkout)), quarantine::Review::default())
+                } else {
+                    before.review(&checkout, &recovery, &writes_to_check)
+                }
             }).await;
             if input.job.drain_notice.lock().unwrap().is_some() || app.admit_work().is_err() {
                 let scratch = _scratch.keep();
@@ -1660,6 +1686,7 @@ pub(crate) async fn run_summary(
     let title = if role == "thread_title" { "スレッド名" } else { "進捗要約" };
     let invocation = Invocation::new(app, session, None, role, &job, title, Some(selection.clone()));
     let launch = WorkerLaunch {
+        execution: None,
         scope: None, instructions: instruction.into(), mcp_url: None, key: String::new(), tools: Vec::new(),
     };
     let mut metadata = RunMetadata::default();
@@ -2009,20 +2036,50 @@ pub async fn run_legacy_codex(
     let run = tokio::spawn(async move {
         let _worker = admission.acquire(|_| {}).await;
         let _work = app.admit_work()?;
-        let codex = app.codex().await?;
-        let thread = codex.start_thread(&session, parent.clone()).await?;
+        let lease = if crate::canary() { None } else { app.hub.full_approval_lease()? };
+        let execution = if crate::canary() {
+            None
+        } else {
+            crate::worker_execution::settings(&app)?.lock().unwrap().effective(lease.is_some())
+        };
+        let launch = execution.map(|execution| -> Result<_> {
+            let scratch = tempfile::Builder::new().prefix("worker-").tempdir_in(&app.state_dir)?;
+            let scope = crate::worker_scope::Scope::open(&app.project_dir, &app.project_dir, scratch.path())?;
+            Ok((WorkerLaunch {
+                execution: Some(execution), scope: Some(scope), instructions: String::new(),
+                mcp_url: None, key: String::new(), tools: Vec::new(),
+            }, scratch))
+        }).transpose()?;
+        let policy = launch.as_ref().map(|(launch, _scratch)| launch);
+        let codex = match policy {
+            Some(launch) => app.worker_codex(launch).await?,
+            None => app.codex().await?,
+        };
+        let thread = codex.start_thread(&session, parent.clone(), policy).await?;
         let history = app.history.turn(&app.project_dir, "agent:codex".into(), &session, parent).await;
         let before_project = app.project_dir.clone();
         let before = tokio::task::spawn_blocking(move || Files::read(&before_project)).await;
-        let result = codex.run_turn(&thread, &prompt).await;
+        let full = lease.is_some();
+        let result = tokio::select! {
+            biased;
+            _ = crate::full_approval::wait_for_end(lease) => {
+                let _ = tokio::time::timeout(Duration::from_secs(5), codex.interrupt(&thread)).await;
+                Err(anyhow::anyhow!("Full approval ended. Start a new worker to continue."))
+            }
+            result = codex.run_turn(&thread, &prompt) => result,
+        };
         if let Some(history) = history {
             history.finish(result.as_ref().ok().cloned(), Vec::new()).await;
         }
         codex.close_worker(&thread).await;
         let project = app.project_dir.clone();
-        let report = tokio::task::spawn_blocking(move || {
-            before.map(|before| before.review(&project, &recovery, &writes).1.render(false))
-        }).await;
+        let report = if full {
+            Ok(Ok(String::new()))
+        } else {
+            tokio::task::spawn_blocking(move || {
+                before.map(|before| before.review(&project, &recovery, &writes).1.render(false))
+            }).await
+        };
         let details = match report {
             Ok(Ok(details)) => details,
             _ => "\n\n## Out-of-scope writes\nThe worktree check failed.".into(),
@@ -2181,6 +2238,16 @@ pub(crate) async fn request_shell_approval(
     let protected = crate::worker_scope::protected_roots(&app.state_dir);
     let shell = crate::worker_scope::shell::check(scope, &input, &protected);
     let (summary, candidate) = if let Some(approved) = shell {
+        if crate::full_approval::authorize(
+            &app.hub,
+            fuzukue_proto::ApprovalOwner { thread: session.into(), job: job.into(), requester: "claude".into() },
+            "Bash (validated)",
+            fuzukue_proto::ApprovalRisk::Low,
+            serde_json::json!({"fingerprint": crate::full_approval::fingerprint(&approved.input), "request": backend_id}),
+            serde_json::json!({"worktree": scope.cwd}),
+        )? {
+            return Ok(Some(approved.input));
+        }
         let candidate = ShellApproval { scope: scope.clone(), input: input.clone(), prefix: approved.prefix };
         (format!("Bash: {}", approved.command), Some(candidate))
     } else {
@@ -2336,7 +2403,7 @@ async fn mcp_review_findings_respect_authenticated_worker_access() -> Result<()>
         Arc::new(RunningJob {
             session: session.into(),
             key: key.into(),
-            tools,
+            tools: tools.into(),
             approach: Default::default(),
             summary: Default::default(),
             retry: Default::default(),
@@ -2448,7 +2515,7 @@ async fn mcp_reading_tools_respect_authenticated_worker_access() -> Result<()> {
         Arc::new(RunningJob {
             session: session.into(),
             key: key.into(),
-            tools,
+            tools: tools.into(),
             approach: Default::default(),
             summary: Default::default(),
             retry: Default::default(),

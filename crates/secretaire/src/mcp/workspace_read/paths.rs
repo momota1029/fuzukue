@@ -48,6 +48,15 @@ impl ReadScope {
         self
     }
 
+    pub(crate) fn with_additional_grant(mut self, id: String) -> Self {
+        if let Some(ids) = self.access.as_mut().and_then(|access| access.worker_grants.as_mut()) {
+            let mut allowed = ids.to_vec();
+            allowed.push(id);
+            *ids = allowed.into();
+        }
+        self
+    }
+
     pub(super) fn in_scope(&self, path: &Path) -> bool {
         self.roots.iter().any(|root| path.starts_with(root))
     }

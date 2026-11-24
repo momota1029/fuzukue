@@ -53,6 +53,7 @@ impl ReviewLease {
         Ok(Some(Self {
             id,
             launch: WorkerLaunch {
+                execution: None,
                 scope: None,
                 instructions: GUIDANCE.into(),
                 mcp_url: Some(url.to_string()),

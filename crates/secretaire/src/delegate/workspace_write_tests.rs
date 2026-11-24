@@ -43,7 +43,7 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
     let worker = Arc::new(RunningJob {
         session: session.into(),
         key: key.into(),
-        tools,
+        tools: tools.into(),
         approach: Default::default(),
         summary: Default::default(),
         retry: Default::default(),
@@ -183,6 +183,74 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
         fs::read_to_string(root.join("out.txt"))?,
         "concurrent edit\n"
     );
+
+    // Enable through the real authenticated settings router using the same app.
+    use axum::{Extension, extract::ConnectInfo};
+    use std::os::unix::fs::PermissionsExt;
+    let token = crate::remote::ensure_token(&state, false)?;
+    let access = Arc::new(crate::remote::Access::new(&state, Default::default())?);
+    let settings = crate::router(crate::App::fixture(app.clone()), access)
+        .layer(Extension(ConnectInfo("127.0.0.1:1234".parse::<std::net::SocketAddr>()?)));
+    let route = |path: &str, credential: &str, change: Option<Value>| {
+        let mut request = Request::builder().uri(format!("{path}?workspace={}", app.id));
+        if !credential.is_empty() {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {credential}"));
+        }
+        let request = match change {
+            Some(change) => request.method("POST").header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(change.to_string())),
+            None => request.body(Body::empty()),
+        }.unwrap();
+        let settings = settings.clone();
+        async move {
+            let response = settings.oneshot(request).await?;
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 64 * 1024).await?;
+            Ok::<_, anyhow::Error>((status, serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null)))
+        }
+    };
+    let path = crate::full_approval::SETTINGS_PATH;
+    let enable = || Some(json!({"mode": "full"}));
+    for credential in ["", key] {
+        assert_eq!(route(path, credential, enable()).await?.0, StatusCode::FORBIDDEN);
+    }
+    let (status, body) = route(path, &token, enable()).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["active"]["duration"], "24h");
+    let enabled = body["active"]["enabled_at"].as_i64().unwrap();
+    assert_eq!(body["active"]["expires_at"], enabled + 24 * 60 * 60 * 1000);
+    let settings_file = state.join("full-approval-mode.json");
+    assert_eq!(fs::metadata(&settings_file)?.permissions().mode() & 0o777, 0o600);
+    fs::write(&settings_file, "null")?;
+    assert_eq!(route(path, &token, None).await?.1["active"]["duration"], "24h");
+
+    let (status, result) = route(crate::full_approval::EXECUTION_PATH, &token, Some(json!({
+        "sandbox": "full-access", "approval": "ask"
+    }))).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["settings"]["sandbox"], "full-access");
+    assert_eq!(result["settings"]["approval"], "ask");
+    assert!(result["bubblewrap"]["checked_at"].is_i64());
+    assert_eq!(route(crate::full_approval::EXECUTION_PATH, key, None).await?.0, StatusCode::FORBIDDEN);
+
+    let (_, mut queue_updates) = app.hub.pending_approvals()?;
+    let first = request(true, "tools/call", write("full.txt", "written once\n")).await?;
+    assert_eq!(first["isError"], false, "{first}");
+    let repeat = request(true, "tools/call", write("full.txt", "written once\n")).await?;
+    assert_eq!(repeat["isError"], false, "{repeat}");
+    assert_eq!(fs::read_to_string(root.join("full.txt"))?, "written once\n");
+    let decision = queue_updates.try_recv()?;
+    assert_eq!(decision.state, fuzukue_proto::ApprovalState::Granted);
+    assert!(decision.consumed_at.is_some());
+    assert!(queue_updates.try_recv().is_err());
+    let audit = route(path, &token, None).await?.1;
+    assert_eq!(audit["audit"].as_array().unwrap().len(), 1);
+    assert_eq!(audit["audit"][0]["granted_by"], "full_mode");
+    assert_eq!(audit["audit"][0]["action"]["args"], "[redacted]");
+    assert_eq!(audit["audit"][0]["approval_id"], decision.approval_id);
+    let lease = app.hub.full_approval_lease()?;
+    assert!(route(path, &token, Some(json!({"mode": "off"}))).await?.1["active"].is_null());
+    tokio::time::timeout(Duration::from_secs(1), crate::full_approval::wait_for_end(lease)).await?;
 
     let pending = tokio::spawn(request(
         true,

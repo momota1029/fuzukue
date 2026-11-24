@@ -41,6 +41,8 @@ mod branch_review;
 mod lean_reading;
 mod hub;
 mod folder_grants;
+mod full_approval;
+mod worker_execution;
 mod mail;
 mod inbox;
 mod routing;
@@ -140,6 +142,8 @@ pub struct Workspace {
     hold_planner_during_update: bool,
     delegates: delegate::Workers,
     worker_approval_policy: std::sync::Mutex<fuzukue_proto::WorkerApprovalPolicy>,
+    worker_execution: worker_execution::StoredSettings,
+    worker_codex: std::sync::Mutex<Vec<std::sync::Weak<Codex>>>,
     shell_approval_rules: worker_scope::shell_rules::Rules,
     drain: self_update::drain::Journal,
     drain_codex: std::sync::Mutex<HashMap<String, i64>>,
@@ -246,6 +250,8 @@ impl Workspace {
             session_records: Arc::new(std::sync::Mutex::new(saved)),
             delegates: delegate::Workers::new(),
             worker_approval_policy: std::sync::Mutex::new(state::load_worker_approval_policy(&state_dir)),
+            worker_execution: Default::default(),
+            worker_codex: Default::default(),
             shell_approval_rules: worker_scope::shell_rules::Rules::load(&state_dir),
             drain: Default::default(),
             drain_codex: Default::default(),
@@ -404,6 +410,19 @@ impl Workspace {
         }
         let codex = Codex::spawn(&self.project_dir, self.hub.clone(), self.usage.clone(), self.session_stats.clone()).await?;
         *slot = Some(codex.clone());
+        Ok(codex)
+    }
+
+    async fn worker_codex(&self, launch: &delegate::WorkerLaunch) -> anyhow::Result<Arc<Codex>> {
+        let Some(policy) = launch.execution else { return self.codex().await };
+        let scope = launch.scope.as_ref().context("worker filesystem scope is missing")?;
+        let mut command = policy.command(Path::new("codex"), scope).await?;
+        policy.backend_home(&mut command, &scope.scratch, "CODEX_HOME", ".codex", &["auth.json", "config.toml"])?;
+        command.arg("app-server").envs(scope.temp_env());
+        let codex = Codex::spawn_command(command, &scope.cwd, self.hub.clone(), self.usage.clone(), self.session_stats.clone()).await?;
+        let mut workers = self.worker_codex.lock().unwrap();
+        workers.retain(|worker| worker.strong_count() > 0);
+        workers.push(Arc::downgrade(&codex));
         Ok(codex)
     }
 
@@ -697,6 +716,8 @@ fn router(app: Arc<App>, access: Arc<remote::Access>) -> Router {
         .route("/source/{*path}", get(source::source_handler))
         .route("/editor/{*path}", get(source_editor::read_handler))
         .route("/mcp", post(mcp::route))
+        .route(full_approval::SETTINGS_PATH, get(full_approval::get).post(full_approval::set))
+        .route(full_approval::EXECUTION_PATH, get(full_approval::get_execution).post(full_approval::set_execution))
         .route(reviewers::section::blind::editor::ROUTE, post(reviewers::section::blind::editor::route))
         .with_state(app)
         .layer(axum::middleware::from_fn_with_state(access, remote::enforce))
@@ -765,6 +786,7 @@ async fn ws_handler(
     State(app): State<Arc<App>>,
     axum::Extension(remote::ClientIp(ip)): axum::Extension<remote::ClientIp>,
     device: Option<axum::Extension<remote::DeviceSession>>,
+    settings: Option<axum::Extension<remote::SettingsPrincipal>>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // Browser scripts set Origin on WebSockets. Only native desktop connections
@@ -773,7 +795,8 @@ async fn ws_handler(
     let grant_principal = device.as_ref().map(|device| format!("device:{}", device.0.id()))
         .unwrap_or_else(|| if ip.is_loopback() { "local_user" } else { "shared_token_user" }.into());
     ws.on_upgrade(move |socket| async move {
-        let serve = client_loop(socket, app, ip, github_report_client, grant_principal);
+        let settings = settings.filter(|_| github_report_client).map(|extension| extension.0);
+        let serve = client_loop(socket, app, ip, github_report_client, grant_principal, settings);
         if let Some(axum::Extension(device)) = device {
             device.run(serve).await;
         } else {
@@ -798,7 +821,10 @@ async fn file_handler(
     tokio::fs::read(&full).await.map_err(|e| not_found(e.into()))
 }
 
-async fn client_loop(socket: WebSocket, registry: Arc<App>, peer: std::net::IpAddr, github_report_client: bool, grant_principal: String) {
+async fn client_loop(
+    socket: WebSocket, registry: Arc<App>, peer: std::net::IpAddr,
+    github_report_client: bool, grant_principal: String, settings: Option<remote::SettingsPrincipal>,
+) {
     let (mut tx, mut rx) = socket.split();
     let (protocol, resume_from, requested, locale, platform, build_id, thread_history, mut transcripts) = match rx.next().await {
         Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(&t) {
@@ -890,7 +916,7 @@ async fn client_loop(socket: WebSocket, registry: Arc<App>, peer: std::net::IpAd
     let mut notices = (protocol >= fuzukue_proto::NOTIFICATIONS_PROTOCOL).then(|| registry.notices.subscribe());
     let mut first = true;
     loop {
-        let Some(next) = serve_workspace(&mut tx, &mut rx, &registry, app, (protocol, resume, first, thread_history), transcripts.as_ref(), &locale, manifest.take(), &mut distribution, (platform.as_deref(), build_id.as_deref()), github_report_client, &grant_principal, &mut notices).await else { break };
+        let Some(next) = serve_workspace(&mut tx, &mut rx, &registry, app, (protocol, resume, first, thread_history), transcripts.as_ref(), &locale, manifest.take(), &mut distribution, (platform.as_deref(), build_id.as_deref()), github_report_client, &grant_principal, settings.as_ref(), &mut notices).await else { break };
         first = false;
         app = next;
         resume = 0;
@@ -1056,6 +1082,7 @@ async fn serve_workspace(
     client_version: (Option<&str>, Option<&str>),
     github_report_client: bool,
     grant_principal: &str,
+    settings: Option<&remote::SettingsPrincipal>,
     notices: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
 ) -> Option<Arc<Workspace>> {
     let locale_for_wire = || *locale.read().unwrap();
@@ -2159,6 +2186,31 @@ async fn serve_workspace(
                 }
                 Ok(mut prompt @ (ClientMsg::Prompt { .. } | ClientMsg::PromptWithAttachments { .. })) if protocol >= 4 => {
                     let (session, text) = prompt_text(&prompt);
+                    if let commands::Input::Command { name: "full-approval", args } = commands::parse(text) {
+                        let result = full_approval::command(&app.hub, args, settings);
+                        let message = match result {
+                            Ok(Some(mode)) => match mode.expires_at.and_then(chrono::DateTime::from_timestamp_millis) {
+                                Some(at) => fuzukue_proto::LocalizedMessage::new("server-full-approval-until", [
+                                    ("at", at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string()),
+                                ]),
+                                None => fuzukue_proto::LocalizedMessage::new("server-full-approval-until-disabled", []),
+                            },
+                            Ok(None) => fuzukue_proto::LocalizedMessage::new("server-full-approval-off", []),
+                            Err(error) => {
+                                let _ = reply.send(ServerEvent::Error { message: error.to_string() });
+                                continue;
+                            }
+                        };
+                        let text = l10n::render(fuzukue_i18n::Locale::JAPANESE, &message);
+                        if app.hub.has_thread(session) {
+                            app.hub.publish(ServerEvent::LocalNotice {
+                                session: session.into(), item: mail::session_key(), text, localized: Some(message),
+                            });
+                        } else {
+                            let _ = reply.send(ServerEvent::Error { message: l10n::render(*locale.read().unwrap(), &message) });
+                        }
+                        continue;
+                    }
                     if session.is_empty() && matches!(commands::parse(text), commands::Input::Command { name: "new", .. }) {
                         if let Some(id) = commands::dispatch(&app, session, text).await {
                             let _ = reply.send(ServerEvent::ThreadCreated { id });
@@ -3381,16 +3433,24 @@ async fn resolve_approval(app: &Workspace, request_id: String, decision: String,
     if app.delegates.resolve_approval(&request_id, &decision, automatic)? {
         return Ok(());
     }
-    let mut handled = match app.running_codex().await {
-        Some(c) => {
-            let handled = c.resolve(&request_id, &decision, automatic).await?;
-            if automatic && !handled {
-                return Ok(());
+    let mut handled = false;
+    if request_id.starts_with(codex::WORKER_APPROVAL_PREFIX) {
+        let workers: Vec<_> = app.worker_codex.lock().unwrap().iter().filter_map(std::sync::Weak::upgrade).collect();
+        for worker in workers {
+            if worker.resolve(&request_id, &decision, automatic).await? {
+                handled = true;
+                break;
             }
-            handled
-        },
-        None => false,
-    };
+        }
+    }
+    if !handled {
+        if let Some(codex) = app.running_codex().await {
+            handled = codex.resolve(&request_id, &decision, automatic).await?;
+        }
+    }
+    if automatic && !handled && request_id.starts_with(codex::WORKER_APPROVAL_PREFIX) {
+        return Ok(());
+    }
     if !handled {
         let sessions: Vec<_> = app.sessions.lock().await.values().cloned().collect();
         for s in sessions {

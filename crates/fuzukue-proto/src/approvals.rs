@@ -74,6 +74,61 @@ pub struct ApprovalDisplayAction {
     pub scope: Value,
 }
 
+/// The duration selected explicitly by an authenticated operator.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullApprovalDuration {
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "8h")]
+    EightHours,
+    #[default]
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+    UntilDisabled,
+}
+
+/// A workspace settings change. The default enabled period is twenty-four hours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FullApprovalChange {
+    Off,
+    Full {
+        #[serde(default)]
+        duration: FullApprovalDuration,
+    },
+}
+
+/// An active operator opt-in. Timestamps are Unix milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullApprovalMode {
+    pub duration: FullApprovalDuration,
+    pub enabled_at: i64,
+    pub expires_at: Option<i64>,
+    pub enabled_by: String,
+}
+
+/// A redacted approval decision from the append-only queue history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullApprovalAudit {
+    pub approval_id: String,
+    pub at: i64,
+    pub granted_by: String,
+    pub thread: String,
+    pub job: String,
+    pub risk: ApprovalRisk,
+    pub action: ApprovalDisplayAction,
+}
+
+/// Current settings and an optional page of past automatic decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullApprovalSettings {
+    pub active: Option<FullApprovalMode>,
+    pub audit: Vec<FullApprovalAudit>,
+    pub next_before: Option<usize>,
+    pub last_24_hours_by_tool: std::collections::BTreeMap<String, usize>,
+}
+
 /// Client-visible view of a request. Timestamps are Unix milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalSummary {

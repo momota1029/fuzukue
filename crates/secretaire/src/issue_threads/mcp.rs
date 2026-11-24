@@ -340,6 +340,26 @@ async fn approve(
     confirm: bool,
     summary: LocalizedMessage,
 ) -> Result<()> {
+    let tool = match summary.key.as_str() {
+        "github-approve-comment" => Some("github_comment"),
+        "github-approve-labels" => Some("github_label"),
+        "github-approve-tracking-issue" | "approval-create-issue" => Some("github_issue_create"),
+        "github-approve-close" => Some("github_issue_close"),
+        _ => None,
+    };
+    if let Some(tool) = tool {
+        let args = serde_json::json!(summary.args);
+        if crate::full_approval::authorize(
+            &app.hub,
+            crate::full_approval::desk_owner(session),
+            tool,
+            fuzukue_proto::ApprovalRisk::Mid,
+            serde_json::json!({"fingerprint": crate::full_approval::fingerprint(&args)}),
+            serde_json::json!({"target": args.get("item").or_else(|| args.get("repo"))}),
+        )? {
+            return Ok(());
+        }
+    }
     ensure!(confirm, "Ask the user first, then set confirm=true");
     let decision =
         crate::delegate::request_approval(app, session, APPROVAL, actor, summary).await?;

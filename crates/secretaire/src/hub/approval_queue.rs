@@ -1,12 +1,15 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use fuzukue_proto::{ApprovalDecision, ApprovalOwner, ApprovalSummary};
+use fuzukue_proto::{
+    ApprovalDecision, ApprovalOwner, ApprovalSummary, FullApprovalChange, FullApprovalMode,
+    FullApprovalSettings,
+};
 use tokio::sync::broadcast;
 
 use super::{
     Hub,
-    approval_store::{Action, Queue, Registration},
+    approval_store::{Action, FullAuthorization, Queue, Registration},
 };
 
 #[cfg(test)]
@@ -29,6 +32,33 @@ impl Hub {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn register_approval(&self, registration: Registration) -> Result<String> {
         self.approval_queue()?.register(registration)
+    }
+
+    pub(crate) fn set_full_approval(
+        &self,
+        change: FullApprovalChange,
+        principal: &crate::remote::SettingsPrincipal,
+    ) -> Result<Option<FullApprovalMode>> {
+        self.approval_queue()?.set_full_mode(change, principal.as_str())
+    }
+
+    pub(crate) fn full_approval_lease(&self) -> Result<Option<(FullApprovalMode, tokio::sync::watch::Receiver<()>)>> {
+        match self.approval_queue.get() {
+            Some(queue) => queue.full_mode_lease(),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn full_approval_settings(&self, before: Option<usize>) -> Result<FullApprovalSettings> {
+        self.approval_queue()?.full_settings(before)
+    }
+
+    pub(crate) fn authorize_full_approval(&self, request: Registration) -> Result<FullAuthorization> {
+        if let Some(queue) = self.approval_queue.get() {
+            queue.authorize_full(request)
+        } else {
+            Ok(FullAuthorization::Human)
+        }
     }
 
     pub(crate) fn pending_approvals(

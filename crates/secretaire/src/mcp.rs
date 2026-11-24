@@ -1008,6 +1008,15 @@ pub(crate) fn worker_tool_names(allow: &[String]) -> Vec<String> {
         .map(|tool| tool.name().to_owned()).collect()
 }
 
+pub(crate) fn read_only_worker_tools(tools: Vec<String>) -> Vec<String> {
+    tools.into_iter().filter(|name| {
+        worker_tools().chain([Tool::Escalate]).any(|tool| {
+            tool.name() == name && !tool.writes()
+                && !matches!(tool, Tool::Recipe(_) | Tool::BuildPaper | Tool::CaptureScreenshot | Tool::LeanDocCheck | Tool::Lsp(_))
+        })
+    }).collect()
+}
+
 const PLANNER_TOOLS: [Tool; 3] = [Tool::ListAgents, Tool::AgentStats, Tool::TierStats];
 const CONSULT_TOOLS: [Tool; 1] = [Tool::SearchLibrary];
 
@@ -1234,7 +1243,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                 async {
                     let scope = app.delegates.workspace_read_scope(job)?;
                     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                    Ok(data_result(call_read_tool(&app, &q.session, tool, scope, &args).await?, false))
+                    Ok(data_result(call_read_tool(&app, &q.session, Some(job), tool, scope, &args).await?, false))
                 }.await
             } else if let Some(tool) = harness_candidates::Tool::named(name) {
                 let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
@@ -1625,13 +1634,23 @@ fn import_paths(project: &Path, args: &ImportLatexArgs) -> Result<(PathBuf, Path
 }
 
 async fn call_read_tool(
-    app: &Workspace, session: &str, tool: workspace_read::Tool, scope: workspace_read::ReadScope, args: &Value,
+    app: &Workspace, session: &str, job: Option<&str>, tool: workspace_read::Tool,
+    scope: workspace_read::ReadScope, args: &Value,
 ) -> Result<Value> {
-    match tool.call(scope, args).await {
+    match tool.call(scope.clone(), args).await {
         Err(error) if !crate::canary() => {
             let Some(outside) = error.downcast_ref::<crate::folder_grants::OutsideScope>() else {
                 return Err(error);
             };
+            if let Some(id) = app.hub.auto_folder_access(session, job, &outside.0)? {
+                if let Some(job) = job {
+                    app.delegates.workspace_read_scope(job)?;
+                }
+                return tool.call(scope.with_additional_grant(id), args).await;
+            }
+            if job.is_some() {
+                return Err(error);
+            }
             match app.hub.request_folder_access(session, &outside.0) {
                 Ok(id) => anyhow::bail!(
                     "{error}. Folder access request {id} is pending in the thread's approvals. Ask the user to approve it there, then retry. Delegated workers need the grant ID explicitly listed in their assignment."
@@ -1813,17 +1832,17 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         Tool::WorkspaceRead(tool) => {
             let scope = workspace_read::ReadScope::new(project, &app.state_dir, None)?
                 .with_grants(crate::folder_grants::Access { hub: app.hub.clone(), session: session.into(), worker_grants: None });
-            Box::pin(call_read_tool(app, session, tool, scope, args)).await?
+            Box::pin(call_read_tool(app, session, None, tool, scope, args)).await?
         }
         Tool::HarnessCandidates(tool) => Box::pin(tool.call(app, None, args)).await?,
         Tool::WorkspaceWrite(_) => unreachable!("Workspace writes use the authenticated worker route"),
         Tool::FolderGrants => {
             // The front desk branch has already authenticated the session in dispatch.
             match parse_args(args)? {
-                FolderGrantAction::Request { path } => json!({
-                    "request_id": app.hub.request_folder_access(session, &path)?,
-                    "status": "pending",
-                }),
+                FolderGrantAction::Request { path } => match app.hub.auto_folder_access(session, None, &path)? {
+                    Some(id) => json!({"grant_id": id, "status": "granted"}),
+                    None => json!({"request_id": app.hub.request_folder_access(session, &path)?, "status": "pending"}),
+                },
                 FolderGrantAction::List { audit_before } => {
                     let (grants, audit, audit_before) = app.hub.list_folder_grants(session, audit_before)?;
                     json!({"grants": grants, "audit": audit, "audit_before": audit_before})

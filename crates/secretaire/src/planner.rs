@@ -1813,6 +1813,7 @@ async fn revise(
     };
     let format = response_format(locale);
     let launch = delegate::WorkerLaunch {
+        execution: None,
         scope: None,
         instructions: format!("{}\n{directory}\n{format}", agent.prompt),
         mcp_url: Some(url.to_string()),

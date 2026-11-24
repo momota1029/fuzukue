@@ -428,7 +428,7 @@ mod tests {
         )
         .await?;
         let running = app.delegates.running.lock().unwrap()[&job].clone();
-        assert!(running.key.is_empty() && running.tools.is_empty());
+        assert!(running.key.is_empty() && running.tools.lock().unwrap().is_empty());
         assert_eq!(
             app.delegates.worker_tools(&session, &job, &running.key),
             None

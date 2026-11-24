@@ -147,15 +147,27 @@ async fn request_with<Fut>(
 where
     Fut: Future<Output = anyhow::Result<String>>,
 {
-    // Register the human waiter first. This is a live approval throughout review and drain.
-    let (wait, mut reply) = super::open_approval(app, &owner.session, &owner.job, Actor::Claude,
-        format!("{tool} {input}").into(), Some(owner.clone()));
-    let policy = *app.worker_approval_policy.lock().unwrap();
     let path = || {
         let scope = app.delegates.approval_scope(&owner.session, &owner.job)?;
         let path = checked_read(tool, input, human_only, &scope.root, &protected_roots(&app.state_dir))?;
         Some((scope, path))
     };
+    if let Some((scope, canonical)) = path() {
+        let approval_owner = fuzukue_proto::ApprovalOwner {
+            thread: owner.session.clone(), job: owner.job.clone(), requester: "claude".into(),
+        };
+        if crate::full_approval::authorize(
+            &app.hub, approval_owner, "Read", fuzukue_proto::ApprovalRisk::Low,
+            json!({"fingerprint": crate::full_approval::fingerprint(input), "request": owner.backend_id}),
+            json!({"worktree": scope.root, "path": canonical.strip_prefix(&scope.root)?}),
+        )? {
+            return Ok("accept".into());
+        }
+    }
+    // Register the human waiter before invoking the legacy advisor.
+    let (wait, mut reply) = super::open_approval(app, &owner.session, &owner.job, Actor::Claude,
+        format!("{tool} {input}").into(), Some(owner.clone()));
+    let policy = *app.worker_approval_policy.lock().unwrap();
     if policy != WorkerApprovalPolicy::Ask {
         if let Some((scope, reviewed_path)) = path() {
             let answer = tokio::select! {
@@ -250,7 +262,7 @@ mod tests {
         let writes = Arc::new(WriteSet::new(&root, Some(vec!["README.md".into()]), "", || None)?);
         app.delegates.running.lock().unwrap().insert(JOB.into(), Arc::new(RunningJob {
             session: SESSION.into(), key: String::new(), approach: String::new(),
-            summary: Default::default(), retry: Default::default(), tools: Vec::new(),
+            summary: Default::default(), retry: Default::default(), tools: Default::default(),
             input: Default::default(), cancel: Default::default(), started: true.into(),
             drain_notice: Default::default(), capture_scope: Default::default(),
             workspace_read_scope: Default::default(),

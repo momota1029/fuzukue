@@ -32,6 +32,7 @@ struct ThreadInfo {
     session: String,
     parent_tool_use: Option<String>,
     read_only: bool,
+    worker_execution: Option<crate::worker_execution::Policy>,
     current_turn: Option<String>,
     /// 最後の final_answer
     last_answer: String,
@@ -225,6 +226,17 @@ struct SkillRoots {
     snapshots: HashMap<[u8; 32], tempfile::TempDir>,
     active: Option<[u8; 32]>,
     unsupported: bool,
+}
+
+fn approval_result(permissions: Option<Value>, decision: &str) -> Value {
+    match permissions {
+        Some(permissions) => json!({"scope": "turn", "permissions": if decision == "accept" && permissions.is_object() {
+            permissions
+        } else {
+            json!({})
+        }}),
+        None => json!({"decision": decision}),
+    }
 }
 
 pub struct Codex {
@@ -485,10 +497,10 @@ impl Codex {
     }
 
     /// 新しいスレッドを作る。作業ディレクトリへの書き込みは許し、それ以外は承認を求めさせる。
-    pub async fn start_thread(&self, session: &str, parent_tool_use: Option<String>) -> Result<String> {
+    pub async fn start_thread(&self, session: &str, parent_tool_use: Option<String>, launch: Option<&crate::delegate::WorkerLaunch>) -> Result<String> {
         // A legacy worker can start before its parent tool event arrives.
         let parent_tool_use = Some(parent_tool_use.unwrap_or_else(|| format!("codex-run:{}", crate::mail::session_key())));
-        self.start_thread_with_policy(&self.project_dir, session, parent_tool_use, false, None, None, None).await
+        self.start_thread_with_policy(&self.project_dir, session, parent_tool_use, false, None, None, launch).await
     }
 
     pub async fn run_worker(
@@ -642,7 +654,7 @@ impl Codex {
         let mut skill_roots = self.skill_roots.lock().await;
         let rule_project = if worker.is_some() { project.to_path_buf() } else { self.project_dir.clone() };
         let workspace_review = launch.is_some_and(crate::mcp::workspace_read::is_review_launch);
-        let mut instructions = if let Some(launch) = launch.filter(|_| !workspace_review) {
+        let mut instructions = if let Some(launch) = launch.filter(|launch| !workspace_review && !launch.instructions.is_empty()) {
             self.set_skill_roots(&mut skill_roots, Default::default()).await?;
             launch.instructions.clone()
         } else {
@@ -697,7 +709,20 @@ impl Codex {
             });
         }
         let scope = launch.and_then(|launch| launch.scope.as_ref());
-        if let Some(scope) = scope {
+        let execution = launch.and_then(|launch| launch.execution);
+        if let Some(policy) = execution {
+            use crate::worker_execution::Approval;
+            // bubblewrap, when selected, already constrains the app-server and its subprocesses.
+            params["sandbox"] = json!("danger-full-access");
+            params["approvalPolicy"] = json!(match policy.approval {
+                Approval::Ask | Approval::Auto => "untrusted",
+                Approval::Never => "never",
+            });
+            params["config"]["features"] = json!({
+                "hooks": false, "plugins": false, "multi_agent": false, "multi_agent_v2": false,
+                "skill_mcp_dependency_install": false,
+            });
+        } else if let Some(scope) = scope {
             let mut fs = serde_json::Map::new();
             fs.insert(":minimal".into(), json!("read"));
             for root in &scope.read_roots {
@@ -776,7 +801,7 @@ impl Codex {
             self.start_or_resume(params, saved).await?.0
         };
         drop(skill_roots);
-        if scope.is_some() && (r["activePermissionProfile"]["id"] != WORKER_PERMISSIONS
+        if scope.is_some() && execution.is_none() && (r["activePermissionProfile"]["id"] != WORKER_PERMISSIONS
             || r["approvalPolicy"] != "never")
         {
             if let Some(thread) = r["thread"]["id"].as_str() {
@@ -784,7 +809,20 @@ impl Codex {
             }
             bail!("Codex did not activate the worker filesystem permissions profile");
         }
-        self.register_thread(&r, session, parent_tool_use, read_only, None)
+        if let Some(policy) = execution {
+            let expected = if policy.approval == crate::worker_execution::Approval::Never { "never" } else { "untrusted" };
+            if r["sandbox"]["type"] != "dangerFullAccess" || r["approvalPolicy"] != expected {
+                if let Some(thread) = r["thread"]["id"].as_str() {
+                    self.close_worker(thread).await;
+                }
+                bail!("Codex did not activate the requested worker execution policy");
+            }
+        }
+        let id = self.register_thread(&r, session, parent_tool_use, read_only, None)?;
+        if let Some(thread) = self.threads.lock().unwrap().get_mut(&id) {
+            thread.worker_execution = execution;
+        }
+        Ok(id)
     }
 
     fn register_thread(
@@ -808,6 +846,7 @@ impl Codex {
                 session: session.into(),
                 parent_tool_use,
                 read_only,
+                worker_execution: None,
                 current_turn: None,
                 last_answer: String::new(),
                 acted_or_asked: false,
@@ -1041,14 +1080,7 @@ impl Codex {
             approvals.remove(request_id)
         };
         let Some(pending) = pending else { return Ok(false) };
-        let result = match pending.permissions {
-            Some(permissions) => json!({"scope": "turn", "permissions": if decision == "accept" && permissions.is_object() {
-                permissions
-            } else {
-                json!({})
-            }}),
-            None => json!({"decision": decision}),
-        };
+        let result = approval_result(pending.permissions, decision);
         if let Err(error) = self.write(json!({ "jsonrpc": "2.0", "id": pending.rpc_id, "result": result })).await {
             self.approval_cancelled(request_id.into());
             return Err(error);
@@ -1157,6 +1189,27 @@ impl Codex {
             )),
             _ => None,
         };
+        if let (Some(_), Some((session, Actor::Codex { parent_tool_use: Some(job), .. }, false))) = (&summary, &thread) {
+            let execution = self.threads.lock().unwrap().get(thread_id).and_then(|thread| thread.worker_execution);
+            let request = format!("{thread_id}:{id}");
+            let decision = crate::full_approval::authorize_worker(&self.hub, session, job, "codex", method, &request, p);
+            use crate::hub::approval_store::FullAuthorization::*;
+            let accept = match decision {
+                Ok(Granted) => Some(true),
+                Ok(AlreadyConsumed) => return,
+                Ok(Human) if execution.is_some_and(|policy| !policy.full && policy.approval != crate::worker_execution::Approval::Ask) => Some(true),
+                Ok(Human) => None,
+                Err(error) => {
+                    tracing::warn!(%error, %job, "Codex worker approval not granted");
+                    Some(false)
+                }
+            };
+            if let Some(accept) = accept {
+                let result = approval_result(permissions, if accept { "accept" } else { "decline" });
+                let _ = self.write(json!({ "jsonrpc": "2.0", "id": id, "result": result })).await;
+                return;
+            }
+        }
         match (summary, thread) {
             (Some(_), Some((_, _, true))) => {
                 let _ = self.write(json!({ "jsonrpc": "2.0", "id": id, "result": { "decision": "decline" } })).await;
@@ -1276,6 +1329,20 @@ impl Codex {
         }
         let item = &p["item"];
         let item_id = item["id"].as_str().unwrap_or("").to_string();
+        if method == "item/started" && !item_id.is_empty() {
+            let native = match item["type"].as_str() {
+                Some("commandExecution") => Some("exec"),
+                Some("fileChange") => Some("apply_patch"),
+                _ => None,
+            };
+            let full = self.threads.lock().unwrap().get(thread_id)
+                .is_some_and(|thread| thread.worker_execution.is_some_and(|policy| policy.full));
+            if full {
+                if let (Some(tool), Actor::Codex { parent_tool_use: Some(job), .. }) = (native, &actor) {
+                    crate::full_approval::observe_worker_tool(&self.hub, &session, job, "codex", tool, &item_id);
+                }
+            }
+        }
         let delegated = matches!(&actor, Actor::Codex { parent_tool_use: Some(job), .. }
             if job.starts_with(fuzukue_proto::DELEGATE_JOB));
         if !read_only && !delegated
@@ -1568,6 +1635,7 @@ mod tests {
         let codex = Codex::spawn_command(fixture, project.path(), hub.clone(),
             Arc::new(Usage::new(hub.clone())), Default::default()).await?;
         let launch = crate::delegate::WorkerLaunch {
+            execution: None,
             instructions: String::new(), scope: None, key: "fixture-key".into(),
             mcp_url: Some("http://127.0.0.1:7878/mcp?session=owner&job=consult".into()),
             tools: crate::mcp::planning_tool_names(true),
@@ -1586,7 +1654,7 @@ mod tests {
         assert!(server.get("default_tools_approval_mode").is_none());
         codex.close_worker(&thread).await;
 
-        let thread = codex.start_thread("owner", Some("delegate:fixture".into())).await?;
+        let thread = codex.start_thread("owner", Some("delegate:fixture".into()), None).await?;
         let mut events = hub.subscribe(u64::MAX).1;
         let message = "MCP tool call requires approval, but approval policy is never";
         for (error, result, expected) in [
@@ -1614,7 +1682,7 @@ mod tests {
         fixture.env("FUZUKUE_CODEX_FIXTURE_LOG", &log);
         let codex = Codex::spawn_command(fixture, project.path(), hub.clone(),
             Arc::new(Usage::new(hub.clone())), Default::default()).await?;
-        let thread = codex.start_thread("owner", Some("delegate:fixture".into())).await?;
+        let thread = codex.start_thread("owner", Some("delegate:fixture".into()), None).await?;
         let mut requests = hub.subscribe(u64::MAX).1;
         let action = json!({"threadId": thread, "command": "cat README.md", "cwd": project.path()});
         let method = "item/commandExecution/requestApproval";
@@ -1651,7 +1719,7 @@ mod tests {
         assert!(codex.resolve(&grant, "decline", false).await?);
         codex.close_worker(&thread).await;
 
-        let legacy = codex.start_thread("owner", Some("legacy-tool-use".into())).await?;
+        let legacy = codex.start_thread("owner", Some("legacy-tool-use".into()), None).await?;
         let mut requests = hub.subscribe(u64::MAX).1;
         codex.on_server_request(method, json!(93), &json!({
             "threadId": legacy, "command": "git push", "cwd": project.path(),
@@ -1664,6 +1732,23 @@ mod tests {
         assert!(codex.resolve(&request_id, "decline", false).await?);
         codex.close_worker(&legacy).await;
 
+        // The same native request when full approval is active sends one reply.
+        hub.init_approval_queue("fixture".into(), project.path());
+        hub.set_full_approval(
+            fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour },
+            &crate::remote::SettingsPrincipal::fixture(),
+        )?;
+        let full = codex.start_thread("owner", Some("delegate:full".into()), None).await?;
+        let push = json!({"threadId": full, "command": "git push", "cwd": project.path()});
+        codex.on_server_request(method, json!(94), &push).await;
+        codex.on_server_request(method, json!(94), &push).await;
+        assert!(hub.live_approval_threads().is_empty());
+        let audit = hub.full_approval_settings(None)?.audit;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].granted_by, "full_mode");
+        assert_eq!(audit[0].action.args, "[redacted]");
+        codex.close_worker(&full).await;
+
         let replies = std::fs::read_to_string(log)?.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|message| message.get("method").is_none())
             .collect::<Vec<_>>();
@@ -1671,6 +1756,7 @@ mod tests {
             json!({"jsonrpc":"2.0", "id":backend_id, "result":{"decision":"decline"}}),
             json!({"jsonrpc":"2.0", "id":92, "result":{"scope":"turn", "permissions":{}}}),
             json!({"jsonrpc":"2.0", "id":93, "result":{"decision":"decline"}}),
+            json!({"jsonrpc":"2.0", "id":94, "result":{"decision":"accept"}}),
         ]);
         Ok(())
     }

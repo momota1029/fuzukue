@@ -55,6 +55,9 @@ server-resume-error = 再開できない: { $detail }
 server-auto-approval-error = 自動承認に失敗しました: { $detail }
 server-invalid-message = 不正な要求: { $detail }
 server-codex-error = Codex: { $detail }
+server-full-approval-until = 完全承認モードは { $at } まで有効
+server-full-approval-until-disabled = 完全承認モードは停止するまで有効
+server-full-approval-off = 完全承認モードは無効
 
 server-parallel-limit = 並行数の上限に達している（{ $running }/{ $limit } 件が実行中。このスレッドの設定: { $setting ->
     [normal] 標準

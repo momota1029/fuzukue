@@ -1613,15 +1613,32 @@ pub(crate) async fn run_worker(
     }));
     let config = json!({"mcpServers": servers}).to_string();
     let scope = launch.scope.as_ref().context("worker filesystem scope is missing")?;
-    let scope_settings = scope.claude_settings(&std::env::current_exe()?).to_string();
+    use crate::worker_execution::Approval;
+    let execution = launch.execution;
+    let scope_settings = match execution {
+        Some(policy) if policy.approval == Approval::Never => json!({}),
+        Some(_) => json!({"permissions": {"ask": ["Bash"]}}),
+        None => scope.claude_settings(&std::env::current_exe()?),
+    }.to_string();
     let instructions = format!("{}{}", launch.instructions, crate::rules::worker_voice());
-    let mut cmd = Command::new(program);
+    let (mut cmd, mode) = if let Some(policy) = execution {
+        let mut command = policy.command(&program, scope).await?;
+        policy.backend_home(&mut command, &scope.scratch, "CLAUDE_CONFIG_DIR", ".claude", &[".credentials.json"])?;
+        let mode = match policy.approval {
+            Approval::Never => PermissionMode::BypassPermissions,
+            Approval::Auto => PermissionMode::AcceptEdits,
+            Approval::Ask => PermissionMode::Default,
+        };
+        (command, mode)
+    } else {
+        let mode = match settings.permission_mode {
+            PermissionMode::BypassPermissions => PermissionMode::AcceptEdits,
+            mode => mode,
+        };
+        (Command::new(program), mode)
+    };
     #[cfg(target_os = "linux")]
     crate::worker_scope::lower_child_cpu_priority(&mut cmd);
-    let mode = match settings.permission_mode {
-        PermissionMode::BypassPermissions => PermissionMode::AcceptEdits,
-        mode => mode,
-    };
     cmd.args([
         "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
         "--include-partial-messages",
@@ -1694,6 +1711,14 @@ pub(crate) async fn run_worker(
                             if let Some(text) = item["text"].as_str() {
                                 last_answer = text.into();
                             }
+                            if execution.is_some_and(|policy| policy.full) && item["type"] == "tool_use" {
+                                let name = item["name"].as_str().unwrap_or_default();
+                                if !name.is_empty() && !name.starts_with("mcp__") {
+                                    if let Some(id) = item["id"].as_str() {
+                                        crate::full_approval::observe_worker_tool(&app.hub, session, job, "claude", name, id);
+                                    }
+                                }
+                            }
                         }
                     }
                     Some("control_request") => {
@@ -1701,17 +1726,37 @@ pub(crate) async fn run_worker(
                         anyhow::ensure!(!pending_approvals.contains_key(backend_id), "Claude reused a pending approval request ID");
                         let request = &frame["request"];
                         let tool = request["tool_name"].as_str().unwrap_or("Claude");
+                        if request["subtype"] == "can_use_tool" {
+                            use crate::hub::approval_store::FullAuthorization::*;
+                            match crate::full_approval::authorize_worker(&app.hub, session, job, "claude", tool, backend_id, &request["input"]) {
+                                Ok(Granted) => {
+                                    write_worker_approval(stdin, backend_id, Some(request["input"].clone())).await?;
+                                    continue;
+                                }
+                                Ok(AlreadyConsumed) => continue,
+                                Ok(Human) if execution.is_some_and(|policy| !policy.full && policy.approval != Approval::Ask) => {
+                                    write_worker_approval(stdin, backend_id, Some(request["input"].clone())).await?;
+                                    continue;
+                                }
+                                Ok(Human) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, %job, "Claude worker approval not granted");
+                                    write_worker_approval(stdin, backend_id, None).await?;
+                                    continue;
+                                }
+                            }
+                        }
                         let guard = scope.claude_decision(&json!({
                             "tool_name": tool, "tool_input": request["input"], "cwd": cwd,
                         }));
                         if request["subtype"] != "can_use_tool" || (
-                            guard["hookSpecificOutput"]["permissionDecision"] == "deny"
+                            execution.is_none() && guard["hookSpecificOutput"]["permissionDecision"] == "deny"
                             && matches!(tool, "Read" | "Grep" | "Glob" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit")
                         ) {
                             write_worker_approval(stdin, backend_id, None).await?;
                             continue;
                         }
-                        if tool == "Bash" {
+                        if execution.is_none() && tool == "Bash" {
                             if let Some((approved, who)) = worker_shell(app, scope, request) {
                                 write_worker_approval(stdin, backend_id, Some(approved.input.clone())).await?;
                                 let id = format!("{job}:{}", crate::mail::session_key());

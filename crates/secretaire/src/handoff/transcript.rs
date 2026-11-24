@@ -157,6 +157,7 @@ pub(super) async fn generate(
         log.chars().take(4000).collect::<String>(),
     );
     let launch = WorkerLaunch {
+        execution: None,
         scope: None,
         instructions,
         mcp_url: None,

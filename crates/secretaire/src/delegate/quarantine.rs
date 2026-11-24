@@ -61,6 +61,7 @@ struct Entry {
     action: Action,
 }
 
+#[derive(Default)]
 pub(super) struct Review {
     entries: Vec<Entry>,
     manifest: Option<PathBuf>,

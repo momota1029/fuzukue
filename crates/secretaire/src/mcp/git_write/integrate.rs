@@ -642,44 +642,61 @@ pub(in crate::mcp) async fn call(
         ));
     }
     if args.override_privacy || local_approval.is_some() {
-        let actor = local_approval.context("Privacy override requires front desk approval")?;
-        let details = format!(
-            "Integrate Git patch SHA-256 {} at HEAD {} ({} files){}",
-            prepared.patch_sha256,
-            prepared.head,
-            prepared.changes.len(),
-            if args.override_privacy {
-                format!(
-                    ". Privacy override ({} flagged lines): {}",
-                    findings.count,
-                    findings
-                        .locations
-                        .join(", ")
-                        .chars()
-                        .take(1000)
-                        .collect::<String>()
-                )
-            } else {
-                String::new()
+        let automatic = !args.override_privacy
+            && prepared.changes.iter().all(|change| change.after.is_some())
+            && crate::full_approval::authorize(
+                &app.hub,
+                crate::full_approval::desk_owner(session),
+                NAME,
+                fuzukue_proto::ApprovalRisk::Mid,
+                json!({
+                    "patch": prepared.patch_sha256,
+                    "head": prepared.head,
+                    "index": prepared.index_hash,
+                    "message": crate::full_approval::fingerprint(&json!(prepared.message)),
+                }),
+                json!({"ref": prepared.reference, "files": prepared.changes.len()}),
+            )?;
+        if !automatic {
+            let actor = local_approval.context("Privacy override requires front desk approval")?;
+            let details = format!(
+                "Integrate Git patch SHA-256 {} at HEAD {} ({} files){}",
+                prepared.patch_sha256,
+                prepared.head,
+                prepared.changes.len(),
+                if args.override_privacy {
+                    format!(
+                        ". Privacy override ({} flagged lines): {}",
+                        findings.count,
+                        findings
+                            .locations
+                            .join(", ")
+                            .chars()
+                            .take(1000)
+                            .collect::<String>()
+                    )
+                } else {
+                    String::new()
+                }
+            );
+            let decision = crate::delegate::request_approval(
+                app,
+                session,
+                fuzukue_proto::GIT_APPROVAL,
+                actor,
+                details,
+            )
+            .await;
+            match decision {
+                Ok(decision) if decision == "accept" => {}
+                Ok(_) => {
+                    return Ok(failure(
+                        "approval_denied",
+                        "The user did not approve the integration",
+                    ));
+                }
+                Err(error) => return Ok(failure("approval_failed", error)),
             }
-        );
-        let decision = crate::delegate::request_approval(
-            app,
-            session,
-            fuzukue_proto::GIT_APPROVAL,
-            actor,
-            details,
-        )
-        .await;
-        match decision {
-            Ok(decision) if decision == "accept" => {}
-            Ok(_) => {
-                return Ok(failure(
-                    "approval_denied",
-                    "The user did not approve the integration",
-                ));
-            }
-            Err(error) => return Ok(failure("approval_failed", error)),
         }
         recheck.await?;
     }

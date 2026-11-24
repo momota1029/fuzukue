@@ -52,6 +52,44 @@ fn request(approval: &PendingApproval) -> Option<(&str, &str)> {
 }
 
 impl Hub {
+    /// Issue a one-hour grant for the exact folder of the current read. The worker
+    /// caller receives this ID for its retry; its assignment grants stay unchanged.
+    pub(crate) fn auto_folder_access(&self, session: &str, job: Option<&str>, path: &Path) -> Result<Option<String>> {
+        // Preserve the existing lock order: queue state is acquired under the Hub lock.
+        let mut inner = self.inner.lock().unwrap();
+        let Some((mode, changes)) = self.full_approval_lease()? else { return Ok(None) };
+        ensure!(inner.live_thread(session), "Thread is archived or missing");
+        let folder = canonical_folder(path, &inner.folder_store()?.protected())?;
+        let mut owner = crate::full_approval::desk_owner(session);
+        if let Some(job) = job {
+            owner.job = job.into();
+            owner.requester = "worker".into();
+        }
+        let turn = inner.current_turn(session);
+        let grant = inner.folder_store()?.active(session, chrono::Utc::now().timestamp_millis(), turn)
+            .find(|grant| grant.path == folder && grant.granted_by == "full_mode");
+        let id = if let Some(grant) = grant {
+            // Old grants remain available to their existing holders. An active mode
+            // is required to give the current caller a new reference to one.
+            if changes.has_changed().unwrap_or(true)
+                || mode.expires_at.is_some_and(|at| at <= chrono::Utc::now().timestamp_millis())
+            {
+                return Ok(None);
+            }
+            grant.id.clone()
+        } else {
+            if !crate::full_approval::authorize(
+                self, owner, "folder_read", fuzukue_proto::ApprovalRisk::Mid,
+                serde_json::json!({"expiry": "one_hour"}),
+                serde_json::json!({"folder": folder}),
+            )? {
+                return Ok(None);
+            }
+            self.add_folder_grant_locked(&mut inner, session, folder, FolderGrantExpiry::OneHour, "full_mode")?.id
+        };
+        Ok(Some(id))
+    }
+
     pub(crate) fn request_folder_access(&self, session: &str, path: &Path) -> Result<String> {
         let mut inner = self.inner.lock().unwrap();
         ensure!(inner.live_thread(session), "Thread is archived or missing");
@@ -140,7 +178,7 @@ impl Hub {
             Path::new(&folder) == path,
             "Use the canonical folder path without symlinks"
         );
-        self.add_folder_grant_locked(&mut inner, session, folder, expiry, principal)
+        self.add_folder_grant_locked(&mut inner, session, folder, expiry, principal).map(|_| ())
     }
 
     fn add_folder_grant_locked(
@@ -150,10 +188,10 @@ impl Hub {
         path: String,
         expiry: FolderGrantExpiry,
         principal: &str,
-    ) -> Result<()> {
+    ) -> Result<FolderGrant> {
         ensure!(inner.live_thread(session), "Thread is archived or missing");
         let turn = inner.current_turn(session);
-        inner
+        let grant = inner
             .folder_store_mut()?
             .add(session.into(), path, expiry, turn, principal)?;
         let _ = self
@@ -161,7 +199,7 @@ impl Hub {
             .send(crate::snapshot(ServerEvent::FolderGrantsChanged {
                 session: session.into(),
             }));
-        Ok(())
+        Ok(grant)
     }
 
     pub(crate) fn list_folder_grants(

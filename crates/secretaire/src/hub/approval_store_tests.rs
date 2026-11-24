@@ -33,6 +33,71 @@ fn hub(dir: &Path) -> Hub {
     hub
 }
 
+#[test]
+fn full_approval_grants_one_claim_and_masks_its_history() -> Result<()> {
+    let dir = TestDir::new();
+    let queue = Queue::new("workspace".into(), dir.path());
+    let request = || {
+        let mut request = request();
+        request.action.tool = "fs_write".into();
+        request
+    };
+    assert_eq!(queue.authorize_full(request())?, FullAuthorization::Human);
+
+    let change = FullApprovalChange::Full {
+        duration: FullApprovalDuration::OneHour,
+    };
+    let enabled = queue.set_full_mode(change, "test-user")?.unwrap();
+    assert_eq!(enabled.expires_at, Some(enabled.enabled_at + HOUR_MS));
+    assert_eq!(queue.authorize_full(request())?, FullAuthorization::Granted);
+    assert_eq!(queue.authorize_full(request())?, FullAuthorization::AlreadyConsumed);
+
+    let mut push = request();
+    push.action.tool = "git push".into();
+    push.unattended = ApprovalUnattended::NeverUnattended;
+    let mut desk_push = request();
+    desk_push.owner = crate::full_approval::desk_owner("thread-1");
+    desk_push.action.tool = "git push".into();
+    desk_push.unattended = ApprovalUnattended::NeverUnattended;
+    assert_eq!(queue.authorize_full(push)?, FullAuthorization::Granted);
+    let pending = queue.register(desk_push)?;
+    assert_eq!(queue.pending()?.0[0].approval_id, pending);
+    let audit = queue.full_settings(None)?;
+    assert_eq!(audit.audit.len(), 2);
+    assert!(audit.audit.iter().all(|entry| entry.granted_by == "full_mode" && entry.action.args == json!("[redacted]")));
+    assert_eq!(audit.last_24_hours_by_tool["fs_write"], 1);
+
+    let mut unclaimed = request();
+    unclaimed.action.args = json!({"other": "contents"});
+    let owner = unclaimed.owner.clone();
+    let action = unclaimed.action.clone();
+    let id = queue.register(unclaimed)?;
+    queue.set_full_mode(FullApprovalChange::Off, "test-user")?;
+    assert!(!queue.consume_once(&id, &owner, &action)?);
+    assert!(queue.full_settings(None)?.active.is_none());
+    Ok(())
+}
+
+#[test]
+fn full_approval_expiry_and_until_disabled() -> Result<()> {
+    let dir = TestDir::new();
+    let queue = Queue::new("workspace".into(), dir.path());
+    let change = FullApprovalChange::Full {
+        duration: FullApprovalDuration::EightHours,
+    };
+    queue.set_full_mode_at(change, "test-user", || 0)?;
+    assert!(queue.full_mode(8 * HOUR_MS - 1)?.is_some());
+    assert!(queue.full_mode(8 * HOUR_MS)?.is_none());
+
+    let until_disabled = queue.set_full_mode(FullApprovalChange::Full {
+        duration: FullApprovalDuration::UntilDisabled,
+    }, "test-user")?.unwrap();
+    assert_eq!(until_disabled.expires_at, None);
+    assert!(crate::full_approval::command(&hub(dir.path()), "8h", None).is_err());
+    assert!(queue.full_settings(None)?.active.is_some());
+    Ok(())
+}
+
 const GRANT_ONCE: ApprovalDecision = ApprovalDecision::Grant {
     scope: ApprovalGrantScope::Once,
 };
@@ -238,7 +303,8 @@ fn restart_preserves_pending_decisions_and_consumption() -> Result<()> {
     assert!(matches!(
         history[1].event,
         AuditEvent::Granted {
-            scope: ApprovalGrantScope::Once
+            scope: ApprovalGrantScope::Once,
+            full_mode_id: None,
         }
     ));
     assert_eq!(history[1].principal, "device:desktop");
