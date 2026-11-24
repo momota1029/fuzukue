@@ -94,7 +94,7 @@ impl UiTree<'_> {
                     .font_semibold()
                     .child(title.clone());
                 let panel = panel(id("card"), theme)
-                    .when(!theme.is_dark(), |panel| panel.bg(theme.background))
+                    .when(!theme.is_dark(), |panel| panel.bg(theme.popover))
                     .rounded_lg()
                     .p_4()
                     .gap_3()
@@ -162,7 +162,7 @@ impl UiTree<'_> {
                 let surface = if theme.is_dark() {
                     theme.secondary
                 } else {
-                    theme.background.blend(theme.secondary.opacity(0.15))
+                    theme.popover.blend(theme.secondary.opacity(0.15))
                 };
                 let foreground = tone.map_or(theme.foreground, |tone| {
                     tone_foreground(theme, tone, surface)
@@ -349,7 +349,7 @@ impl UiTree<'_> {
                 let surface = if theme.is_dark() {
                     theme.muted.opacity(0.45)
                 } else {
-                    theme.background
+                    theme.popover
                 };
                 let heading = format!("{level} · {title}");
                 let panel = panel(id("callout"), theme)

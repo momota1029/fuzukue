@@ -18,10 +18,11 @@ pub struct DesktopColors {
     pub background: u32,
     pub chrome: u32,
     pub chat: u32,
+    pub raised: u32,
     pub code: u32,
-    /// Structural rules target at least 1.5:1 on the desktop surfaces.
+    /// Decorative rules target at least 1.5:1 on the desktop surfaces.
     pub divider: u32,
-    /// Card and control outlines target at least 2:1 on the desktop surfaces.
+    /// Card and control outlines target at least 3:1 on the desktop surfaces.
     pub outline: u32,
 }
 
@@ -29,21 +30,23 @@ impl DesktopColors {
     pub const fn for_dark_mode(dark: bool) -> Self {
         if dark {
             Self {
-                background: 0x191919,
-                chrome: 0x1f1f1f,
-                chat: 0x252525,
-                code: 0x080a0d,
-                divider: 0x575757,
-                outline: 0x747474,
+                background: 0x403034,
+                chrome: 0x37292d,
+                chat: 0x49373c,
+                raised: 0x533f45,
+                code: 0x2e2326,
+                divider: 0x806970,
+                outline: 0xb49ba2,
             }
         } else {
             Self {
-                background: 0xffffff,
-                chrome: 0xf7f7f7,
-                chat: 0xefefef,
-                code: 0xdfe2e7,
-                divider: 0xb7b7b7,
-                outline: 0x959595,
+                background: 0xe6f1fa,
+                chrome: 0xdceaf5,
+                chat: 0xf0f6fc,
+                raised: 0xffffff,
+                code: 0xd7e7f4,
+                divider: 0xa69aa0,
+                outline: 0x80717b,
             }
         }
     }
@@ -309,8 +312,10 @@ mod tests {
 
         for dark in [false, true] {
             let colors = DesktopColors::for_dark_mode(dark);
-            for (border, minimum) in [(colors.divider, 1.5), (colors.outline, 2.)] {
-                for surface in [colors.background, colors.chrome, colors.chat, colors.code] {
+            for (border, minimum) in [(colors.divider, 1.5), (colors.outline, 3.)] {
+                for surface in [
+                    colors.background, colors.chrome, colors.chat, colors.raised, colors.code,
+                ] {
                     let (border_l, surface_l) = (luminance(border), luminance(surface));
                     let ratio = (border_l.max(surface_l) + 0.05) / (border_l.min(surface_l) + 0.05);
                     assert!(ratio >= minimum, "#{border:06x} on #{surface:06x}: {ratio:.2}:1");

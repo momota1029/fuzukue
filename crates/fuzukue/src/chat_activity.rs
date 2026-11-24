@@ -166,7 +166,7 @@ impl Workbench {
             .line_height(UI_LINE_HEIGHT)
             .whitespace_nowrap()
             .text_color(theme.muted_foreground)
-            .child(activity_spinner(activity_id("icon"), theme.link).mr_1())
+            .child(activity_spinner(activity_id("icon"), theme.ring).mr_1())
             .when_some(label, |status, label| status.child(
                 status_row(&label, theme.muted_foreground)
                     .id(activity_id("label"))
@@ -306,7 +306,7 @@ impl Workbench {
                 h_flex()
                     .items_center()
                     .gap_1()
-                    .child(activity_spinner(activity_id("turn-icon"), theme.link))
+                    .child(activity_spinner(activity_id("turn-icon"), theme.ring))
                     .child(status_row(&turn_activity_detail(turn), theme.muted_foreground))
             }))
             .children(waiting.map(|wait| status_row(&waiting_label(wait, now_ms), theme.muted_foreground)))
@@ -423,7 +423,7 @@ impl Workbench {
                 .when_some(worker.elapsed.as_ref(), |heading, _| {
                     heading.child(activity_spinner(
                         activity_id(&format!("job-icon-{index}")),
-                        theme.link,
+                        theme.ring,
                     ))
                 })
                 .when(worker.elapsed.is_none(), |heading| {

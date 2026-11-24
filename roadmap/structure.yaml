@@ -48,6 +48,8 @@ sections:
   - R-54
   - R-55
   - R-56
+  - R-57
+  - R-58
 - title: 技術的負債
   items:
   - R-38
