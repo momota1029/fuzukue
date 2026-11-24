@@ -1,0 +1,12 @@
+name = "memo-stats"
+version = "0.1.0"
+title = "title"
+description = "description"
+author = "fuzukue"
+component = "extension.wasm"
+view = true
+events = ["memo-added", "card-saved"]
+
+[permissions]
+read = ["memos/*/card.md"]
+agent-tools = true

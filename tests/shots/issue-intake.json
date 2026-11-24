@@ -1,0 +1,15 @@
+{"steps":[
+    {"action":"size","width":1200,"height":800},
+    {"action":"connect"},
+    {"action":"select_thread","title":"Repository intake"},
+    {"action":"open_thread_menu"},
+    {"action":"screenshot","name":"issue-intake-menu"},
+    {"action":"key","key":"down"},
+    {"action":"key","key":"down"},
+    {"action":"key","key":"down"},
+    {"action":"key","key":"down"},
+    {"action":"key","key":"enter"},
+    {"action":"wait_element","id":"github-intake-badge-thread-intake-fixture"},
+    {"action":"open_thread_menu"},
+    {"action":"screenshot","name":"issue-intake-badge"}
+]}

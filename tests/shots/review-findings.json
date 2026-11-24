@@ -1,0 +1,26 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "locale", "locale": "en"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread", "deck": "research/concentration"},
+    {"action": "click", "id": "open-attachment-research/concentration"},
+    {"action": "click", "id": "tabdeck-concentration"},
+    {"action": "wait_element", "id": "review-findings-row-q-product"},
+    {"action": "wait_element", "id": "review-findings-row-idea-isoperimetry"},
+    {"action": "screenshot", "name": "review-findings-deck"},
+    {"action": "click", "id": "card-q-product"},
+    {"action": "wait_element", "id": "card-detail-review-findings"},
+    {"action": "screenshot", "name": "review-findings-card"},
+    {"action": "click", "id": "card-detail-review-findings"},
+    {"action": "wait_element", "id": "review-finding-cb38ac8b-d670-47be-91e3-9c4ecdb61d26"},
+    {"action": "screenshot", "name": "review-findings-card-ledger"},
+    {"action": "click", "id": "review-findings-close"},
+    {"action": "click", "id": "open-attachment-research/concentration"},
+    {"action": "click", "id": "tabdeck-concentration"},
+    {"action": "click", "id": "deck-review-findings"},
+    {"action": "wait_element", "id": "review-finding-ece8c201-f35f-418d-8975-013363d3cedc"},
+    {"action": "screenshot", "name": "review-findings-deck-ledger"}
+  ]
+}

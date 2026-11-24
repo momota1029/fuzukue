@@ -1,0 +1,12 @@
+kind = "paper"
+title = "Lévy 族と球面の集中"
+status = "drafting"
+next = "球面の集中の証明（等周不等式からの評価）を段に分けて書く"
+outputs = ["build/paper.pdf"]
+preamble = "preamble.tex"
+
+[macros]
+ObsDiam = "\\operatorname{ObsDiam}"
+
+[review]
+auto = true

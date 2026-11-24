@@ -1,0 +1,1008 @@
+use super::*;
+use crate::{delegate, Workspace};
+use fuzukue_proto::{Actor, AgentCaller, ClientMsg, DelegateSettings, PlanStep, SelfUpdateBlockerKind, ServerEvent};
+
+async fn until(test: impl Fn() -> bool) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while !test() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("fixture did not reach expected state")
+}
+
+fn install_desk_fixture(app: &crate::App, dir: &Path) -> Result<()> {
+    let program = dir.join("mock-claude");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+case "$1" in --help) echo 'Claude'; exit 0;; esac
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture"}'
+while IFS= read -r input; do
+    case "$input" in *'"type":"user"'*)
+        printf '%s\n' "$input" >> prompts
+        printf '%s\n' '{"type":"result","is_error":false,"result":"saved result"}'
+        ;; esac
+done
+"#,
+    )?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+    assert!(app.test_claude_program.set(program).is_ok());
+    Ok(())
+}
+
+fn load(dir: &Path) -> Result<(Arc<crate::App>, Arc<Update>, Arc<Workspace>)> {
+    let (app, update) = tests::waiting_fixture(dir)?;
+    let update = Arc::new(update);
+    assert!(app.self_update.set(update.clone()).is_ok());
+    install_desk_fixture(&app, dir)?;
+    let workspace = app.select(None)?;
+    Ok((app, update, workspace))
+}
+
+fn begin(update: &Update) -> Result<WaitGuard<'_>> {
+    let reason = DrainReason::Update;
+    let id = update
+        .begin_wait(reason, false)?
+        .context("drain did not open")?;
+    Ok(WaitGuard {
+        control: &update.wait_control,
+        id,
+        reason,
+    })
+}
+
+impl Update {
+    pub(crate) fn test_update_drain(
+        self: &Arc<Self>, app: Arc<crate::App>,
+    ) -> Result<(i64, tokio::task::JoinHandle<Result<()>>)> {
+        fs::create_dir_all(&self.root)?;
+        let reason = DrainReason::Update;
+        let id = self.begin_wait(reason, false)?.context("drain did not open")?;
+        let update = self.clone();
+        let task = tokio::spawn(async move {
+            let wait = WaitGuard { control: &update.wait_control, id, reason };
+            let WaitOutcome::Ready(_permit) = update.wait_for_idle(&app, &wait, None).await? else {
+                anyhow::bail!("drain did not reach the swap gate");
+            };
+            update.set_drain_progress(id, DrainProgress::Ready, None);
+            Ok(())
+        });
+        Ok((id, task))
+    }
+}
+
+fn prompt_count(workspace: &Workspace, text: &str) -> usize {
+    fs::read_to_string(workspace.project_dir.join("prompts"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(text))
+        .count()
+}
+
+fn planner_thread(workspace: &Workspace, task: &str) -> Result<String> {
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    workspace.hub.edit_threads(|threads| threads.set_roles(&session, None, Some(DelegateSettings {
+        model: fuzukue_proto::CLAUDE_OPUS.into(), effort: "high".into(),
+    })))?;
+    crate::planner::write_test_plan_steps(workspace, &session, vec![PlanStep {
+        task: task.into(), agent: None, reason: String::new(),
+        routing: Default::default(), tier_reason: None, blocker: None,
+    }])?;
+    Ok(session)
+}
+
+async fn assign(workspace: &Arc<Workspace>, session: &str, task: &str, caller: AgentCaller) -> Result<String> {
+    delegate::start(workspace, session, task.into(), None, None, caller, Default::default(), None).await
+}
+
+async fn assert_assignment_replayed(workspace: &Workspace, job: &str, task: &str) -> Result<()> {
+    until(|| prompt_count(workspace, task) == 1).await
+        .with_context(|| format!("waiting for assignment {job} to run: {task}"))?;
+    until(|| workspace.drain.records(&workspace.state_dir)
+        .is_ok_and(|records| records.iter().all(|record| record.id != job))).await
+        .with_context(|| format!("waiting for assignment {job} to leave the journal"))?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(prompt_count(workspace, task), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_attach_and_drain_follow_the_worker_approval_waiter() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let (_, mut live) = workspace.hub.subscribe(u64::MAX);
+    let worker = workspace.clone();
+    let thread = session.clone();
+    *workspace.worker_approval_policy.lock().unwrap() = fuzukue_proto::WorkerApprovalPolicy::Advisor;
+    let pending = tokio::spawn(async move {
+        delegate::request_worker_approval(&worker, &thread, "delegate:fixture", "fixture-rpc", "Bash",
+            &serde_json::json!({"command":"cargo test"}), false).await
+    });
+    let request_id = match tokio::time::timeout(Duration::from_secs(5), live.recv()).await??.event {
+        ServerEvent::ApprovalRequested { request_id, .. } => request_id,
+        event => anyhow::bail!("expected worker approval, got {event:?}"),
+    };
+    assert!(!workspace.hub.thread_active(&session));
+    let replay_has_request = || workspace.hub.subscribe_client(0, true).0.iter().any(|env| {
+        matches!(&env.event, ServerEvent::ApprovalRequested { request_id: id, .. } if id == &request_id)
+    });
+    assert!(replay_has_request());
+    assert!(matches!(&app.swap_blockers().blockers[..], [blocker]
+        if blocker.kind == SelfUpdateBlockerKind::Approval && blocker.workspace == workspace.id
+            && blocker.session.as_deref() == Some(session.as_str()) && blocker.id == request_id
+            && blocker.started_at > 0));
+    workspace.hub.expire_orphaned_approvals(Duration::ZERO);
+    assert!(replay_has_request());
+    let wait = begin(&update)?;
+    let drain = update.wait_for_idle(&app, &wait, None);
+    tokio::pin!(drain);
+    assert!(tokio::time::timeout(Duration::from_millis(100), &mut drain).await.is_err());
+
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    assert!(matches!(live.recv().await?.event, ServerEvent::ApprovalResolved {
+        request_id: id, decision, automatic: false,
+    } if id == request_id && decision == "cancelled"));
+    assert!(!replay_has_request());
+    assert!(app.swap_blockers().blockers.is_empty());
+    assert!(matches!(tokio::time::timeout(Duration::from_secs(5), &mut drain).await??, WaitOutcome::Ready(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn drain_uses_the_worker_title_or_a_short_assignment_summary() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, _, workspace) = load(dir.path())?;
+    let program = dir.path().join("mock-claude");
+    let script = fs::read_to_string(&program)?.replace(
+        "printf '%s\\n' \"$input\" >> prompts",
+        "while [ ! -f finish-worker ]; do sleep 0.05; done",
+    );
+    fs::write(program, script)?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    workspace.hub.edit_threads(|threads| threads.set_roles(&session, None, Some(DelegateSettings {
+        model: fuzukue_proto::CLAUDE_OPUS.into(), effort: "high".into(),
+    })))?;
+    let done = workspace.project_dir.join("finish-worker");
+    let long = "検".repeat(45);
+    let short = format!("サーバーテスト {}…", "検".repeat(32));
+    let prompt = format!("サーバーテスト\n  {long}");
+    for (title, expected) in [(Some("Named job"), "Named job"), (None, short.as_str())] {
+        let job = delegate::start(&workspace, &session, prompt.clone(), title.map(str::to_owned), None,
+            AgentCaller::FrontDesk, Default::default(), None).await?;
+        until(|| app.swap_blockers().blockers.iter().any(|b| b.id == job)).await?;
+        let blocker = app.swap_blockers().blockers.into_iter().find(|b| b.id == job).unwrap();
+        assert_eq!(blocker.kind, SelfUpdateBlockerKind::Worker);
+        assert_eq!(blocker.title.as_deref(), Some(expected));
+        assert!(blocker.started_at > 0);
+        fs::write(&done, "")?;
+        until(|| !workspace.delegates.is_running(&session)).await?;
+        fs::remove_file(&done)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_closes_orphaned_worker_approvals_and_expires_other_orphans() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (_app, _update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let requests = [
+        ("delegate:fixture:lost".into(), Actor::Claude),
+        ("codex-1".into(), Actor::Codex { thread_id: "worker".into(), parent_tool_use: Some("delegate:fixture".into()) }),
+        (format!("{}orphan", fuzukue_proto::GIT_APPROVAL), Actor::System),
+        (format!("{}:orphan", fuzukue_proto::RESEARCH_ISSUE_APPROVAL), Actor::System),
+        (format!("{}:orphan", crate::issue_threads::APPROVAL), Actor::System),
+    ];
+    for (request_id, actor) in &requests {
+        workspace.hub.publish(ServerEvent::ApprovalRequested {
+            session: session.clone(), request_id: request_id.clone(), actor: actor.clone(),
+            summary: "fixture".into(), localized: None, shell_directory: None, shell_prefix: None,
+        });
+    }
+    let cursor = workspace.hub.subscribe(0).0.last().unwrap().seq;
+    let hub = crate::Hub::with_timeline(&workspace.state_dir);
+    assert!(hub.live_approval_threads().is_empty());
+    let (resumed, _) = hub.subscribe_client(cursor, true);
+    for (request_id, _) in requests {
+        assert!(resumed.iter().any(|env| matches!(&env.event,
+            ServerEvent::ApprovalResolved { request_id: id, decision, automatic: false }
+            if id == &request_id && decision == "cancelled")));
+    }
+    let (_, mut live) = hub.subscribe(u64::MAX);
+    hub.expire_orphaned_approvals(Duration::ZERO);
+    assert!(live.try_recv().is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_cancelled_tool_request_releases_approval_while_turn_stays_live() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, _update, workspace) = load(dir.path())?;
+    let id = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let mut command = tokio::process::Command::new("/usr/bin/python3");
+    command.arg("-c").arg(r#"
+import json, sys, time
+from pathlib import Path
+json.loads(sys.stdin.readline())
+print(json.dumps({"type":"control_request", "request_id":"tool", "request":{
+    "subtype":"can_use_tool", "tool_name":"Bash", "input":{"command":"git status"},
+}}), flush=True)
+while not Path("cancel-tool").exists():
+    time.sleep(0.01)
+print(json.dumps({"type":"control_cancel_request", "request_id":"tool"}), flush=True)
+sys.stdin.readline()
+"#);
+    let claude = crate::ClaudeSession::spawn_command(
+        command, id.clone(), workspace.project_dir.clone(), &workspace, Box::new(|_| {}),
+    )?;
+    workspace.sessions.lock().await.insert(id.clone(), claude.clone());
+    let (_, mut live) = workspace.hub.subscribe(u64::MAX);
+    claude.prompt("Request a tool approval.").await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let request_id = loop {
+            if let ServerEvent::ApprovalRequested { request_id, .. } = live.recv().await?.event {
+                break request_id;
+            }
+        };
+        let reason = app.swap_blockers();
+        assert!(reason.blockers.iter().any(|blocker| blocker.kind == SelfUpdateBlockerKind::Approval && blocker.id == request_id));
+        assert_eq!(app.drain_job_count(&reason), 1);
+        fs::write(workspace.project_dir.join("cancel-tool"), "")?;
+        loop {
+            if let ServerEvent::ApprovalResolved { request_id: resolved, decision, automatic } = live.recv().await?.event {
+                assert_eq!(resolved, request_id);
+                assert_eq!(decision, "cancelled");
+                assert!(!automatic);
+                break;
+            }
+        }
+        let reason = app.swap_blockers();
+        assert!(matches!(&reason.blockers[..], [blocker] if blocker.kind == SelfUpdateBlockerKind::Turn && blocker.id == id));
+        assert_eq!(app.drain_job_count(&reason), 1);
+        assert!(!claude.resolve(&request_id, "accept").await?);
+        Ok::<_, anyhow::Error>(())
+    }).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn planner_assignments_queue_during_drain_and_retry_after_startup_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (_app, update, workspace) = load(dir.path())?;
+    let prompt = "Read the saved test assignment";
+    let session = planner_thread(&workspace, prompt)?;
+    let wait = begin(&update)?;
+    let job = delegate::start(
+        &workspace, &session, prompt.into(), None, None, AgentCaller::Planner, Default::default(), None,
+    ).await?;
+    assert!(delegate::start(
+        &workspace, &session, prompt.into(), None, None, AgentCaller::FrontDesk, Default::default(), None,
+    ).await.is_err());
+    let held = workspace.drain.records(&workspace.state_dir)?;
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].id, job);
+    assert!(!held[0].claimed);
+    let drain::Work::Delegate(assignment) = held[0].work.clone() else {
+        anyhow::bail!("expected a held delegation");
+    };
+    delegate::restore_assignment(&workspace, session.clone(), job.clone(), assignment).await;
+    assert!(!workspace.delegates.is_running(&session));
+    drop(wait);
+
+    // Simulate an older server that lost the worker after claiming the assignment.
+    assert!(workspace.drain.claim(&workspace.state_dir, &session, &job)?);
+    workspace.drain.finish(&workspace.state_dir, &session, &job, Some(
+        "The previous server stopped after claiming this work. Check the thread and worktree before retrying.".into(),
+    ));
+    let new_app = crate::App::new(
+        dir.path().into(), workspace.project_dir.clone(), workspace.state_dir.clone(),
+        "127.0.0.1:0".into(), None,
+    )?;
+    install_desk_fixture(&new_app, dir.path())?;
+    let next = Arc::new(Update::with_paths(
+        Config::default(), None, workspace.project_dir.clone(), dir.path().join("next-builds"), PathBuf::new(),
+    ));
+    next.trial_pending.store(true, std::sync::atomic::Ordering::Release);
+    assert!(new_app.self_update.set(next.clone()).is_ok());
+    let restarted = new_app.select(None)?;
+    drain::start(&restarted);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(restarted.drain.records(&restarted.state_dir)?[0].claimed);
+    assert!(!restarted.delegates.is_running(&session));
+    next.trial_pending.store(false, std::sync::atomic::Ordering::Release);
+    until(|| prompt_count(&restarted, prompt) == 1).await?;
+    until(|| !restarted.delegates.is_running(&session)).await?;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(prompt_count(&restarted, prompt), 1);
+    assert!(!restarted.drain.records(&restarted.state_dir)?.iter().any(|record| record.id == job));
+    Ok(())
+}
+
+#[tokio::test]
+async fn planner_work_held_during_build_and_test_replays_after_startup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    drain::start(&workspace);
+    let task = "Planner assignment submitted during build";
+    let session = planner_thread(&workspace, task)?;
+    let review = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    crate::planner::write_test_plan(&workspace, &review)?;
+
+    update.step(Step::Build, State::Running);
+    let job = assign(&workspace, &session, task, AgentCaller::Planner).await?;
+    update.step(Step::Build, State::Passed);
+    update.step(Step::Test, State::Running);
+    delegate::plan_follow_up(&workspace, &review);
+    delegate::resume_goal(&workspace, &review);
+    delegate::plan_follow_up(&workspace, &review);
+
+    let user = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    workspace.hub.edit_threads(|threads| threads.set_roles(&user, None, Some(DelegateSettings {
+        model: fuzukue_proto::CLAUDE_OPUS.into(), effort: "high".into(),
+    })))?;
+    let manual = "Explicit request sent by the front desk";
+    let manual_job = assign(&workspace, &user, manual, AgentCaller::FrontDesk).await?;
+    assert_assignment_replayed(&workspace, &manual_job, manual).await?;
+    assert!(!workspace.delegates.is_running(&session));
+    assert_eq!(prompt_count(&workspace, task), 0);
+    assert_eq!(prompt_count(&workspace, "Resume test goal"), 0);
+    let records = workspace.drain.records(&workspace.state_dir)?;
+    assert_eq!(records.iter().filter(|record| !record.claimed && record.work.is_planner()).count(), 2);
+    assert!(records.iter().any(|record| record.session == review
+        && matches!(record.work, drain::Work::Desk(delegate::DeskTurn::Plan { resumed: true }))));
+
+    update.step(Step::Test, State::Passed);
+    let wait = begin(&update)?;
+    let idle = tokio::time::timeout(Duration::from_secs(5), update.wait_for_idle(&app, &wait, None)).await??;
+    assert!(matches!(idle, WaitOutcome::Ready(_)));
+    assert_eq!(update.subscribe().borrow().planner_work_held, Some(2));
+    assert_eq!(app.drain_job_count(&app.swap_blockers()), 0);
+
+    let new_app = crate::App::new(
+        dir.path().into(), workspace.project_dir.clone(), workspace.state_dir.clone(),
+        "127.0.0.1:0".into(), None,
+    )?;
+    install_desk_fixture(&new_app, dir.path())?;
+    let next = Arc::new(Update::with_paths(
+        Config::default(), None, workspace.project_dir.clone(), dir.path().join("next-builds"), PathBuf::new(),
+    ));
+    next.trial_pending.store(true, std::sync::atomic::Ordering::Release);
+    assert!(new_app.self_update.set(next.clone()).is_ok());
+    let restarted = new_app.select(None)?;
+    drain::start(&restarted);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(prompt_count(&restarted, task), 0);
+    assert_eq!(prompt_count(&restarted, "Resume test goal"), 0);
+    assert!(!restarted.delegates.is_running(&session));
+
+    next.trial_pending.store(false, std::sync::atomic::Ordering::Release);
+    until(|| prompt_count(&restarted, "Resume test goal") == 1).await
+        .context("waiting for the saved review after the startup check")?;
+    assert_assignment_replayed(&restarted, &job, task).await?;
+    assert_eq!(prompt_count(&restarted, "Resume test goal"), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_holds_planner_assignment_already_waiting_for_a_worker_slot() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    update.status.send_modify(|status| status.active = false);
+    let slots = tokio::time::timeout(Duration::from_secs(20), delegate::hold_all_slots(&workspace)).await?;
+    let task = "Planner assignment waiting for a slot";
+    let session = planner_thread(&workspace, task)?;
+    let job = assign(&workspace, &session, task, AgentCaller::Planner).await?;
+    update.status.send_modify(|status| status.active = true);
+    update.step(Step::Build, State::Running);
+    drop(slots);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(prompt_count(&workspace, task), 0);
+    assert!(workspace.drain.delegation_queued(&workspace.state_dir, &job)?);
+    let wait = begin(&update)?;
+    let idle = tokio::time::timeout(Duration::from_secs(5), update.wait_for_idle(&app, &wait, None)).await??;
+    assert!(matches!(idle, WaitOutcome::Ready(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn planner_work_replays_on_update_failure_or_cancel() -> Result<()> {
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (app, update, workspace) = load(dir.path())?;
+        drain::start(&workspace);
+        update.step(Step::Test, State::Running);
+        let task = "Planner assignment submitted during test";
+        let session = planner_thread(&workspace, task)?;
+        let job = assign(&workspace, &session, task, AgentCaller::Planner).await?;
+        let review = workspace.hub.edit_threads(|threads| threads.create(None))?;
+        crate::planner::write_test_plan(&workspace, &review)?;
+        delegate::plan_follow_up(&workspace, &review);
+        delegate::plan_follow_up(&workspace, &review);
+        update.report_planner_queue(&app);
+        assert_eq!(update.subscribe().borrow().planner_work_held, Some(2));
+
+        if cancel {
+            let wait = begin(&update)?;
+            update.control_wait(wait.id, WaitAction::Cancel)?;
+            assert!(matches!(update.wait_for_idle(&app, &wait, None).await?, WaitOutcome::Cancelled));
+            assert!(update.subscribe().borrow().cancelled);
+        } else {
+            // The configured source is a fixture directory, so Check fails.
+            update.start(app.clone(), false)?;
+            assert!(update.planner_work_held());
+            until(|| update.subscribe().borrow().error.is_some()).await?;
+        }
+        assert!(update.subscribe().borrow().planner_work_held.is_none());
+        until(|| prompt_count(&workspace, "Resume test goal") == 1).await?;
+        assert_assignment_replayed(&workspace, &job, task).await?;
+        assert_eq!(prompt_count(&workspace, "Resume test goal"), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_can_allow_planner_work_during_update_preparation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, default) = load(dir.path())?;
+    let path = dir.path().join("opt-out");
+    fs::create_dir(&path)?;
+    fs::write(path.join("fuzukue.toml"), "[delegate]\nhold_planner_during_update = false\n")?;
+    let workspace = app.select(Some(&app.register(path.to_str().unwrap())?))?;
+    let task = "Planner assignment allowed during test";
+    let session = planner_thread(&workspace, task)?;
+    let review = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    crate::planner::write_test_plan(&workspace, &review)?;
+    update.step(Step::Test, State::Running);
+    assert!(default.planner_work_held());
+    let job = assign(&workspace, &session, task, AgentCaller::Planner).await?;
+    delegate::plan_follow_up(&workspace, &review);
+    until(|| prompt_count(&workspace, "Resume test goal") == 1).await?;
+    assert_assignment_replayed(&workspace, &job, task).await?;
+    assert!(update.planner_work_held());
+    update.report_planner_queue(&app);
+    assert!(update.subscribe().borrow().planner_work_held.is_none());
+
+    let _wait = begin(&update)?;
+    let job = assign(&workspace, &session, task, AgentCaller::Planner).await?;
+    assert!(workspace.drain.delegation_queued(&workspace.state_dir, &job)?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission_closes_atomically_across_workspaces_and_cancel_reopens_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, first) = load(dir.path())?;
+    let second = dir.path().join("second");
+    fs::create_dir(&second)?;
+    let id = app.register(second.to_str().unwrap())?;
+    let second = app.select(Some(&id))?;
+    let first_thread = first.hub.edit_threads(|threads| threads.create(None))?;
+    let second_thread = second.hub.edit_threads(|threads| threads.create(None))?;
+    let ready = Arc::new(tokio::sync::Barrier::new(3));
+    let admitted = Arc::new(tokio::sync::Barrier::new(3));
+    let mut jobs = Vec::new();
+    for (workspace, session) in [
+        (first.clone(), first_thread.clone()),
+        (second.clone(), second_thread.clone()),
+    ] {
+        let (ready, admitted) = (ready.clone(), admitted.clone());
+        jobs.push(tokio::spawn(async move {
+            let _permit = workspace.admit_work().unwrap();
+            workspace.hub.publish(ServerEvent::TurnActivity {
+                session: session.clone(),
+                running: true,
+            });
+            ready.wait().await;
+            admitted.wait().await;
+            assert!(workspace.admit_work().is_err());
+            workspace.hub.publish(ServerEvent::TurnEnded {
+                session,
+                actor: Actor::Claude,
+            });
+        }));
+    }
+    ready.wait().await;
+    let wait = begin(&update)?;
+    let (_, reason) = update.swap_gate(&app);
+    assert!(reason.gate_held);
+    assert_eq!(reason.threads.len(), 2);
+    assert!(reason
+        .threads
+        .iter()
+        .any(|thread| thread.workspace == first.id && thread.id == first_thread && thread.running));
+    assert!(reason
+        .threads
+        .iter()
+        .any(|thread| thread.workspace == second.id
+            && thread.id == second_thread
+            && thread.running));
+    assert!(update
+        .control_wait(wait.id - 1, WaitAction::Cancel)
+        .is_err());
+    update.control_wait(wait.id, WaitAction::Cancel)?;
+    assert!(matches!(
+        update.wait_for_idle(&app, &wait, None).await?,
+        WaitOutcome::Cancelled
+    ));
+    admitted.wait().await;
+    for job in jobs {
+        job.await?;
+    }
+    drop(wait);
+    assert!(first.admit_work().is_ok() && second.admit_work().is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn save_failure_is_visible_and_keeps_the_gate_closed_until_retry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace
+        .hub
+        .edit_threads(|threads| threads.create_titled(None, Some("Saving thread".into())))?;
+    let wait = begin(&update)?;
+    fs::create_dir(workspace.state_dir.join("held-work.json"))?;
+    let request = ClientMsg::Prompt {
+        session: session.clone(),
+        text: "try to hold this".into(),
+    };
+    assert!(crate::handle(&workspace, request.clone()).await.is_err());
+    let mut statuses = update.subscribe();
+    let action = async {
+        {
+            let status = statuses.wait_for(|status| status.wait.is_some()).await?;
+            let threads = &status.wait.as_ref().unwrap().reason.threads;
+            assert!(threads
+                .iter()
+                .any(|thread| thread.id == session && thread.checking));
+            assert!(status
+                .steps
+                .iter()
+                .any(|step| step.kind == Step::Wait && step.log.contains("saving work")));
+        }
+        fs::remove_dir(workspace.state_dir.join("held-work.json"))?;
+        crate::handle(&workspace, request).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::try_join!(update.wait_for_idle(&app, &wait, None), action)
+    })
+    .await??;
+    assert!(matches!(outcome, WaitOutcome::Ready(_)));
+    let records = workspace.drain.records(&workspace.state_dir)?;
+    assert_eq!(records.iter().filter(|record| !record.claimed).count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_delegation_resumes_once_after_cancel() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    workspace.hub.edit_threads(|threads| {
+        threads.set_roles(
+            &session,
+            None,
+            Some(fuzukue_proto::DelegateSettings {
+                model: "claude-sonnet-5-5".into(),
+                effort: String::new(),
+            }),
+        )
+    })?;
+    let slots = tokio::time::timeout(Duration::from_secs(20), delegate::hold_all_slots(&workspace)).await?;
+    let id = delegate::start(
+        &workspace,
+        &session,
+        "manual task marker".into(),
+        None,
+        None,
+        fuzukue_proto::AgentCaller::FrontDesk,
+        Default::default(),
+        None,
+    )
+    .await?;
+    let wait = begin(&update)?;
+    assert!(delegate::start(
+        &workspace,
+        &session,
+        "recursive denied".into(),
+        None,
+        None,
+        fuzukue_proto::AgentCaller::Worker,
+        Default::default(),
+        None,
+    )
+    .await
+    .is_err());
+    drop(slots);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(prompt_count(&workspace, "manual task marker"), 0);
+    assert!(workspace
+        .drain
+        .records(&workspace.state_dir)?
+        .iter()
+        .any(|record| record.id == id && !record.claimed));
+    update.control_wait(wait.id, WaitAction::Cancel)?;
+    assert!(matches!(
+        update.wait_for_idle(&app, &wait, None).await?,
+        WaitOutcome::Cancelled
+    ));
+    drop(wait);
+    until(|| prompt_count(&workspace, "manual task marker") == 1).await?;
+    until(|| {
+        workspace
+            .drain
+            .records(&workspace.state_dir)
+            .is_ok_and(|records| records.iter().all(|record| record.id != id))
+    })
+    .await?;
+    assert_eq!(prompt_count(&workspace, "manual task marker"), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn safe_close_reports_active_threads_and_force_commits_only_the_matching_shutdown() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    workspace.hub.publish(ServerEvent::TurnActivity { session: session.clone(), running: true });
+    let work = app.shutdown_work();
+    assert_eq!(work.jobs_running, 1);
+    assert_eq!(work.threads[0].id, session);
+
+    let job = workspace.admit_work()?;
+    update.request_shutdown(app.clone(), Duration::from_secs(60), false)?;
+    let id = update.drain_status.borrow().as_ref().unwrap().started_at;
+    assert!(update.force_shutdown(&app, Some(id - 1)).await.is_err());
+    assert!(!*update.shutdown_ready.borrow());
+    update.force_shutdown(&app, Some(id)).await?;
+    assert!(*update.shutdown_ready.borrow());
+    assert!(workspace.admit_work().is_err());
+    assert_eq!(update.drain_status.borrow().as_ref().unwrap().progress, DrainProgress::Ready);
+    assert!(update.cancel_shutdown(id).is_err());
+    drop(job);
+    tokio::task::yield_now().await;
+    assert_eq!(update.drain_status.borrow().as_ref().unwrap().progress, DrainProgress::Ready);
+
+    let other = tempfile::tempdir()?;
+    let (app, update, workspace) = load(other.path())?;
+    let _job = workspace.admit_work()?;
+    let (entered, running) = tokio::sync::oneshot::channel();
+    let mutation = tokio::spawn(async move {
+        let mutation = crate::mutations::Mutation::new(&workspace, "", "Shutdown fixture".into())?;
+        mutation.run(async {
+            mutation.begin_write();
+            let _ = entered.send(());
+            std::future::pending::<Result<()>>().await
+        }).await
+    });
+    running.await?;
+    update.force_shutdown(&app, None).await?;
+    assert!(*update.shutdown_ready.borrow());
+    assert!(app.loaded(None)?.admit_work().is_err());
+    assert!(mutation.await?.unwrap_err().to_string().contains("needs review"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_restart_waits_for_trial_and_usage_then_replays_input_and_goal_once() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let goal = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    crate::planner::write_test_plan(&workspace, &goal)?;
+    let reset = crate::usage::now() + 3;
+    workspace
+        .usage
+        .update_claude(&serde_json::json!({"unifiedWindows":{"five_hour":{
+            "utilization":0.99, "resetsAt":reset, "status":"rejected"
+        }}}));
+    let job = workspace.admit_work()?;
+    update.request_shutdown(app.clone(), Duration::from_millis(100), true)?;
+    assert!(workspace.admit_work().is_err());
+    crate::handle(
+        &workspace,
+        ClientMsg::Prompt {
+            session: session.clone(),
+            text: "held input marker".into(),
+        },
+    )
+    .await?;
+    delegate::resume_goal(&workspace, &goal);
+    delegate::resume_goal(&workspace, &goal);
+    until(|| *update.shutdown_ready.borrow()).await?;
+    assert_eq!(
+        update.drain_status.borrow().as_ref().unwrap().progress,
+        DrainProgress::TimedOut
+    );
+    assert!(workspace.admit_work().is_err());
+    assert_eq!(prompt_count(&workspace, "held input marker"), 0);
+    drop(job);
+
+    // A new registry represents the selected process after startup or rollback.
+    let new_app = crate::App::new(
+        dir.path().into(),
+        workspace.project_dir.clone(),
+        workspace.state_dir.clone(),
+        "127.0.0.1:0".into(),
+        None,
+    )?;
+    install_desk_fixture(&new_app, dir.path())?;
+    let next = Arc::new(Update::with_paths(
+        Config::default(),
+        None,
+        workspace.project_dir.clone(),
+        dir.path().join("next-builds"),
+        PathBuf::new(),
+    ));
+    next.trial_pending
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(new_app.self_update.set(next.clone()).is_ok());
+    let new_workspace = new_app.select(None)?;
+    assert_eq!(
+        new_workspace
+            .usage
+            .blocked("claude")
+            .map(|(until, _)| until),
+        Some(reset)
+    );
+    let held = new_workspace.drain.records(&new_workspace.state_dir)?;
+    assert_eq!(
+        held.iter()
+            .filter(|record| matches!(record.work, drain::Work::Desk(_)))
+            .count(),
+        1
+    );
+    drain::start(&new_workspace);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(prompt_count(&new_workspace, "held input marker"), 0);
+    next.trial_pending
+        .store(false, std::sync::atomic::Ordering::Release);
+    until(|| prompt_count(&new_workspace, "held input marker") == 1).await?;
+    until(|| prompt_count(&new_workspace, "Resume test goal") == 1).await?;
+    assert!(crate::usage::now() >= reset);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(prompt_count(&new_workspace, "held input marker"), 1);
+    assert_eq!(prompt_count(&new_workspace, "Resume test goal"), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_rollback_protects_a_goal_until_a_capable_server_reopens_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    crate::planner::write_test_plan(&workspace, &session)?;
+    let old = dir.path().join("old-build");
+    fs::write(&old, "#!/bin/sh\nexit 0")?;
+    assert!(!drain::supports(&old)?);
+    let marker = dir.path().join("compatible-build");
+    fs::write(
+        &marker,
+        [vec![b' '; 65530], drain::FORMAT_MARKER.as_bytes().to_vec()].concat(),
+    )?;
+    assert!(drain::supports(&marker)?);
+    let wait = begin(&update)?;
+    app.protect_legacy_rollback()?;
+    let plan = workspace
+        .project_dir
+        .join("threads")
+        .join(&session)
+        .join("plan.md");
+    assert!(fs::read_to_string(&plan)?.contains("waiting_for_user"));
+    assert!(fs::read_to_string(workspace.hub.thread_path(&session)?)?.contains("held-work.json"));
+    let old_process_journal = drain::Journal::default();
+    assert!(old_process_journal
+        .records(&workspace.state_dir)?
+        .iter()
+        .any(|record| matches!(record.work, drain::Work::LegacyPlan(_))));
+    drop(wait);
+    drain::start(&workspace);
+    until(|| fs::read_to_string(&plan).is_ok_and(|plan| !plan.contains("waiting_for_user")))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_signals_close_admission_then_exit_on_the_second_signal() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut child = tokio::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "self_update::drain_tests::signal_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("FUZUKUE_DRAIN_TEST_ROOT", dir.path())
+        .kill_on_drop(true)
+        .spawn()?;
+    let pid = child.id().unwrap() as libc::pid_t;
+    until(|| dir.path().join("signal-ready").is_file())
+        .await
+        .context("child registering signal handlers")?;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    until(|| dir.path().join("signal-draining").is_file())
+        .await
+        .context("child saving held input after SIGTERM")?;
+    assert!(child.try_wait()?.is_none());
+    let journal = drain::Journal::default().records(&dir.path().join("state"))?;
+    assert!(journal
+        .iter()
+        .any(|record| matches!(record.work, drain::Work::Prompt { .. })));
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    assert!(tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await??
+        .success());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "spawned by the signal integration test"]
+async fn signal_child() -> Result<()> {
+    let dir = PathBuf::from(
+        std::env::var_os("FUZUKUE_DRAIN_TEST_ROOT").context("missing signal test root")?,
+    );
+    let (app, update, workspace) = load(&dir)?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let work = workspace.admit_work()?;
+    workspace.hub.publish(ServerEvent::TurnActivity {
+        session: session.clone(),
+        running: true,
+    });
+    let mut progress = update.subscribe_drain();
+    let handle = tokio::spawn(crate::handle_shutdown_signals(
+        crate::ShutdownSignals::new()?,
+        update,
+        app,
+        Duration::from_secs(60),
+    ));
+    fs::write(dir.join("signal-ready"), "")?;
+    progress
+        .wait_for(|state| {
+            state.as_ref().is_some_and(|state| {
+                state.reason == DrainReason::Shutdown && state.jobs_running >= 1
+            })
+        })
+        .await?;
+    assert!(workspace.admit_work().is_err());
+    crate::handle(
+        &workspace,
+        ClientMsg::Prompt {
+            session,
+            text: "saved before second signal".into(),
+        },
+    )
+    .await?;
+    fs::write(dir.join("signal-draining"), "")?;
+    handle.await?;
+    drop(work);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn force_timeout_leaves_admission_closed_and_allows_cancel() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    workspace.hub.publish(ServerEvent::TurnActivity {
+        session,
+        running: true,
+    });
+    let wait = begin(&update)?;
+    let mut statuses = update.subscribe_drain();
+    let action = async {
+        statuses
+            .wait_for(|status| {
+                status
+                    .as_ref()
+                    .is_some_and(|status| status.jobs_running == 1)
+            })
+            .await?;
+        update.control_wait(wait.id, WaitAction::Force)?;
+        statuses
+            .wait_for(|status| {
+                status
+                    .as_ref()
+                    .is_some_and(|status| status.progress == DrainProgress::Forcing)
+            })
+            .await?;
+        tokio::time::advance(Duration::from_secs(16)).await;
+        statuses
+            .wait_for(|status| {
+                status
+                    .as_ref()
+                    .and_then(|status| status.message.as_deref())
+                    .is_some_and(|message| message.contains("Timed out"))
+            })
+            .await?;
+        assert!(workspace.admit_work().is_err());
+        update.control_wait(wait.id, WaitAction::Cancel)?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::try_join!(update.wait_for_idle(&app, &wait, None), action)
+    })
+    .await??;
+    assert!(matches!(outcome, WaitOutcome::Cancelled));
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_write_failure_reopens_admission_without_losing_held_work() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let permit = workspace.admit_work()?;
+    let wait = begin(&update)?;
+    crate::handle(
+        &workspace,
+        ClientMsg::Prompt {
+            session,
+            text: "already saved".into(),
+        },
+    )
+    .await?;
+    fs::create_dir(update.root.join(STATUS_FILE))?;
+    assert!(update.wait_for_idle(&app, &wait, None).await.is_err());
+    drop(wait);
+    drop(permit);
+    assert!(workspace.admit_work().is_ok());
+    assert_eq!(workspace.drain.records(&workspace.state_dir)?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn signal_takes_over_an_update_that_has_not_handed_off() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let wait = begin(&update)?;
+    let WaitOutcome::Ready(gate) = update.wait_for_idle(&app, &wait, None).await? else {
+        anyhow::bail!("update did not become ready");
+    };
+    update.request_shutdown(app.clone(), Duration::from_secs(5), true)?;
+    let status = update.subscribe_drain().borrow().clone().unwrap();
+    assert_eq!(status.reason, DrainReason::Shutdown);
+    assert_ne!(status.started_at, wait.id);
+    assert!(workspace.admit_work().is_err());
+    drop(gate);
+    drop(wait);
+    until(|| *update.shutdown_ready.borrow()).await?;
+    assert!(workspace.admit_work().is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_admitted_after_draining_reopens() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (_app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|store| store.create(None))?;
+    let wait = begin(&update)?;
+
+    crate::commands::dispatch(&workspace, &session, "/compact Keep decisions").await;
+    crate::replay_prompts(&workspace).await;
+    assert!(workspace.hub.compaction(&session).is_none());
+    let records = workspace.drain.records(&workspace.state_dir)?;
+    assert!(records.iter().any(|record| !record.claimed
+        && matches!(&record.work, drain::Work::Compact { instructions } if instructions == "Keep decisions")));
+
+    drop(wait);
+    let (_, mut events) = workspace.hub.subscribe(u64::MAX);
+    crate::replay_prompts(&workspace).await;
+    // This thread has no backend session yet, so admission reaches the handler and it reports that.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let ServerEvent::LocalNotice { localized: Some(message), .. } = events.recv().await?.event {
+                assert_eq!(message.key, "command-failed");
+                assert!(message.args["detail"].contains("Claude Code"));
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    }).await??;
+    Ok(())
+}

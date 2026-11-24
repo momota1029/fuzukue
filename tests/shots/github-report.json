@@ -1,0 +1,33 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "git_hub_report_result"},
+    {"action": "git_hub_report_preview"},
+    {"action": "click", "id": "github-title-button"},
+    {"action": "wait_element", "id": "github-menu-mark"},
+    {"action": "screenshot", "name": "github-auth-menu"},
+    {"action": "key", "key": "escape"},
+    {"action": "click", "id": "sidebar-more-toggle"},
+    {"action": "click", "id": "menu-help"},
+    {"action": "click", "id": "menu-report-bug"},
+    {"action": "wait_element", "id": "github-report-title-input"},
+    {"action": "wait_element", "id": "github-report-body-input"},
+    {"action": "wait_element", "id": "github-report-browser"},
+    {"action": "screenshot", "name": "github-report"},
+    {"action": "key", "key": "escape"},
+    {"action": "screenshot_capture_fixture"},
+    {"action": "key", "key": "Ctrl+Shift+S"},
+    {"action": "wait_element", "id": "screenshot-preview"},
+    {"action": "click", "id": "screenshot-note"},
+    {"action": "type", "text": "The workbench stopped updating after switching threads."},
+    {"action": "click", "id": "screenshot-report"},
+    {"action": "wait_element", "id": "github-report-destination"},
+    {"action": "wait_element", "id": "github-report-account-disconnected"},
+    {"action": "wait_element", "id": "github-report-title-input"},
+    {"action": "wait_element", "id": "github-report-body-input"},
+    {"action": "wait_element", "id": "github-report-screenshot"},
+    {"action": "wait_element", "id": "github-report-save-screenshot"},
+    {"action": "screenshot", "name": "github-report-from-screenshot"}
+  ]
+}

@@ -1,0 +1,16 @@
+tests-close-tests = テストを閉じる
+tests-discovering-tests = テストを探しています…
+tests-failed = 失敗
+tests-hide-output = 出力を隠す
+tests-no-tests-found = テストが見つかりません
+tests-passed = 成功
+tests-rediscover = 再検出
+tests-run = 実行
+tests-run-result = { $state } · 成功 { $passed } 件 / 失敗 { $failed } 件
+tests-running = 実行中
+tests-show-output = 出力を表示
+tests-stop = 停止
+tests-tests = テスト
+tests-timed-out = 時間切れ
+tests-unavailable = 実行不可
+tests-unavailable-not-found = 実行不可（{ $program } が見つかりません）

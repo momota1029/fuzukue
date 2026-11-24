@@ -1,0 +1,23 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1000},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread", "deck": "papers/levy-families"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "並行撮影。原稿の文章と証明をそれぞれ確認して。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_partner_text", "text": "文章と証明の確認をそれぞれ依頼した。"},
+    {"action": "wait_delegate_summaries", "count": 2},
+    {"action": "open_delegate_details"},
+    {"action": "screenshot", "name": "tier-details"},
+    {"action": "key", "key": "escape"},
+    {"action": "wait_event", "event": "agent_usage_changed"},
+    {"action": "click", "id": "menu-help"},
+    {"action": "click", "id": "tool-settings"},
+    {"action": "click", "id": "settings-agents"},
+    {"action": "wait_event", "event": "agent_stats"},
+    {"action": "wait_element", "id": "tier-usage-totals"},
+    {"action": "screenshot", "name": "tier-usage"}
+  ]
+}

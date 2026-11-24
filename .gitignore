@@ -1,0 +1,45 @@
+# Build and cache output
+/target/
+/crates/fuzukue/target/
+build/
+.gradle/
+.kotlin/
+.lake/
+*.apk
+*.aab
+
+# Local projects, conversations and agent/service state
+/inbox/
+/threads/
+.fuzukue/
+.labo/
+/.agents/
+/.aws/
+/.codex/
+/.claude/
+/.ssh/
+/fuzukue.toml
+server.toml
+settings.toml
+local.properties
+
+# Credentials, signing material and per-user environment
+.env
+.env.*
+!.env.example
+.netrc
+.npmrc
+credentials.json
+remote-token
+token.json
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.key
+*.pem
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa

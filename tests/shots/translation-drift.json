@@ -1,0 +1,20 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "locale", "locale": "en"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread", "deck": "translated"},
+    {"action": "click", "id": "open-attachment-translated"},
+    {"action": "click", "id": "tabdeck-translated"},
+    {"action": "wait_element", "id": "translation-diagnostic-local-estimate"},
+    {"action": "screenshot", "name": "translation-drift-list"},
+    {"action": "click", "id": "card-local-estimate"},
+    {"action": "wait_element", "id": "record-source-fingerprint"},
+    {"action": "screenshot", "name": "translation-drift-detail"},
+    {"action": "click", "id": "record-source-fingerprint"},
+    {"action": "wait_event", "event": "card_save_result"},
+    {"action": "wait_idle", "quiet_ms": 800},
+    {"action": "screenshot", "name": "translation-drift-recorded"}
+  ]
+}

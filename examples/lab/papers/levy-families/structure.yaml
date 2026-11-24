@@ -1,0 +1,17 @@
+title: Lévy 族と球面の集中
+sections:
+- title: 序
+  items:
+  - intro
+- title: 定義
+  items:
+  - def-mm-space
+  - def-concentration-function
+  - def-levy-family
+- title: 球面
+  items:
+  - thm-sphere-concentration
+  - lem-median-concentration
+- title: 例
+  items:
+  - ex-hamming-diameter

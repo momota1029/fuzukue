@@ -1,0 +1,22 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread", "deck": "research/observable-diameter"},
+    {"action": "click", "id": "open-attachment-research/observable-diameter"},
+    {"action": "click", "id": "thread-info-toggle"},
+    {"action": "wait_element", "id": "card-idea-projection"},
+    {"action": "screenshot", "name": "deck-overview"},
+    {"action": "click", "id": "tabdeck-observable-diameter"},
+    {"action": "wait_element", "id": "deck-card-list"},
+    {"action": "wait_element", "id": "card-idea-projection"},
+    {"action": "screenshot", "name": "deck-cards"},
+    {"action": "click", "id": "deck-cards-back"},
+    {"action": "wait_event", "event": "issues"},
+    {"action": "click", "id": "refresh-issues"},
+    {"action": "wait_event", "event": "issues"},
+    {"action": "screenshot", "name": "deck-overview-issues"}
+  ]
+}

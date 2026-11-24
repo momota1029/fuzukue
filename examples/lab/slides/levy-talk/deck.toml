@@ -1,0 +1,15 @@
+kind = "slides"
+title = "Lévy 族と球面の集中"
+outputs = ["build/slides.pdf"]
+
+[slides]
+theme = "Madrid"
+aspect_ratio = "16:9"
+author = "サンプル研究室"
+date = "研究会"
+
+[external]
+lf = "../../papers/levy-families"
+
+[macros]
+Real = "\\mathbb{R}"

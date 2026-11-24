@@ -1,0 +1,17 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "wait_element", "id": "review-marker-intro-2026-11-20-jfa-R1.2"},
+    {"action": "screenshot", "name": "review-card-marker"},
+    {"action": "click", "id": "paper-show-reviews"},
+    {"action": "click", "id": "review-submission-2026-11-20-jfa"},
+    {"action": "screenshot", "name": "review-points"},
+    {"action": "click", "id": "review-filter-1"},
+    {"action": "click", "id": "review-point-R1.1"},
+    {"action": "screenshot", "name": "review-point"}
+  ]
+}

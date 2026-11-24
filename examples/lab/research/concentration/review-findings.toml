@@ -1,0 +1,23 @@
+version = 1
+
+[[findings]]
+id = "cb38ac8b-d670-47be-91e3-9c4ecdb61d26"
+summary = "Clarify the dependence on the number of factors"
+detail = "The comparison needs a constant uniform in the number of factors."
+severity = "major"
+locations = [
+    { card = "q-product" },
+    { card = "idea-isoperimetry" },
+    { card = "q-product", file = "research/concentration/cards/q-product.md" },
+]
+sources = [{ kind = "human" }]
+transitions = [{ status = "open", actor = "reviewer", time_ms = 1795392000000 }]
+
+[[findings]]
+id = "ece8c201-f35f-418d-8975-013363d3cedc"
+summary = "Specify the metric in the plan"
+detail = "State which product metric is used for this estimate."
+severity = "minor"
+locations = [{ file = "research/concentration/cards/plan.md" }]
+sources = [{ kind = "human" }]
+transitions = [{ status = "open", actor = "reviewer", time_ms = 1795392000000 }]

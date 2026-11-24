@@ -1,0 +1,32 @@
+# Literal phrases, matched case-insensitively at word boundaries in English.
+phrases = [
+    "と言えるでしょう",
+    "重要なのは",
+    "さまざまな",
+    "において重要な役割を果たす",
+    "という点で",
+    "まとめると",
+    "総じて",
+    "注目すべきは",
+    "ゲームチェンジャー",
+    "可能性を解き放つ",
+    "奇跡的な結果",
+    "delve",
+    "crucial",
+    "pivotal",
+    "in conclusion",
+    "it is worth noting",
+    "plays a key role",
+    "a testament to",
+    "seamlessly",
+]
+# An isolated transition is ordinary prose.
+repeated_phrases = ["furthermore"]
+
+max_ja_chars = 100
+max_en_words = 40
+max_ja_commas = 3
+max_kanji_chars = 6
+max_ascii_commas = 3
+period_mark = "。"
+prefer_register = "auto"

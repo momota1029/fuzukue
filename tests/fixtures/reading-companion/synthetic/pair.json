@@ -1,0 +1,6 @@
+{
+  "slug": "mean",
+  "paper": "Fictional note",
+  "note": {"source_dir": "note", "pdf": "note/main.pdf"},
+  "companion": {"spec": "companion/companion.json", "html": "build/companion.html"}
+}

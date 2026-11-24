@@ -1,0 +1,65 @@
+{
+ "title": "Synthetic review",
+ "summary_html": "<p>Synthetic review</p>",
+ "panel": [],
+ "review_conclusion": "No gap found within the stated scope (S1, T; no sources read)",
+ "findings": [
+  {
+   "id": "F1",
+   "sev": "minor",
+   "status": "suspected",
+   "steps": [
+    "S1"
+   ],
+   "from": [
+    "line-by-line"
+   ],
+   "short": "State a hypothesis",
+   "detail": "<p>Explain the hypothesis.</p>"
+  }
+ ],
+ "prior": [],
+ "indicator": {
+  "facts": {
+   "review_done": true,
+   "delta_stated": true
+  },
+  "verdict": "short_or_preprint",
+  "verdict_why": "Synthetic comparison.",
+  "axes": [
+   {
+    "key": "correctness",
+    "level": "mid",
+    "why": "Synthetic evidence"
+   },
+   {
+    "key": "novelty",
+    "level": "mid",
+    "why": "Synthetic evidence"
+   },
+   {
+    "key": "delta",
+    "level": "mid",
+    "why": "Synthetic evidence"
+   },
+   {
+    "key": "strength",
+    "level": "mid",
+    "why": "Synthetic evidence"
+   },
+   {
+    "key": "significance",
+    "level": "mid",
+    "why": "Synthetic evidence"
+   },
+   {
+    "key": "literature",
+    "level": "mid",
+    "why": "Synthetic evidence"
+   }
+  ],
+  "changers": [
+   "Check one example."
+  ]
+ }
+}

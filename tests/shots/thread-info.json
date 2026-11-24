@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1000},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread", "deck": "papers/levy-families"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "論文「Lévy 族と球面の集中」へのコメントが 1 件。[[thm-sphere-concentration]] の定理文を確認する。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "turn_ended"},
+    {"action": "wait_idle"},
+    {"action": "click", "id": "thread-info-toggle"},
+    {"action": "wait_event", "event": "thread_artifacts"},
+    {"action": "click", "id": "thread-artifacts-toggle"},
+    {"action": "click", "id": "thread-mcp-toggle"},
+    {"action": "screenshot", "name": "thread-info-light"},
+    {"action": "theme", "theme": "dark"},
+    {"action": "screenshot", "name": "thread-info-dark"},
+    {"action": "click", "id": "compact-session"},
+    {"action": "wait_event", "event": "compact_status"},
+    {"action": "wait_event", "event": "compact_status"},
+    {"action": "click", "id": "thread-info-toggle"}
+  ]
+}

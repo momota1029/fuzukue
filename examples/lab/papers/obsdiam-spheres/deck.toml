@@ -1,0 +1,11 @@
+kind = "paper"
+title = "球面のオブザーバブル直径"
+status = "idea"
+next = "漸近公式の証明を、射影 S^n → R の像測度の Gauss 極限から組み立てる"
+outputs = ["build/paper.pdf"]
+
+[external]
+lf = "../levy-families"
+
+[macros]
+ObsDiam = "\\operatorname{ObsDiam}"

@@ -1,0 +1,335 @@
+#!/usr/bin/python3
+"""Deterministic Claude Code stream-json fixture for the screenshot server."""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+
+def emit(kind, **fields):
+    print(json.dumps(dict(type=kind, **fields), ensure_ascii=False), flush=True)
+
+
+if "--help" in sys.argv:
+    print("--effort <level>  low, medium, high, xhigh, max")
+    sys.exit(0)
+
+if "--system-prompt" in sys.argv and "--tools" in sys.argv and sys.argv[sys.argv.index("--tools") + 1] == "":
+    evidence = sys.argv[-1]
+    emit("result", is_error=False, result="原稿を読み、定理文の仮定と参照を確認中。" if "原稿" in evidence else "作業の途中経過を確認中。")
+    sys.exit(0)
+
+
+def call_labo(name, arguments):
+    config = json.loads(sys.argv[sys.argv.index("--mcp-config") + 1])["mcpServers"]["fuzukue"]
+    rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+           "params": {"name": name, "arguments": arguments}}
+    headers = {"Content-Type": "application/json", **config.get("headers", {})}
+    with urlopen(Request(config["url"], json.dumps(rpc).encode(), headers), timeout=5) as response:
+        return json.load(response)["result"]
+
+
+# Same init → stdin user message → result handshake as the resume fixture in
+# crates/secretaire/src/claude.rs. The chat shot also exercises tool messages
+# and the permission control exchange.
+session = sys.argv[sys.argv.index("--resume") + 1] if "--resume" in sys.argv else "1e887e36-91da-4c31-ae65-17afe7c8cb8e"
+worker = "--no-session-persistence" in sys.argv
+model = sys.argv[sys.argv.index("--model") + 1] if "--model" in sys.argv else "claude-sonnet-5-5"
+emit("system", subtype="init", session_id=session, model=model, effort="medium",
+     tools=["Read", "Edit", "mcp__fuzukue__list_decks", "mcp__fuzukue__card_context", "mcp__fuzukue__check_cards", "mcp__fuzukue__open_paper"])
+
+number = -1
+queued = ""
+question_card = None
+while line := (queued or sys.stdin.readline()):
+    number += 1
+    queued = ""
+    request = json.loads(line)
+    if request.get("type") == "control_response":
+        if question_card is not None:
+            key, dismiss, input = question_card
+            response = request["response"]
+            assert response["request_id"] == key
+            decision = response["response"]
+            if dismiss:
+                assert decision == {"behavior": "deny", "message": "The user dismissed the question."}
+            else:
+                assert decision["behavior"] == "allow"
+                assert decision["updatedInput"] == {
+                    **input, "answers": dict(zip((q["question"] for q in input["questions"]), [
+                        input["questions"][0]["options"][0]["label"], "導入, 結論", "集中現象の手引き",
+                    ])),
+                }
+            question_card = None
+        emit("result", is_error=False, session_id=session)
+        continue
+    if request.get("type") != "user":
+        continue
+    content = request["message"]["content"]
+    prompt = json.dumps(content, ensure_ascii=False)
+    if "paper batch failure fixture" in prompt:
+        tool_id = f"paper-batch-{number}"
+        emit("assistant", message={"content": [
+            {"type": "tool_use", "id": tool_id, "name": "mcp__fuzukue__build_papers", "input": {}},
+        ]})
+        emit("user", message={"content": [{
+            "type": "tool_result", "tool_use_id": tool_id, "is_error": False,
+            "content": [{"type": "text", "text": (
+                "Failed 1 / 3 total (1 succeeded, 1 with warnings)\n\n"
+                "- papers/limit: Undefined control sequence.\n\n"
+                "| Deck | Status |\n| --- | --- |\n| papers/limit | Failed |\n"
+            )}],
+        }]})
+        emit("result", is_error=False, session_id=session)
+        continue
+    if "question-card fixture" in prompt:
+        key = f"question-card-{number}"
+        fixtures = Path(__file__).resolve().parent
+        file = fixtures / "question-card-input.json"
+        if not file.is_file():
+            file = fixtures / "fixtures/question-card.json"
+        input = json.loads(file.read_text())
+        question_card = (key, "question-card fixture dismissal" in prompt, input)
+        emit("control_request", request_id=key, request={
+            "subtype": "can_use_tool", "tool_name": "AskUserQuestion", "input": input,
+        })
+        continue
+    if "front-desk-test:silent" in prompt:
+        message_id = f"silent-{number}"
+        emit("stream_event", event={"type": "message_start", "message": {"id": message_id}})
+        for text in ("<si", "lent/>"):
+            emit("stream_event", event={"type": "content_block_delta", "index": 0,
+                                       "delta": {"type": "text_delta", "text": text}})
+        emit("assistant", message={"id": message_id, "content": [{"type": "text", "text": "<silent/>"}]})
+        emit("result", is_error=False, result="<silent/>", session_id=session)
+        continue
+    if "front-desk-test:" in prompt or "You ended your last reply" in prompt or "前の返事では着手を予告した" in prompt:
+        nudged = "You ended your last reply" in prompt or "前の返事では着手を予告した" in prompt
+        answer = "次は照合してみるよ"
+        blocks = []
+        for tool in ("delegate", "plan", "replan"):
+            if f"front-desk-test:{tool}" in prompt:
+                blocks.append({"type": "tool_use", "id": f"test-tool-{number}",
+                               "name": f"mcp__fuzukue__{tool}", "input": {}})
+        if "front-desk-test:question" in prompt:
+            answer += "。回していい？"
+        if "front-desk-test:earlier-question" in prompt:
+            emit("assistant", message={"id": f"question-{number}", "content": [
+                {"type": "text", "text": "回していい？"},
+            ]})
+        blocks.append({"type": "text", "text": ("Nudge received. " if nudged else "") + answer})
+        emit("assistant", message={"id": f"reply-{number}", "content": blocks})
+        emit("result", is_error=False, session_id=session)
+        continue
+
+    if "変更履歴の撮影用に導入カードを追記して" in prompt:
+        with Path("papers/levy-families/cards/expl/intro/card.md").open("a", encoding="utf-8") as note:
+            note.write("\n\nこの節では有限次元の場合を扱う。\n")
+        report = "導入カードに適用範囲を追記した。"
+        emit("assistant", message={"id": "change-history", "content": [{"type": "text", "text": report}]})
+        emit("result", is_error=False, session_id=session, result=report)
+        continue
+    if "# Split an external peer-review report" in prompt or "# 外部の査読報告を指摘に分ける" in prompt:
+        assert sys.argv[sys.argv.index("--tools") + 1] == "Read,Grep,Glob"
+        assert json.loads(sys.argv[sys.argv.index("--mcp-config") + 1]) == {"mcpServers": {}}
+        answer = {"points": [{"lines": [1, 1], "summary": "原稿の説明を補う", "cards": ["intro"]}]}
+        emit("result", is_error=False, result=json.dumps(answer, ensure_ascii=False))
+        break
+    if "--tools" in sys.argv and os.environ.get("FUZUKUE_REVIEW_SHOT"):
+        assert sys.argv[sys.argv.index("--tools") + 1] == "Read,Grep,Glob"
+        assert "--resume" not in sys.argv
+        path = "papers/levy-families/cards/expl/intro/card.md"
+        lines = Path(path).read_text().splitlines()
+        target = lines.index("集中の仮定がそこに現れる。") + 1
+        time.sleep(5)
+        answer = {"findings": [{"card": "intro", "text":
+            f"{path}:L{target}-L{target}\n「そこ」が指す箇所を節名で示すと追いやすい。"}]}
+        emit("result", is_error=False, result=json.dumps(answer, ensure_ascii=False))
+        break
+    if "user-confirmed review point" in prompt or "利用者が確定した査読の指摘" in prompt:
+        emit("assistant", message={"id": f"fix-{number}", "content": [
+            {"type": "text", "text": "関係するカードを確認した。"},
+        ]})
+        emit("result", is_error=False, session_id=session)
+        continue
+    if os.environ.get("FUZUKUE_REVIEW_SHOT") and "査読用に導入カードを追記して" in prompt:
+        with Path("papers/levy-families/cards/expl/intro/card.md").open("a") as note:
+            note.write("\n\n集中の仮定がそこに現れる。\n")
+        emit("assistant", message={"id": f"reply-{number}", "content": [
+            {"type": "text", "text": "導入カードに一文を追記した。"},
+        ]})
+        emit("result", is_error=False, session_id=session)
+        continue
+    if os.environ.get("FUZUKUE_REVIEW_SHOT") and "査読中に確認" in prompt:
+        emit("assistant", message={"id": f"reply-{number}", "content": [
+            {"type": "text", "text": "導入では集中の仮定とその適用範囲を説明する。"},
+        ]})
+        emit("result", is_error=False, session_id=session)
+        continue
+    if worker:
+        capture = Path("claude-worker.jsonl")
+        if capture.is_file():
+            with capture.open("a") as file:
+                file.write(line)
+        if "参照だけ確認して" in prompt:
+            if os.environ.get("FUZUKUE_CODEX_SHOT"):
+                time.sleep(2)
+            report = "I checked only the references, as requested."
+            emit("assistant", message={"id": f"worker-{number}-report", "content": [{"type": "text", "text": report}]})
+            emit("result", is_error=False, session_id=session, result=report)
+            continue
+        if "原稿の章構成を確認する。" in prompt:
+            time.sleep(0.4)
+            emit("result", is_error=False, session_id=session, result="I checked the chapter structure.",
+                 usage={"input_tokens": 850, "output_tokens": 150})
+            continue
+        message_id = f"worker-{number}"
+        emit("stream_event", event={"type": "message_start", "message": {"id": message_id, "model": model}})
+        parts = ["**I started checking the manuscript.**", " I am collecting the theorem assumptions."]
+        for text in parts:
+            emit("stream_event", event={
+                "type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text},
+            })
+            time.sleep(0.35)
+        emit("assistant", message={"id": message_id, "content": [
+            {"type": "text", "text": "".join(parts)},
+            {"type": "tool_use", "id": "worker-read", "name": "Read", "input": {"file_path": "README.md"}},
+        ]})
+        if "追加の指示を待つ" in prompt:
+            queued = sys.stdin.readline()
+            if not queued:
+                break
+        time.sleep(12 if "撮影用の作業" in prompt else 1.5)
+        emit("user", message={"content": [
+            {"type": "tool_result", "tool_use_id": "worker-read", "content": "README.md を読んだ。"},
+        ]})
+        report = "I verified that the theorem statement matches the proof."
+        emit("assistant", message={"id": f"{message_id}-report", "content": [{"type": "text", "text": report}]})
+        emit("result", is_error=False, session_id=session, result=report)
+        continue
+    capture = Path("claude-prompts.jsonl")
+    if capture.is_file():
+        with capture.open("a") as file:
+            file.write(line)
+    if content == "/compact":
+        emit("system", subtype="compact_boundary", compact_metadata={"trigger": "manual", "preTokens": 27000})
+        emit("result", is_error=False, session_id=session)
+        continue
+    if "方針の撮影" in prompt:
+        emit("rate_limit_event", rate_limit_info={"unifiedWindows": {
+            "five_hour": {"utilization": 0.92, "status": "allowed_warning", "resetsAt": int(time.time()) + 3600}
+        }})
+        args = {"goal": "Lévy 族の原稿で引用と参照を確認する",
+                "context": "方針の撮影用。出典の一覧は整理済み。", "long_running": True}
+        result = call_labo("plan", args)
+        assert not result["isError"], result
+        assert result["structuredContent"]["plan"]["next"]
+        emit("assistant", message={"id": f"reply-{number}", "content": [
+            {"type": "text", "text": "出典の一覧は整理できた。使用量が回復したら、残っている引用の照合から続けるよ。"},
+        ]})
+        emit("result", is_error=False, session_id=session)
+        continue
+    if "作業履歴の撮影" in prompt:
+        result = call_labo("delegate", {"agent": "book", "prompt": "原稿の章構成を確認する。"})
+        assert not result["isError"], result
+        emit("result", is_error=False, result="章構成を確認するよ。", session_id=session)
+        continue
+    if "並行撮影" in prompt:
+        for agent, brief in [("prose", "原稿の言い回しを確認する。"), ("proof", "定理の仮定を検証する。")]:
+            result = call_labo("delegate", {"agent": agent, "prompt": f"撮影用の作業。{brief}"})
+            assert not result["isError"], result
+        emit("assistant", message={"id": f"reply-{number}", "content": [
+            {"type": "text", "text": "文章と証明の確認をそれぞれ依頼した。"},
+        ]})
+        emit("result", is_error=False, session_id=session)
+        continue
+    elif "コンポーザーの撮影" in prompt:
+        message_id = f"composer-{number}"
+        usage = {"input_tokens": 3200, "cache_read_input_tokens": 144000}
+        time.sleep(2)
+        emit("stream_event", event={"type": "message_start", "message": {
+            "id": message_id, "model": model, "usage": usage,
+        }})
+        emit("assistant", message={"id": message_id, "content": [
+            {"type": "text", "text": "入力欄とコンテキスト使用量の撮影用の応答です。"},
+        ]})
+        emit("result", is_error=False, session_id=session,
+             modelUsage={model: {"contextWindow": 1000000}},
+             usage=dict(usage, output_tokens=400), total_cost_usd=0.032, num_turns=1)
+        continue
+    if ("Worker job finished" in prompt or "作業役の仕事が終わった" in prompt):
+        emit("assistant", message={"id": f"reply-{number}", "content": [
+            {"type": "text", "text": "作業役の確認が終わり、結果を受け取った。"},
+        ]})
+        emit("result", is_error=False, session_id=session)
+        continue
+    if "球面の集中について相談したい" in prompt:
+        if "rejected your previous answer" in prompt or "前の返事の作り直し" in prompt:
+            report = "球面の集中の不等式から見ていこう。[[thm-sphere-concentration]] では測度の減り方を評価しているよ。"
+        else:
+            report = "[[thm-sphere-concentration]] に、球面の集中の評価がまとまっている。"
+        emit("assistant", message={"id": f"reply-{number}", "content": [{"type": "text", "text": report}]})
+        emit("result", is_error=False, session_id=session, result=report,
+             usage={"input_tokens": 850, "output_tokens": 150})
+        continue
+    if "球面集中の定理を開いて" in prompt:
+        tool_id = f"open-paper-{number}"
+        args = {"deck": "papers/levy-families", "card": "thm-sphere-concentration"}
+        emit("assistant", message={"id": f"open-{number}", "content": [
+            {"type": "tool_use", "id": tool_id, "name": "mcp__fuzukue__open_paper", "input": args},
+        ]})
+        result = call_labo("open_paper", args)
+        emit("user", message={"content": [{
+            "type": "tool_result", "tool_use_id": tool_id,
+            "content": result["content"], "is_error": result["isError"],
+        }]})
+        emit("assistant", message={"id": f"reply-{number}", "content": [
+            {"type": "text", "text": "球面集中の定理を開いた。"},
+        ]})
+        emit("result", is_error=result["isError"], session_id=session)
+        continue
+    if ("へのコメントが" in prompt or "Comments on" in prompt) and "[[thm-sphere-concentration]]" in prompt:
+        time.sleep(2)
+        path = Path("papers/levy-families/cards/thm/thm-sphere-concentration/statement.tex")
+        with path.open("a") as statement:
+            statement.write("\n% Revised for the comment fixture\n")
+        edit_id = f"edit-{number}"
+        emit("stream_event", event={"type": "message_start", "message": {
+            "id": f"reply-{number}", "model": model,
+            "usage": {"input_tokens": 3200, "cache_read_input_tokens": 21800, "cache_creation_input_tokens": 2000},
+        }})
+        emit("assistant", message={"id": f"reply-{number}", "content": [
+            {"type": "tool_use", "id": edit_id, "name": "Edit", "input": {"file_path": str(path)}},
+            {"type": "text", "text": "[[thm-sphere-concentration]] の定理文にコメントを反映しました。"},
+        ]})
+        emit("user", message={"content": [{"type": "tool_result", "tool_use_id": edit_id, "content": "Updated"}]})
+        emit("result", is_error=False, session_id=session,
+             modelUsage={model: {"contextWindow": 200000}},
+             usage={"input_tokens": 3200, "cache_read_input_tokens": 21800,
+                    "cache_creation_input_tokens": 2000, "output_tokens": 400},
+             total_cost_usd=0.032, num_turns=1)
+        continue
+    if "承認" not in json.dumps(content, ensure_ascii=False):
+        emit("assistant", message={"id": f"reply-{number}", "content": [
+            {"type": "text", "text": "確認用の応答です。"}
+        ]})
+        emit("result", is_error=False, session_id=session)
+        continue
+
+    read_id = f"read-{number}"
+    write_id = f"write-{number}"
+    emit("assistant", message={"id": f"review-{number}", "content": [
+        {"type": "text", "text": r"本文のLévy族$\LevyFamily$を確認しました。次に確認メモをまとめます。"},
+        {"type": "tool_use", "id": read_id, "name": "Read", "input": {"file_path": "README.md"}},
+        {"type": "tool_use", "id": write_id, "name": "Write", "input": {"file_path": "確認メモ.md"}},
+    ]})
+    emit("user", message={"content": [
+        {"type": "tool_result", "tool_use_id": read_id, "content": "README.md · 12 行"}
+    ]})
+    emit("control_request", request_id=f"approve-{number}", request={
+        "subtype": "can_use_tool", "tool_name": "Write",
+        "input": {"file_path": "確認メモ.md"}, "tool_use_id": write_id,
+    })

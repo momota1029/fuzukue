@@ -1,0 +1,17 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1000},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "方針の撮影。Lévy 族の原稿の引用を、長期目標として確認して。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "plan_changed"},
+    {"action": "wait_idle"},
+    {"action": "click", "id": "thread-info-toggle"},
+    {"action": "wait_element", "id": "thread-plan"},
+    {"action": "wait_element", "id": "thread-goal-title"},
+    {"action": "screenshot", "name": "planner-paused"}
+  ]
+}

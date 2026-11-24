@@ -1,0 +1,15 @@
+{"steps": [
+  {"action": "size", "width": 1440, "height": 900},
+  {"action": "theme", "theme": "light"},
+  {"action": "connect"},
+  {"action": "click", "id": "tool-search"},
+  {"action": "type", "text": "file: main.rs"},
+  {"action": "key", "key": "Enter"},
+  {"action": "wait_element", "id": "source-editor"},
+  {"action": "wait_source_diagnostics"},
+  {"action": "wait_element", "id": "source-lsp-status"},
+  {"action": "screenshot", "name": "lsp-diagnostics"},
+  {"action": "hover_source", "line": 2, "col": 19},
+  {"action": "wait_source_hover"},
+  {"action": "screenshot", "name": "lsp-hover"}
+]}

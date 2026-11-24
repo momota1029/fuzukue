@@ -1,0 +1,16 @@
+threads-archive = アーカイブ
+threads-archive-drop-zone = ここにドロップしてアーカイブ
+threads-cancel = キャンセル
+threads-confirm-attach = 「{ $title }」に付ける？
+threads-detach = { $deck } を外す
+threads-no-decks-available = 付けられるデッキがありません
+threads-open = { $deck } を開く
+threads-pinned = ピン留め
+threads-rename = 名前を変更
+threads-reorder = スレッドを並べ替える（Alt+上下）
+threads-restore-from-archive = アーカイブから戻す
+threads-save = 保存
+threads-thread-actions = スレッドの操作
+threads-threads = スレッド
+threads-unpin = ピン留めを外す
+threads-new-thread = 新しいスレッド

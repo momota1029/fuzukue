@@ -1,0 +1,26 @@
+{
+  "auto_review": true,
+  "steps": [
+    {"action": "size", "width": 1440, "height": 960},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "review_settings_changed"},
+    {"action": "new_thread", "deck": "papers/levy-families"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "査読用に導入カードを追記して。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_partner_text", "text": "導入カードに一文を追記した。"},
+    {"action": "wait_reviews", "deck": "papers/levy-families", "kinds": ["style", "math"], "running": true},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "査読中に確認したい。導入の役割は？"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_partner_text", "text": "導入では集中の仮定とその適用範囲を説明する。"},
+    {"action": "wait_idle", "quiet_ms": 200},
+    {"action": "wait_reviews", "deck": "papers/levy-families", "kinds": ["style", "math"], "running": true},
+    {"action": "screenshot", "name": "review-agents-running"},
+    {"action": "wait_reviews", "deck": "papers/levy-families", "kinds": ["style", "math"], "running": false},
+    {"action": "screenshot", "name": "review-agents-done"},
+    {"action": "click", "id": "review-comments-style-papers/levy-families"},
+    {"action": "wait_paper_card", "deck": "papers/levy-families", "card": "intro"}
+  ]
+}

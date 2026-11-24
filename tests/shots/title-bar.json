@@ -1,0 +1,29 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 800},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_git", "path": "git-shot.txt"},
+    {"action": "screenshot", "name": "title-bar-collapsed"},
+    {"action": "click", "id": "app-menu"},
+    {"action": "wait_element", "id": "menu-help"},
+    {"action": "click", "id": "menu-file"},
+    {"action": "hover", "id": "menu-view"},
+    {"action": "wait_element", "id": "tool-library"},
+    {"action": "screenshot", "name": "title-bar-menu"},
+    {"action": "click", "id": "tool-library"},
+    {"action": "wait_element", "id": "library-close"},
+    {"action": "click", "id": "library-close"},
+    {"action": "self_update_preview"},
+    {"action": "distribution_preview"},
+    {"action": "click", "id": "workspace-account"},
+    {"action": "wait_element", "id": "workspace-account-menu"},
+    {"action": "screenshot", "name": "workspace-details"},
+    {"action": "key", "key": "escape"},
+    {"action": "click", "id": "app-menu"},
+    {"action": "click", "id": "title-bar-settings"},
+    {"action": "wait_element", "id": "close-settings"},
+    {"action": "screenshot", "name": "title-bar-settings"}
+  ]
+}

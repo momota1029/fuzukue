@@ -1,0 +1,29 @@
+{
+  "steps": [
+    {"action": "size", "width": 1360, "height": 860},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread"},
+    {"action": "screenshot", "name": "composer-empty-light"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "コンポーザーの撮影\n論文の導入を確認したい。\n定理の仮定と本文の対応も見て。"},
+    {"action": "screenshot", "name": "composer-multiline-light"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_responding", "status": "考えている…"},
+    {"action": "screenshot", "name": "composer-responding-light"},
+    {"action": "wait_event", "event": "turn_ended"},
+    {"action": "wait_idle"},
+    {"action": "theme", "theme": "dark"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "screenshot", "name": "composer-empty-dark"},
+    {"action": "type", "text": "メッセージを入力"},
+    {"action": "screenshot", "name": "composer-single-line-dark"},
+    {"action": "hover", "id": "composer-context-ring"},
+    {"action": "wait_element", "id": "composer-context-tooltip"},
+    {"action": "click", "id": "composer-context-ring"},
+    {"action": "wait_element", "id": "composer-context-details"},
+    {"action": "screenshot", "name": "composer-context-tooltip-dark"}
+  ]
+}

@@ -1,0 +1,10 @@
+kind = "research"
+title = "オブザーバブル直径の計算"
+summary = "オブザーバブル直径を、具体的な空間の列で漸近まで計算する。"
+status = "in_progress"
+next = "球面の漸近（Shioya）の証明を、原稿 obsdiam-spheres に段で書く"
+papers = ["../../papers/levy-families", "../../papers/obsdiam-spheres"]
+
+[external]
+lf = "../../papers/levy-families"
+od = "../../papers/obsdiam-spheres"

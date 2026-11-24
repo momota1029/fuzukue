@@ -1,0 +1,18 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-library"},
+    {"action": "click", "id": "library-ledger-tab"},
+    {"action": "wait_event", "event": "ledger_result"},
+    {"action": "wait_element", "id": "ledger-row-publisher-supplement"},
+    {"action": "screenshot", "name": "ledger"},
+    {"action": "click", "id": "ledger-filter-3"},
+    {"action": "click", "id": "ledger-attempts-publisher-supplement"},
+    {"action": "wait_element", "id": "ledger-history-publisher-supplement"},
+    {"action": "screenshot", "name": "ledger-attempts"}
+  ]
+}

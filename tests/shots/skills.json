@@ -1,0 +1,24 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1040},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread", "deck": "papers/levy-families"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "作業履歴の撮影。原稿の章構成を確認して。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "assert_delegate_report", "model": "claude-sonnet-5-5"},
+    {"action": "click", "id": "menu-help"},
+    {"action": "click", "id": "tool-settings"},
+    {"action": "click", "id": "settings-agents"},
+    {"action": "wait_event", "event": "agent_stats"},
+    {"action": "wait_element", "id": "agent-enabled-book"},
+    {"action": "screenshot", "name": "skills-settings"},
+    {"action": "click", "id": "settings-agent-history"},
+    {"action": "wait_event", "event": "agent_history"},
+    {"action": "wait_element", "id": "agent-history-entry-0"},
+    {"action": "screenshot", "name": "skills-history"},
+    {"action": "click", "id": "agent-history-entry-0"}
+  ]
+}

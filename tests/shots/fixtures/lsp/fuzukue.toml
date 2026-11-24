@@ -1,0 +1,4 @@
+title = "Language Server"
+
+[lsp]
+rust = "python3 ./fake-lsp.py"

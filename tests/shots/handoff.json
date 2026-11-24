@@ -1,0 +1,19 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "handoffs"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "wait_element", "id": "more-handoff"},
+    {"action": "click", "id": "more-handoff"},
+    {"action": "wait_element", "id": "handoff-receive-0"},
+    {"action": "screenshot", "name": "handoff-list"},
+    {"action": "click", "id": "handoff-receive-0"},
+    {"action": "wait_element", "id": "handoff-checklist"},
+    {"action": "click", "id": "handoff-select-0"},
+    {"action": "click", "id": "handoff-ready-0"},
+    {"action": "screenshot", "name": "handoff-checklist"}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "more-screenshot"},
+    {"action": "wait_element", "id": "screenshot-preview"},
+    {"action": "type", "text": "入力欄を開いた時の表示"},
+    {"action": "screenshot", "name": "client-screenshot-preview"}
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 820},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "key", "key": "Ctrl+O"},
+    {"action": "wait_element", "id": "file-row-experiment.rs"},
+    {"action": "type", "text": "exper"},
+    {"action": "screenshot", "name": "open-file-filter"},
+    {"action": "key", "key": "Enter"},
+    {"action": "wait_element", "id": "source-editor"},
+    {"action": "wait_element", "id": "source-file-breadcrumb"},
+    {"action": "key", "key": "Ctrl+O"},
+    {"action": "type", "text": "/analpy"},
+    {"action": "wait_element", "id": "file-row-analysis.py"},
+    {"action": "screenshot", "name": "open-file-search"}
+  ]
+}

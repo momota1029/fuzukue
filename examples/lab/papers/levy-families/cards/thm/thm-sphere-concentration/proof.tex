@@ -1,0 +1,62 @@
+$n \ge 3$ とする（$n = 1, 2$ は最後に述べる）。
+
+\begin{enumerate}
+\item \textbf{等周不等式。}
+  $\mu(A) \ge 1/2$ なる集合 $A \subset S^n(1)$ と、北極 $p$ を中心とする半球 $H = \{\theta \le \pi/2\}$（$\theta$ は $p$ からの測地距離）をとる。
+  Lévy の等周不等式により $\mu(A_r) \ge \mu(H_r)$ なので、
+  \[
+    1 - \mu(A_r) \le 1 - \mu(H_r) = \mu\{\theta > \pi/2 + r\}.
+  \]
+  よって $\alpha_{S^n(1)}(r) \le \mu\{\theta > \pi/2 + r\}$。$r \ge \pi/2$ なら右辺は $0$ なので、$0 < r < \pi/2$ とする。
+
+\item \textbf{球冠の測度を積分で書く。}
+  $\theta$ の分布は密度 $c_n \sin^{n-1}\theta$ $(0 \le \theta \le \pi)$ をもつ。ここで
+  \[
+    c_n^{-1} = \int_0^\pi \sin^{n-1}\theta\, d\theta = 2 W_{n-1},
+    \qquad W_m := \int_0^{\pi/2} \cos^m t\, dt.
+  \]
+  $t = \theta - \pi/2$ と置くと $\sin\theta = \cos t$ なので、
+  \[
+    \mu\{\theta > \pi/2 + r\}
+    = c_n \int_{\pi/2 + r}^{\pi} \sin^{n-1}\theta\, d\theta
+    = \frac{1}{2 W_{n-1}} \int_r^{\pi/2} \cos^{n-1} t\, dt.
+  \]
+
+\item \textbf{分子の評価。}
+  $[0, \pi/2]$ で $\cos t \le e^{-t^2/2}$ が成り立つ。実際、$g(t) = \log\cos t + t^2/2$ は $g(0) = 0$、$g'(t) = t - \tan t \le 0$。
+  したがって
+  \[
+    \int_r^{\pi/2} \cos^{n-1} t\, dt
+    \le \int_r^{\infty} e^{-(n-1)t^2/2}\, dt
+    = \int_0^{\infty} e^{-(n-1)(r+s)^2/2}\, ds .
+  \]
+  $(r+s)^2 \ge r^2 + s^2$ （$r, s \ge 0$）より、これは
+  \[
+    \le e^{-(n-1)r^2/2} \int_0^\infty e^{-(n-1)s^2/2}\, ds
+    = e^{-(n-1)r^2/2} \sqrt{\frac{\pi}{2(n-1)}}.
+  \]
+
+\item \textbf{分母の評価。}
+  部分積分により $W_{m+1} = \frac{m}{m+1} W_{m-1}$ $(m \ge 1)$。よって $(m+1) W_m W_{m+1} = m W_{m-1} W_m$ で、$(m+1)W_mW_{m+1}$ は $m$ によらず、$W_0 W_1 = \pi/2$ に等しい。すなわち $W_m W_{m+1} = \dfrac{\pi}{2(m+1)}$。
+  $W_m$ は $m$ について単調減少なので $W_m^2 \ge W_m W_{m+1} = \pi/(2(m+1))$。$m = n-1$ として
+  \[
+    W_{n-1} \ge \sqrt{\frac{\pi}{2n}}.
+  \]
+
+\item \textbf{まとめ。}
+  段 2--4 を合わせると
+  \[
+    \mu\{\theta > \pi/2 + r\}
+    \le \frac{1}{2}\sqrt{\frac{2n}{\pi}}\sqrt{\frac{\pi}{2(n-1)}}\; e^{-(n-1)r^2/2}
+    = \frac{1}{2}\sqrt{\frac{n}{n-1}}\; e^{-(n-1)r^2/2}.
+  \]
+  $n \ge 3$ なら $\sqrt{n/(n-1)} \le \sqrt{3/2} \le \sqrt{\pi/2}$ なので、係数は $\frac12\sqrt{\pi/2} = \sqrt{\pi/8}$ 以下。
+
+\item \textbf{小さい $n$。}
+  $n = 1$ は指数が $0$ で、$\alpha \le 1/2 \le \sqrt{\pi/8}$。
+  $n = 2$ は段 2 の積分が閉じて $\mu\{\theta > \pi/2 + r\} = (1 - \sin r)/2$ となり、$0 \le r \le \pi/2$ で $(1-\sin r)/2 \le \sqrt{\pi/8}\, e^{-r^2/2}$ を（数値的に、最小の余裕約 $0.12$ で）確かめた。
+  ※ この区間の不等式の解析的な証明はまだ。
+
+\item \textbf{Lévy 族。}
+  任意の固定した $r > 0$ について $\alpha_{S^n(1)}(r) \to 0$ $(n \to \infty)$ なので、定義より $(S^n(1))_n$ は Lévy 族。
+\end{enumerate}

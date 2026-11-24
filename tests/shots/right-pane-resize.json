@@ -1,0 +1,23 @@
+{
+  "steps": [
+    {"action": "size", "width": 1360, "height": 860},
+    {"action": "theme", "theme": "dark"},
+    {"action": "seed_thread_switch"},
+    {"action": "assert_thread_info_layout", "open": false},
+    {"action": "click", "id": "thread-info-toggle"},
+    {"action": "assert_thread_info_layout", "open": true},
+    {"action": "wait_element", "id": "right-pane-splitter"},
+    {"action": "drag_from_element", "id": "right-pane-splitter", "dx": -120, "dy": 0},
+    {"action": "hover", "id": "right-pane-splitter"},
+    {"action": "assert_thread_info_layout", "open": true},
+    {"action": "screenshot", "name": "right-pane-resized"},
+    {"action": "click", "id": "close-thread-details"},
+    {"action": "assert_thread_info_layout", "open": false},
+    {"action": "size", "width": 800, "height": 700},
+    {"action": "click", "id": "thread-info-toggle"},
+    {"action": "assert_thread_info_layout", "open": true},
+    {"action": "screenshot", "name": "right-pane-narrow"},
+    {"action": "key", "key": "Escape"},
+    {"action": "assert_thread_info_layout", "open": false}
+  ]
+}

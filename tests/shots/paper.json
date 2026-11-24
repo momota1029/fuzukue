@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {"action": "size", "width": 1120, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "attach_deck", "deck": "papers/levy-families"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "open_paper", "deck": "papers/levy-families", "via": "tool-paper"},
+    {"action": "wait_idle"},
+    {"action": "screenshot", "name": "paper-opening"},
+    {"action": "scroll_to_card", "id": "thm-sphere-concentration"},
+    {"action": "screenshot", "name": "paper-folded"},
+    {"action": "expand_proofs"},
+    {"action": "scroll_to_card", "id": "thm-sphere-concentration"},
+    {"action": "screenshot", "name": "paper-proof"},
+    {"action": "attach_deck", "deck": "papers/obsdiam-spheres"},
+    {"action": "open_paper", "deck": "papers/obsdiam-spheres", "via": "open-attachment-papers/obsdiam-spheres"},
+    {"action": "expand_proofs"},
+    {"action": "scroll_to_card", "id": "lem-levy-iff-obsdiam"},
+    {"action": "screenshot", "name": "paper-observable"},
+    {"action": "theme", "theme": "dark"},
+    {"action": "screenshot", "name": "paper-observable-dark"}
+  ]
+}

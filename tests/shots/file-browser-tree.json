@@ -1,0 +1,18 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 960},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "key", "key": "Ctrl+O"},
+    {"action": "wait_element", "id": "file-tree-label-papers"},
+    {"action": "click", "id": "file-tree-expand-papers"},
+    {"action": "wait_element", "id": "file-tree-label-papers/levy-families"},
+    {"action": "assert_file_tree_labels", "paths": ["", "papers", "papers/levy-families"]},
+    {"action": "screenshot", "name": "file-browser-tree-wide"},
+    {"action": "size", "width": 640, "height": 960},
+    {"action": "assert_file_tree_labels", "paths": ["", "papers", "papers/levy-families"]},
+    {"action": "wait_element", "id": "file-row-papers"},
+    {"action": "screenshot", "name": "file-browser-tree-narrow"}
+  ]
+}

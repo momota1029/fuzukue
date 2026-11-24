@@ -1,0 +1,9 @@
+# 本の並び。sections が章、items にカードの id と小節を並べる。
+title: （本の題）
+sections:
+- title: 第1章 （章の題）
+  items:
+  - ch1-intro
+  - {subsection: 1.1 （節の題）}
+  - ch1-def-example
+  - ch1-thm-example

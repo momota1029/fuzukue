@@ -1,0 +1,5 @@
+{
+  "provenance": "author-code run", "script": "average.jl", "commit": "fixture", "data": "1 and 3",
+  "runtime_seconds": 0, "scale_down": "",
+  "author": {"default": {"points": [[1, 0], [3, 0], [2, 0]]}}
+}

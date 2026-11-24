@@ -1,0 +1,9 @@
+kind = "research"
+title = "測度の集中の基礎"
+summary = "集中関数で測った集中が、積や射影でどう振る舞うかを整理する。"
+status = "in_progress"
+next = "積空間の集中関数の評価（q-product）を、球面の場合で確かめる"
+papers = ["../../papers/levy-families"]
+
+[external]
+lf = "../../papers/levy-families"

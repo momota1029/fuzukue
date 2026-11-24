@@ -1,0 +1,23 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "clipboard_image"},
+    {"action": "key", "key": "Ctrl+V"},
+    {"action": "wait_event", "event": "attachment_uploaded"},
+    {"action": "wait_element", "id": "chat-draft-image-1"},
+    {"action": "screenshot", "name": "clipboard-attachment"},
+    {"action": "click", "id": "chat-draft-image-1"},
+    {"action": "wait_element", "id": "chat-attachment-full-image"},
+    {"action": "screenshot", "name": "clipboard-attachment-enlarged"},
+    {"action": "key", "key": "escape"},
+    {"action": "click", "id": "send-prompt"},
+    {"action": "wait_element", "id": "chat-message-image-0-0"},
+    {"action": "screenshot", "name": "clipboard-attachment-sent"}
+  ]
+}

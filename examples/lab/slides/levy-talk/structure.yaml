@@ -1,0 +1,14 @@
+sections:
+- title: 集中の定義
+  frames:
+  - {frame: "何を測るか", tex: "motivation.tex"}
+  - "lf:def-mm-space"
+  - "lf:def-concentration-function"
+  - frame: 小さくなる量とその意味
+    cards:
+    - "lf:def-levy-family"
+    - "lf:lem-median-concentration"
+- title: 球面での例
+  frames:
+  - "lf:thm-sphere-concentration"
+  - talk-summary

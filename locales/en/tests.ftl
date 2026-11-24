@@ -1,0 +1,16 @@
+tests-close-tests = Close tests
+tests-discovering-tests = Discovering tests…
+tests-failed = Failed
+tests-hide-output = Hide output
+tests-no-tests-found = No tests found
+tests-passed = Passed
+tests-rediscover = Rediscover
+tests-run = Run
+tests-run-result = { $state } · { $passed } passed / { $failed } failed
+tests-running = Running
+tests-show-output = Show output
+tests-stop = Stop
+tests-tests = Tests
+tests-timed-out = Timed out
+tests-unavailable = Unavailable
+tests-unavailable-not-found = Unavailable ({ $program } not found)

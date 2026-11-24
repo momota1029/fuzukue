@@ -1,0 +1,6 @@
+# 本のデッキの設定（fuzukue / fuzukue-cards が読む。~/research の論文ハーネスと同じ形）
+language = "ja"
+
+[mathjax_macros]
+# 本全体で使う、引数なしのマクロ。数式の表示でだけ展開する。
+# R = "\\mathbb{R}"

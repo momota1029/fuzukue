@@ -1,0 +1,31 @@
+{
+  "title": "Averages",
+  "source": "Fictional note",
+  "edges": [["1", "2", "mean of two inputs"]],
+  "sections": [
+    {
+      "id": "1", "title": "Averages", "pages": [1, 2], "heading_word": "Averages",
+      "question": "What value is halfway?", "answer": "The arithmetic mean.",
+      "evidence": "p. 1", "lead": "There are two inputs.", "bridge": "The next section gives a value.",
+      "translation": ["Input two numbers and take the arithmetic mean."],
+      "weights": [0, 0, 0], "figures": [],
+      "code": [{"kind": "author", "name": "average", "src": "Fictional note", "state": "held", "lic": "MIT"}],
+      "flow": "Find the midpoint", "why": "Use the definition of the mean",
+      "after": "This supplies the value needed in the examples",
+      "no_comparison_reason": "The note uses one implementation.",
+      "steps": [{
+        "title": "Compute the average", "what": "Apply the formula", "math": "$m=(a+b)/2$",
+        "file": "companion/average.jl", "first": 2, "last": 3,
+        "lines": [[2, 2, "Divide the sum of the two inputs by two."], [3, 3, "Reuse the average for equal inputs."]],
+        "apis": [{"name": "average", "sig": "average(a, b)", "ret": "The arithmetic mean",
+          "note": "The second call uses the same input twice."}]
+      }]
+    },
+    {
+      "id": "2", "title": "Examples", "pages": [2, 2], "heading_word": "Examples",
+      "question": "What if the inputs are 1 and 3?", "answer": "The answer is 2.",
+      "evidence": "p. 2", "lead": "Substitute the input values.", "weights": [0, 0, 0],
+      "figures": [], "translation": ["For the inputs 1 and 3 the result is 2."]
+    }
+  ]
+}

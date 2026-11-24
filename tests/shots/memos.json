@@ -1,0 +1,18 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-library"},
+    {"action": "wait_event", "event": "library_results"},
+    {"action": "click", "id": "library-memo-input"},
+    {"action": "type", "text": "球面の集中の例\n次はオブザーバブル直径を調べる。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "memo_result"},
+    {"action": "wait_event", "event": "library_results"},
+    {"action": "wait_element", "id": "library-hit-0"},
+    {"action": "screenshot", "name": "memos"}
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {"action": "size", "width": 820, "height": 750},
+    {"action": "theme", "theme": "light"},
+    {"action": "assert_transcript_scroll_growth"},
+    {"action": "screenshot", "name": "chat-scroll-growth"}
+  ]
+}

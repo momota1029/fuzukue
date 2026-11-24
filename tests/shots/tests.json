@@ -1,0 +1,27 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "more-tests"},
+    {"action": "wait_element", "id": "tests-run-analysis"},
+    {"action": "click", "id": "tests-run-analysis"},
+    {"action": "wait_element", "id": "tests-failure-analysis-0"},
+    {"action": "screenshot", "name": "tests-failed"},
+    {"action": "click", "id": "tests-failure-analysis-0"},
+    {"action": "wait_element", "id": "source-editor"},
+    {"action": "screenshot", "name": "tests-failure-source"},
+    {"action": "key", "key": "End"},
+    {"action": "screenshot", "name": "tests-source-long-line"},
+    {"action": "key", "key": "Down"},
+    {"action": "screenshot", "name": "tests-source-short-line"},
+    {"action": "key", "key": "Ctrl+H"},
+    {"action": "wait_element", "id": "search-panel"},
+    {"action": "screenshot", "name": "tests-source-replace"},
+    {"action": "key", "key": "Escape"},
+    {"action": "click", "id": "source-dock-toggle"},
+    {"action": "screenshot", "name": "tests-source-centered"},
+    {"action": "click", "id": "source-dock-toggle"}
+  ]
+}

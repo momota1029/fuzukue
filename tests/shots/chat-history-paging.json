@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {"action": "size", "width": 820, "height": 750},
+    {"action": "theme", "theme": "light"},
+    {"action": "assert_thread_history_paging"},
+    {"action": "screenshot", "name": "chat-history-paging"}
+  ]
+}

@@ -1,0 +1,290 @@
+#!/usr/bin/python3
+"""Deterministic Codex app-server fixture for server tests and screenshots."""
+
+import json
+import os
+import sys
+import threading
+import time
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from pathlib import Path
+
+
+def send(**message):
+    print(json.dumps({"jsonrpc": "2.0", **message}, ensure_ascii=False), flush=True)
+
+
+def notify(method, thread_id, **params):
+    send(method=method, params=dict(threadId=thread_id, **params))
+
+
+def finish(thread_id, turn_id, answer, deltas=None):
+    answer_id = f"{turn_id}-answer"
+    for delta in (answer,) if deltas is None else deltas:
+        notify("item/agentMessage/delta", thread_id, itemId=answer_id, delta=delta)
+    notify("item/completed", thread_id, item={
+        "type": "agentMessage", "phase": "final_answer", "id": answer_id, "text": answer,
+    })
+    notify("thread/tokenUsage/updated", thread_id, tokenUsage={
+        "last": {"inputTokens": 120}, "total": {"inputTokens": 120, "outputTokens": 18},
+        "modelContextWindow": 8000,
+    })
+    notify("turn/completed", thread_id, turn={"id": turn_id, "status": "completed"})
+
+
+def delegate(thread_id, turn_id, config, wait_for_steering):
+    time.sleep(1.5)
+    url = config["url"]
+    assert urlparse(url).hostname == "127.0.0.1"
+    task = {"name": "delegate", "arguments": {
+        "prompt": "添付論文の定理文と証明の対応を確認し、結果を報告する。"
+    }}
+    if wait_for_steering:
+        task["arguments"]["prompt"] += " 最初の確認のあと、追加の指示を待つ。"
+    item = {"type": "mcpToolCall", "id": f"{turn_id}-mcp",
+            "server": "fuzukue", "tool": "delegate", "arguments": task["arguments"]}
+    notify("item/started", thread_id, item=item)
+    try:
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": task}
+        request = Request(url, data=json.dumps(payload).encode(),
+                          headers={"Content-Type": "application/json", **config["http_headers"]})
+        with urlopen(request, timeout=10) as response:
+            result = json.load(response)["result"]
+        if result["isError"]:
+            raise ValueError(result["content"][0]["text"])
+        item["result"] = result
+        assert result["structuredContent"]["job"].startswith("delegate:")
+        answer = "作業役に依頼した。"
+    except Exception as error:
+        item["error"] = str(error)
+        answer = f"委譲が失敗した。{error}"
+    notify("item/completed", thread_id, item=item)
+    finish(thread_id, turn_id, answer)
+
+
+def wait_for_gate(stopped=None):
+    gate = os.environ.get("FUZUKUE_CODEX_FIXTURE_GATE")
+    if gate and (stopped is not None or next_thread == 1):
+        deadline = time.monotonic() + 5
+        while not Path(gate).exists() and time.monotonic() < deadline:
+            if stopped is not None and stopped.wait(0.01):
+                return
+            if stopped is None:
+                time.sleep(0.01)
+
+
+def work(thread_id, turn_id, stopped, prompt):
+    shot = os.environ.get("FUZUKUE_CODEX_SHOT")
+    progress_id = f"{turn_id}-progress"
+    first = "**I started checking the manuscript.**"
+    second = " I am comparing the theorem assumptions with the proof references."
+    notify("item/agentMessage/delta", thread_id, itemId=progress_id, delta=first)
+    wait_for_gate(stopped)
+    if stopped.is_set():
+        notify("turn/completed", thread_id, turn={"id": turn_id, "status": "interrupted"})
+        return
+    if shot:
+        time.sleep(0.35)
+    item = {"type": "commandExecution", "id": f"{turn_id}-check",
+            "command": "確認用の原稿チェック", "exitCode": 0,
+            "aggregatedOutput": "定理文と証明の対応を確認した。"}
+    notify("item/started", thread_id, item=item)
+    extra = {"type": "commandExecution", "id": f"{turn_id}-refs",
+             "command": "参照先の確認", "exitCode": 1, "aggregatedOutput": "参照先が見つからなかった。"}
+    if shot:
+        notify("item/started", thread_id, item=extra)
+        notify("item/completed", thread_id, item=extra)
+    notify("item/agentMessage/delta", thread_id, itemId=progress_id, delta=second)
+    notify("item/completed", thread_id, item={
+        "type": "agentMessage", "phase": "commentary", "id": progress_id, "text": first + second,
+    })
+    notify("turn/plan/updated", thread_id, turnId=turn_id, plan=[
+        {"step": "定理の仮定を読む", "status": "completed"},
+        {"step": "証明中の参照を確認する", "status": "inProgress"},
+    ])
+    if shot and stopped.wait(12 if "撮影用の作業" in prompt else 1.5):
+        notify("turn/completed", thread_id, turn={"id": turn_id, "status": "interrupted"})
+        return
+    notify("item/completed", thread_id, item=item)
+    finish(thread_id, turn_id, "I verified that the theorem statement matches the proof.")
+
+
+def review(thread_id, turn_id, stopped, prompt):
+    if stopped.wait(5):
+        notify("turn/completed", thread_id, turn={"id": turn_id, "status": "interrupted"})
+        return
+    if "# Consistency with a human edit" in prompt or "# 人の編集との整合" in prompt:
+        assert "ここでは確率測度の場合を扱う。" in prompt and '"card": "intro"' in prompt
+        answer = {"findings": [{"card": "intro", "text": "定義に合わせて、確率測度を対象とすることを明記する。"}]}
+    else:
+        assert ("# Mathematics review" in prompt or "# 数学査読" in prompt) and '"id": "intro"' in prompt
+        answer = {"findings": [{"card": "intro", "text": "集中の仮定が成り立つ測度の範囲を明記する。"}]}
+    finish(thread_id, turn_id, json.dumps(answer, ensure_ascii=False))
+def workshop(thread_id, turn_id, stopped, cwd):
+    progress = "Lean 化の確認を始めた。"
+    notify("item/agentMessage/delta", thread_id, itemId=f"{turn_id}-workshop", delta=progress)
+    if stopped.wait(4):
+        notify("turn/completed", thread_id, turn={"id": turn_id, "status": "interrupted"})
+        return
+    note = Path(cwd) / "notes/workshop/issue-12/1.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("Hamming 距離の上界を確認した。\n")
+    finish(thread_id, turn_id, """下書き: notes/workshop/issue-12/1.md
+
+lake build: ok
+'LabSample.Hamming.hamming_le_length' depends on axioms: [propext, Quot.sound]
+'LabSample.Hamming.hamming_map_not' depends on axioms: [propext, Quot.sound]
+'LabSample.Hamming.hamming_triangle' depends on axioms: [propext, Classical.choice, Quot.sound]""")
+
+
+configs = {}
+workers = {}
+questions = {}
+next_thread = 0
+next_turn = 0
+default_model = "gpt-6.2-sol"
+log = os.environ.get("FUZUKUE_CODEX_FIXTURE_LOG")
+for line in sys.stdin:
+    request = json.loads(line)
+    if log:
+        with Path(log).open("a") as file:
+            file.write(line)
+    if "method" not in request and request.get("id") in questions:
+        thread_id, turn_id, dismiss = questions.pop(request["id"])
+        expected = {} if dismiss else {
+            "choice": {"answers": ["Pick this"]},
+            "secret": {"answers": ["user_note: fixture-secret"]},
+        }
+        assert request["result"] == {"answers": expected}
+        notify("serverRequest/resolved", thread_id, requestId=request["id"])
+        finish(thread_id, turn_id, "Question fixture completed.")
+        continue
+    if "id" not in request or "method" not in request:
+        continue
+    request_id, method = request["id"], request["method"]
+    params = request.get("params", {})
+    if method == "model/list":
+        result = {
+            "data": [
+                {"model": default_model, "displayName": "GPT-6.2 Sol",
+                 "supportedReasoningEfforts": [{"reasoningEffort": "high"}]},
+                {"model": "codex-auto-review", "hidden": True},
+            ],
+            "nextCursor": None,
+        }
+    elif method == "thread/resume" and params.get("threadId") == os.environ.get("FUZUKUE_CODEX_FIXTURE_MISSING_THREAD"):
+        send(id=request_id, error={"code": -32600, "message": "no rollout found for thread"})
+        continue
+    elif method in ("thread/start", "thread/resume"):
+        next_thread += 1
+        thread_id = params.get("threadId", f"fixture-thread-{next_thread}")
+        configs[thread_id] = params
+        result = {"thread": {"id": thread_id}, "model": params.get("model") or default_model}
+        if "permissions" in params:
+            result["cwd"] = params["cwd"]
+            result["activePermissionProfile"] = {"id": params["permissions"]}
+            result["approvalPolicy"] = params["approvalPolicy"]
+    elif method == "turn/start":
+        thread_id = params["threadId"]
+        prompt = " ".join(value["text"] for value in params["input"])
+        if "report-delivery-test:reject-start" in prompt:
+            send(id=request_id, error={"code": -32600, "message": "fixture rejected report turn"})
+            continue
+        next_turn += 1
+        turn_id = f"{thread_id}-turn-{next_turn}"
+        send(id=request_id, result={"turn": {"id": turn_id}})
+        notify("turn/started", thread_id, turn={"id": turn_id})
+        if "report-delivery-test:disconnect-after-start" in prompt:
+            sys.exit(0)
+        config = configs[thread_id]
+        if not config.get("ephemeral"):
+            wait_for_gate()
+        if config.get("ephemeral") and "方針の撮影用" in prompt and any(marker in config["developerInstructions"] for marker in ("Return one JSON object", "返すのは次の形")):
+            plan = {
+                "done_condition": "本文のすべての引用を出典と照合できた",
+                "status": "active",
+                "done": ["出典の一覧を整理した"],
+                "next": [{"task": "第2節の引用を出典と照合する", "agent": "prose",
+                          "reason": "版が異なる箇所のページ番号を確かめる"}],
+                "rejected": [{"approach": "引用キーだけで一致を判定する",
+                              "reason": "版が異なる資料を区別できなかった"}],
+            }
+            finish(thread_id, turn_id, json.dumps(plan, ensure_ascii=False))
+        elif "points" in (params.get("outputSchema") or {}).get("properties", {}):
+            assert config["sandbox"] == "read-only" and config["approvalPolicy"] == "never"
+            answer = {"points": [{"lines": [1, 1], "summary": "原稿の説明を補う", "cards": ["intro"]}]}
+            finish(thread_id, turn_id, json.dumps(answer, ensure_ascii=False))
+        elif os.environ.get("FUZUKUE_REVIEW_SHOT") and "outputSchema" in params:
+            assert config["sandbox"] == "read-only" and config["approvalPolicy"] == "never"
+            assert config["model"] == default_model
+            stopped = threading.Event()
+            workers[turn_id] = stopped
+            threading.Thread(target=review, args=(thread_id, turn_id, stopped, prompt), daemon=True).start()
+        elif config.get("ephemeral"):
+            stopped = threading.Event()
+            workers[turn_id] = stopped
+            if "Research issue #12" in prompt or "研究 Issue #12" in prompt:
+                threading.Thread(target=workshop, args=(thread_id, turn_id, stopped, config["cwd"]), daemon=True).start()
+            else:
+                threading.Thread(target=work, args=(thread_id, turn_id, stopped, prompt), daemon=True).start()
+        elif os.environ.get("FUZUKUE_CODEX_SHOT") and any(
+            "委譲して" in value["text"] for value in params["input"]
+        ):
+            mcp = config["config"]["mcp_servers"]["fuzukue"]
+            steering = "追加の指示を待って" in prompt
+            threading.Thread(target=delegate, args=(thread_id, turn_id, mcp, steering), daemon=True).start()
+        elif "codex-question fixture" in prompt:
+            ask_id = f"{turn_id}-question"
+            questions[ask_id] = (thread_id, turn_id, "dismissal" in prompt)
+            send(id=ask_id, method="item/tool/requestUserInput", params={
+                "threadId": thread_id, "turnId": turn_id, "itemId": ask_id, "isBlocking": True,
+                "questions": [
+                    {"id": "choice", "header": "Choice", "question": "Which option?", "options": [
+                        {"label": "Pick this", "description": "The first option"},
+                    ]},
+                    {"id": "secret", "header": "Secret", "question": "Private value?", "options": None, "isSecret": True},
+                ],
+            })
+            if "cancellation" in prompt:
+                del questions[ask_id]
+                notify("serverRequest/resolved", thread_id, requestId=ask_id)
+                finish(thread_id, turn_id, "Question fixture cancelled.")
+        elif "front-desk-test:silent" in prompt:
+            notify("item/reasoning/summaryTextDelta", thread_id, itemId=f"{turn_id}-reasoning",
+                   delta="Checking whether there is an update.")
+            finish(thread_id, turn_id, "<silent/>", deltas=("<si", "lent/>"))
+        elif "front-desk-test:" in prompt or "You ended your last reply" in prompt or "前の返事では着手を予告した" in prompt:
+            nudged = "You ended your last reply" in prompt or "前の返事では着手を予告した" in prompt
+            answer = "Next, I will check the references."
+            for tool in ("delegate", "plan", "replan"):
+                if f"front-desk-test:{tool}" in prompt:
+                    notify("item/started", thread_id, item={
+                        "type": "mcpToolCall", "id": f"{turn_id}-tool",
+                        "server": "fuzukue", "tool": tool, "arguments": {},
+                    })
+            if "front-desk-test:question" in prompt:
+                answer += " Should I go ahead?"
+            if "front-desk-test:earlier-question" in prompt:
+                notify("item/completed", thread_id, item={
+                    "type": "agentMessage", "phase": "commentary",
+                    "id": f"{turn_id}-question", "text": "Should I go ahead?",
+                })
+            finish(thread_id, turn_id, ("Nudge received. " if nudged else "") + answer)
+        elif ("Worker job finished" in prompt or "作業役の仕事が終わった" in prompt):
+            answer = ("作業役が参照を確認し、報告を受け取った。"
+                      if os.environ.get("FUZUKUE_CODEX_SHOT") and "I checked only the references" in prompt
+                      else "作業役の確認が終わり、結果を受け取った。")
+            finish(thread_id, turn_id, answer)
+        else:
+            finish(thread_id, turn_id, "Codex の確認用の返信。")
+        continue
+    elif method == "turn/steer":
+        result = {"turnId": params["expectedTurnId"]}
+    elif method == "turn/interrupt":
+        if params["turnId"] in workers:
+            workers[params["turnId"]].set()
+        result = {}
+    else:
+        result = {}
+    send(id=request_id, result=result)

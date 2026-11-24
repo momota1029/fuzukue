@@ -1,0 +1,11 @@
+fuzukue
+Copyright (c) 2026 the fuzukue contributors
+
+The fuzukue project is available under the MIT License or the Apache License,
+Version 2.0, at your option. See LICENSE-MIT and LICENSE-APACHE.
+
+This distribution includes software from gpui-kit, Zed/GPUI, and zorite,
+including GPUI Windows code with a Microsoft attribution. It also includes
+icons from Lucide and Feather and the Gradle Wrapper. The Android build uses
+KaTeX fonts via RaTeX. Copyright and attribution notices are preserved in
+the component files listed in THIRD_PARTY_NOTICES.

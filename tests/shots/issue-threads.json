@@ -1,0 +1,13 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "git_hub_activity", "timeout_ms": 150000},
+    {"action": "select_thread", "title": "#13"},
+    {"action": "wait_element", "id": "github-chip-13"},
+    {"action": "wait_element", "id": "github-respond-example-owner/lab#13:Comment:710:"},
+    {"action": "wait_element", "id": "github-full-example-owner/lab#13:Comment:711:"},
+    {"action": "screenshot", "name": "issue-threads"}
+  ]
+}

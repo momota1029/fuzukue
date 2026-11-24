@@ -1,0 +1,30 @@
+{
+  "steps": [
+    {"action": "size", "width": 1120, "height": 800},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "new_thread", "deck": "research/curvature"},
+    {"action": "wait_element", "id": "open-attachment-research/curvature"},
+    {"action": "click", "id": "open-attachment-research/curvature"},
+    {"action": "wait_element", "id": "open-exploration"},
+    {"action": "click", "id": "open-exploration"},
+    {"action": "wait_element", "id": "exploration-record-gaussian-bound"},
+    {"action": "screenshot", "name": "exploration-tree"},
+    {"action": "click", "id": "exploration-branch-curvature-and-concentration"},
+    {"action": "click", "id": "exploration-mode-state"},
+    {"action": "wait_element", "id": "exploration-record-gaussian-bound"},
+    {"action": "screenshot", "name": "exploration-by-state"},
+    {"action": "click", "id": "exploration-record-gaussian-bound"},
+    {"action": "wait_element", "id": "edit-card"},
+    {"action": "wait_element", "id": "open-attachment-research/curvature"},
+    {"action": "click", "id": "open-attachment-research/curvature"},
+    {"action": "wait_element", "id": "open-exploration"},
+    {"action": "click", "id": "open-exploration"},
+    {"action": "wait_element", "id": "exploration-record-diameter-manuscript"},
+    {"action": "click", "id": "exploration-record-diameter-manuscript"},
+    {"action": "wait_note", "path": "papers/obsdiam-spheres/structure.yaml", "text": "def-observable-diameter"},
+    {"action": "wait_element", "id": "close-pane"},
+    {"action": "screenshot", "name": "exploration-record"}
+  ]
+}

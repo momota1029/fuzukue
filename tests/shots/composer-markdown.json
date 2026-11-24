@@ -1,0 +1,19 @@
+{
+  "steps": [
+    {"action": "size", "width": 1120, "height": 700},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "**太字** と *斜体* と `code`"},
+    {"action": "assert_composer_decorations", "styled": 3, "dimmed": 2},
+    {"action": "key", "key": "Enter"},
+    {"action": "assert_composer_decorations", "styled": 3, "dimmed": 6},
+    {"action": "screenshot", "name": "composer-markdown-light"},
+    {"action": "theme", "theme": "dark"},
+    {"action": "assert_composer_decorations", "styled": 3, "dimmed": 6},
+    {"action": "screenshot", "name": "composer-markdown-dark"}
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 1100},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "distribution_preview"},
+    {"action": "click", "id": "workspace-account"},
+    {"action": "click", "id": "account-server"},
+    {"action": "wait_element", "id": "distribution-host"},
+    {"action": "wait_element", "id": "distribution-keep"},
+    {"action": "wait_element", "id": "distribution-auto"},
+    {"action": "wait_element", "id": "client-update"},
+    {"action": "screenshot", "name": "distribution-settings"},
+    {"action": "click", "id": "distribution-keep"},
+    {"action": "screenshot", "name": "distribution-keep-enabled"},
+    {"action": "click", "id": "distribution-host"},
+    {"action": "screenshot", "name": "distribution-host-disabled"},
+    {"action": "client_rollback_preview"},
+    {"action": "wait_element", "id": "client-update-rollback-dismiss"},
+    {"action": "screenshot", "name": "distribution-rollback"}
+  ]
+}

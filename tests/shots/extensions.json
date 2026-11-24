@@ -1,0 +1,20 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "extensions"},
+    {"action": "wait_element", "id": "extension-permission-dialog"},
+    {"action": "wait", "ms": 250},
+    {"action": "screenshot", "name": "extension-permissions"},
+    {"action": "click", "id": "extension-approve"},
+    {"action": "wait_event", "event": "extensions"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "wait_element", "id": "extension-view-memo-stats"},
+    {"action": "wait", "ms": 250},
+    {"action": "click", "id": "extension-view-memo-stats"},
+    {"action": "wait_element", "id": "extension-table-extension-1"},
+    {"action": "screenshot", "name": "extension-memo-stats"}
+  ]
+}

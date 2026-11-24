@@ -1,0 +1,4 @@
+title = "実験コード"
+
+[tests.analysis]
+command = ["/bin/sh", "-c", "printf 'analysis.py:8: 平均値の検証に失敗しました\n'; exit 1"]

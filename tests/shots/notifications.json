@@ -1,0 +1,18 @@
+{
+  "steps": [
+    {"action":"size","width":1280,"height":900},
+    {"action":"locale","locale":"ja"},
+    {"action":"connect"},
+    {"action":"new_thread"},
+    {"action":"click","id":"tool-settings"},
+    {"action":"click","id":"settings-notifications"},
+    {"action":"wait_element","id":"notification-settings"},
+    {"action":"click","id":"notifications-test"},
+    {"action":"wait_element","id":"notification-feedback"},
+    {"action":"screenshot","name":"notifications-ja"},
+    {"action":"click","id":"settings-notifications"},
+    {"action":"click","id":"locale-en"},
+    {"action":"click","id":"settings-notifications"},
+    {"action":"screenshot","name":"notifications-en"}
+  ]
+}

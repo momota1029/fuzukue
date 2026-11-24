@@ -1,0 +1,21 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 950},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "thread-info-toggle"},
+    {"action": "click", "id": "git-toggle"},
+    {"action": "wait_git", "path": "git-shot.txt"},
+    {"action": "screenshot", "name": "git-status"},
+    {"action": "click", "id": "git-file-0"},
+    {"action": "wait_git", "diff": "+after Git change"},
+    {"action": "screenshot", "name": "git-diff"},
+    {"action": "click", "id": "git-diff-close"},
+    {"action": "click", "id": "git-commit-open"},
+    {"action": "type", "text": "フィクスチャの変更を記録"},
+    {"action": "click", "id": "git-commit-confirm"},
+    {"action": "wait_git", "commit": "フィクスチャの変更を記録"},
+    {"action": "screenshot", "name": "git-commit"}
+  ]
+}

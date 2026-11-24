@@ -1,0 +1,14 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "scroll_to_card", "id": "thm-sphere-concentration"},
+    {"action": "wait_paper_card", "deck": "papers/levy-families", "card": "thm-sphere-concentration"},
+    {"action": "drag_from_element", "id": "formula:S^n(1) \\subset \\mathbb{R}^{n+1}", "dx": 110, "dy": 0},
+    {"action": "screenshot", "name": "math-selection"},
+    {"action": "click", "id": "quote-thm-sphere-concentration"},
+    {"action": "screenshot", "name": "math-comment-draft"}
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 960},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread", "deck": "papers/levy-families"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "scroll_to_card", "id": "intro"},
+    {"action": "click", "id": "edit-paper-statement-intro"},
+    {"action": "type", "text": "人が導入の説明を追加した。\n\n"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "card_save_result"},
+    {"action": "wait_paper_card", "deck": "papers/levy-families", "card": "intro", "text": "人が導入の説明を追加した。"},
+    {"action": "click", "id": "paper-history-intro"},
+    {"action": "wait_element", "id": "history-record-0"},
+    {"action": "click", "id": "history-record-0"},
+    {"action": "wait_element", "id": "history-diff"},
+    {"action": "screenshot", "name": "change-history-card"},
+    {"action": "click", "id": "history-close"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "変更履歴の撮影用に導入カードを追記して。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_partner_text", "text": "導入カードに適用範囲を追記した。"},
+    {"action": "wait_idle"},
+    {"action": "wait_element", "id": "turn-history-change-history:0"},
+    {"action": "screenshot", "name": "change-history-actions"},
+    {"action": "click", "id": "turn-history-change-history:0"},
+    {"action": "wait_element", "id": "history-diff"},
+    {"action": "screenshot", "name": "change-history-turn"}
+  ]
+}

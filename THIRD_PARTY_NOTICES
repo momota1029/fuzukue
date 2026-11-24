@@ -1,0 +1,73 @@
+Third-party notices for the fuzukue source distribution
+
+Vendored Rust crates
+
+* gpui-base 0.10.0 (gpui-kit), Apache-2.0.
+  Upstream: https://github.com/longbridge/gpui-kit
+  License: vendor/gpui-base/LICENSE-APACHE
+  Local changes: vendor/gpui-base/VENDORED.md
+* gpui-pre 0.3.12 (Zed/GPUI), Apache-2.0.
+  Upstream: https://github.com/zed-industries/zed
+  License: vendor/gpui-pre/LICENSE-APACHE
+  Local changes: vendor/gpui-pre/VENDORED.md
+* gpui-pre-windows 0.3.12 (Zed/GPUI Windows), Apache-2.0.
+  Upstream: https://github.com/zed-industries/zed
+  License: vendor/gpui-pre-windows/LICENSE-APACHE
+  Local changes: vendor/gpui-pre-windows/VENDORED.md
+  The Microsoft copyright and license notice in src/alpha_correction.hlsl
+  is preserved.
+* gpui-pdf 0.7.0 (zorite), MIT.
+  Upstream: https://github.com/packetThrower/zorite
+  License and copyright: vendor/gpui-pdf/LICENSE
+  Local changes: vendor/gpui-pdf/VENDORED.md
+
+The upstream gpui-pre SVG example used dragon.svg under CC BY-SA 3.0.
+The asset and its example are omitted from this distribution. Any separate
+redistribution of that upstream asset is subject to its attribution and
+share-alike terms. License: https://creativecommons.org/licenses/by-sa/3.0/
+
+Desktop icons
+
+Lucide (ISC with MIT-licensed Feather portions) and Feather (MIT).
+Copyright and license texts are in crates/fuzukue/assets/icons/LICENSE and
+crates/fuzukue/assets/icons/LICENSE-FEATHER.
+
+Fonts and Android dependencies
+
+KaTeX fonts used by RaTeX are covered by the SIL Open Font License 1.1.
+See android/app/src/main/assets/licenses/KaTeX-OFL-1.1.txt and NOTICE.txt.
+The Android third-party notices for RaTeX, OkHttp, the MPL-2.0 Public Suffix
+List and other Android dependencies are in the same directory in
+THIRD_PARTY_LICENSES.txt.
+
+The Gradle Wrapper scripts and JAR are distributed under Apache-2.0.
+The scripts carry the original copyright and license headers. See LICENSE-APACHE.
+Upstream: https://github.com/gradle/gradle
+
+Reading-companion PDF fixture
+
+tests/fixtures/reading-companion/synthetic/note/main.pdf embeds subsets of
+Latin Modern Roman 10 Regular and Latin Modern Roman 12 Bold.
+Copyright 2003–2021 B. Jackowski and J. M. Nowacki (on behalf of TeX Users Groups).
+The copyright years are from the Debian fonts-lmodern 2.005 copyright file
+(2003--2021).
+Font source: https://ctan.org/pkg/lm
+The GUST Font License refers to the LaTeX Project Public License (LPPL)
+version 1.3c or later.
+GUST Font License text: https://www.gust.org.pl/fonts/licenses/GUST-FONT-LICENSE.txt
+CTAN copy: https://ctan.org/license/gfl
+
+Build from the fixture directory with LuaHBTeX (TeX Live 2023).
+
+  lualatex -no-shell-escape -interaction=nonstopmode -halt-on-error main.tex
+
+Cargo dependencies
+
+option-ext 0.2.0 is MPL-2.0. The covered dependency source and its LICENSE.txt
+are available in the published source package:
+https://crates.io/crates/option-ext/0.2.0
+License: https://www.mozilla.org/en-US/MPL/2.0/
+Distributions containing an executable form of this dependency must make
+its covered source available and tell recipients how to obtain it.
+
+Binary distribution notices should reflect the components in the built artifact.

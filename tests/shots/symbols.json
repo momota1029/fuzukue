@@ -1,0 +1,15 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "open_paper", "deck": "papers/obsdiam-spheres"},
+    {"action": "scroll_to_card", "id": "lem-levy-iff-obsdiam"},
+    {"action": "wait_paper_card", "deck": "papers/obsdiam-spheres", "card": "lem-levy-iff-obsdiam", "text": "Lévy 族"},
+    {"action": "ctrl_click_text", "card": "lem-levy-iff-obsdiam", "text": "Lévy 族"},
+    {"action": "wait_paper_card", "deck": "papers/levy-families", "card": "def-levy-family"},
+    {"action": "wait_element", "id": "symbol-reference-0"},
+    {"action": "screenshot", "name": "symbols-references"}
+  ]
+}

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>arXiv Query Results</title>
+  <entry>
+    <id>http://arxiv.org/abs/2301.01234v2</id>
+    <published>2023-01-03T12:34:56Z</published>
+    <title>  Concentration &amp;
+      geometry  </title>
+    <author><name>Emmy Noether</name></author>
+    <author><name>Michel Ledoux</name></author>
+    <arxiv:journal_ref>Journal of Fixture Mathematics</arxiv:journal_ref>
+    <arxiv:doi>10.1234/geometry</arxiv:doi>
+    <link href="http://arxiv.org/pdf/2301.01234v2" rel="related" title="pdf" type="application/pdf"/>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/math.GT/0301001v1</id>
+    <published>2003-01-02T12:34:56Z</published>
+    <title>Withdrawn concentration note</title>
+    <author><name>Emmy Noether</name></author>
+    <link href="https://publisher.example/preprint.pdf" title="pdf" type="application/pdf"/>
+  </entry>
+</feed>

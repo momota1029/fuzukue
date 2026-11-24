@@ -1,0 +1,7 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "assert_pane_text_selection"},
+    {"action": "screenshot", "name": "selection-region"}
+  ]
+}

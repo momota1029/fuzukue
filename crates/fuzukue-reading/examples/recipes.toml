@@ -1,0 +1,80 @@
+# Copy the desired tables into the server configuration. Use a fixed, host-installed binary.
+[recipes.build-companion]
+command = ["/usr/local/bin/reading-companion", "build_companion", "{spec}", "--out", "{html}"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 120
+max_memory_mib = 2048
+args = { spec = { kind = "test-name", required = true }, html = { kind = "test-name", required = true } }
+
+[recipes.check-companion]
+command = ["/usr/local/bin/reading-companion", "check_companion", "{spec}", "{html}", "--workspace", ".", "--no-dom"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 120
+max_memory_mib = 2048
+args = { spec = { kind = "test-name", required = true }, html = { kind = "test-name", required = true } }
+
+[recipes.check-outline]
+command = ["/usr/local/bin/reading-companion", "check_outline", "{spec}"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 120
+max_memory_mib = 2048
+args = { spec = { kind = "test-name", required = true } }
+
+[recipes.build-section-page]
+command = ["/usr/local/bin/reading-companion", "build_section_page", "{record}", "--out", "{out}"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 300
+max_memory_mib = 4096
+args = { record = { kind = "test-name", required = true }, out = { kind = "test-name", required = true } }
+
+[recipes.build-section-page-with-original]
+command = ["/usr/local/bin/reading-companion", "build_section_page", "{record}", "--out", "{out}", "--original", "{pdf}"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 300
+max_memory_mib = 4096
+args = { record = { kind = "test-name", required = true }, out = { kind = "test-name", required = true }, pdf = { kind = "test-name", required = true } }
+
+[recipes.check-section-record]
+command = ["/usr/local/bin/reading-companion", "check_section_record", "{record}"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 120
+max_memory_mib = 2048
+args = { record = { kind = "test-name", required = true } }
+
+[recipes.proof-book-build]
+command = ["/usr/local/bin/reading-companion", "proof_book", "build", "{project}"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 600
+max_memory_mib = 4096
+args = { project = { kind = "test-name", required = true } }
+
+[recipes.proof-book-check]
+command = ["/usr/local/bin/reading-companion", "proof_book", "check", "{project}"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 180
+max_memory_mib = 4096
+args = { project = { kind = "test-name", required = true } }
+
+[recipes.proof-book-refs]
+command = ["/usr/local/bin/reading-companion", "proof_book", "refs", "{project}", "--block", "{block}"]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 120
+max_memory_mib = 2048
+args = { project = { kind = "test-name", required = true }, block = { kind = "test-name", required = true } }
+
+[recipes.archive-pair]
+command = ["/usr/local/bin/reading-companion", "archive_pair", "{pair}", "--workspace", "."]
+cwd = "."
+queue = "reading-companion"
+timeout_secs = 300
+max_memory_mib = 4096
+args = { pair = { kind = "test-name", required = true } }

@@ -1,0 +1,45 @@
+editor-a-utf-8-text-file-is-required = A UTF-8 text file is required
+editor-cancel = Cancel
+editor-close-tab = Close tab
+editor-connection-lost-before-the-save-result-arrived = Connection lost before the save result arrived
+editor-discard-changes-and-close = Discard changes and close
+editor-edit-range = Edit range
+editor-edited = Edited
+editor-loading = Loading…
+editor-move-to-center = Move to center
+editor-move-to-right-pane = Move to right pane
+editor-n-rest-of-diff-omitted = { "\u000A" }… Rest of diff omitted
+editor-on-disk = On disk
+editor-outline = Outline
+editor-referenced-card = Referenced card
+editor-save = Save
+editor-saved = Saved
+editor-saving = Saving…
+editor-source-editor = Source editor
+editor-the-file-on-disk-changed = The file on disk changed
+editor-unsaved-changes = Unsaved changes
+editor-whole-file = Whole file
+
+editor-lsp-starting = Language server starting
+editor-lsp-running = Language server running
+editor-lsp-failed = Language server failed
+editor-lsp-idle = Language server idle
+editor-lsp-yulang-unavailable = Yulang language server unavailable
+editor-lsp-lean-goal = Lean goals
+editor-lsp-lean-term-goal = Expected type
+editor-position = Line { $line }, Col { $column }
+editor-selected-characters = { $count ->
+    [one] 1 character selected
+   *[other] { $count } characters selected
+    }
+editor-plain-text = Plain text
+editor-unsaved = Unsaved
+editor-stop-editing = Cancel
+editor-save-shortcut = Save (Ctrl+S)
+editor-stop-editing-shortcut = Cancel (Esc)
+editor-discard = Discard changes
+editor-keep-editing = Keep editing
+editor-reload = Reload
+editor-view-diff = View diff
+editor-hide-diff = Hide diff
+editor-overwrite = Overwrite

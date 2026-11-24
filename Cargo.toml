@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/fuzukue-i18n", "crates/fuzukue-proto", "crates/secretaire", "crates/fuzukue-cards", "crates/fuzukue-reading", "crates/fuzukue-view", "crates/fuzukue-extension-api", "examples/extensions/memo-stats"]
+# fuzukue はデスクトップ用。Linux の UI キャプチャも別のマニフェストからビルドする。
+exclude = ["crates/fuzukue", "vendor/gpui-pre", "vendor/gpui-pre-windows"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+inherits = "dev"

@@ -1,0 +1,96 @@
+---
+id: install-and-update
+kind: design
+title: fuzukue のインストール・保存先・更新
+status: proposed
+links:
+  - {to: public-release, rel: refines}
+  - {to: release-distribution, rel: refines}
+  - {to: self-update, rel: see}
+  - {to: distribution, rel: see}
+  - {to: android-client, rel: see}
+---
+
+インストール、保存先、更新操作の設計案。実装済みの範囲は「現状」に記録する。
+
+
+## 現状
+
+| 対象 | 確認できるもの |
+| --- | --- |
+| サーバー（secretaire） | Linux / WSL では、手元のソースを点検し、ビルド、テスト・撮影、作業の終了待ち、入れ替え、起動確認、失敗時の復旧まで行う。設定した Windows クライアントは並行で事前ビルドし、サーバーの起動確認後に登録・通知する。systemd ユーザーサービスにも対応。 [自己更新](self-update.md) · [サービス](../../docs/service.md) |
+| Windows デスクトップ | GPUI の x86_64 をソースからビルドでき、既存のサーバーへの登録スクリプトがある。現在の運用で配布しているデスクトップ成果物はこの形式。Windows でローカルサーバーを使う場合は WSL2 内で動かす。 [Windows ガイド](../../docs/windows.md) · [登録スクリプト](../../scripts/publish-windows.sh) |
+| Linux デスクトップ | 別の Cargo マニフェストから GPUI をビルドして撮影する経路がある。`scripts/run.sh` に release ビルドとローカル起動の手順がある。配布 API は `linux-x86_64` を受け付ける。公開パッケージと対応ディストリビューションは未確認。 [撮影スクリプト](../../scripts/shot.sh) · [ローカル起動スクリプト](../../scripts/run.sh) · [配布手順](../../docs/update.md) |
+| macOS | `scripts/run.sh` にソースビルドの手順があり、配布 API は `macos-aarch64` を受け付ける。Mac ガイドにサーバーの `cargo check --target aarch64-apple-darwin` の記録がある。GPUI の実機ビルド・起動と配布成果物は未確認。 [Mac ガイド](../../docs/mac.md) · [配布手順](../../docs/update.md) |
+| デスクトップの更新 | 接続先サーバーから版・サイズ・SHA-256 を取得し、別プロセスが実行ファイルを入れ替える。HTTP の確認は WebSocket のプロトコル不一致時も使える。新版が Welcome を受け取れなければ旧版に戻す。既存設定には自動入れ替えモードがある。 [更新ガイド](../../docs/update.md#クライアントを更新する) |
+| 公開版向けの検証 | リリースマニフェストのローカル生成・検証 CLI、Ed25519 署名検証、候補選定と巻き戻し防止のライブラリがある。GitHub からの取得、公開 CI、稼働中の自己更新との接続は新規作業。 [配布設計](release-distribution.md) · [実装](../../crates/secretaire/src/release.rs) |
+| Android | 署名済み APK を生成するスクリプトとアプリ内の手動更新がある。既定フィードは配布専用リポジトリのローリングプレリリース `android-beta`。Tailscale でサーバーに接続し、APK を tailnet 内で渡すこともできる。 [Android の手順](../../android/README.md) |
+
+## インストールと保存先
+
+ユーザー単位で導入する。インストールルートの下で `client` と `server` を分け、導入する方だけを作る。各コンポーネントの例は `client/fuzukue.exe`（Windows の固定ランチャー）または `client/fuzukue`（Unix の固定ランチャー）、`client/current`、`client/v<version>/`。サーバー側は `server/secretaire`、`server/current`、`server/previous`、`server/v<version>/` とする。Windows の `current` は版ディレクトリ名を一行で記録し、Unix はルート内を指す相対シンボリックリンクを使う案とする。以下の `<channel>` はインストール済みクライアントの版種別（beta または stable）を表す。
+
+| OS | インストールルートと起動口 | データ・設定・状態・キャッシュ |
+| --- | --- | --- |
+| Windows | `%LOCALAPPDATA%\fuzukue\install` にクライアント。スタートメニューは `install\client\fuzukue.exe` を指す。サーバーを同居させる場合は WSL2 の Linux 側に別途導入する。 | `%LOCALAPPDATA%\fuzukue\data\<channel>\` の下に `data\`、`config\`（`settings.toml`）、`state\`、`cache\`。 |
+| Linux / WSL2 | `${XDG_DATA_HOME:-$HOME/.local/share}/fuzukue/install/`。起動口は `~/.local/bin/fuzukue` と `~/.local/bin/secretaire`、Linux のデスクトップエントリ、既存の systemd ユーザーサービス。 | データは `${XDG_DATA_HOME:-$HOME/.local/share}/fuzukue/`、設定は `${XDG_CONFIG_HOME:-$HOME/.config}/fuzukue/`、状態は `${XDG_STATE_HOME:-$HOME/.local/state}/fuzukue/`、キャッシュは `${XDG_CACHE_HOME:-$HOME/.cache}/fuzukue/`。各配下のクライアント用は `client/<channel>/`。サーバーの `server.toml` とワークスペース別状態の既存パスを維持する。XDG 変数は絶対パスだけ採用する。 |
+| macOS | `~/Library/Application Support/fuzukue/install/`。`~/Applications/Fuzukue.app` の固定ランチャーと、CLI 用の `~/.local/bin/secretaire` を候補とする。 | `~/Library/Application Support/fuzukue/` の下に `data/`、`config/`、`state/`。クライアント用は各配下の `client/<channel>/`、サーバー用は `server.toml` を `config/`、ワークスペース別の状態を `state/` に置く。キャッシュは `~/Library/Caches/fuzukue/`（クライアント用は `client/<channel>/`）。 |
+
+ワークスペース内のカード、会話ファイル、リポジトリ、`fuzukue.toml` は既存の場所を使う。サーバーのチャネルは稼働版の選択に使い、同じワークスペースの状態は一つとする。旧版との状態形式の互換性を起動確認とロールバックの条件に含める。手動のロールバックに状態の復元が必要なら、対象と復元手順を明示する。
+
+展開は切り替え先と同じファイルシステムの一時領域で行う。インストーラーとランチャーは専用ルートの管理マーカーとロックを共有し、展開済みの完全な版だけを公開してから `current` をアトミックに差し替える。ランチャーが参照する版は管理ルート内に限定し、起動中の版と復旧用の版を残す。コマンドやサービスの作業ディレクトリとプロジェクト引数は継承する。
+
+## 既存環境からの移行
+
+1. サーバーを動かしている同じユーザーと XDG 設定で、`$XDG_STATE_HOME/fuzukue/server-builds/`（既定は `~/.local/state/fuzukue/server-builds/`）、`<commit>/build-*/secretaire`、`current`・`previous` の実体、稼働版、起動引数を記録する。各ワークスペースの配布レジストリ `builds/<platform>/` は別に扱う。既存の `labo-gui` 名からの移行が必要なときは更新ガイドに沿って先に解決する。
+2. サービスと手動起動を通常の終了手順で停止させる。現行版と復旧用の実体を新しい `server/` に一意なローカル版としてコピーし、両ポインタを新ルート内向けに作り直す。Mac の旧 XDG 状態があれば新しい Application Support の状態パスにコピーし、既存の移行先に衝突したら利用者に候補を示す。設定・状態の権限を保ち、キャッシュは再生成する。
+3. サービス、CLI、ローカル起動設定を固定ランチャーへ切り替え、同じプロジェクトでヘルスチェックする。移行した設定・状態のパスは起動時に明示し、旧バイナリがそのパスを扱えない場合は旧ランチャーと旧パスの組を復旧用に保存する。失敗したら起動先と必要な状態を移行前に戻す。成功後も旧 `server-builds` は復旧用に保持し、公開版は新ルートを操作する。従来のソース更新で旧レイアウトを使う導入は移行なしで続けられる。
+4. デスクトップは実行ファイルの隣の `settings.toml` や OS の旧設定パス（Windows は `%APPDATA%\fuzukue\settings.toml`、Mac は Application Support 直下の既存設定など）を調べ、未作成のチャネル領域に必要な設定・状態を一度だけコピーする。旧データを保持し、既存の新設定を優先する。接続を確認してからショートカットを張り替える。中断後の再実行で移行済みの設定を上書きしない。 [現行の改名移行](../../docs/update.md#旧版から名前が変わる最初の更新)
+
+## 配布チャネルと初回導入
+
+- **beta（既定）**。初回は公開済みの互換プレリリースを選ぶ。更新では 安定版も候補に含め、たとえば `v0.2.0` を `v0.2.0-beta.12` より新しい版として提示する。
+- **stable**。公開済みの互換安定版だけを候補にする。どちらも対象 OS・アーキテクチャ・役割に対応した成果物のある版から選ぶ。通常の更新は新版だけを提示する。別チャネルを選んで古い版に移るときは版と互換性を示し、追加の確認を取る。
+- 公開版の配布元は公開リポジトリの GitHub Releases とする。Git にはソースを置き、バイナリはリリースに添付する。beta の CI ごとの番号付けと公開、stable の手動ドラフトと確認後の公開を expos にそろえる案とする。週次昇格は従来の配布設計にある案。詳細な公開頻度と保持数は実装前に決める。
+
+ブートストラップの一行例。スクリプト、URL、環境変数は設計上の名前。
+
+~~~powershell
+powershell -NoProfile -Command "irm https://downloads.example.org/fuzukue/get-fuzukue.ps1 | iex"
+~~~
+
+~~~sh
+( installer=$(mktemp) && trap 'rm -f "$installer"' 0 && curl --proto '=https' --proto-redir '=https' -fsSL https://downloads.example.org/fuzukue/install.sh -o "$installer" && sh "$installer" )
+~~~
+
+PowerShell は Windows クライアント、POSIX `install.sh` は Linux / macOS の対象を選ぶ。初回はクライアントを既定とし、サーバーは Bash を必要としない `install.sh` に `FUZUKUE_INSTALL_ROLE=server` を渡して明示する。両方を同居させる場合はそれぞれの環境で導入する。 `FUZUKUE_CHANNEL=stable` でチャネルを選び、`FUZUKUE_VERSION` は明示した公開タグの初回導入に使う。対応成果物がなければ対象と理由を表示して終了する。
+
+一行例は HTTPS で取得したブートストラップそのものを実行するため、初回に信頼する公式 URL を明示し、コミット固定版や取得後に内容を読んで実行する手順も案内する。配布物には版・完全なソースコミット SHA、対応プロトコル、役割・OS・アーキテクチャ別のファイル名・サイズ・SHA-256 を含む署名付きマニフェストと `SHA256SUMS` を添える。ブートストラップとサーバーは、解決した公開タグの完全なコミット SHA（注釈付きタグでは参照先のコミット）とマニフェストの SHA を一致させる。既知の公開鍵でマニフェストの Ed25519 署名を検証し、対象ファイルの一意な `SHA256SUMS` 項目も署名済みの値と一致させて、取得したバイト列のサイズと SHA-256 を照合する。検証は展開・実行・切り替えの前に完了させる。同じ経路で配るランチャーやインストーラーも検証の対象とする。 [公開版の更新方針](public-release.md#公開版の更新)
+
+## 更新の操作とサーバーからの配布
+
+1. 管理者はサーバー側でチャネルを選ぶ。デスクトップの「更新」から手動確認でき、自動確認のオン・オフも選べる。自動確認の頻度はサーバー側で制限し、候補があれば版・変更点を通知する。公開モードではサーバー・デスクトップとも自動確認は通知までとし、既存の自動入れ替え設定を移行しても適用は利用者の操作を待つ。
+2. 管理者が「インストール」を押すと、サーバーが GitHub Releases からサーバーと対応するデスクトップの成果物を取得・検証し、バックグラウンドでステージングする。準備が終わったら二度目の確認で切り替えを承認する。既存の自己更新の終了待ち、入れ替え、起動確認、ロールバックを使う。検証に失敗した版は選択中の版とレジストリに反映しない。
+3. サーバーの起動確認後、そのプロトコルに適合する署名検証済みデスクトップ成果物をサーバーに登録し、接続中の端末に通知する。サーバーだけの更新では、互換な登録済みクライアントを引き続き提示できる。登録に失敗したときはエラーを表示し、保存済みの検証済み成果物から再試行する。旧サーバーへ戻すときは旧版と互換な配布情報も戻す。
+4. デスクトップの通常更新は接続先サーバーの通知と認証付き HTTP を使う。利用者が選ぶと、クライアントが署名済みの配布情報、ハッシュ、互換性を確認し、版ディレクトリに準備する。二度目の確認でセッションを保存し、`current` を切り替えて固定ランチャー経由で再起動する。Welcome を受け取れなければ旧版に戻し、理由を表示する。GitHub Releases の直接利用は初回導入・明示的な復旧用とする。サーバーとプロトコルが合わない場合も HTTP の更新情報を確認できるようにする。 [既存のクライアント配布](distribution.md)
+5. Android は署名済み APK と `android-latest.json` を使う。 `android-beta` では APK とハッシュを先に置き、JSON を最後に差し替える。GitHub からの取得と、Tailscale 経由の接続・個別配布に対応する。サーバーから配る場合は、互換版の同じ署名済み APK と JSON をクライアントに案内する。既存の手動確認と Android のシステムインストーラーの確認を使う。初回導入や個別配布ではリリースの署名証明書とハッシュを照合する。更新は同じ署名鍵・アプリ ID と単調増加する `versionCode` を条件とする。 [Android の配布手順](../../android/README.md#配布と更新)
+
+## パッケージ、アンインストール、開発版
+
+- Windows は x86_64 の ZIP と PowerShell から始める。Linux は x86_64 の `.tar.gz` にランチャーと実行ファイルを収める。素の tarball で必要な共有ライブラリとサポート対象を記録する。AppImage は依存関係の問題を tarball で解決しにくい場合の候補とする。
+- macOS は Apple Silicon で GPUI とサーバーを実機ビルド・起動してから配布対象を確定する。デスクトップの `.app` を版ごとに完全な状態で保管する案。Developer ID 署名、公証とチケットの同梱、Gatekeeper と隔離属性、署名済みランチャーから各版を起動する構成、更新後とオフラインでの挙動は未確認・要決定。公開時は標準設定の Mac で初回導入と更新を検証する。
+- アンインストールはプロセスと管理対象のサービスを停止し、管理マーカーを確認してランチャー、ショートカット、サービス登録、インストール済みの版を外す。データ、設定、ワークスペース別状態、移行元とワークスペース本体は保持し、再導入で再利用する。Android のアンインストールでは OS が端末内の設定を消すため、通常の APK 更新で設定を引き継ぐ。
+- 開発版は既存の `scripts/setup-windows.ps1`、`scripts/run.sh`、`scripts/publish-windows.sh` と、サーバーのローカルソース自己更新を使い続ける。版付きディレクトリとランチャーの試験には、ローカルビルドから同じ手順でインストールする専用の開発ルートを用意する。版の識別にはコミットとビルドごとの識別子を使い、古い開発版の整理では現行版・復旧用・使用中を残す。開発ルートは公開版の状態や `current` から分ける。
+
+## 決めること
+
+- 署名鍵の生成、固定公開鍵の初回配布と交代、ブートストラップで既存と同じ正規化形式を検証する方法。beta の公開頻度・保持数、stable を公開する条件、欠けた成果物や固定バージョンの扱い。
+- Linux のビルド基準（glibc、共有ライブラリ、実機で検証するディストリビューション）と追加アーキテクチャ。Mac のサポート OS・Intel 対応、署名・公証の運用、常駐起動に `launchd` を使うか。
+- 複数サーバーに接続するデスクトップが、互換な版を共用できないときの切り替え方法。サーバーが稼働中に版を引き下げる際の状態形式と告知。Android の stable を始める条件と、サーバー経由で APK を配る形。
+
+## 実装の順序案
+
+1. ローカルで使える署名検証を土台に、Windows クライアント・Linux サーバー・Linux クライアントの CI パッケージと、版・署名・ハッシュを検証できるテスト用リリースを作る。 [R-27](../../roadmap/cards/R-27.md)
+2. Windows / Linux の初回導入、ランチャー、旧パスの移行と復旧、アンインストールをテスト用リリースで通す。WSL2 に同居させる構成も確かめる。 [R-28](../../roadmap/cards/R-28.md)
+3. 公開版サーバーの確認・通知・利用者確認・入れ替えとクライアント配布を接続し、認証と Android の実機確認も行う。新しい Git 履歴で既存の自己更新・復旧を試し、公開は公開計画の承認手順で進める。 [R-11](../../roadmap/cards/R-11.md) · [R-26](../../roadmap/cards/R-26.md) · [公開計画](public-release.md#前提と移行順序)
+4. macOS の実機確認と署名・公証の判断を行い、パッケージとランチャーを共通のリリース・更新経路に追加する。 [R-29](../../roadmap/cards/R-29.md)

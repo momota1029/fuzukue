@@ -1,0 +1,13 @@
+[package]
+name = "fuzukue-memo-stats-example"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fuzukue-extension-api = { path = "../../../crates/fuzukue-extension-api" }
+serde_json.workspace = true

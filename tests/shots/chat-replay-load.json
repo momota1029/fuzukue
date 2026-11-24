@@ -1,0 +1,6 @@
+{
+  "steps": [
+    {"action": "assert_chat_replay_load"},
+    {"action": "screenshot", "name": "chat-replay-load"}
+  ]
+}

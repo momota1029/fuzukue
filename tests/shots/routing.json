@@ -1,0 +1,28 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "球面の集中について相談したい"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "turn_ended"},
+    {"action": "wait_element", "id": "undo-auto-attachment-papers/levy-families"},
+    {"action": "screenshot", "name": "routing-auto-attach"},
+    {"action": "upload", "name": "sources.bib", "text": "@article{sample, title={Example paper}}\n"},
+    {"action": "wait_inbox_proposal", "to": "papers/levy-families"},
+    {"action": "click", "id": "inbox-file-other-sources.bib"},
+    {"action": "screenshot", "name": "routing-inbox"},
+    {"action": "key", "key": "down"},
+    {"action": "key", "key": "enter"},
+    {"action": "wait_event", "event": "inbox_filed"},
+    {"action": "key", "key": "Ctrl+K"},
+    {"action": "type", "text": "Lévy 族と球面の集中"},
+    {"action": "wait_event", "event": "deck_search_results"},
+    {"action": "wait_element", "id": "palette-0"},
+    {"action": "screenshot", "name": "routing-search"},
+    {"action": "click", "x": 10, "y": 12},
+    {"action": "screenshot", "name": "routing-search-closed"}
+  ]
+}

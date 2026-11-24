@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-library"},
+    {"action": "wait_event", "event": "library_results"},
+    {"action": "click", "id": "library-memo-input"},
+    {"action": "type", "text": "球面の集中の例\n次はオブザーバブル直径を調べる。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "memo_result"},
+    {"action": "wait_element", "id": "library-delete-memo-0"},
+    {"action": "click", "id": "library-delete-memo-0"},
+    {"action": "wait_element", "id": "trash-confirmation"},
+    {"action": "screenshot", "name": "trash-confirmation"},
+    {"action": "click", "id": "trash-confirm"},
+    {"action": "wait_event", "event": "trash_items"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-trash"},
+    {"action": "wait_event", "event": "trash_items"},
+    {"action": "wait_trash_title", "title": "球面の集中の例"},
+    {"action": "screenshot", "name": "trash"}
+  ]
+}

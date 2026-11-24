@@ -1,0 +1,17 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "click", "id": "paper-show-pdf"},
+    {"action": "build_paper"},
+    {"action": "wait_pdf"},
+    {"action": "wait_element", "id": "pdf-audit"},
+    {"action": "screenshot", "name": "pdf"},
+    {"action": "click_pdf_card", "card": "thm-sphere-concentration"},
+    {"action": "screenshot", "name": "popup"},
+    {"action": "click", "id": "edit-pdf-card"},
+    {"action": "screenshot", "name": "edit"}
+  ]
+}

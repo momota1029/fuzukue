@@ -1,0 +1,21 @@
+{
+  "auto_review": true,
+  "steps": [
+    {"action": "size", "width": 1440, "height": 960},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "review_settings_changed"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "scroll_to_card", "id": "def-levy-family"},
+    {"action": "click", "id": "edit-paper-statement-def-levy-family"},
+    {"action": "type", "text": "ここでは確率測度の場合を扱う。\n\n"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_paper_card", "deck": "papers/levy-families", "card": "def-levy-family", "text": "ここでは確率測度の場合を扱う。"},
+    {"action": "wait_reviews", "deck": "papers/levy-families", "kinds": ["consistency"], "running": true},
+    {"action": "wait_element", "id": "stop-consistency-papers/levy-families"},
+    {"action": "screenshot", "name": "consistency-review-running"},
+    {"action": "wait_reviews", "deck": "papers/levy-families", "kinds": ["consistency"], "running": false},
+    {"action": "wait_element", "id": "review-comments-consistency-papers/levy-families"},
+    {"action": "screenshot", "name": "consistency-review-done"}
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 800},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "メモの書き込み前に承認を聞いて。"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "approval_requested"},
+    {"action": "click", "id": "menu-file"},
+    {"action": "click", "id": "menu-stop-server"},
+    {"action": "wait_element", "id": "safe-close-save"},
+    {"action": "screenshot", "name": "safe-close-review"},
+    {"action": "click", "id": "safe-close-save"},
+    {"action": "wait_element", "id": "safe-close-progress"},
+    {"action": "screenshot", "name": "safe-close-progress"},
+    {"action": "click", "id": "safe-close-force"},
+    {"action": "wait_element", "id": "safe-close-force-confirm"},
+    {"action": "screenshot", "name": "safe-close-force"},
+    {"action": "click", "id": "safe-close-force-back"},
+    {"action": "click", "id": "safe-close-cancel"}
+  ]
+}

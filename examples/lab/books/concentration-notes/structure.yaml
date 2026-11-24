@@ -1,0 +1,7 @@
+title: 『測度の集中』を噛み砕くノート
+sections:
+- title: 第1章 集中とは何か
+  items:
+  - ch1-intro
+  - ch1-def-median
+  - ch1-prop-median-vs-mean

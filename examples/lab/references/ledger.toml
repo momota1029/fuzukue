@@ -1,0 +1,47 @@
+[[entries]]
+key = "concentration-notes"
+title = "集中現象のノート"
+kind = "paper"
+reason = "papers/levy-families"
+status = "acquired"
+
+[[entries.locations]]
+kind = "url"
+value = "https://example.org/concentration"
+
+[entries.acquired]
+file = "references/fixture-notes/notes.txt"
+sha256 = "b2ae5dc1ff304b036ecffe766ebddb3a7b360be952c903cf01718c04fa2eb956"
+date = "2026-11-20"
+source = "https://example.org/concentration"
+license = "CC0-1.0"
+
+[[entries]]
+key = "levy-preprint"
+title = "Lévy 族のプレプリント"
+kind = "paper"
+reason = "papers/levy-families"
+status = "pending"
+
+[[entries.locations]]
+kind = "arxiv"
+value = "2301.01234"
+
+[[entries]]
+key = "publisher-supplement"
+title = "集中定理の補遺"
+kind = "supplement"
+reason = "papers/levy-families"
+status = "ask_user"
+
+[[entries.locations]]
+kind = "url"
+value = "https://publisher.example/supplement"
+
+[[entries.attempts]]
+at = "2026-11-20T09:00:00+00:00"
+outcome = "manual"
+
+[entries.attempts.location]
+kind = "url"
+value = "https://publisher.example/supplement"

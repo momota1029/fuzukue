@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-library"},
+    {"action": "type", "text": "球面の集中"},
+    {"action": "wait_event", "event": "library_results"},
+    {"action": "click", "id": "library-kind-1"},
+    {"action": "wait_event", "event": "library_results"},
+    {"action": "wait_element", "id": "library-hit-0"},
+    {"action": "screenshot", "name": "library-results"}
+  ]
+}

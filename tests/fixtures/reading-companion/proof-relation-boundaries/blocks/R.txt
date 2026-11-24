@@ -1,0 +1,12 @@
+block: R
+title: Relation command boundaries
+claim: Compare adjacent TeX rows.
+
+step: R.1
+title: Align consecutive relations
+claim: Start a new chain when a left-hand side appears.
+- x\ge2 @@ First left-hand side
+- \le1 @@ Digit after the command
+- \leq_{a}2 @@ Underscore after the command
+- \left(y\right)\geq3 @@ New left-hand side
+- \ge_42 @@ Continuation of the new chain

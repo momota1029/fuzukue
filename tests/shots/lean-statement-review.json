@@ -1,0 +1,15 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-branch-review"},
+    {"action": "wait_element", "id": "literate-lean-statement-review"},
+    {"action": "screenshot", "name": "lean-statement-review"},
+    {"action": "click", "id": "branch-review-merge"},
+    {"action": "wait_element", "id": "literate-lean-merge-override"},
+    {"action": "screenshot", "name": "lean-statement-review-warning"}
+  ]
+}

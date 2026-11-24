@@ -1,0 +1,23 @@
+{
+  "questions": [
+    {
+      "header": "形式",
+      "question": "どの形式でまとめる？",
+      "options": [
+        {"label": "研究ノートの読者が背景から結論まで順番にたどれるように、長い説明を段落に分けて書く形式", "description": "選択肢が狭い会話欄でも折り返される。"},
+        {"label": "短い要約"}
+      ]
+    },
+    {
+      "header": "章",
+      "question": "どの章を含める？",
+      "multiSelect": true,
+      "options": [{"label": "導入"}, {"label": "結論"}]
+    },
+    {
+      "header": "題名",
+      "question": "題名はどうする？",
+      "options": [{"label": "研究ノート"}]
+    }
+  ]
+}

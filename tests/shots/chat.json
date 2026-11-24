@@ -1,0 +1,23 @@
+{
+  "steps": [
+    {"action": "size", "width": 1360, "height": 860},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread", "deck": "papers/levy-families"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "**Lévy族の集中**として、族$\\LevyFamily$の本文と数式を読み、メモの書き込み前に承認を聞いて。\n\n$$\n\\LevyFamily = (X_n, d_n, \\LevyMeasure{n})_{n \\ge 1}\n$$"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "tool_result"},
+    {"action": "wait_event", "event": "approval_requested"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "**次の確認**は測度$\\LevyMeasure{n}$の定義。"},
+    {"action": "screenshot", "name": "chat-light"},
+    {"action": "theme", "theme": "dark"},
+    {"action": "screenshot", "name": "chat-dark"},
+    {"action": "resolve_approval", "decision": "decline"},
+    {"action": "wait_event", "event": "approval_resolved"},
+    {"action": "wait_idle"},
+    {"action": "screenshot", "name": "chat-one-voice-approval-folded"}
+  ]
+}

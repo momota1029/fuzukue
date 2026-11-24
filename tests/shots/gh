@@ -1,0 +1,164 @@
+#!/usr/bin/python3
+"""GitHub fixture. Its only state lives in the copied repository."""
+import hashlib
+from datetime import datetime, timezone
+import json
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+args = sys.argv[1:]
+repo = "example-owner/lab"
+path = Path(".git/workshop-fixture.json")
+
+
+def option(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+if args[:2] == ["repo", "view"]:
+    print(repo)
+    sys.exit()
+issues = json.loads(path.read_text()) if path.exists() else [{
+    "number": 12, "title": "Hamming 距離の上界を Lean で確認",
+    "url": f"https://github.com/{repo}/issues/12",
+    "body": "---\nkind: lean\ncards: [lab:papers/levy-families#ex-hamming-diameter]\n---\n\n"
+            "Hamming 距離の性質を Lake で検査し、公理の依存をカードの下書きに記録する。",
+    "state": "OPEN", "labels": [], "createdAt": "2026-01-01T00:00:00Z", "comments": [{
+        "author": {"login": "fixture"}, "createdAt": "2026-01-02T00:00:00Z",
+        "body": "対象の Lean 宣言を入口カードで確認した。",
+    }],
+}]
+activity_path = Path("github-activity-fixture.json")
+if activity_path.exists():
+    fixture = json.loads(activity_path.read_text())
+    repo = fixture.get("repo", repo)
+    issues = fixture.get("issues", issues)
+else:
+    fixture = {}
+
+if args[:1] == ["api"]:
+    log = Path("github-fixture-log.jsonl")
+    with log.open("a") as out:
+        out.write(json.dumps(args) + "\n")
+    if "-i" in args:
+        request = urlsplit(args[args.index("--hostname") + 2])
+        params = parse_qs(request.query)
+        route = request.path.removeprefix(f"repos/{repo}/")
+        headers = {}
+        if fixture.get("rate_limit"):
+            print("HTTP/2 403 Forbidden\nRetry-After: 240\n\n", end="")
+            print("gh: secondary rate limit", file=sys.stderr)
+            sys.exit(1)
+        if fixture.get("poll_interval"):
+            headers["X-Poll-Interval"] = str(fixture["poll_interval"])
+        if route == "labels":
+            data = list({label["name"]: label for row in issues for label in row["labels"]}.values())
+        elif route == "branches":
+            data = []
+        elif route == "issues":
+            data = [row for row in issues if
+                    (params.get("state", ["all"])[0] in ("all", row["state"].lower()))
+                    and all(any(label["name"] == name for label in row["labels"])
+                            for name in params.get("labels", []))]
+            data = [dict(row, html_url=row["url"], comments=len(row.get("comments", []))) for row in data]
+        elif route in fixture.get("routes", {}):
+            data = fixture["routes"][route]
+        else:
+            group, number, *suffix = route.split("/")
+            row = next(row for row in issues if row["number"] == int(number))
+            if not suffix:
+                data = dict(row, html_url=row["url"], state=row["state"].lower())
+            elif suffix == ["comments"]:
+                data = row.get("activity", row.get("comments", []))
+                if fixture.get("shot") and number == "13" and sum(
+                        f"/issues/{number}/comments?" in line for line in log.read_text().splitlines()
+                ) > 1:
+                    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    data = [
+                        {"id": 710, "body": "別に他のところ掘ればいいのでは……",
+                         "created_at": now, "user": {"login": "example-owner"},
+                         "html_url": row["url"] + "#issuecomment-710"},
+                        {"id": 711, "body": "### やったこと\n\n"
+                         "空入力での挙動を [テストの記録](https://github.com/example-owner/lab/issues/13) にまとめた。\n\n"
+                         "### 分かったこと\n\n入力の境界条件を変えると別のケースを再現できる。\n\n"
+                         "### 確かめたこと\n\n既存ケースと空入力のテストが通った。\n\n"
+                         "### 残り\n\n複数入力のケースを検証する。\n\n<!-- dot -->",
+                         "created_at": now, "user": {"login": "example-owner"},
+                         "html_url": row["url"] + "#issuecomment-711"},
+                    ]
+            elif suffix == ["timeline"]:
+                data = row.get("timeline", [])
+            else:
+                raise ValueError(args)
+        body = json.dumps(data)
+        tag = '"' + hashlib.sha256(body.encode()).hexdigest() + '"'
+        headers["ETag"] = tag
+        unchanged = option("-H") == "If-None-Match: " + tag
+        print("HTTP/2 304 Not Modified" if unchanged else "HTTP/2 200 OK")
+        for key, value in headers.items():
+            print(f"{key}: {value}", end="\r\n")
+        print(end="\r\n")
+        if unchanged:
+            sys.exit(1)
+        print(body)
+    elif args[-1] == "user":
+        print(json.dumps({"login": "fixture"}))
+    elif option("--method") == "PATCH":
+        group, number = args[args.index("PATCH") + 1].removeprefix(f"repos/{repo}/").split("/")
+        row = next(row for row in issues if row["number"] == int(number))
+        assert group == "issues" and "pull_request" not in row and "state=closed" in args, args
+        if fixture.get("close_error"):
+            sys.exit("closing failed")
+        row["state"] = "CLOSED"
+        row["state_reason"] = next(arg.split("=", 1)[1] for arg in args if arg.startswith("state_reason="))
+        activity_path.write_text(json.dumps(fixture))
+        print(json.dumps(dict(row, html_url=row["url"], state="closed")))
+    elif option("--method") == "POST" and args[args.index("POST") + 1].endswith("/comments"):
+        if fixture.get("post_error"):
+            sys.exit("posting failed")
+        print(json.dumps({"id": 711}))
+    elif "--method" in args:
+        print(json.dumps({"id": 711}))
+    else:
+        route = args[args.index("--hostname") + 2].split("/") if "--hostname" in args else args[1].split("/")
+        number = int(route[-1])
+        row = next(row for row in issues if row["number"] == number)
+        print(json.dumps(dict(row, html_url=row["url"])))
+    sys.exit()
+
+assert args[0] in ("issue", "pr") and option("--repo", repo) == repo, args
+if activity_path.exists() and args[1] in ("comment", "edit"):
+    with Path("github-fixture-log.jsonl").open("a") as out:
+        out.write(json.dumps(args) + "\n")
+    if fixture.get("post_error"):
+        print("posting failed", file=sys.stderr)
+        sys.exit(1)
+    sys.exit()
+
+operation = args[1]
+if operation == "list":
+    state = option("--state", "all").upper()
+    print(json.dumps([row for row in issues if state == "ALL" or row["state"] == state]))
+    sys.exit()
+if operation == "create":
+    number = max((row["number"] for row in issues), default=11) + 1
+    url = f"https://github.com/{repo}/issues/{number}"
+    label = option("--label")
+    issues.append(dict(number=number, title=option("--title"), body=option("--body"), url=url,
+                       state="OPEN", labels=[{"name": label}] if label else [], comments=[]))
+    print(url)
+else:
+    row = next(row for row in issues if row["number"] == int(args[2]))
+    if operation == "view":
+        print(json.dumps(row))
+        sys.exit()
+    if operation == "comment":
+        row["comments"].append({"body": option("--body")})
+    elif operation == "close":
+        row["state"] = "CLOSED"
+    elif operation == "edit":
+        row["labels"].append({"name": option("--add-label")})
+    else:
+        raise ValueError(args)
+path.write_text(json.dumps(issues))

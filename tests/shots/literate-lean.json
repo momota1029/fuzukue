@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "click", "id": "tool-search"},
+    {"action": "type", "text": "file: lean/LabSample/LabSample/Literate.lean"},
+    {"action": "key", "key": "Enter"},
+    {"action": "wait_element", "id": "literate-lean-toggle"},
+    {"action": "click", "id": "literate-lean-toggle"},
+    {"action": "wait_element", "id": "literate-lean-reading"},
+    {"action": "screenshot", "name": "literate-lean"}
+  ]
+}

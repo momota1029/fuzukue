@@ -1,0 +1,10 @@
+title: 球面のオブザーバブル直径
+sections:
+- title: 定義
+  items:
+  - def-partial-diameter
+  - def-observable-diameter
+- title: 結果
+  items:
+  - lem-levy-iff-obsdiam
+  - thm-sphere-asymptotics

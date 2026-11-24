@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "open_paper", "deck": "papers/levy-families"},
+    {"action": "scroll_to_card", "id": "thm-sphere-concentration"},
+    {"action": "click", "id": "edit-paper-statement-thm-sphere-concentration"},
+    {"action": "screenshot", "name": "card-editor"},
+    {"action": "type", "text": "球面上の集中不等式を示す。\n\n"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "card_save_result"},
+    {"action": "wait_paper_card", "deck": "papers/levy-families", "card": "thm-sphere-concentration", "text": "球面上の集中不等式を示す。"},
+    {"action": "screenshot", "name": "card-saved"}
+  ]
+}

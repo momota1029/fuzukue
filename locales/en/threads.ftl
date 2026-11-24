@@ -1,0 +1,16 @@
+threads-archive = Archive
+threads-archive-drop-zone = Drop here to archive
+threads-cancel = Cancel
+threads-confirm-attach = Attach to “{ $title }”?
+threads-detach = Detach { $deck }
+threads-no-decks-available = No decks available
+threads-open = Open { $deck }
+threads-pinned = Pinned
+threads-rename = Rename
+threads-reorder = Reorder thread (Alt+Up or Alt+Down)
+threads-restore-from-archive = Restore from archive
+threads-save = Save
+threads-thread-actions = Thread actions
+threads-threads = Threads
+threads-unpin = Unpin
+threads-new-thread = New thread

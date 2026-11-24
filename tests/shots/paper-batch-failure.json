@@ -1,0 +1,17 @@
+{
+  "comment": "A failed paper stays visible in the folded batch tool group.",
+  "steps": [
+    {"action": "size", "width": 1360, "height": 820},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "en"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "paper batch failure fixture"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "tool_result"},
+    {"action": "screenshot", "name": "paper-batch-failure"},
+    {"action": "click", "x": 500, "y": 177},
+    {"action": "screenshot", "name": "paper-batch-result"}
+  ]
+}

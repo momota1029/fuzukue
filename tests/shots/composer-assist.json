@@ -1,0 +1,22 @@
+{
+  "steps": [
+    {"action": "size", "width": 1120, "height": 700},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "- a"},
+    {"action": "key", "key": "Enter"},
+    {"action": "assert_composer_text", "text": "- a\n- "},
+    {"action": "key", "key": "Ctrl+Z"},
+    {"action": "assert_composer_text", "text": "- a"},
+    {"action": "key", "key": "Enter"},
+    {"action": "type", "text": "b"},
+    {"action": "key", "key": "Enter"},
+    {"action": "key", "key": "Enter"},
+    {"action": "assert_composer_text", "text": "- a\n- b\n"},
+    {"action": "screenshot", "name": "composer-assist"}
+  ]
+}

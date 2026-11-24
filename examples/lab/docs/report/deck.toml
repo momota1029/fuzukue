@@ -1,0 +1,7 @@
+kind = "document"
+title = "測度の集中に関する研究報告"
+template = "templates/research-report.tex"
+outputs = ["build/document.pdf"]
+
+[macros]
+Prob = "\\mathbb{P}"

@@ -1,0 +1,24 @@
+{
+  "status": "ok",
+  "message-type": "work-list",
+  "message": {
+    "items": [
+      {
+        "DOI": "10.1234/CONCENTRATION",
+        "title": ["A concentration theorem"],
+        "author": [{"given": "Michel", "family": "Lédoux"}, {"name": "A research team"}],
+        "issued": {"date-parts": [[2001, 2]]},
+        "container-title": ["Journal of Fixture Mathematics"],
+        "type": "journal-article",
+        "link": [{"URL": "https://publisher.example/concentration.pdf", "content-type": "application/pdf"}]
+      },
+      {
+        "DOI": "10.1234/geometry",
+        "title": ["Concentration & geometry"],
+        "author": [{"given": "Emmy", "family": "Noether"}],
+        "published": {"date-parts": [[2023]]},
+        "relation": {"has-preprint": [{"id-type": "doi", "id": "10.48550/arXiv.2301.01234v2"}]}
+      }
+    ]
+  }
+}

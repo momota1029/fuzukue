@@ -1,0 +1,4 @@
+title = "Extension example"
+
+[[extensions]]
+source = "memo-stats"

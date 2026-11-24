@@ -1,0 +1,10 @@
+kind = "research"
+title = "曲率から集中を導く"
+summary = "Ricci 曲率の下限や曲率次元条件から、集中関数とオブザーバブル直径を評価する。"
+status = "idea"
+next = "CD(K,∞) から Gauss 型の集中関数の評価を、カードに起こす"
+papers = ["../../papers/obsdiam-spheres"]
+
+[external]
+od = "../../papers/obsdiam-spheres"
+conc = "../concentration"

@@ -1,0 +1,7 @@
+{
+  "casual": "「要点」と「概要」ってどう使い分けるの？ 短く教えて。",
+  "card-edit": "papers/levy-families の intro カードの導入を、意味を変えずに読みやすく直して。コミットや外部への書き込みはしないで。",
+  "proof-check": "papers/levy-families の thm-sphere-concentration の証明で、使っている補題の仮定が全部そろっているか確かめて。",
+  "skill": "papers/levy-families の intro カードについて、文章の作法を扱うスキルを使って論文の文体を見て。ファイルは編集しないで。",
+  "direction": "この研究室の原稿で、補題の仮定を先に確認するか、それとも説明の流れを先に直すか迷ってる。どうするのがいい？"
+}

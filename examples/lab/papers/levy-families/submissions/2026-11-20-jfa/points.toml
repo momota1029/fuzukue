@@ -1,0 +1,19 @@
+split_reports = [1]
+
+[[points]]
+id = "R1.1"
+report = 1
+lines = [3, 3]
+quote = "集中不等式を使う箇所で、球面の距離と測度の正規化を明示してほしい。"
+summary = "球面の距離と測度の正規化を明示する"
+cards = ["thm-sphere-concentration"]
+status = "todo"
+
+[[points]]
+id = "R1.2"
+report = 1
+lines = [5, 5]
+quote = "導入で、集中関数の定義がどこにあるかを示してほしい。"
+summary = "導入から集中関数の定義を参照する"
+cards = ["intro", "def-concentration-function"]
+status = "in_progress"

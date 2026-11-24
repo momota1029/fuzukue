@@ -1,0 +1,56 @@
+{
+  "title": "Arithmetic means",
+  "lang": "en",
+  "paper": {"citation": "Fictional note, §1", "main_figures": 1},
+  "note": {"pdf": "../note/main.pdf", "aux": "../note/main.aux"},
+  "background": {
+    "picture": "Two real numbers are given.",
+    "summary": "The arithmetic mean lies halfway between them.",
+    "question": "How do we select their midpoint?",
+    "context": "A one-step example of linear averaging.",
+    "terms": [{"term": "mean", "meaning": "sum divided by the number of inputs"}],
+    "primer": "n/a: no plot is available in this fixture"
+  },
+  "overview": [
+    {"id": "mean", "name": "Average", "role": "take the midpoint", "input": "two values", "output": "one value"}
+  ],
+  "lineage": {
+    "entries": [{"name": "Arithmetic mean", "made_for": "Summarising a list of numbers",
+      "kept": "The usual formula", "verified": "Checked directly for the two inputs", "reference": true}]
+  },
+  "methods": {
+    "author": {"name": "Toy Julia code", "repo": "example/mean", "url": "https://example.test/mean",
+      "commit": "fixture", "license": "MIT", "root": "."}
+  },
+  "code_map": {
+    "entry": {"name": "average", "file": "average.jl", "first": 2, "last": 2},
+    "blocks": [{"step": "mean", "first": 2, "last": 2, "text": "Divide the sum by two"}]
+  },
+  "datasets": [{"id": "toy", "name": "Two values", "source": "Fictional note", "identity": "[1, 3]", "level": "L1"}],
+  "requests": [],
+  "features": [{
+    "id": "run", "kind": "run", "title": "Compute the mean", "limits": "One pair of inputs",
+    "dataset": "toy", "terms": [{"term": "mean", "meaning": "midpoint of the two inputs"}],
+    "author_code": {"file": "average.jl", "first": 2, "last": 2},
+    "prior_code": "n/a: the note has no implementation comparison",
+    "results": "results.json",
+    "run_card": {"calls": [{"code": "average(1, 3)", "where": "average.jl L2", "by": "author"}],
+      "steps": ["mean"], "not_run": "No second input pair was used"},
+    "run_role": {"role": "code", "shows": "The midpoint for inputs 1 and 3"},
+    "figure": {"paper_locator": "Note, §1", "paper_crop_absent": "The input pair is given as text"}
+  }],
+  "figures": [{
+    "id": "fig1", "number": 1, "label": "Fig. 1", "title": "Midpoint",
+    "plain": "One output between the inputs", "trouble": "The figure image was not acquired",
+    "handoff": "Read the calculation alongside the note",
+    "claim": {"text": "The answer is 2", "source": "Note, §2"},
+    "reads": [{"mark": "Output", "see": "The midpoint", "learn": "Both distances are equal",
+      "check": {"paper_only": true, "reason": "There is no acquired figure image to compare"}}],
+    "presenter": {"say": "Sum then divide", "point": "The answer is 2", "not_shown": "The original figure"},
+    "reproduction": {"level": "L4", "reason": "The original image was not acquired"},
+    "points": [{"panel": "A", "figure_point": "Midpoint", "code_point": "Division by two", "step": "run",
+      "focus": {"author": [2, 2]}}],
+    "note_labels": ["sec:mean"],
+    "figure": {"paper_locator": "Fig. 1", "paper_crop_absent": "The original figure was not acquired"}
+  }]
+}

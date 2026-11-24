@@ -1,0 +1,14 @@
+{
+  "steps": [
+    {"action": "size", "width": 1320, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "open_workspace", "path": "~/workspace-other", "path_tail": "workspace-other"},
+    {"action": "new_thread"},
+    {"action": "switch_workspace", "path_tail": "project"},
+    {"action": "screenshot", "name": "workspace-sidebar"},
+    {"action": "switch_workspace", "path_tail": "workspace-other"},
+    {"action": "screenshot", "name": "workspace-switched"}
+  ]
+}

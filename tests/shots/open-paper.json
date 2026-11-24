@@ -1,0 +1,15 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "球面集中の定理を開いて"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "open_paper"},
+    {"action": "wait_event", "event": "tool_result"},
+    {"action": "wait_paper_card", "deck": "papers/levy-families", "card": "thm-sphere-concentration"},
+    {"action": "screenshot", "name": "open-paper"}
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "open_thread_menu"},
+    {"action": "key", "key": "down"},
+    {"action": "key", "key": "enter"},
+    {"action": "key", "key": "Ctrl+A"},
+    {"action": "type", "text": "作業中のスレッド"},
+    {"action": "key", "key": "enter"},
+    {"action": "new_thread"},
+    {"action": "open_thread_menu"},
+    {"action": "screenshot", "name": "thread-menu"},
+    {"action": "key", "key": "up"},
+    {"action": "key", "key": "enter"},
+    {"action": "wait_thread_archived", "title": "新しいスレッド"},
+    {"action": "assert_active_thread", "title": "作業中のスレッド"},
+    {"action": "click", "id": "archived-threads-toggle"},
+    {"action": "screenshot", "name": "thread-archive"}
+  ]
+}

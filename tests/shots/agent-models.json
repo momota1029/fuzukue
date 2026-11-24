@@ -1,0 +1,19 @@
+{
+  "steps": [
+    {"action":"size","width":1440,"height":1000},
+    {"action":"locale","locale":"ja"},
+    {"action":"model_setup_fixture"},
+    {"action":"connect"},
+    {"action":"wait_element","id":"model-setup"},
+    {"action":"screenshot","name":"model-setup-ja"},
+    {"action":"click","id":"model-setup-later"},
+    {"action":"click","id":"menu-help"},
+    {"action":"click","id":"tool-settings"},
+    {"action":"click","id":"settings-agents"},
+    {"action":"wait_event","event":"agent_stats"},
+    {"action":"wait_element","id":"model-usage-settings"},
+    {"action":"screenshot","name":"model-usage-ja"},
+    {"action":"click","id":"model-setup-reopen"},
+    {"action":"wait_element","id":"model-setup"}
+  ]
+}

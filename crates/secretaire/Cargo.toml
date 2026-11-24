@@ -1,0 +1,67 @@
+[package]
+name = "secretaire"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+wasmtime = { version = "48", default-features = false, features = ["anyhow", "runtime", "cranelift", "component-model", "std", "parallel-compilation", "cache"] }
+wasmtime-wasi = "48"
+fluent-bundle = "0.16"
+fuzukue-proto = { path = "../fuzukue-proto" }
+fuzukue-i18n = { path = "../fuzukue-i18n" }
+serde.workspace = true
+serde_json.workspace = true
+lsp-types = "0.97"
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+fuzukue-cards = { path = "../fuzukue-cards" }
+fuzukue-reading = { path = "../fuzukue-reading" }
+fuzukue-view = { path = "../fuzukue-view" }
+shlex = "2"
+notify = "8"
+walkdir = "2"
+glob = "0.3"
+globset = "0.4"
+serde_yaml = "0.9"
+toml = "0.8"
+toml_edit = "0.22"
+regex = "1"
+regex-automata = { version = "0.4", features = ["dfa-build"] }
+markdown = "1.0.0"
+roxmltree = "0.21"
+sha2 = "0.10"
+ring = "0.17"
+semver = { version = "1", features = ["serde"] }
+flate2 = "1"
+hayro-syntax = { version = "0.8", default-features = false, features = ["std"] }
+tempfile = "3"
+unicode-normalization = "0.1"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+url = "2"
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
+webpki-roots = "1.0.12"
+futures = "0.3.34"
+mailparse = "0.18.0"
+encoding_rs = "0.8.44"
+base64 = "0.23.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rand = "0.10.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+html5gum = { version = "0.7", default-features = false }
+subtle = "2.6"
+rustix = { version = "1", features = ["fs", "pipe", "process", "termios"] }
+signal-hook-registry = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.29"

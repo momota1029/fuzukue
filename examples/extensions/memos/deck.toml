@@ -1,0 +1,3 @@
+kind = "memos"
+title = "Memos"
+dirs = ["."]

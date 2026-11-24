@@ -1,0 +1,61 @@
+package fuzukue:extension@0.1.0;
+
+interface types {
+    record file {
+        path: string,
+        contents: list<u8>,
+    }
+
+    record tool {
+        name: string,
+        description: string,
+        input-schema-json: string,
+    }
+
+    enum event-kind {
+        card-saved,
+        memo-added,
+    }
+
+    record project-event {
+        kind: event-kind,
+        path: string,
+    }
+
+    record ui-event {
+        id: string,
+        value: option<string>,
+    }
+}
+
+interface read-files {
+    use types.{file};
+    read: func(pattern: string) -> result<list<file>, string>;
+}
+
+interface write-files {
+    write: func(path: string, contents: list<u8>) -> result<_, string>;
+}
+
+interface network {
+    fetch: func(url: string) -> result<list<u8>, string>;
+}
+
+interface logging {
+    log: func(message: string);
+}
+
+world extension {
+    use types.{tool, project-event, ui-event};
+
+    import read-files;
+    import write-files;
+    import network;
+    import logging;
+
+    export list-tools: func() -> list<tool>;
+    export invoke-tool: func(name: string, arguments-json: string) -> result<string, string>;
+    export on-event: func(event: project-event) -> result<_, string>;
+    export render-view: func(locale: string) -> result<string, string>;
+    export on-ui-event: func(event: ui-event, locale: string) -> result<string, string>;
+}

@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {"action": "size", "width": 1120, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "open_paper", "deck": "papers/reader"},
+    {"action": "scroll_to_card", "id": "markdown-design"},
+    {"action": "screenshot", "name": "card-markdown-reader"},
+    {"action": "click", "id": "read-head-markdown-design"},
+    {"action": "screenshot", "name": "card-markdown-detail"},
+    {"action": "click", "id": "link-in-requires-markdown-scroll"},
+    {"action": "size", "width": 820, "height": 750},
+    {"action": "assert_card_scrollbar_drag"},
+    {"action": "screenshot", "name": "card-markdown-scroll"}
+  ]
+}

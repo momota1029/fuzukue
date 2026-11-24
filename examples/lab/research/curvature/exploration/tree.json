@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "revision": 3,
+  "settings": {"mode": "sequential", "integrator": "primary", "max_workers": 2},
+  "nodes": [
+    {
+      "id": "curvature-and-concentration",
+      "parent": null,
+      "kind": "category",
+      "title": "曲率と集中",
+      "summary": "曲率下限と集中評価の関係を整理する。",
+      "next": "曲率次元条件からの評価を調べる。",
+      "state": "active",
+      "owner": null,
+      "record": "research/curvature/cards/plan.md",
+      "claim_refs": [],
+      "dependency_refs": [],
+      "proof_required": false,
+      "revision": 1
+    },
+    {
+      "id": "gaussian-bound",
+      "parent": "curvature-and-concentration",
+      "kind": "question",
+      "title": "曲率次元条件から得られる集中評価",
+      "summary": "CD(K,∞) から Gauss 型の集中関数を評価できるか調べる。",
+      "next": "評価に必要な仮定を確認する。",
+      "state": "queued",
+      "owner": null,
+      "record": "research/curvature/cards/idea-cd-gaussian.md",
+      "claim_refs": [],
+      "dependency_refs": [],
+      "proof_required": false,
+      "revision": 1
+    },
+    {
+      "id": "diameter-manuscript",
+      "parent": "curvature-and-concentration",
+      "kind": "task",
+      "title": "観測直径の原稿を参照する",
+      "summary": "研究デッキに関連する原稿の構成を調べる。",
+      "next": "観測直径の定義と参照箇所を揃える。",
+      "state": "done",
+      "owner": null,
+      "record": "papers/obsdiam-spheres/structure.yaml",
+      "claim_refs": [],
+      "dependency_refs": [],
+      "proof_required": false,
+      "revision": 1
+    }
+  ]
+}

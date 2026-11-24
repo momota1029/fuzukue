@@ -1,0 +1,32 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 1250},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "self_update_status"},
+    {"action": "click", "id": "workspace-account"},
+    {"action": "click", "id": "account-server"},
+    {"action": "wait_event", "event": "self_update_status"},
+    {"action": "self_update_preview"},
+    {"action": "wait_element", "id": "self-update-start"},
+    {"action": "wait_element", "id": "self-update-rollback"},
+    {"action": "click", "id": "self-update-log-build"},
+    {"action": "wait_element", "id": "self-update-output-build"},
+    {"action": "screenshot", "name": "self-update"},
+    {"action": "self_update_preview", "canary": true},
+    {"action": "wait_element", "id": "self-update-canary-promote"},
+    {"action": "wait_element", "id": "self-update-canary-discard"},
+    {"action": "screenshot", "name": "self-update-canary"},
+    {"action": "size", "width": 1100, "height": 1250},
+    {"action": "self_update_preview", "waiting": true},
+    {"action": "wait_element", "id": "self-update-wait-blocker-1-status"},
+    {"action": "wait_element", "id": "self-update-cancel"},
+    {"action": "wait_element", "id": "self-update-force"},
+    {"action": "screenshot", "name": "self-update-wait"},
+    {"action": "click", "id": "self-update-force"},
+    {"action": "wait_element", "id": "self-update-force-confirm"},
+    {"action": "screenshot", "name": "self-update-force-confirmation"},
+    {"action": "click", "id": "self-update-force-back"}
+  ]
+}

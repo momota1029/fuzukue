@@ -1,0 +1,17 @@
+% !TeX program = uplatex
+\documentclass[uplatex,dvipdfmx,openany]{jsbook}
+\usepackage{amsmath,amsthm,thmtools,graphicx}
+\usepackage{subfiles}
+\usepackage{cleveref}
+\graphicspath{{figures/}}
+\input{theorems}
+\title{カードで読む数学}
+\author{山田}
+\date{}
+\begin{document}
+\maketitle
+\tableofcontents
+\part{基礎}
+\include{chapters/first}
+\subfile{chapters/second}
+\end{document}

@@ -1,0 +1,31 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1000},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_research_issue", "number": 12, "state": "ready"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-research-issues"},
+    {"action": "wait_element", "id": "research-issue-list"},
+    {"action": "screenshot", "name": "workshop-list"},
+    {"action": "click", "id": "research-issue-12"},
+    {"action": "wait_element", "id": "research-issue-body"},
+    {"action": "wait_element", "id": "research-issue-comment-0"},
+    {"action": "screenshot", "name": "workshop-ready"},
+    {"action": "click", "id": "research-issue-start"},
+    {"action": "wait_event", "event": "thread_created"},
+    {"action": "assert_active_thread", "title": "Issue #12: Hamming 距離の上界を Lean で確認"},
+    {"action": "wait_delegate_text", "text": "Lean 化の確認を始めた"},
+    {"action": "wait_research_issue", "number": 12, "state": "running"},
+    {"action": "screenshot", "name": "workshop-running"},
+    {"action": "open_delegate_details"},
+    {"action": "screenshot", "name": "workshop-running-details"},
+    {"action": "key", "key": "escape"},
+    {"action": "wait_research_issue", "number": 12, "state": "needs_review"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-research-issues"},
+    {"action": "click", "id": "research-issue-12"},
+    {"action": "wait_element", "id": "research-issue-report"},
+    {"action": "screenshot", "name": "workshop-needs-review"}
+  ]
+}

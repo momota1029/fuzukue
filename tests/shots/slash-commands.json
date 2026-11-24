@@ -1,0 +1,20 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "/"},
+    {"action": "wait_element", "id": "composer-command-palette"},
+    {"action": "key", "key": "down"},
+    {"action": "screenshot", "name": "slash-palette"},
+    {"action": "key", "key": "tab"},
+    {"action": "key", "key": "enter"},
+    {"action": "wait_event", "event": "local_notice"},
+    {"action": "wait_element", "id": "chat-command-echo-0"},
+    {"action": "wait_element", "id": "chat-local-notice-1"},
+    {"action": "screenshot", "name": "slash-clear"}
+  ]
+}

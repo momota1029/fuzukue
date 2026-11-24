@@ -1,0 +1,17 @@
+[package]
+name = "fuzukue-view"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+fuzukue-proto = { path = "../fuzukue-proto" }
+markdown = "1.0.0"
+percent-encoding = "2"
+serde.workspace = true
+serde_json.workspace = true
+shlex = "2"
+toml = "0.8"
+url = "2"
+tree-sitter = "=0.26.13"
+arborium-lean = "=2.18.2"

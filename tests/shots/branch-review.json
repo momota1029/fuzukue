@@ -1,0 +1,18 @@
+{
+  "steps": [
+    {"action": "size", "width": 1280, "height": 820},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "click", "id": "menu-view"},
+    {"action": "click", "id": "tool-branch-review"},
+    {"action": "wait_event", "event": "branch_review_result"},
+    {"action": "wait_element", "id": "branch-review-patch"},
+    {"action": "screenshot", "name": "branch-review"},
+    {"action": "click", "id": "branch-review-merge"},
+    {"action": "wait_element", "id": "branch-review-cleanup"},
+    {"action": "screenshot", "name": "branch-review-confirm"},
+    {"action": "click", "id": "branch-review-cancel"},
+    {"action": "key", "key": "escape"}
+  ]
+}

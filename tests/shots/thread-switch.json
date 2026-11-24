@@ -1,0 +1,14 @@
+{
+  "steps": [
+    {"action": "size", "width": 1360, "height": 860},
+    {"action": "theme", "theme": "light"},
+    {"action": "seed_thread_switch"},
+    {"action": "wait_element", "id": "chat-thread-switch-a"},
+    {"action": "assert_thread_switch", "session": "thread-switch-b", "restore": false},
+    {"action": "assert_active_thread", "title": "History B"},
+    {"action": "screenshot", "name": "thread-switch"},
+    {"action": "scroll", "pane": "chat", "pixels": -2200},
+    {"action": "assert_thread_switch", "session": "thread-switch-a", "restore": true},
+    {"action": "assert_thread_switch", "session": "thread-switch-b", "restore": true}
+  ]
+}

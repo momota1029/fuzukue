@@ -1,0 +1,24 @@
+{
+  "steps": [
+    {"action": "size", "width": 1200, "height": 850},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "球面の集中について相談したい"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_partner_text", "text": "球面の集中の評価がまとまっている"},
+    {"action": "wait_idle"},
+    {"action": "wait_element", "id": "chat-rewrite"},
+    {"action": "assert_order", "above": "chat-message-bubble-0", "below": "chat-copy-0"},
+    {"action": "assert_order", "above": "chat-message-bubble-1", "below": "chat-rewrite"},
+    {"action": "hover", "id": "chat-rewrite"},
+    {"action": "wait", "ms": 850},
+    {"action": "screenshot", "name": "rewrite-action"},
+    {"action": "click", "id": "chat-rewrite"},
+    {"action": "wait_event", "event": "reply_superseded"},
+    {"action": "wait_partner_text", "text": "球面の集中の不等式から"},
+    {"action": "wait_idle"},
+    {"action": "screenshot", "name": "rewrite-result"}
+  ]
+}
