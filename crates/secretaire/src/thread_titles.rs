@@ -24,7 +24,7 @@ fn title_prompt() -> &'static str {
 impl Workspace {
     pub(crate) fn end_partner_turn(
         self: &Arc<Self>, session: &str, actor: Actor, completed: bool,
-        usage: Option<(TurnKind, AgentOutcome)>,
+        usage: Option<(TurnKind, AgentOutcome)>, escalation: Option<&fuzukue_proto::ChatSettings>,
     ) {
         let backend = match &actor {
             Actor::Claude => fuzukue_proto::AgentBackend::Claude,
@@ -32,7 +32,17 @@ impl Workspace {
             _ => return,
         };
         let duration_ms = self.hub.partner_elapsed(session);
-        let details = self.session_stats.take_details(session, backend, duration_ms);
+        let mut details = self.session_stats.take_details(session, backend, duration_ms);
+        if let Some(settings) = escalation {
+            let requested = fuzukue_proto::AgentSelection::from_model(settings.model.clone(), settings.effort.clone());
+            let details = details.get_or_insert_with(|| fuzukue_proto::RunDetails {
+                selection: requested.clone(), escalated: true, tokens: None, cost_usd: None, duration_ms,
+            });
+            details.escalated = true;
+            if details.selection.model.is_none() {
+                details.selection = requested;
+            }
+        }
         if let Some((kind, outcome)) = usage {
             self.record_partner_usage(session, backend, kind, outcome, duration_ms, details.as_ref());
         }

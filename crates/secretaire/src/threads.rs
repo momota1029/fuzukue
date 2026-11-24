@@ -73,6 +73,8 @@ struct Front {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     partner_settings: Option<ChatSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    partner_pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     worker_settings: Option<DelegateSettings>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     worker_pinned: bool,
@@ -936,6 +938,7 @@ pub struct Store {
     restored_generations: HashMap<String, u64>,
     pub partner_default: ChatSettings,
     pub worker_default: DelegateSettings,
+    pub worker_default_configured: bool,
 }
 
 impl Store {
@@ -953,7 +956,9 @@ impl Store {
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default(),
             partner_default: state::load_partner_default(state_dir),
             worker_default: state::load_delegate_settings(state_dir),
+            worker_default_configured: state_dir.join("delegate-settings.json").is_file(),
         };
+        store.reload_model_defaults();
         let dir = crate::safe_join(project, "threads").ok();
         for entry in dir
             .and_then(|dir| std::fs::read_dir(dir).ok())
@@ -1087,12 +1092,15 @@ impl Store {
             }
         }
         for (id, thread) in &mut self.threads {
-            if thread.front.partner_settings.is_none() {
-                thread.front.partner_settings = Some(records.get(id)
-                    .map(|record| record.chat_settings.clone()).unwrap_or_default());
-            }
-            if thread.front.worker_settings.is_none() {
-                thread.front.worker_settings = Some(self.worker_default.clone());
+            if thread.front.partner_pinned.is_none() {
+                // The old creator copied defaults into the thread. User changes also
+                // went into the session record, which identifies those old overrides.
+                let saved = records.get(id).map(|record| &record.chat_settings);
+                let explicit = saved.is_some_and(|settings| settings.model.is_some() || settings.effort.is_some());
+                thread.front.partner_pinned = Some(explicit);
+                if thread.front.partner_settings.is_none() {
+                    thread.front.partner_settings = saved.cloned();
+                }
             }
             if let Some(record) = records.get(id) {
                 if record.claude_session_id != thread.front.session_id {
@@ -1216,7 +1224,12 @@ impl Store {
                     macros.entry(definition.name.clone()).or_insert_with(|| definition.clone());
                 }
             }
-            thread.view(macros.into_values().collect())
+            let mut view = thread.view(macros.into_values().collect());
+            if let Some((partner, worker)) = self.role_settings(&thread.front.id) {
+                view.partner_settings = Some(partner);
+                view.worker_settings = Some(worker);
+            }
+            view
         }).collect();
         threads.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| b.id.cmp(&a.id)));
         ServerEvent::Threads { threads }
@@ -1385,8 +1398,6 @@ impl Store {
             .collect();
         let timestamp = now().timestamp_millis();
         let mut thread = self.thread(id.into(), attached, title, timestamp, timestamp)?;
-        thread.front.partner_settings = Some(self.partner_default.clone());
-        thread.front.worker_settings = Some(self.worker_default.clone());
         thread.front.github = github;
         self.insert(thread, Transcript::default(), None, None)
     }
@@ -1400,8 +1411,6 @@ impl Store {
         let id = format!("thread-{:032x}", rand::random::<u128>());
         let timestamp = now().timestamp_millis();
         let mut thread = self.thread(id.clone(), Vec::new(), Some(title), timestamp, timestamp)?;
-        thread.front.partner_settings = Some(self.partner_default.clone());
-        thread.front.worker_settings = Some(self.worker_default.clone());
         thread.front.artifacts.push(path.clone());
         thread.front.handoff = Some(crate::handoff::Received { path, issues: Default::default() });
         self.insert(thread, Transcript::default(), None, None)?;
@@ -1426,7 +1435,6 @@ impl Store {
         let id = format!("thread-{:032x}", rand::random::<u128>());
         let timestamp = now().timestamp_millis();
         let mut thread = self.thread(id.clone(), attached, Some(title), timestamp, timestamp)?;
-        thread.front.partner_settings = Some(self.partner_default.clone());
         thread.front.worker_settings = Some(worker);
         thread.front.worker_pinned = true;
         self.insert(thread, Transcript::default(), None, None)?;
@@ -1751,6 +1759,7 @@ impl Store {
                 completed_partner_turns: Some(0),
                 artifacts: Vec::new(),
                 partner_settings: None,
+                partner_pinned: Some(false),
                 worker_settings: None,
                 worker_pinned: false,
                 agent_overrides: Default::default(),
@@ -1903,17 +1912,60 @@ impl Store {
         }).collect()
     }
 
+    pub(crate) fn reload_model_defaults(&mut self) -> bool {
+        let (partner, worker, worker_configured) = match state::model_defaults(&self.state_dir) {
+            Ok(defaults) => defaults,
+            Err(error) => {
+                tracing::warn!("Keep the previous model defaults: {error:#}");
+                return false;
+            }
+        };
+        if partner == self.partner_default && worker == self.worker_default && worker_configured == self.worker_default_configured {
+            return false;
+        }
+        (self.partner_default, self.worker_default, self.worker_default_configured) = (partner, worker, worker_configured);
+        true
+    }
+
     pub fn role_settings(&self, id: &str) -> Option<(ChatSettings, DelegateSettings)> {
         let thread = self.threads.get(id)?;
-        Some((
-            thread.front.partner_settings.clone().unwrap_or_default(),
-            thread.front.worker_settings.clone().unwrap_or_else(|| self.worker_default.clone()),
-        ))
+        let saved = thread.front.partner_settings.as_ref();
+        let partner = if thread.front.partner_pinned == Some(true) {
+            saved.cloned().unwrap_or_default()
+        } else {
+            ChatSettings {
+                permission_mode: saved.map_or(self.partner_default.permission_mode, |settings| settings.permission_mode),
+                ..self.partner_default.clone()
+            }
+        };
+        let worker = thread.front.worker_settings.as_ref().filter(|_| thread.front.worker_pinned)
+            .unwrap_or(&self.worker_default).clone();
+        Some((partner, worker))
+    }
+
+    pub fn set_partner_permission(&mut self, id: &str, mode: fuzukue_proto::PermissionMode) -> Result<()> {
+        let thread = self.threads.get_mut(id).context("スレッドが見つからない")?;
+        let previous = thread.front.partner_settings.clone();
+        thread.front.partner_settings.get_or_insert_with(Default::default).permission_mode = mode;
+        if let Err(error) = thread.save() {
+            thread.front.partner_settings = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn set_partner_model_inherited(&mut self, id: &str) -> Result<()> {
+        let thread = self.threads.get_mut(id).context("スレッドが見つからない")?;
+        let previous = thread.front.partner_pinned.replace(false);
+        if let Err(error) = thread.save() {
+            thread.front.partner_pinned = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn worker_pinned(&self, id: &str) -> bool {
-        self.threads.get(id).is_some_and(|thread| thread.front.worker_pinned
-            || thread.front.worker_settings.as_ref().is_some_and(|worker| worker != &self.worker_default))
+        self.threads.get(id).is_some_and(|thread| thread.front.worker_pinned)
     }
 
     pub fn agent_override(&self, id: &str, name: &str) -> Option<AgentSelection> {
@@ -1940,6 +1992,7 @@ impl Store {
         let previous = thread.front.clone();
         if partner.is_some() {
             thread.front.partner_settings = partner;
+            thread.front.partner_pinned = Some(true);
         }
         if worker.is_some() {
             thread.front.worker_settings = worker;

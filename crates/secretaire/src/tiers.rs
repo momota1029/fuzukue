@@ -40,6 +40,7 @@ pub(crate) struct Route {
     role: String,
     primary: AgentSelection,
     pinned: bool,
+    configured_default: bool,
 }
 
 pub(crate) fn classify(
@@ -202,6 +203,7 @@ impl Route {
             role: role.into(),
             primary,
             pinned,
+            configured_default: role != crate::planner::ROLE && app.hub.read_threads(|store| store.worker_default_configured),
         }
     }
 
@@ -293,10 +295,10 @@ impl Route {
         if tier == Tier::Light {
             if let Some(fallback) = settings.fallbacks.get(&self.role) {
                 selection.clone_from(fallback);
-            } else {
+            } else if !self.configured_default {
                 selection.effort = Some("low".into());
             }
-        } else if tier == Tier::Heavy {
+        } else if tier == Tier::Heavy && !self.configured_default {
             selection.effort = Some("high".into());
         }
         TierModel {

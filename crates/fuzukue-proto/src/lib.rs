@@ -64,7 +64,8 @@ pub const TRANSLATION_DRIFT_PROTOCOL: u32 = 62;
 pub const THREAD_HISTORY_PROTOCOL: u32 = 62;
 pub const REVIEW_FINDINGS_PROTOCOL: u32 = 63;
 pub const FOLDER_GRANTS_PROTOCOL: u32 = 65;
-pub const PROTOCOL_VERSION: u32 = FOLDER_GRANTS_PROTOCOL;
+pub const LIVE_MODELS_PROTOCOL: u32 = 66;
+pub const PROTOCOL_VERSION: u32 = LIVE_MODELS_PROTOCOL;
 
 mod approvals;
 pub use approvals::*;
@@ -206,6 +207,8 @@ pub struct CodexModel {
     pub slug: String,
     pub label: String,
     pub effort_levels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
 }
 
 pub const CLAUDE_OPUS: &str = "claude-opus-5-5";
@@ -340,6 +343,8 @@ pub struct TierDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunDetails {
     pub selection: AgentSelection,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub escalated: bool,
     pub tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
@@ -568,6 +573,8 @@ pub struct AgentSettings {
     pub consult: Option<AgentSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_title: Option<AgentSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<AgentSelection>,
 }
 
 impl AgentSettings {
@@ -586,6 +593,7 @@ pub enum AgentModelRole {
     Consult,
     ThreadTitle,
     WorkerTier(Tier),
+    Escalation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -999,6 +1007,7 @@ pub enum ClientMsg {
     SetThreadAgentOverride { session: String, name: String, selection: Option<AgentSelection> },
     SetSummaryModel { selection: Option<AgentSelection> },
     SetAgentRoleModel { role: AgentModelRole, selection: Option<AgentSelection> },
+    UseDefaultThreadModel { session: String },
     SetAgentFallback { name: String, selection: Option<AgentSelection> },
     Replan { session: String, reason: String },
     SetGoalPace { session: String, pace: Option<GoalPace> },

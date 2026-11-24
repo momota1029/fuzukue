@@ -48,9 +48,16 @@ pub(crate) fn asks_question(text: &str) -> bool {
 pub(crate) enum TurnKind {
     Conversation,
     UserConversation,
+    Escalated,
     Nudge,
     WorkerDigest,
     GoalDecision(u64),
+}
+
+impl TurnKind {
+    pub(crate) fn user_conversation(self) -> bool {
+        matches!(self, Self::UserConversation | Self::Escalated)
+    }
 }
 
 pub(crate) fn needs_nudge(text: &str, acted_or_asked: bool, kind: TurnKind) -> bool {

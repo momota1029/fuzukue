@@ -110,12 +110,12 @@ impl Tool {
             ), json!({"group": {"type": "string", "enum": ["pinned", "current", "archived"]},
                 "open": {"type": "boolean"}}), &["group", "open"]),
             Self::GetServerSettings => (harness_text!(
-                "Read the workspace's review settings.",
-                "ワークスペースの査読設定を読む。"
-            ), json!({}), &[]),
+                "Read workspace review settings, or include model defaults and overrides with models: true.",
+                "ワークスペースの査読設定を読む。models: true でモデルの既定値や上書き設定も返す。"
+            ), json!({"models": {"type": "boolean"}}), &[]),
             Self::SetServerSettings => (harness_text!(
-                "Replace the workspace's review settings. Read them first and carry over fields the user did not ask to change.",
-                "ワークスペースの査読設定を更新する。先に現在の設定を読み、依頼に含まれない項目の値も引き継ぐ。"
+                "Replace the workspace's review settings or set one model role. Read settings first and carry over review settings the user did not ask to change.",
+                "ワークスペースの査読設定または一つのモデル設定を更新する。先に現在の設定を読み、依頼に含まれない査読設定も引き継ぐ。"
             ), json!({"review": {
                 "type": "object",
                 "properties": {
@@ -127,7 +127,19 @@ impl Tool {
                 },
                 "required": REVIEW_FIELDS,
                 "additionalProperties": false
-            }}), &["review"]),
+            }, "model": {
+                "type": "object",
+                "properties": {
+                    "role": {"type": "string", "enum": ["front_desk", "worker", "agent", "worker_tier", "consult", "summary", "thread_title", "escalation"]},
+                    "agent": {"type": "string"},
+                    "tier": {"type": "string", "enum": ["light", "standard", "heavy"]},
+                    "name": {"type": "string"},
+                    "effort": {"type": "string"}
+                },
+                "required": ["role"],
+                "additionalProperties": false,
+                "description": harness_text!("Set one role using a model slug in name and optional effort. Omit name to inherit. Supply agent or tier for the matching role. Supply either model or review.", "name にモデル ID、effort に任意の思考レベルを指定する。name の省略で既定値を継承する。役に対応する agent または tier を指定する。model か review の一方を渡す。")
+            }}), &[]),
             Self::ListJobs => (harness_text!(
                 "Use before telling the user what work is running or why work is waiting. List delegated jobs and their exact wait reasons across this workspace. The default is queued and running jobs.",
                 "実行中の仕事や待機の理由を利用者に伝える前に使う。ワークスペース内の委譲ジョブと待機理由を一覧する。既定では待機中と実行中を表示する。"
@@ -250,11 +262,21 @@ impl Tool {
                 dispatch(app, ClientCommand::SetGroupState { group, open })
             }
             Self::GetServerSettings => {
-                let _: NoArgs = parse_args(args)?;
-                json!({"review": app.review_settings()})
+                let SettingsQuery { models } = parse_args(args)?;
+                let mut settings = json!({"review": app.review_settings()});
+                if models {
+                    settings["models"] = model_settings(app);
+                }
+                settings
             }
             Self::SetServerSettings => {
-                let Settings { review } = parse_args(args)?;
+                let Settings { review, model } = parse_args(args)?;
+                ensure!(review.is_some() != model.is_some(), "Supply either review or model");
+                if let Some(model) = model {
+                    model.apply(app).await?;
+                    return Ok(json!({"models": model_settings(app)}));
+                }
+                let review = review.context("Review settings are missing")?;
                 let fields = review
                     .as_object()
                     .context("Review settings must be an object")?;
@@ -384,7 +406,81 @@ struct GroupState {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
-    review: Value,
+    review: Option<Value>,
+    model: Option<ModelChange>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsQuery {
+    #[serde(default)]
+    models: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ModelRole {
+    FrontDesk,
+    Worker,
+    Agent,
+    WorkerTier,
+    Consult,
+    Summary,
+    ThreadTitle,
+    Escalation,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelChange {
+    role: ModelRole,
+    agent: Option<String>,
+    tier: Option<fuzukue_proto::Tier>,
+    name: Option<String>,
+    effort: Option<String>,
+}
+
+impl ModelChange {
+    async fn apply(self, app: &Workspace) -> Result<()> {
+        use fuzukue_proto::{AgentModelRole, AgentSelection, DelegateSettings};
+        use ModelRole::*;
+        ensure!(self.agent.is_some() == matches!(self.role, Agent), "agent is required only for the agent role");
+        ensure!(self.tier.is_some() == matches!(self.role, WorkerTier), "tier is required only for worker_tier");
+        ensure!(self.name.is_some() || self.effort.is_none(), "effort requires a model name");
+        let selection = self.name.map(|name| AgentSelection::from_model(Some(name), self.effort));
+        match self.role {
+            FrontDesk => app.set_partner_default(selection.map_or_else(Default::default, |model| model.chat_settings())).await,
+            Worker => {
+                let model = selection.context("The worker default requires a model name")?;
+                crate::delegate::set_settings(app, DelegateSettings {
+                    model: model.model.unwrap_or_default(), effort: model.effort.unwrap_or_default(),
+                }).await
+            }
+            Agent => app.set_agent_override(None, self.agent.context("Missing agent")?, selection).await,
+            Summary => app.set_summary_model(selection).await,
+            role => {
+                let role = match role {
+                    WorkerTier => AgentModelRole::WorkerTier(self.tier.context("Missing tier")?),
+                    Consult => AgentModelRole::Consult,
+                    ThreadTitle => AgentModelRole::ThreadTitle,
+                    Escalation => AgentModelRole::Escalation,
+                    _ => unreachable!(),
+                };
+                app.set_agent_role_model(role, selection).await
+            }
+        }
+    }
+}
+
+fn model_settings(app: &Workspace) -> Value {
+    app.hub.refresh_model_defaults();
+    let (front_desk, worker) = app.hub.role_defaults();
+    let settings = app.agent_settings();
+    json!({
+        "front_desk": front_desk, "worker": worker, "agents": settings.overrides,
+        "worker_tiers": settings.tier_models, "consult": settings.consult,
+        "summary": settings.summary, "thread_title": settings.thread_title, "escalation": settings.escalation,
+    })
 }
 
 #[cfg(test)]

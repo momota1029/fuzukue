@@ -69,6 +69,7 @@ struct ActiveTurn {
     last_text: String,
     interrupted: bool,
     compaction: Option<Compaction>,
+    escalation: Option<ChatSettings>,
     records: Vec<String>,
 }
 
@@ -89,6 +90,8 @@ pub(crate) struct PendingPrompt {
     pub records: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     github_auth: Option<crate::github_auth::mcp::Tool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<ChatSettings>,
 }
 
 #[derive(Clone)]
@@ -586,20 +589,25 @@ impl ClaudeSession {
                 return Err(error);
             }
         } else {
-            self.apply_turn_settings(true).await?;
+            self.apply_turn_settings(true, None).await?;
             turns.closed = false;
             self.start_pending(turns).await?;
         }
         Ok(true)
     }
 
-    async fn apply_turn_settings(self: &Arc<Self>, closed: bool) -> Result<()> {
+    async fn apply_turn_settings(self: &Arc<Self>, closed: bool, escalation: Option<&ChatSettings>) -> Result<()> {
         let (Some(launch), Some(app)) = (&self.launch, self.app.upgrade()) else {
             return Ok(());
         };
-        let settings = app.partner_turn_settings(&self.id);
-        let settings = launch.effective(settings);
         let mut process = self.process.lock().await;
+        let settings = escalation.cloned().unwrap_or_else(|| app.partner_turn_settings(&self.id));
+        let settings = if fuzukue_proto::AgentBackend::for_model(settings.model.as_deref()) == fuzukue_proto::AgentBackend::Codex {
+            // Previously queued Claude inputs can finish before the thread switches backends.
+            process.settings.clone()
+        } else {
+            launch.effective(settings)
+        };
         if !closed && process.stdin.is_some() && settings == process.settings {
             return Ok(());
         }
@@ -652,7 +660,7 @@ impl ClaudeSession {
             ),
             None => text.clone(),
         };
-        self.apply_turn_settings(turns.closed).await?;
+        self.apply_turn_settings(turns.closed, prompt.escalation.as_ref()).await?;
         let input = match self.app.upgrade() {
             Some(app) => app.partner_input(&self.id, input).await?,
             None => input,
@@ -677,7 +685,7 @@ impl ClaudeSession {
         turns.idle_since = None;
         turns.active = Some(ActiveTurn {
             history, before, resume_prompt, kind, acted_or_asked: false, last_text: String::new(),
-            interrupted: false, compaction: None, records: prompt.records.clone(),
+            interrupted: false, compaction: None, escalation: prompt.escalation.clone(), records: prompt.records.clone(),
         });
         self.stream.lock().unwrap().relay_reply = matches!(kind, TurnKind::WorkerDigest).then(RelayReply::default);
         self.hub.set_github_auth_request(&self.id, prompt.github_auth);
@@ -766,12 +774,12 @@ impl ClaudeSession {
     /// 入力中のターンを混ぜず、次の指示をキューに入れる。
     #[cfg(test)]
     pub async fn prompt(self: &Arc<Self>, text: &str) -> Result<()> {
-        self.prompt_with_auth(text, Vec::new(), TurnKind::Conversation, None).await
+        self.prompt_with_auth(text, Vec::new(), TurnKind::Conversation, None, None).await
     }
 
     pub(crate) async fn prompt_with_auth(
         self: &Arc<Self>, text: &str, images: Vec<Value>, kind: TurnKind,
-        github_auth: Option<crate::github_auth::mcp::Tool>,
+        github_auth: Option<crate::github_auth::mcp::Tool>, escalation: Option<ChatSettings>,
     ) -> Result<()> {
         let mut turns = self.state.lock().await;
         // Threads recover through Workspace so a missing CLI session can use the project transcript.
@@ -779,7 +787,11 @@ impl ClaudeSession {
             !turns.closed || self.launch.is_some() && !crate::threads::is_thread(&self.id),
             "claude session {} exited", self.id,
         );
-        let mut prompt = PendingPrompt { text: text.into(), images, force: false, kind, not_before: None, records: Vec::new(), github_auth };
+        if escalation.is_some() {
+            anyhow::ensure!(turns.active.is_none() && turns.queued.is_empty() && turns.paused_until.is_none(),
+                "Wait for Claude's current turn and queued messages to finish");
+        }
+        let mut prompt = PendingPrompt { text: text.into(), images, force: false, kind, not_before: None, records: Vec::new(), github_auth, escalation };
         if let Some(app) = self.app.upgrade() {
             let id = crate::mail::session_key();
             app.drain.enqueue(&app.state_dir, &self.id, id.clone(), crate::self_update::drain::Work::Claude(prompt.clone()))?;
@@ -809,7 +821,7 @@ impl ClaudeSession {
             }
         }
         let prompt = PendingPrompt { text, images: Vec::new(), force: false, kind,
-            not_before: None, records: report.into_iter().collect(), github_auth: None };
+            not_before: None, records: report.into_iter().collect(), github_auth: None, escalation: None };
         self.start_turn(&mut turns, &prompt).await?;
         Ok(true)
     }
@@ -874,14 +886,14 @@ impl ClaudeSession {
         if self.stream.lock().unwrap().native_compact == Some(false) {
             return Err(crate::commands::NativeCompactionUnavailable.into());
         }
-        self.apply_turn_settings(false).await?;
+        self.apply_turn_settings(false, None).await?;
         let content = if instructions.is_empty() { "/compact".into() } else { format!("/compact {instructions}") };
         let (complete, mut result) = tokio::sync::oneshot::channel();
         turns.idle_since = None;
         turns.active = Some(ActiveTurn {
             history: None, before: None, resume_prompt: None,
             kind: TurnKind::Conversation, acted_or_asked: false, last_text: String::new(),
-            interrupted: false, compaction: Some(Compaction { complete, boundary: None }),
+            interrupted: false, compaction: Some(Compaction { complete, boundary: None }), escalation: None,
             records: Vec::new(),
         });
         // SDK slash commands use a bare string instead of the normal prompt preamble.
@@ -922,7 +934,7 @@ impl ClaudeSession {
             let prompt = PendingPrompt {
                 text: "The usage window has reset. Continue from the last saved stopping point.".into(),
                 images: Vec::new(), force, kind: turns.interrupted.unwrap_or(TurnKind::Conversation),
-                not_before: turns.paused_until.map(|until| until + RESUME_SLACK_SECS), records: Vec::new(), github_auth: None,
+                not_before: turns.paused_until.map(|until| until + RESUME_SLACK_SECS), records: Vec::new(), github_auth: None, escalation: None,
             };
             let work = crate::self_update::drain::Work::Claude(prompt);
             if force {
@@ -1066,7 +1078,7 @@ impl ClaudeSession {
             text.push_str(&messages.join("\n\n---\n\n"));
         }
         if !text.is_empty() {
-            turns.queued.push_back(PendingPrompt { text, images, force, kind, not_before: None, records, github_auth });
+            turns.queued.push_back(PendingPrompt { text, images, force, kind, not_before: None, records, github_auth, escalation: None });
         }
         self.start_pending(&mut turns).await
     }
@@ -1119,6 +1131,12 @@ impl ClaudeSession {
             history.finish(&self.hub, &self.id, fallback.map(str::to_owned)).await;
         }
         let interrupted = active.as_ref().is_some_and(|turn| turn.interrupted);
+        if matches!(kind, TurnKind::Escalated) && !interrupted && result["is_error"] == true {
+            let detail = result["result"].as_str().filter(|text| !text.is_empty()).unwrap_or_else(|| {
+                harness_text!("Claude Code could not complete this turn.", "Claude Code でこのターンを完了できなかった。")
+            });
+            crate::commands::escalation_unavailable(&self.hub, &self.id, detail.into());
+        }
         if let Some(app) = self.app.upgrade() {
             if let Some(turn) = &active {
                 let review = if interrupted {
@@ -1155,7 +1173,7 @@ impl ClaudeSession {
         if rate_limited && turns.paused_until.is_none() {
             let until = self.usage.blocked("claude").map(|(until, _)| until)
                 .unwrap_or_else(|| now() + FALLBACK_PAUSE_SECS);
-            let retry = (!matches!(kind, TurnKind::GoalDecision(_))).then_some(kind);
+            let retry = (!matches!(kind, TurnKind::GoalDecision(_) | TurnKind::Escalated)).then_some(kind);
             self.pause(&mut turns, until, "Claude が使用量の上限で止まった".into(), retry);
         }
         if turns.paused_until.is_none() || interrupted {
@@ -1190,8 +1208,9 @@ impl ClaudeSession {
                 };
                 (kind, outcome)
             });
-            app.end_partner_turn(&self.id, Actor::Claude, route && turns.paused_until.is_none(), usage);
-            if desk_turn && !interrupted && turns.paused_until.is_none() && matches!(kind, TurnKind::UserConversation) {
+            let escalation = active.as_ref().and_then(|turn| turn.escalation.as_ref());
+            app.end_partner_turn(&self.id, Actor::Claude, route && turns.paused_until.is_none(), usage, escalation);
+            if desk_turn && !interrupted && turns.paused_until.is_none() && kind.user_conversation() {
                 if result["is_error"] == true {
                     self.hub.notify_turn_failed(&self.id);
                 } else {
@@ -1211,7 +1230,7 @@ impl ClaudeSession {
                 if let Ok(_work) = app.admit_work() {
                     let nudge = PendingPrompt {
                         text: front_desk::nudge_prompt().into(), images: Vec::new(), force: false, kind: TurnKind::Nudge,
-                        not_before: None, records: Vec::new(), github_auth: None,
+                        not_before: None, records: Vec::new(), github_auth: None, escalation: None,
                     };
                     return self.start_turn(&mut turns, &nudge).await;
                 }
@@ -2248,7 +2267,7 @@ mod tests {
         let mut turns = TurnState::default();
         assert!(turns.can_start_worker_digest());
         turns.queued.push_back(PendingPrompt {
-            text: "A user request".into(), images: Vec::new(), force: false, kind: TurnKind::Conversation, not_before: None, records: Vec::new(), github_auth: None,
+            text: "A user request".into(), images: Vec::new(), force: false, kind: TurnKind::Conversation, not_before: None, records: Vec::new(), github_auth: None, escalation: None,
         });
         assert!(!turns.can_start_worker_digest());
         turns.paused_until = Some(100);

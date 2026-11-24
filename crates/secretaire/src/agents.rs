@@ -174,6 +174,15 @@ fn validate_hint(hint: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn worker_default(
+    app: &crate::Workspace, definition: Option<AgentSelection>, worker: fuzukue_proto::DelegateSettings,
+) -> AgentSelection {
+    if let Some(selection) = definition.filter(|_| !app.hub.read_threads(|store| store.worker_default_configured)) {
+        return selection;
+    }
+    AgentSelection::from_model(Some(worker.model), (!worker.effort.is_empty()).then_some(worker.effort))
+}
+
 pub(crate) async fn validate(app: &crate::Workspace, selection: &AgentSelection) -> Result<()> {
     let model = selection.model.as_deref();
     let effort = selection.effort.as_deref();
@@ -319,6 +328,29 @@ impl crate::Workspace {
         Ok(agent.info.policy.with_override(settings.policies.get(name)))
     }
 
+    pub(crate) async fn escalation_model(&self, session: &str) -> Result<AgentSelection> {
+        let settings = self.agent_settings();
+        let heavy = fuzukue_proto::Tier::Heavy;
+        let selection = if let Some(selection) = settings.escalation
+            .or_else(|| settings.consult.filter(|selection| selection.model.is_some()))
+            .or_else(|| settings.tier_models.get(&heavy).filter(|selection| selection.model.is_some()).cloned())
+            .or_else(|| settings.tiers.models.get(&heavy)?.iter().find(|model| model.selection.model.is_some())
+                .map(|model| model.selection.clone()))
+        {
+            selection
+        } else {
+            let agents = self.agent_catalog().await?;
+            let planner = agents.get(crate::planner::ROLE).context("Planning advisor unavailable")?;
+            self.agent_selection(Some(session), crate::planner::ROLE, planner.info.default_selection())
+        };
+        anyhow::ensure!(selection.model.is_some() && selection.backend == AgentBackend::for_model(selection.model.as_deref()),
+            "Choose a specific model for the escalation role");
+        validate(self, &selection).await?;
+        anyhow::ensure!(self.usage.blocked(selection.backend.usage_key()).is_none(),
+            "{} usage is currently paused", selection.backend.label());
+        Ok(selection)
+    }
+
     pub(crate) async fn set_summary_model(&self, selection: Option<AgentSelection>) -> Result<()> {
         if let Some(selection) = &selection {
             validate(self, selection).await?;
@@ -332,11 +364,15 @@ impl crate::Workspace {
         use fuzukue_proto::AgentModelRole;
 
         if let Some(selection) = &selection {
+            if role == AgentModelRole::Escalation {
+                ensure!(selection.model.is_some(), "Choose a specific model for the escalation role");
+            }
             validate(self, selection).await?;
         }
         self.edit_agent_settings(|settings| match role {
             AgentModelRole::Consult => settings.consult = selection,
             AgentModelRole::ThreadTitle => settings.thread_title = selection,
+            AgentModelRole::Escalation => settings.escalation = selection,
             AgentModelRole::WorkerTier(tier) => match selection {
                 Some(selection) => { settings.tier_models.insert(tier, selection); }
                 None => { settings.tier_models.remove(&tier); }

@@ -30,7 +30,7 @@ fn parses_only_a_leading_slash_and_unescapes_once() {
 #[test]
 fn both_backends_have_the_same_localized_inventory() {
     let expected = [
-        "compact", "clear", "new", "model", "effort", "archive", "pin", "goal", "pace", "stop",
+        "compact", "clear", "new", "model", "effort", "escalate", "archive", "pin", "goal", "pace", "stop",
         "help",
     ];
     assert_eq!(
@@ -245,10 +245,14 @@ done
     send(&app, &id, "//literal").await?;
     wait_event(&mut events, |event| matches!(event, ServerEvent::TextDelta { actor: Actor::Claude, text, .. } if text == "literal received")).await?;
     for command in [
-        "/archive", "/clear", "/new", "/model", "/effort", "/pin", "/goal", "/pace",
+        "/archive", "/clear", "/new", "/pin", "/goal", "/pace",
     ] {
         send(&app, &id, command).await?;
         wait_notice(&mut events, "command-busy").await?;
+    }
+    for command in ["/model", "/effort"] {
+        send(&app, &id, command).await?;
+        wait_notice(&mut events, "command-value").await?;
     }
     send(&app, &id, "/help").await?;
     wait_notice(&mut events, "command-help").await?;

@@ -614,20 +614,10 @@ impl State {
         let pace = self.pace()?;
         let next = self.plan.as_ref().and_then(|plan| plan.next.iter().find(|step| step.blocker.is_none()));
         let next_backend = next.map(|next| {
-            let (role, primary) = match (next.agent.as_deref(), self.next_default.as_ref()) {
-                (Some(role), Some(default)) => (role, default.clone()),
-                _ => {
-                    let worker = app
-                        .hub
-                        .role_settings(session)
-                        .map_or_else(|| app.hub.role_defaults().1, |roles| roles.1);
-                    let effort = (!worker.effort.is_empty()).then_some(worker.effort);
-                    (
-                        "worker",
-                        AgentSelection::from_model(Some(worker.model), effort),
-                    )
-                }
-            };
+            let role = next.agent.as_deref().unwrap_or("worker");
+            let worker = app.hub.role_settings(session)
+                .map_or_else(|| app.hub.role_defaults().1, |roles| roles.1);
+            let primary = crate::agents::worker_default(app, self.next_default.clone(), worker);
             let classified = crate::tiers::classify(&next.task, None, next.routing, 1);
             let pinned = role == "worker" && app.hub.read_threads(|store| store.worker_pinned(session));
             crate::tiers::Route::new(app, session, role, primary, pinned, classified)

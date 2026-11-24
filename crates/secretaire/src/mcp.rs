@@ -35,11 +35,11 @@ pub(crate) fn front_desk_instructions() -> &'static str {
     harness_text!(
         "\n\nUse consult for a design fork, conflicting requirements, or a risky or irreversible decision.\n\
          Use consult when you have gone around the same question twice. It returns advice for a single question and leaves the plan as it is.\n\
-         Use the available tools for requested thread, sidebar, and review settings changes instead of asking the user to click.\n\
+         Use the available tools for requested thread, sidebar, and server settings changes instead of asking the user to click. For ordinary delegation, pass model and optional effort only when the user requests a specific model for that job. Otherwise use the configured routing.\n\
          For bounded blind section math, call request_review with explicit isolation, API backend and model, ordered targets, and only the permitted source ranges. Keep the request_key across retries and read the receipt with read_section_review.",
         "\n\n設計の分かれ道、要件の衝突、影響が大きい判断や取り消せない判断では consult を使う。\n\
          同じ問いで二度行き詰まったときも consult を使う。一問への助言が返り、方針はそのまま。\n\
-         利用者がスレッドや左欄の操作、査読設定の変更を頼んだら、クリックを頼まず、対応する道具を使う。\n\
+         利用者がスレッドや左欄の操作、サーバー設定の変更を頼んだら、クリックを頼まず、対応する道具を使う。通常の委譲では、利用者がその仕事のモデルを指定したときに model と任意の effort を渡す。省略時は設定済みの振り分けを使う。\n\
          抜粋限定の節の数学査読では request_review に isolation、API の backend と model、掲載順の対象、許可された原文の範囲を明示する。再送には同じ request_key を使い、記録は read_section_review で読む。",
     )
 }
@@ -446,7 +446,8 @@ impl Tool {
                 json!({ "prompt": { "type": "string", "description": harness_text!("Self-contained assignment for the worker.", "作業役への依頼") },
                     "isolation": {"type": "string", "enum": ["blind"], "description": harness_text!("Give the reviewer only the prompt and optional inline artifacts, with no file or tool access.", "査読役には依頼の原文と、指定した成果物の本文だけが渡る。ファイルやツールへのアクセスはない。")},
                     "backend": {"type": "string", "enum": ["codex", "claude"], "description": harness_text!("Provider for blind review only.", "ブラインド査読に使う API の提供元。")},
-                    "model": {"type": "string", "description": harness_text!("Explicit provider API model ID for blind review only.", "ブラインド査読に使う API のモデル ID。")},
+                    "model": {"type": "string", "description": harness_text!("Override the model for this job. For blind review, use the provider API model ID.", "このジョブだけに使うモデル。ブラインド査読では提供元 API のモデル ID。")},
+                    "effort": {"type": "string", "description": harness_text!("Optional reasoning effort for the supplied model in an ordinary delegation.", "通常の委譲で、指定したモデルに使う任意の思考レベル。")},
                     "artifacts": {"type": "array", "description": harness_text!("Blind review only. Inline text and neutral labels such as A and B. Remove original paths and provenance before submitting.", "ブラインド査読専用。出所や元のパスを伏せ、A・B などのラベルと本文を渡す。"),
                         "items": {"type": "object", "properties": {"label": {"type": "string"}, "text": {"type": "string"}}, "required": ["label", "text"], "additionalProperties": false}},
                     "title": { "type": "string", "description": harness_text!("Short label for this parallel work in the user's language, shown to the user as its heading (about 20 characters).", "利用者に見出しとして見せる、この並行作業の短い題。利用者の言語で 20 字程度。") },
@@ -1393,6 +1394,7 @@ struct DelegateArgs {
     isolation: Option<crate::delegate::blind::Isolation>,
     backend: Option<fuzukue_proto::AgentBackend>,
     model: Option<String>,
+    effort: Option<String>,
     artifacts: Option<Vec<crate::delegate::blind::Artifact>>,
     #[serde(default)]
     folder_grants: Vec<String>,
@@ -1862,10 +1864,21 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         }
         Tool::Delegate => {
             let args: DelegateArgs = parse_args(args)?;
-            if args.isolation.is_none() {
-                ensure!(args.backend.is_none() && args.model.is_none() && args.artifacts.is_none(),
-                    "backend, model and artifacts require isolation: blind");
-            }
+            let selection = if args.isolation.is_none() {
+                ensure!(args.backend.is_none() && args.artifacts.is_none(),
+                    "backend and artifacts require isolation: blind");
+                ensure!(args.effort.is_none() || args.model.is_some(), "effort requires model");
+                let selection = args.model.as_ref().map(|model| {
+                    fuzukue_proto::AgentSelection::from_model(Some(model.clone()), args.effort.clone())
+                });
+                if let Some(selection) = &selection {
+                    crate::agents::validate(app, selection).await?;
+                }
+                selection
+            } else {
+                ensure!(args.effort.is_none(), "effort is only available for ordinary delegation");
+                None
+            };
             let caller = if args.plan_step {
                 AgentCaller::Planner
             } else {
@@ -1884,11 +1897,11 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 )).await?
             } else if let Some(number) = args.issue {
                 Box::pin(crate::delegate::start_for_issue(
-                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, number, routing, args.touches, args.folder_grants,
+                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, number, routing, args.touches, args.folder_grants, selection,
                 )).await?
             } else {
                 Box::pin(crate::delegate::start_with_grants(
-                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants,
+                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection,
                 )).await?
             };
             if claude.is_some() || codex.is_some() {

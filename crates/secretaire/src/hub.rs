@@ -669,6 +669,20 @@ impl Hub {
         self.inner.lock().unwrap().threads.as_ref()?.agent_override(id, name)
     }
 
+    pub(crate) fn refresh_model_defaults(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(store) = inner.threads.as_mut() else { return };
+        if store.reload_model_defaults() {
+            for event in [
+                store.snapshot(),
+                ServerEvent::PartnerDefaultChanged { settings: store.partner_default.clone() },
+                ServerEvent::DelegateSettingsChanged { settings: store.worker_default.clone() },
+            ] {
+                let _ = self.tx.send(crate::snapshot(event));
+            }
+        }
+    }
+
     pub fn role_defaults(&self) -> (fuzukue_proto::ChatSettings, fuzukue_proto::DelegateSettings) {
         let inner = self.inner.lock().unwrap();
         let store = inner.threads.as_ref().expect("Workspace initializes the thread store");

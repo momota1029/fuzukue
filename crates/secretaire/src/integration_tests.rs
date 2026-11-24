@@ -28,6 +28,10 @@ const REPORT_PDF: &str = "docs/report/build/document.pdf";
 #[path = "integration_tests/section_math_blind.rs"]
 mod section_math_blind;
 
+#[cfg(unix)]
+#[path = "integration_tests/model_settings.rs"]
+mod model_settings;
+
 #[path = "integration_tests/reading_pages.rs"]
 mod reading_pages;
 
@@ -701,7 +705,7 @@ fn stored_blank_partner_replies_are_hidden_on_full_and_incremental_replay() -> R
             selection: fuzukue_proto::AgentSelection {
                 backend: fuzukue_proto::AgentBackend::Claude, model: None, effort: None,
             },
-            tokens: None, cost_usd: None, duration_ms: None,
+            escalated: false, tokens: None, cost_usd: None, duration_ms: None,
         },
     });
     hub.publish(ServerEvent::TurnEnded { session: id.clone(), actor: Actor::Claude });
@@ -1922,7 +1926,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             ("attention_patterns", "array"), ("attention_marked_lines", "boolean"), ("sources", "array")],
             &["action"]),
         ("delegate", &[("prompt", "string"), ("title", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("folder_grants", "array"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
-            ("isolation", "string"), ("backend", "string"), ("model", "string"), ("artifacts", "array")], &["prompt"]),
+            ("isolation", "string"), ("backend", "string"), ("model", "string"), ("effort", "string"), ("artifacts", "array")], &["prompt"]),
         ("plan", &[("goal", "string"), ("context", "string"), ("long_running", "boolean"), ("pace", "string"), ("tier", "string"), ("min_tier", "string")],
             &["goal", "context"]),
         ("replan", &[("reason", "string"), ("pace", "string")], &["reason"]),
@@ -1939,8 +1943,8 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("pin_thread", &[("id", "string"), ("pinned", "boolean")], &["pinned"]),
         ("reorder_thread", &[("id", "string"), ("target", "string"), ("after", "boolean")], &["target", "after"]),
         ("set_group_state", &[("group", "string"), ("open", "boolean")], &["group", "open"]),
-        ("get_server_settings", &[], &[]),
-        ("set_server_settings", &[("review", "object")], &["review"]),
+        ("get_server_settings", &[("models", "boolean")], &[]),
+        ("set_server_settings", &[("review", "object"), ("model", "object")], &[]),
         ("block_step", &[("step", "string"), ("reason", "string"), ("needs", "string")], &["step", "reason"]),
         ("list_jobs", &[("state", "string"), ("thread", "string"), ("limit", "integer")], &[]),
         ("job_status", &[("job", "string"), ("view", "string")], &["job"]),
@@ -6249,6 +6253,7 @@ async fn role_pairs_persist_steer_and_follow_up_once() -> Result<()> {
         let session = app.hub.edit_threads(|threads| threads.create(Some(PAPER)))?;
         assert_eq!(app.hub.role_settings(&session), Some((partner.clone(), claude.clone())));
 
+        handle(&app, ClientMsg::SetChatSettings { session: session.clone(), settings: partner.clone() }).await?;
         let worker = if codex_partner { claude } else { codex.clone() };
         handle(&app, ClientMsg::SetThreadWorker { session: session.clone(), settings: worker.clone() }).await?;
         handle(&app, ClientMsg::SetPartnerDefault { settings: ChatSettings::default() }).await?;

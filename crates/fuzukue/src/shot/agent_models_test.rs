@@ -80,7 +80,7 @@ fn fresh_model_setup_can_be_dismissed_and_reopened_from_the_roles_list() {
                         "model-usage-settings", "model-front-desk-picker", "model-consult-picker",
                         "model-worker-picker", "model-tier-light-picker", "model-tier-standard-picker",
                         "model-tier-heavy-picker", "summary-model-picker", "model-thread-title-picker",
-                        "model-worker-digest-picker", "agent-model-planner", "agent-model-lean",
+                        "model-worker-digest-picker", "model-escalation-picker", "agent-model-planner", "agent-model-lean",
                     ] {
                         assert!(visible(cx, id)?, "missing {id}");
                     }
@@ -101,7 +101,7 @@ fn fresh_model_setup_can_be_dismissed_and_reopened_from_the_roles_list() {
                         let position = window.shot_element_bounds("summary-model-picker").unwrap().center();
                         window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position, ..Default::default() }), cx);
                         window.dispatch_event(PlatformInput::Scroll(gpui_kit::ScrollEvent {
-                            position, delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-900.))),
+                            position, delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-1250.))),
                             ..Default::default()
                         }), cx);
                     })?;

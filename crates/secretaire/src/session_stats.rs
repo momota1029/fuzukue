@@ -126,7 +126,7 @@ impl SessionStatsStore {
             selection: AgentSelection {
                 backend, model: (!stats.model.is_empty()).then(|| stats.model.clone()), effort: stats.effort.clone(),
             },
-            tokens, cost_usd, duration_ms,
+            escalated: false, tokens, cost_usd, duration_ms,
         })
     }
 

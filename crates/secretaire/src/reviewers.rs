@@ -644,7 +644,7 @@ pub(crate) struct Job {
 impl Job {
     fn details(&self) -> fuzukue_proto::RunDetails {
         self.details.lock().unwrap().clone().unwrap_or_else(|| fuzukue_proto::RunDetails {
-            selection: self.selection.clone(), tokens: None, cost_usd: None, duration_ms: None,
+            selection: self.selection.clone(), escalated: false, tokens: None, cost_usd: None, duration_ms: None,
         })
     }
 
@@ -1118,7 +1118,7 @@ impl Workspace {
                 effort: metadata.effort.clone().or_else(|| job.selection.effort.clone()),
                 backend,
             },
-            tokens: metadata.tokens, cost_usd: metadata.cost_usd, duration_ms: Some(timer.elapsed().as_millis() as u64),
+            escalated: false, tokens: metadata.tokens, cost_usd: metadata.cost_usd, duration_ms: Some(timer.elapsed().as_millis() as u64),
         });
         invocation.finish(self, &result, metadata);
         if result.as_ref().is_err_and(|error| !error.is::<Cancelled>()) && self.usage.blocked(backend.usage_key()).is_some() {

@@ -261,10 +261,11 @@ impl Job {
             "elapsed_ms": elapsed, "error": state == State::Failed || self.activity.had_error,
             "wait_reason": self.wait.as_ref().map(WaitReason::message), "cancel_reason": self.cancel_reason,
         });
+        status["backend"] = json!(self.selection.backend);
+        status["model"] = json!(self.selection.model);
+        status["effort"] = json!(self.selection.effort);
         if let Some(isolation) = self.isolation {
             status["isolation"] = json!(isolation);
-            status["backend"] = json!(self.selection.backend);
-            status["model"] = json!(self.selection.model);
         }
         status
     }
@@ -310,8 +311,6 @@ impl Job {
         status_text(&mut value, "prompt", Some(&self.prompt), 400);
         value["activity"] = json!(self.activity.lines);
         value["attempts"] = json!(report.map(|report| &report.attempts));
-        value["backend"] = json!(self.selection.backend);
-        value["model"] = json!(self.selection.model);
         if self.isolation.is_none() {
             value["worktree"] = json!(self.worktree);
             value["write_observation"] = json!(self

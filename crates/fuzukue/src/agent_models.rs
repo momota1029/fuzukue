@@ -331,6 +331,22 @@ impl Workbench {
                         }),
                 ),
             )
+            .children((self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL).then(|| {
+                let default = self.agent_settings.consult.clone()
+                    .or_else(|| self.agent_settings.tier_models.get(&Tier::Heavy).cloned())
+                    .or_else(|| planner_model.clone());
+                role(
+                    "model-role-escalation",
+                    tr!("model-role-escalation"),
+                    default.and_then(|default| picker(
+                        "model-escalation-picker",
+                        AgentTarget::Role(AgentModelRole::Escalation),
+                        default,
+                        self.agent_settings.escalation.as_ref(),
+                    )),
+                    Some(tr!("model-role-escalation-detail")),
+                )
+            }))
             .child(
                 role(
                     "model-role-worker-digest",
@@ -479,6 +495,7 @@ mod tests {
             slug: SOL.into(),
             label: "Sol".into(),
             effort_levels: vec!["medium".into()],
+            default_effort: Some("medium".into()),
         }];
         assert!(recommendation(None, &[]).is_none());
         assert_eq!(

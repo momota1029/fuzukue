@@ -399,6 +399,7 @@ impl Workspace {
 
 impl Workspace {
     fn partner_turn_settings(&self, session: &str) -> fuzukue_proto::ChatSettings {
+        self.hub.refresh_model_defaults();
         self.chat_settings(session)
     }
 
@@ -1159,6 +1160,9 @@ async fn serve_workspace(
         tx.send(wire_event(&snapshot(event), protocol, Some(&app.id), locale_for_wire())).await.ok()?;
     }
     let supports_chat = protocol >= 5;
+    if supports_chat {
+        app.hub.refresh_model_defaults();
+    }
     let send = |env: &Envelope| wire_event(env, protocol, Some(&app.id), locale_for_wire());
     // v1 クライアントは未知のイベントを受けると切断する。
     let supports = move |env: &Envelope| {
@@ -1983,6 +1987,8 @@ async fn serve_workspace(
                     | ClientMsg::SetSummaryModel { .. } | ClientMsg::WorkerPrompt { .. } | ClientMsg::StopWorker { .. })
                     if protocol < 14 => {}
                 Ok(ClientMsg::SetAgentRoleModel { .. }) if protocol < fuzukue_proto::AGENT_MODELS_PROTOCOL => {}
+                Ok(ClientMsg::SetAgentRoleModel { role: fuzukue_proto::AgentModelRole::Escalation, .. }
+                    | ClientMsg::UseDefaultThreadModel { .. }) if protocol < fuzukue_proto::LIVE_MODELS_PROTOCOL => {}
                 Ok(ClientMsg::Interrupt { session }) if protocol < 14 && !app.hub.thread_active(&session)
                     && app.delegates.only_job(&session).is_some() => {
                     if let Some(job) = app.delegates.only_job(&session) {
@@ -2226,7 +2232,7 @@ async fn serve_workspace(
                         }
                     }
                     let (session, text) = prompt_text(&prompt);
-                    if fuzukue_proto::slash::is_command(text) {
+                    if fuzukue_proto::slash::is_command(text) && !commands::is_escalation(text) {
                         if let Some(id) = commands::dispatch(&app, session, text).await {
                             let _ = reply.send(ServerEvent::ThreadCreated { id });
                         }
@@ -2512,7 +2518,7 @@ async fn start_side_thread(app: &Arc<Workspace>, thread: &str, text: String) -> 
     let event = Some(prompt_event(thread, fuzukue_proto::Actor::User, &text));
     let _start = app.prompt_start.lock().await;
     let _work = app.admit_work()?;
-    let settings = app.chat_settings(thread);
+    let settings = app.partner_turn_settings(thread);
     if AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex {
         prompt_codex(app, thread.to_owned(), settings, text, event).await
     } else {
@@ -2523,7 +2529,16 @@ async fn start_side_thread(app: &Arc<Workspace>, thread: &str, text: String) -> 
 async fn claude_session(
     app: &Arc<Workspace>,
     session: &str,
+    user_event: Option<ServerEvent>,
+) -> anyhow::Result<(Arc<ClaudeSession>, Option<ServerEvent>)> {
+    claude_session_for(app, session, user_event, None).await
+}
+
+async fn claude_session_for(
+    app: &Arc<Workspace>,
+    session: &str,
     mut user_event: Option<ServerEvent>,
+    settings: Option<&fuzukue_proto::ChatSettings>,
 ) -> anyhow::Result<(Arc<ClaudeSession>, Option<ServerEvent>)> {
     let mut sessions = app.sessions.lock().await;
     let isolated = app.issue_threads.intake_turn(session);
@@ -2569,7 +2584,7 @@ async fn claude_session(
                 mcp_url.as_str(),
                 if isolated { None } else { rec.claude_session_id },
                 recovery_summary,
-                app.partner_turn_settings(session),
+                settings.cloned().unwrap_or_else(|| app.partner_turn_settings(session)),
                 Box::new(on_session_id),
                 app,
             ).await?;
@@ -2659,7 +2674,7 @@ fn codex_partner_options(app: &Workspace, session: &str, settings: fuzukue_proto
 }
 
 fn github_auth_request(kind: TurnKind, prompt: &str, event: Option<&ServerEvent>) -> Option<github_auth::mcp::Tool> {
-    if !matches!(kind, TurnKind::UserConversation) {
+    if !kind.user_conversation() {
         return None;
     }
     let text = match event {
@@ -2672,11 +2687,18 @@ fn github_auth_request(kind: TurnKind, prompt: &str, event: Option<&ServerEvent>
 
 #[allow(clippy::too_many_arguments)]
 async fn prompt_codex_with_images(
-    app: &Arc<Workspace>, session: String, settings: fuzukue_proto::ChatSettings,
+    app: &Arc<Workspace>, session: String, mut settings: fuzukue_proto::ChatSettings,
     prompt: String, event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind, desk_record: Option<delegate::DeskDelivery>,
 ) -> anyhow::Result<()> {
     let github_auth = github_auth_request(kind, &prompt, event.as_ref());
     let codex = app.codex().await?;
+    if settings.effort.is_none() {
+        // A null turn/start effort inherits Codex's preceding turn override.
+        // Send the selected model's default to reset that override.
+        settings.effort = codex.models().await.into_iter()
+            .find(|model| Some(model.slug.as_str()) == settings.model.as_deref())
+            .and_then(|model| model.default_effort);
+    }
     let isolated = app.issue_threads.intake_turn(&session);
     let record = app.session_records.lock().unwrap().get(&session).cloned().unwrap_or_default();
     let summary = if isolated {
@@ -2709,7 +2731,7 @@ async fn prompt_codex_with_images(
             session: session.clone(), thread_id: Some(thread_id.clone()),
         });
     }
-    if switched {
+    if switched && !matches!(kind, TurnKind::Escalated) {
         partner_notice(app, &session, settings.model.as_deref());
     }
     let prompt = handover(if switched || fresh { summary } else { None }, &prompt);
@@ -2774,7 +2796,7 @@ async fn prompt_codex_with_images(
             };
             app.end_partner_turn(&session, fuzukue_proto::Actor::Codex {
                 thread_id: thread_id.clone(), parent_tool_use: None,
-            }, result.is_ok(), Some((kind, outcome)));
+            }, result.is_ok(), Some((kind, outcome)), matches!(kind, TurnKind::Escalated).then_some(&settings));
             if isolated {
                 drop(_start);
                 codex.close_worker(&thread_id).await;
@@ -2786,7 +2808,7 @@ async fn prompt_codex_with_images(
                 break;
             }
             let steered = app.hub.take_user_steer(&session);
-            if steered || matches!(kind, TurnKind::UserConversation) {
+            if steered || kind.user_conversation() {
                 match &result {
                     Ok(reply) => app.hub.notify_turn_finished(&session, true, reply),
                     Err(error) if !error.is::<crate::cancellation::Cancelled>() => app.hub.notify_turn_failed(&session),
@@ -2804,7 +2826,11 @@ async fn prompt_codex_with_images(
                 }
                 Ok(_) => break,
                 Err(error) if !retrying => {
-                    publish_codex_turn_error(&app.hub, &session, error);
+                    if matches!(kind, TurnKind::Escalated) && !error.is::<cancellation::Cancelled>() {
+                        commands::escalation_unavailable(&app.hub, &session, format!("Codex: {error:#}"));
+                    } else {
+                        publish_codex_turn_error(&app.hub, &session, error);
+                    }
                     break;
                 }
                 Err(_) => break,
@@ -2824,6 +2850,14 @@ async fn prompt_claude_with_images(
     app: &Arc<Workspace>, session: &str, prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind,
     report: Option<String>,
 ) -> anyhow::Result<bool> {
+    prompt_claude_turn(app, session, prompt, user_event, images, kind, report, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prompt_claude_turn(
+    app: &Arc<Workspace>, session: &str, prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind,
+    report: Option<String>, escalation: Option<fuzukue_proto::ChatSettings>,
+) -> anyhow::Result<bool> {
     let is_report = report.is_some();
     let github_auth = github_auth_request(kind, &prompt, user_event.as_ref());
     let (mut switched, has_claude) = app.session_records.lock().unwrap().get(session)
@@ -2836,12 +2870,12 @@ async fn prompt_claude_with_images(
     };
     if switched {
         anyhow::ensure!(!app.hub.thread_active(session), "Codex は実行中");
-        if !is_report {
+        if !is_report && escalation.is_none() {
             partner_notice(app, session, app.chat_settings(session).model.as_deref());
         }
     }
     let images = screenshots::claude_images(images).await?;
-    let (s, user_event) = match claude_session(app, session, user_event).await {
+    let (s, user_event) = match claude_session_for(app, session, user_event, escalation.as_ref()).await {
         Ok(started) => started,
         Err(error) => {
             if !is_report {
@@ -2856,7 +2890,7 @@ async fn prompt_claude_with_images(
     let result = if is_report || matches!(kind, TurnKind::WorkerDigest | TurnKind::GoalDecision(_)) {
         s.try_background_prompt(prompt, kind, report).await
     } else {
-        s.prompt_with_auth(&prompt, images, kind, github_auth).await.map(|()| true)
+        s.prompt_with_auth(&prompt, images, kind, github_auth, escalation).await.map(|()| true)
     };
     match result {
         Ok(false) => return Ok(false),
@@ -3015,8 +3049,8 @@ async fn replay_prompts(app: &Arc<Workspace>) {
         match record.work {
             Work::Claude(prompt) => {
                 if prompt.not_before.is_some_and(|until| until > usage::now()) { continue; }
-                let claude = if backend == AgentBackend::Claude {
-                    claude_session(app, session, None).await
+                let claude = if backend == AgentBackend::Claude || prompt.escalation.is_some() {
+                    claude_session_for(app, session, None, prompt.escalation.as_ref()).await
                 } else {
                     Err(anyhow::anyhow!("The thread's backend changed"))
                 };
@@ -3091,14 +3125,32 @@ async fn set_chat_settings(app: &Workspace, session: &str, settings: fuzukue_pro
     let selected = settings.model.as_deref();
     delegate::validate_model(app, selected, settings.effort.as_deref()).await?;
     let previous = app.chat_settings(session);
-    anyhow::ensure!(AgentBackend::for_model(previous.model.as_deref()) == AgentBackend::for_model(selected)
-        || !app.hub.thread_active(session) && !app.delegates.is_running(session),
-        "{PARTNER_SWITCH_WAIT}");
-    app.hub.edit_threads(|store| store.set_roles(session, Some(settings.clone()), None))?;
-    // 旧状態ファイルにも反映する。役の復元時はスレッドの front matter を優先する。
+    app.hub.edit_threads(|store| {
+        if previous.model == settings.model && previous.effort == settings.effort
+            && previous.permission_mode != settings.permission_mode {
+            store.set_partner_permission(session, settings.permission_mode)
+        } else {
+            store.set_roles(session, Some(settings.clone()), None)
+        }
+    })?;
     app.record_session(session, |record| record.chat_settings = settings.clone());
     app.hub.publish_snapshot(ServerEvent::ChatSettingsChanged { session: session.into(), settings });
     Ok(())
+}
+
+impl Workspace {
+    async fn set_partner_default(&self, mut settings: fuzukue_proto::ChatSettings) -> anyhow::Result<()> {
+        settings.permission_mode = Default::default();
+        delegate::validate_model(self, settings.model.as_deref(), settings.effort.as_deref()).await?;
+        let _start = self.prompt_start.lock().await;
+        self.hub.edit_threads(|store| {
+            state::save_partner_default(&self.state_dir, &settings)?;
+            store.partner_default = settings.clone();
+            Ok(())
+        })?;
+        self.hub.publish_snapshot(ServerEvent::PartnerDefaultChanged { settings });
+        Ok(())
+    }
 }
 
 async fn handle_from_client(
@@ -3139,15 +3191,14 @@ async fn handle_from_client(
             app.publish_approval_settings();
         }
         ClientMsg::SetReviewSettings { settings } => app.set_review_settings(settings).await?,
-        ClientMsg::SetPartnerDefault { mut settings } => {
-            settings.permission_mode = Default::default();
-            delegate::validate_model(app, settings.model.as_deref(), settings.effort.as_deref()).await?;
-            app.hub.edit_threads(|store| {
-                state::save_partner_default(&app.state_dir, &settings)?;
-                store.partner_default = settings.clone();
-                Ok(())
-            })?;
-            app.hub.publish_snapshot(ServerEvent::PartnerDefaultChanged { settings });
+        ClientMsg::SetPartnerDefault { settings } => app.set_partner_default(settings).await?,
+        ClientMsg::UseDefaultThreadModel { session } => {
+            let _start = app.prompt_start.lock().await;
+            app.hub.edit_threads(|store| store.set_partner_model_inherited(&session))?;
+            app.record_session(&session, |record| {
+                record.chat_settings.model = None;
+                record.chat_settings.effort = None;
+            });
         }
         ClientMsg::SetThreadWorker { session, settings } => {
             delegate::validate_worker(app, &settings).await?;
@@ -3190,7 +3241,8 @@ async fn handle_from_client(
         prompt @ (ClientMsg::Prompt { .. } | ClientMsg::PromptWithAttachments { .. }
             | ClientMsg::RolePrompt { .. } | ClientMsg::WorkerPrompt { .. }) => {
             let (session, text) = prompt_text(&prompt);
-            if fuzukue_proto::slash::is_command(text) {
+            let escalating = commands::is_escalation(text);
+            if fuzukue_proto::slash::is_command(text) && !escalating {
                 commands::dispatch(app, session, text).await;
                 return Ok(());
             }
@@ -3204,7 +3256,10 @@ async fn handle_from_client(
                 ClientMsg::WorkerPrompt { session, job, text, paths } => (session, text, paths, Some(job)),
                 _ => unreachable!(),
             };
-            let commands::Input::Prompt(text) = commands::parse(&text) else { unreachable!() };
+            let text = match commands::parse(&text) {
+                commands::Input::Prompt(text) => text,
+                commands::Input::Command { args, .. } => args,
+            };
             let text = text.to_owned();
             anyhow::ensure!(app.hub.has_thread(&session), "スレッドが見つからない");
             let (text, paths, prompt, images) = if paths.is_empty() {
@@ -3222,6 +3277,7 @@ async fn handle_from_client(
             send_latency::after_prompt_lock(waiting);
             anyhow::ensure!(app.hub.has_thread(&session), "スレッドが見つからない");
             if let Some(job) = job {
+                anyhow::ensure!(!escalating, "Send escalation requests to the front desk");
                 let event = ServerEvent::UserPrompt {
                     session: session.clone(), item: format!("{job}:{}", user_item()), text, paths, to_worker: true,
                 };
@@ -3242,23 +3298,43 @@ async fn handle_from_client(
             let settings = app.partner_turn_settings(&session);
             let work = app.admit_work();
             let intake_turn = app.issue_threads.intake_turn(&session);
-            if !intake_turn && work.is_ok() && app.hub.compaction(&session).is_none() && AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex {
-                if app.hub.thread_running(&session) {
-                    let thread = app.session_records.lock().unwrap().get(&session)
-                        .and_then(|record| record.codex_thread_id.clone()).context("Codex のスレッドが見つからない")?;
-                    let codex = app.running_codex().await.context("Codex が停止した")?;
-                    let prompt = app.partner_input(&session, prompt).await?;
-                    codex.steer_with_images(&thread, &prompt, &images).await?;
-                    app.hub.set_github_auth_request(&session,
-                        github_auth_request(TurnKind::UserConversation, "", user_event.as_ref()));
-                    app.hub.mark_user_steer(&session);
-                    let event = user_event.unwrap();
-                    send_latency::expect_echo(&event, "codex_steer");
-                    app.hub.publish(event);
-                    return Ok(());
+            if escalating {
+                let result = async {
+                    anyhow::ensure!(!prompt.trim().is_empty(), "Use /escalate followed by a message");
+                    anyhow::ensure!(!intake_turn && !app.hub.thread_active(&session) && !has_held_prompt(app, &session)?,
+                        "Wait for the current turn and queued messages to finish");
+                    let _work = work?;
+                    let selection = app.escalation_model(&session).await?;
+                    let settings = fuzukue_proto::ChatSettings { permission_mode: settings.permission_mode, ..selection.chat_settings() };
+                    match selection.backend {
+                        AgentBackend::Codex => prompt_codex_with_images(app, session.clone(), settings, prompt, user_event, images, TurnKind::Escalated, None).await,
+                        AgentBackend::Claude => prompt_claude_turn(app, &session, prompt, user_event, images, TurnKind::Escalated, None, Some(settings)).await.map(|_| ()),
+                    }
+                }.await;
+                if let Err(error) = result {
+                    commands::escalation_unavailable(&app.hub, &session, format!("{error:#}"));
                 }
+                return Ok(());
             }
-            if intake_turn || work.is_err() || app.hub.compaction(&session).is_some() || has_held_prompt(app, &session)? {
+            let wants_codex = AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex;
+            let running = app.hub.thread_running(&session);
+            let prior_codex = app.session_records.lock().unwrap().get(&session).is_some_and(|record| record.last_partner_codex);
+            if !intake_turn && work.is_ok() && running && prior_codex && wants_codex && app.hub.compaction(&session).is_none() {
+                let thread = app.session_records.lock().unwrap().get(&session)
+                    .and_then(|record| record.codex_thread_id.clone()).context("Codex のスレッドが見つからない")?;
+                let codex = app.running_codex().await.context("Codex が停止した")?;
+                let prompt = app.partner_input(&session, prompt).await?;
+                codex.steer_with_images(&thread, &prompt, &images).await?;
+                app.hub.set_github_auth_request(&session,
+                    github_auth_request(TurnKind::UserConversation, "", user_event.as_ref()));
+                app.hub.mark_user_steer(&session);
+                let event = user_event.unwrap();
+                send_latency::expect_echo(&event, "codex_steer");
+                app.hub.publish(event);
+                return Ok(());
+            }
+            let switching = running && prior_codex != wants_codex;
+            if switching || intake_turn || work.is_err() || app.hub.compaction(&session).is_some() || has_held_prompt(app, &session)? {
                 let (item, text, paths) = match user_event.as_ref().unwrap() {
                     ServerEvent::UserPrompt { item, text, paths, .. } => (item, text, paths.clone()),
                     ServerEvent::TextDelta { item, text, .. } => (item, text, Vec::new()),

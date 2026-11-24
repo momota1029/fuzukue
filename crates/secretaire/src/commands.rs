@@ -33,6 +33,14 @@ pub(crate) fn parse(text: &str) -> Input<'_> {
     }
 }
 
+pub(crate) fn is_escalation(text: &str) -> bool {
+    matches!(parse(text), Input::Command { name: "escalate", .. })
+}
+
+pub(crate) fn escalation_unavailable(hub: &crate::hub::Hub, session: &str, detail: String) {
+    notice(hub, session, LocalizedMessage::new("command-escalation-unavailable", [("detail", detail)]));
+}
+
 pub(crate) fn notice(hub: &crate::hub::Hub, session: &str, message: LocalizedMessage) {
     notice_with_id(hub, session, crate::mail::session_key(), message);
 }
@@ -160,7 +168,7 @@ async fn execute(app: &Arc<Workspace>, session: &str, spec: Spec, args: &str) ->
     if spec.command == Compact {
         return request_compaction(app, session, args).await;
     }
-    if app.hub.thread_running(session) {
+    if app.hub.thread_running(session) && !matches!(spec.command, Model | Effort) {
         return Ok(message("command-busy"));
     }
     if invalid_arguments {
@@ -187,6 +195,7 @@ async fn execute(app: &Arc<Workspace>, session: &str, spec: Spec, args: &str) ->
                 .edit_threads(|store| store.set_pinned(session, true))?;
             message("command-pinned")
         }
+        Escalate => usage(spec),
         Model | Effort => {
             let mut settings = app.chat_settings(session);
             if !args.is_empty() {

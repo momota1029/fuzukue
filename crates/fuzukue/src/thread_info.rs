@@ -454,20 +454,9 @@ impl Workbench {
         } else {
             chat.codex_thread_id.clone()
         };
-        let (model, effort, connected, mcp_tools) = match if has_claude { claude } else { codex } {
-            Some(ServerEvent::SessionStats {
-                model,
-                effort,
-                connected,
-                mcp_tools,
-                ..
-            }) => (
-                Some(model.as_str()).filter(|model| !model.is_empty()),
-                effort.as_deref(),
-                *connected,
-                mcp_tools.as_deref(),
-            ),
-            _ => (None, None, None, None),
+        let (connected, mcp_tools) = match if has_claude { claude } else { codex } {
+            Some(ServerEvent::SessionStats { connected, mcp_tools, .. }) => (*connected, mcp_tools.as_deref()),
+            _ => (None, None),
         };
         let mcp_tools = mcp_tools.or_else(|| {
             self.chat_capabilities
@@ -476,8 +465,7 @@ impl Workbench {
         });
         let heading = |text: &'static str| div().font_bold().child(text);
         let muted = |text: String| status_row(&text, theme.muted_foreground).text_color(theme.muted_foreground);
-        let model = chat.settings.model.as_deref().or(model)
-            .unwrap_or(tr!("thread-details-default-model"));
+        let model = chat.settings.model.as_deref().unwrap_or(tr!("thread-details-default-model"));
         let mut partner = v_flex().gap_1().child(heading(tr!("thread-details-partner")))
             .child(status_row(&tr!("thread-details-advisor-model", model = model), theme.muted_foreground))
             .child(h_flex().gap_2().children(self.chat_model_menu(cx)).children(self.chat_effort_menu(cx)));
@@ -494,7 +482,7 @@ impl Workbench {
         } else {
             tr!("thread-details-not-started")
         };
-        let reasoning = effort.or(chat.settings.effort.as_deref());
+        let reasoning = chat.settings.effort.as_deref();
         partner = partner.child(muted(tr!("thread-details-reasoning-effort",
             effort = reasoning.map(|effort| crate::chat::effort_label(Some(effort)))
                 .unwrap_or(tr!("thread-details-default"))

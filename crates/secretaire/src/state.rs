@@ -183,6 +183,54 @@ mod tests {
     }
 }
 
+#[derive(Default, Deserialize)]
+struct ModelConfig {
+    #[serde(default)]
+    models: ModelDefaults,
+}
+
+#[derive(Default, Deserialize)]
+struct ModelDefaults {
+    front_desk: Option<fuzukue_proto::ChatSettings>,
+    worker: Option<fuzukue_proto::DelegateSettings>,
+}
+
+pub(crate) fn model_defaults(dir: &Path) -> anyhow::Result<(fuzukue_proto::ChatSettings, fuzukue_proto::DelegateSettings, bool)> {
+    use anyhow::Context;
+
+    fn optional(path: &Path) -> anyhow::Result<Option<String>> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    fn config(path: &Path) -> anyhow::Result<ModelDefaults> {
+        optional(path)?.map(|text| {
+            toml::from_str::<ModelConfig>(&text).map(|file| file.models)
+                .with_context(|| format!("read model defaults in {}", path.display()))
+        }).transpose().map(Option::unwrap_or_default)
+    }
+
+    let global = {
+        #[cfg(not(test))]
+        { config_dir().map(|path| config(&path.join("fuzukue.toml"))).transpose()?.unwrap_or_default() }
+        #[cfg(test)]
+        { ModelDefaults::default() }
+    };
+    let workspace = config(&dir.join("fuzukue.toml"))?;
+    let partner = optional(&dir.join("partner-default.json"))?
+        .map(|text| serde_json::from_str(&text)).transpose().context("read partner-default.json")?;
+    let worker = optional(&dir.join("delegate-settings.json"))?
+        .map(|text| serde_json::from_str(&text)).transpose().context("read delegate-settings.json")?;
+    let mut partner = partner.or(workspace.front_desk).or(global.front_desk).unwrap_or_default();
+    partner.permission_mode = Default::default();
+    let worker = worker.or(workspace.worker).or(global.worker);
+    let worker_configured = worker.is_some();
+    Ok((partner, worker.unwrap_or_default(), worker_configured))
+}
+
 pub fn load_delegate_settings(dir: &Path) -> fuzukue_proto::DelegateSettings {
     std::fs::read(dir.join("delegate-settings.json")).ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()

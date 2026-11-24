@@ -2578,7 +2578,15 @@ impl Workbench {
                             .children(row_actions),
                     ).children(group_actions)
                 } else {
+                    let escalation = match &row.content {
+                        Content::Message(message) => message.details.as_ref().filter(|details| details.escalated),
+                        _ => None,
+                    };
                     row_el.child(body.id(SharedString::from(format!("chat-message-bubble-{ix}"))))
+                        .children(escalation.map(|details| {
+                            div().text_xs().text_color(theme.muted_foreground).child(tr!("chat-escalated-reply",
+                                model = details.selection.model.as_deref().unwrap_or_else(|| details.selection.backend.label()).to_owned()))
+                        }))
                         .children(actions_below)
                 };
                 Some(list_row
@@ -3913,11 +3921,22 @@ impl Workbench {
     }
 
     pub(super) fn send_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_prompt_with_escalation(false, window, cx);
+    }
+
+    fn send_prompt_with_escalation(&mut self, escalate: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.threads_loaded || composing(&self.input, window, cx) {
             return;
         }
-        let text = self.input.read(cx).value().to_string();
-        if self.protocol >= fuzukue_proto::SLASH_COMMAND_PROTOCOL && fuzukue_proto::slash::is_command(&text) {
+        let mut text = self.input.read(cx).value().to_string();
+        let command = text.strip_prefix('/').and_then(|body| body.split_whitespace().next());
+        let escalation = command == Some("escalate") && self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL;
+        if escalate {
+            if text.trim().is_empty() || fuzukue_proto::slash::is_command(&text) {
+                return;
+            }
+            text = format!("/escalate {text}");
+        } else if self.protocol >= fuzukue_proto::SLASH_COMMAND_PROTOCOL && fuzukue_proto::slash::is_command(&text) && !escalation {
             if self.out.send(ClientMsg::Prompt { session: self.active.clone(), text }).is_ok() {
                 self.input.update(cx, |input, cx| input.clean(window, cx));
                 self.record_composer_text(cx);
@@ -3941,7 +3960,7 @@ impl Workbench {
         if paths.is_empty() && text.trim().is_empty() {
             return;
         }
-        let msg = if let Some(job) = chat.worker_target.clone().filter(|_| self.protocol >= 14) {
+        let msg = if let Some(job) = chat.worker_target.clone().filter(|_| self.protocol >= 14 && !escalate && !escalation) {
             ClientMsg::WorkerPrompt { session, job, text, paths }
         } else if worker_running && (12..14).contains(&self.protocol) {
             ClientMsg::RolePrompt { session, text, paths, to_worker: !chat.delegate_to_partner }
@@ -4261,6 +4280,14 @@ impl Workbench {
                             }),
                     )
                     .child(input)
+                    .children((self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL && !turn_running
+                        && chat.worker_target.is_none() && !text.trim().is_empty()
+                        && !fuzukue_proto::slash::is_command(&text) && can_send).then(|| {
+                        Button::new("send-escalated-prompt").ghost().small().flex_none()
+                            .label(tr!("chat-escalate-action")).tooltip(tr!("chat-send-escalated"))
+                            .accessibility_label(tr!("chat-send-escalated"))
+                            .on_click(cx.listener(|this, _, window, cx| this.send_prompt_with_escalation(true, window, cx)))
+                    }))
                     .child(
                         h_flex().flex_none().ml_1().w(COMPOSER_ACTION_SIZE)
                             .child(action.w(COMPOSER_ACTION_SIZE)
@@ -4359,7 +4386,8 @@ impl Workbench {
         let chat = &self.chats[&self.active];
         self.role_model_menu(
             RoleSettings::PartnerThread(self.active.clone()), chat.settings.clone(),
-            self.thread_working(&self.active) || self.thread_usage_paused(&self.active), cx,
+            self.protocol < fuzukue_proto::LIVE_MODELS_PROTOCOL
+                && (self.thread_working(&self.active) || self.thread_usage_paused(&self.active)), cx,
         )
     }
 
@@ -4378,7 +4406,7 @@ impl Workbench {
         let codex = self.codex_models.clone();
         let claude = self.chat_capabilities.as_ref().map(|cap| cap.effort_levels.clone()).unwrap_or_default();
         let (claude_available, codex_available) = self.model_backends();
-        let cli_default = !matches!(target, AgentTarget::WorkerDefault);
+        let cli_default = !matches!(target, AgentTarget::WorkerDefault | AgentTarget::Role(fuzukue_proto::AgentModelRole::Escalation));
         let codex_cli_default = cli_default && !matches!(target, AgentTarget::PartnerDefault | AgentTarget::Setup);
         let model = current.model.as_deref().map_or(tr!("chat-cli-default"), |model| {
             codex.iter().find(|entry| entry.slug == model).map_or_else(|| model_label(model), |entry| &entry.label)
@@ -4503,7 +4531,8 @@ impl Workbench {
         let target = RoleSettings::PartnerThread(self.active.clone());
         Some(
             composer_picker("effort-picker", effort_label(settings.effort.as_deref()).to_owned(), cx)
-                .disabled(levels.is_empty() || self.thread_working(&self.active) || self.thread_usage_paused(&self.active))
+                .disabled(levels.is_empty() || self.protocol < fuzukue_proto::LIVE_MODELS_PROTOCOL
+                    && (self.thread_working(&self.active) || self.thread_usage_paused(&self.active)))
                 .tooltip(tr!("chat-reasoning-effort-applies-next-turn"))
                 .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
                     role_effort_items(menu, &levels, &settings, &target, &entity)
@@ -4638,6 +4667,7 @@ impl Workbench {
                 .child(status_row(&label, cx.theme().muted_foreground).truncate()).dropdown_caret(true)
         };
         let entity = cx.weak_entity();
+        let can_inherit = self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL;
         Some(
             button
                 .disabled(disabled)
@@ -4688,6 +4718,17 @@ impl Workbench {
                     }
                     if !composer && !effort_levels.is_empty() {
                         menu = role_effort_items(menu.separator(), &effort_levels, &settings, &target, &entity);
+                    }
+                    if let RoleSettings::PartnerThread(session) = &target {
+                        if can_inherit {
+                            let (entity, session) = (entity.clone(), session.clone());
+                            menu = menu.separator().item(PopupMenuItem::new(tr!("chat-use-workspace-model"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = entity.update(cx, |this, _| {
+                                        let _ = this.out.send(ClientMsg::UseDefaultThreadModel { session: session.clone() });
+                                    });
+                                }));
+                        }
                     }
                     menu
                 })

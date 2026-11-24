@@ -118,6 +118,8 @@ fn model_entry(entry: &Value) -> Option<CodexModel> {
         label: entry["displayName"].as_str().or_else(|| entry["display_name"].as_str())
             .unwrap_or(slug).into(),
         effort_levels,
+        default_effort: entry["defaultReasoningEffort"].as_str()
+            .or_else(|| entry["default_reasoning_level"].as_str()).map(str::to_owned),
     })
 }
 
