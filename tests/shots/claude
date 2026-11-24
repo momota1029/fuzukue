@@ -70,14 +70,15 @@ while line := (queued or sys.stdin.readline()):
         continue
     content = request["message"]["content"]
     prompt = json.dumps(content, ensure_ascii=False)
-    if "xml-components fixture" in prompt:
+    if "xml-components fixture" in prompt or "ui-kit fixture" in prompt:
         fixtures = Path(__file__).resolve().parent
-        file = fixtures / "xml-components.md"
+        name = "ui-kit" if "ui-kit fixture" in prompt else "xml-components"
+        file = fixtures / f"{name}.md"
         if not file.is_file():
-            file = fixtures / "fixtures/xml-components.md"
+            file = fixtures / "fixtures" / f"{name}.md"
         answer = file.read_text(encoding="utf-8")
-        message_id = f"xml-components-{number}"
-        split = answer.index("</callout>") + len("</callout>\n~~")
+        message_id = f"{name}-{number}"
+        split = answer.index("\n~~~\n", answer.index("~~~fuzukue-v1")) + len("\n~~")
         emit("stream_event", event={"type": "message_start", "message": {"id": message_id}})
         for text in (answer[:split], answer[split:]):
             emit("stream_event", event={"type": "content_block_delta", "index": 0,

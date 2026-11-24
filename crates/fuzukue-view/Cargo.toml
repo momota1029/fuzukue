@@ -9,7 +9,7 @@ fuzukue-proto = { path = "../fuzukue-proto" }
 markdown = "1.0.0"
 percent-encoding = "2"
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 shlex = "2"
 toml = "0.8"
 url = "2"

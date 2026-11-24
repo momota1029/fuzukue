@@ -26,6 +26,22 @@ class MarkdownComponentsTest {
     }
 
     @Test
+    fun namespacedNestedComponentsRemainOneReadableCodeBlock() {
+        val xml = """
+            <fuzukue:card xmlns:fuzukue="urn:fuzukue:ui:v1" title="Proof status">
+              <fuzukue:grid columns="2">
+                <fuzukue:stat label="Reviewed" value="10"/>
+                <fuzukue:stat label="Open" value="3"/>
+              </fuzukue:grid>
+              <fuzukue:text>Press <fuzukue:kbd>Enter</fuzukue:kbd>.</fuzukue:text>
+            </fuzukue:card>
+        """.trimIndent()
+        val expected = listOf(Block(xml, BlockStyle.Code))
+        assertEquals(expected, markdownBlocks("~~~fuzukue-v1\n$xml"))
+        assertEquals(expected, markdownBlocks("~~~fuzukue-v1\n$xml\n~~~\n"))
+    }
+
+    @Test
     fun unknownVersionsAndPartialComponentsStayLiteral() {
         val xml = """<future href="javascript:example()"><script>""" + "\n" + "x".repeat(20_000)
         for (marker in listOf("fuzukue-v1", "fuzukue-v42")) {

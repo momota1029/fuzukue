@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1000},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "dark"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread", "deck": "research/concentration"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "ui-kit fixture"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_idle"},
+    {"action": "wait_element", "id": "xml-component-card-130"},
+    {"action": "wait_element", "id": "xml-component-grid-130-0"},
+    {"action": "wait_element", "id": "xml-component-stat-130-0-1"},
+    {"action": "wait_element", "id": "xml-component-progress-130-1"},
+    {"action": "wait_element", "id": "xml-component-divider-130-2"},
+    {"action": "wait_element", "id": "xml-component-list-130-4"},
+    {"action": "assert_order", "above": "xml-component-progress-130-1", "below": "xml-component-divider-130-2"},
+    {"action": "assert_order", "above": "xml-component-divider-130-2", "below": "xml-component-list-130-4"},
+    {"action": "screenshot", "name": "ui-kit-dark"},
+    {"action": "theme", "theme": "light"},
+    {"action": "screenshot", "name": "ui-kit-light"}
+  ]
+}

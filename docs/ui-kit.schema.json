@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fuzukue UI tree v1",
+  "description": "One component. Clients also validate the 8-level depth, 256 total components, UTF-8 byte limits (including 16 KiB total), control characters, table shape, checklist fields, progress sums, and project-relative finding paths.",
+  "$ref": "#/$defs/component",
+  "$defs": {
+    "label": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\r\\n\\t]*\\S[^\\r\\n\\t]*$", "description": "A nonblank single line, at most 512 UTF-8 bytes."},
+    "tone": {"enum": ["info", "success", "warn", "error", "accent", "muted"]},
+    "span": {
+      "oneOf": [
+        {"$ref": "#/$defs/plain"},
+        {"$ref": "#/$defs/code"},
+        {"$ref": "#/$defs/kbd"},
+        {"$ref": "#/$defs/badge"}
+      ]
+    },
+    "plain": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "plain"},
+        "text": {"type": "string", "minLength": 0, "maxLength": 2048}
+      }
+    },
+    "code": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "code"},
+        "text": {"$ref": "#/$defs/label"}
+      }
+    },
+    "kbd": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "kbd"},
+        "text": {"$ref": "#/$defs/label"}
+      }
+    },
+    "badge": {
+      "type": "object",
+      "required": ["type", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "badge"},
+        "text": {"$ref": "#/$defs/label"},
+        "tone": {"anyOf": [{"$ref": "#/$defs/tone"}, {"type": "null"}]}
+      }
+    },
+    "listItem": {
+      "type": "object",
+      "required": ["body"],
+      "additionalProperties": false,
+      "properties": {
+        "checked": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+        "body": {"type": "array", "items": {"$ref": "#/$defs/component"}, "minItems": 1, "maxItems": 24}
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["title"],
+      "additionalProperties": false,
+      "properties": {
+        "title": {"$ref": "#/$defs/label"},
+        "status": {"enum": ["pending", "current", "done"], "default": "pending"},
+        "body": {"type": "array", "items": {"$ref": "#/$defs/component"}, "minItems": 0, "maxItems": 24}
+      }
+    },
+    "segment": {
+      "type": "object",
+      "required": ["value", "tone"],
+      "additionalProperties": false,
+      "properties": {
+        "value": {"type": "number", "exclusiveMinimum": 0},
+        "tone": {"$ref": "#/$defs/tone"}
+      }
+    },
+    "component": {
+      "oneOf": [
+        {"$ref": "#/$defs/card"},
+        {"$ref": "#/$defs/grid"},
+        {"$ref": "#/$defs/stat"},
+        {"$ref": "#/$defs/progress"},
+        {"$ref": "#/$defs/text"},
+        {"$ref": "#/$defs/list"},
+        {"$ref": "#/$defs/steps"},
+        {"$ref": "#/$defs/details"},
+        {"$ref": "#/$defs/divider"},
+        {"$ref": "#/$defs/callout"},
+        {"$ref": "#/$defs/table"},
+        {"$ref": "#/$defs/finding"}
+      ]
+    },
+    "card": {
+      "type": "object",
+      "required": ["type", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "card"},
+        "title": {"$ref": "#/$defs/label"},
+        "tone": {"anyOf": [{"$ref": "#/$defs/tone"}, {"type": "null"}]},
+        "body": {"type": "array", "items": {"$ref": "#/$defs/component"}, "minItems": 0, "maxItems": 24}
+      }
+    },
+    "grid": {
+      "type": "object",
+      "required": ["type", "columns", "items"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "grid"},
+        "columns": {"type": "integer", "minimum": 1, "maximum": 4},
+        "items": {"type": "array", "items": {"$ref": "#/$defs/component"}, "minItems": 1, "maxItems": 24}
+      }
+    },
+    "stat": {
+      "type": "object",
+      "required": ["type", "label", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "stat"},
+        "label": {"$ref": "#/$defs/label"},
+        "value": {"$ref": "#/$defs/label"},
+        "unit": {"anyOf": [{"$ref": "#/$defs/label"}, {"type": "null"}]},
+        "tone": {"anyOf": [{"$ref": "#/$defs/tone"}, {"type": "null"}]},
+        "hint": {"anyOf": [{"$ref": "#/$defs/label"}, {"type": "null"}]}
+      }
+    },
+    "progress": {
+      "type": "object",
+      "required": ["type", "value", "max"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "progress"},
+        "value": {"type": "number", "minimum": 0},
+        "max": {"type": "number", "exclusiveMinimum": 0},
+        "label": {"anyOf": [{"$ref": "#/$defs/label"}, {"type": "null"}]},
+        "caption": {"anyOf": [{"$ref": "#/$defs/label"}, {"type": "null"}]},
+        "tone": {"anyOf": [{"$ref": "#/$defs/tone"}, {"type": "null"}]},
+        "segments": {"type": "array", "items": {"$ref": "#/$defs/segment"}, "minItems": 0, "maxItems": 24}
+      }
+    },
+    "text": {
+      "type": "object",
+      "required": ["type", "spans"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "text"},
+        "kind": {"enum": ["body", "heading"], "default": "body"},
+        "spans": {"type": "array", "items": {"$ref": "#/$defs/span"}, "minItems": 1, "maxItems": 24}
+      }
+    },
+    "list": {
+      "type": "object",
+      "required": ["type", "items"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "list"},
+        "kind": {"enum": ["unordered", "ordered", "checklist"], "default": "unordered"},
+        "items": {"type": "array", "items": {"$ref": "#/$defs/listItem"}, "minItems": 1, "maxItems": 24}
+      }
+    },
+    "steps": {
+      "type": "object",
+      "required": ["type", "steps"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "steps"},
+        "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}, "minItems": 1, "maxItems": 24}
+      }
+    },
+    "details": {
+      "type": "object",
+      "required": ["type", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "details"},
+        "title": {"$ref": "#/$defs/label"},
+        "open": {"type": "boolean", "default": false},
+        "body": {"type": "array", "items": {"$ref": "#/$defs/component"}, "minItems": 0, "maxItems": 24}
+      }
+    },
+    "divider": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "divider"}
+      }
+    },
+    "callout": {
+      "type": "object",
+      "required": ["type", "severity", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "callout"},
+        "severity": {"enum": ["info", "warn", "error"]},
+        "title": {"$ref": "#/$defs/label"},
+        "body": {"type": "array", "items": {"$ref": "#/$defs/component"}, "minItems": 0, "maxItems": 24}
+      }
+    },
+    "table": {
+      "type": "object",
+      "required": ["type", "rows"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "table"},
+        "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string", "minLength": 0, "maxLength": 512}, "minItems": 1, "maxItems": 6}, "minItems": 1, "maxItems": 24}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["type", "deck", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "finding"},
+        "deck": {"type": "string", "minLength": 1, "maxLength": 512},
+        "id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
+      }
+    }
+  }
+}

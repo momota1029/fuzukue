@@ -1,45 +1,40 @@
-//! Read-only XML component vocabulary for Markdown chat messages.
+//! Fenced XML transport for the canonical UI tree.
 
+use crate::ui_kit::{
+    self, Component, ListItem, ListKind, Segment, Severity, Span, Step, StepStatus, TextKind, Tone,
+    MAX_CELLS, MAX_CHILDREN, MAX_DEPTH, MAX_LABEL, MAX_ROWS, MAX_TEXT,
+};
 use fuzukue_proto::MarkdownComponentCapability;
 use markdown::mdast::Node;
 
 const FENCE_LANGUAGE: &str = "fuzukue-v1";
-const VERSION: u32 = 1;
-const TAGS: &[&str] = &["callout", "table", "finding"];
+const NAMESPACE: &str = "urn:fuzukue:ui:v1";
+const PREFIX: &str = "fuzukue:";
+const TAGS: &[&str] = &[
+    "callout",
+    "table",
+    "finding",
+    "card",
+    "grid",
+    "stat",
+    "progress",
+    "text",
+    "badge",
+    "list",
+    "steps",
+    "details",
+    "accordion",
+    "divider",
+    "kbd",
+    "code",
+];
 const MAX_BLOCK: usize = 16 * 1024;
-const MAX_ATTRIBUTE: usize = 512;
-const MAX_BODY: usize = 2048;
-const MAX_ROWS: usize = 24;
-const MAX_COLUMNS: usize = 6;
-const MAX_CELL: usize = 512;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Severity {
-    Info,
-    Warn,
-    Error,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Component {
-    Callout {
-        severity: Severity,
-        title: String,
-        body: String,
-    },
-    /// The first row contains column headings.
-    Table(Vec<Vec<String>>),
-    Finding {
-        deck: String,
-        id: String,
-    },
-}
 
 pub fn capabilities() -> Vec<MarkdownComponentCapability> {
     TAGS.iter()
         .map(|&tag| MarkdownComponentCapability {
             tag: tag.into(),
-            version: VERSION,
+            version: 1,
         })
         .collect()
 }
@@ -77,72 +72,58 @@ fn parse_component(source: &str) -> Option<Component> {
     let mut xml = Xml {
         rest: source.trim(),
     };
-    let (tag, attrs, empty) = xml.open()?;
-    let component = match (tag, empty) {
-        ("callout", false) if attrs.len() == 2 => {
-            let severity = match attribute(&attrs, "severity")? {
-                "info" => Severity::Info,
-                "warn" => Severity::Warn,
-                "error" => Severity::Error,
-                _ => return None,
-            };
-            let title = attribute(&attrs, "title")?.trim();
-            if title.is_empty() || title.contains(['\n', '\r', '\t']) {
-                return None;
-            }
-            let body = xml.text(MAX_BODY)?.trim().to_owned();
-            xml.close("callout")?;
-            Component::Callout {
-                severity,
-                title: title.to_owned(),
-                body,
-            }
+    let mut root = xml.open()?;
+    if let Some(index) = root
+        .attrs
+        .iter()
+        .position(|(key, _)| *key == "xmlns:fuzukue")
+    {
+        if !root.name.starts_with(PREFIX) || root.attrs.remove(index).1 != NAMESPACE {
+            return None;
         }
-        ("table", false) if attrs.is_empty() => Component::Table(xml.table()?),
-        ("finding", true) if attrs.len() == 2 => {
-            let deck = attribute(&attrs, "deck")?;
-            let id = attribute(&attrs, "id")?;
-            if !valid_deck(deck) || !valid_finding_id(id) {
-                return None;
-            }
-            Component::Finding {
-                deck: deck.into(),
-                id: id.into(),
-            }
-        }
-        _ => return None,
-    };
+    }
+    let component = xml.component(root, 1)?;
+    component.validate().ok()?;
     xml.rest.trim().is_empty().then_some(component)
 }
 
-fn attribute<'a>(attrs: &'a [(&str, String)], key: &str) -> Option<&'a str> {
-    attrs
-        .iter()
-        .find(|(name, _)| *name == key)
-        .map(|(_, value)| value.as_str())
+struct Tag<'a> {
+    name: &'a str,
+    attrs: Vec<(&'a str, String)>,
+    empty: bool,
 }
 
-fn valid_deck(deck: &str) -> bool {
-    deck == "."
-        || deck.split('/').all(|segment| {
-            !segment.is_empty()
-                && !matches!(segment, "." | "..")
-                && !segment.trim().is_empty()
-                && segment.chars().all(|ch| {
-                    !matches!(
-                        ch,
-                        ':' | '\\' | '%' | '?' | '#' | '<' | '>' | '\n' | '\r' | '\t'
-                    )
-                })
-        })
-}
+impl Tag<'_> {
+    fn allowed(&self, keys: &[&str]) -> Option<()> {
+        self.attrs
+            .iter()
+            .all(|(key, _)| keys.contains(key))
+            .then_some(())
+    }
 
-fn valid_finding_id(id: &str) -> bool {
-    id.len() == 36
-        && id.bytes().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
-        })
+    fn get(&self, key: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn local(&self) -> &str {
+        self.name.strip_prefix(PREFIX).unwrap_or(self.name)
+    }
+
+    fn tone(&self) -> Option<Option<Tone>> {
+        match self.get("tone") {
+            None => Some(None),
+            Some("info") => Some(Some(Tone::Info)),
+            Some("success") => Some(Some(Tone::Success)),
+            Some("warn") => Some(Some(Tone::Warn)),
+            Some("error") => Some(Some(Tone::Error)),
+            Some("accent") => Some(Some(Tone::Accent)),
+            Some("muted") => Some(Some(Tone::Muted)),
+            _ => None,
+        }
+    }
 }
 
 struct Xml<'a> {
@@ -150,6 +131,275 @@ struct Xml<'a> {
 }
 
 impl<'a> Xml<'a> {
+    fn component(&mut self, tag: Tag<'_>, depth: usize) -> Option<Component> {
+        if depth > MAX_DEPTH
+            || (!tag.name.starts_with(PREFIX)
+                && !matches!(tag.name, "callout" | "table" | "finding"))
+        {
+            return None;
+        }
+        Some(match tag.local() {
+            "card" => {
+                tag.allowed(&["title", "tone"])?;
+                Component::Card {
+                    title: tag.get("title")?.into(),
+                    tone: tag.tone()?,
+                    body: self.body(&tag, depth + 1)?,
+                }
+            }
+            "grid" => {
+                tag.allowed(&["columns"])?;
+                Component::Grid {
+                    columns: tag.get("columns")?.parse().ok()?,
+                    items: self.body(&tag, depth + 1)?,
+                }
+            }
+            "stat" if tag.empty => {
+                tag.allowed(&["label", "value", "unit", "tone", "hint"])?;
+                Component::Stat {
+                    label: tag.get("label")?.into(),
+                    value: tag.get("value")?.into(),
+                    unit: tag.get("unit").map(str::to_owned),
+                    tone: tag.tone()?,
+                    hint: tag.get("hint").map(str::to_owned),
+                }
+            }
+            "progress" => self.progress(&tag)?,
+            "text" => {
+                tag.allowed(&["style"])?;
+                let kind = match tag.get("style").unwrap_or("body") {
+                    "body" => TextKind::Body,
+                    "heading" => TextKind::Heading,
+                    _ => return None,
+                };
+                let mut body = self.flow(&tag, None)?;
+                let [Component::Text { kind: actual, .. }] = body.as_mut_slice() else {
+                    return None;
+                };
+                *actual = kind;
+                body.pop()?
+            }
+            "badge" | "kbd" | "code" => paragraph(vec![self.span(&tag)?]),
+            "list" => {
+                tag.allowed(&["kind"])?;
+                let kind = match tag.get("kind").unwrap_or("unordered") {
+                    "unordered" => ListKind::Unordered,
+                    "ordered" => ListKind::Ordered,
+                    "checklist" => ListKind::Checklist,
+                    _ => return None,
+                };
+                let items = self.members(&tag, MAX_CHILDREN, |xml, item| {
+                    if item.name != "fuzukue:item" {
+                        return None;
+                    }
+                    item.allowed(&["checked"])?;
+                    let checked = item.get("checked").map(str::parse).transpose().ok()?;
+                    Some(ListItem {
+                        checked,
+                        body: xml.body(&item, depth + 1)?,
+                    })
+                })?;
+                Component::List { kind, items }
+            }
+            "steps" => {
+                tag.allowed(&[])?;
+                let steps = self.members(&tag, MAX_CHILDREN, |xml, step| {
+                    if step.name != "fuzukue:step" {
+                        return None;
+                    }
+                    step.allowed(&["title", "status"])?;
+                    let status = match step.get("status").unwrap_or("pending") {
+                        "pending" => StepStatus::Pending,
+                        "current" => StepStatus::Current,
+                        "done" => StepStatus::Done,
+                        _ => return None,
+                    };
+                    Some(Step {
+                        title: step.get("title")?.into(),
+                        status,
+                        body: xml.body(&step, depth + 1)?,
+                    })
+                })?;
+                Component::Steps { steps }
+            }
+            "details" | "accordion" => {
+                tag.allowed(&["title", "open"])?;
+                Component::Details {
+                    title: tag.get("title")?.into(),
+                    open: tag.get("open").unwrap_or("false").parse().ok()?,
+                    body: self.body(&tag, depth + 1)?,
+                }
+            }
+            "divider" if tag.empty => {
+                tag.allowed(&[])?;
+                Component::Divider
+            }
+            "callout" if !tag.empty => {
+                tag.allowed(&["severity", "title"])?;
+                let severity = match tag.get("severity")? {
+                    "info" => Severity::Info,
+                    "warn" => Severity::Warn,
+                    "error" => Severity::Error,
+                    _ => return None,
+                };
+                let body = if tag.name == "callout" {
+                    let text = self.text(MAX_TEXT)?.trim().to_owned();
+                    self.close(tag.name)?;
+                    (!text.is_empty())
+                        .then(|| paragraph(vec![Span::Plain { text }]))
+                        .into_iter()
+                        .collect()
+                } else {
+                    self.body(&tag, depth + 1)?
+                };
+                Component::Callout {
+                    severity,
+                    title: tag.get("title")?.trim().into(),
+                    body,
+                }
+            }
+            "table" => Component::Table {
+                rows: self.table(&tag)?,
+            },
+            "finding" if tag.empty => {
+                tag.allowed(&["deck", "id"])?;
+                Component::Finding {
+                    deck: tag.get("deck")?.into(),
+                    id: tag.get("id")?.into(),
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    fn progress(&mut self, tag: &Tag<'_>) -> Option<Component> {
+        tag.allowed(&["value", "max", "percent", "label", "caption", "tone"])?;
+        let (value, max) = match (tag.get("percent"), tag.get("value"), tag.get("max")) {
+            (Some(percent), None, None) => (percent.parse().ok()?, 100.0),
+            (None, Some(value), Some(max)) => (value.parse().ok()?, max.parse().ok()?),
+            _ => return None,
+        };
+        let segments = self.members(tag, MAX_CHILDREN, |_, segment| {
+            if segment.name != "fuzukue:segment" || !segment.empty {
+                return None;
+            }
+            segment.allowed(&["value", "tone"])?;
+            Some(Segment {
+                value: segment.get("value")?.parse().ok()?,
+                tone: segment.tone()??,
+            })
+        })?;
+        Some(Component::Progress {
+            value,
+            max,
+            label: tag.get("label").map(str::to_owned),
+            caption: tag.get("caption").map(str::to_owned),
+            tone: tag.tone()?,
+            segments,
+        })
+    }
+
+    fn span(&mut self, tag: &Tag<'_>) -> Option<Span> {
+        if tag.empty {
+            return None;
+        }
+        let text = self.text(MAX_LABEL)?;
+        self.close(tag.name)?;
+        Some(match tag.name {
+            "fuzukue:badge" => {
+                tag.allowed(&["tone"])?;
+                Span::Badge {
+                    text,
+                    tone: tag.tone()?,
+                }
+            }
+            "fuzukue:kbd" => {
+                tag.allowed(&[])?;
+                Span::Kbd { text }
+            }
+            "fuzukue:code" => {
+                tag.allowed(&[])?;
+                Span::Code { text }
+            }
+            _ => return None,
+        })
+    }
+
+    fn body(&mut self, tag: &Tag<'_>, depth: usize) -> Option<Vec<Component>> {
+        self.flow(tag, Some(depth))
+    }
+
+    // Collect phrasing content into a single text block between adjacent components.
+    fn flow(&mut self, tag: &Tag<'_>, depth: Option<usize>) -> Option<Vec<Component>> {
+        let mut body = Vec::new();
+        let mut spans = Vec::new();
+        if tag.empty {
+            return Some(body);
+        }
+        while !self.rest.starts_with("</") {
+            if self.rest.starts_with('<') {
+                let child = self.open()?;
+                if matches!(child.name, "fuzukue:badge" | "fuzukue:kbd" | "fuzukue:code") {
+                    spans.push(self.span(&child)?);
+                } else {
+                    flush_paragraph(&mut body, &mut spans);
+                    body.push(self.component(child, depth?)?);
+                }
+            } else {
+                spans.push(Span::Plain {
+                    text: self.text(MAX_TEXT)?,
+                });
+            }
+            if spans.len() > MAX_CHILDREN || body.len() > MAX_CHILDREN {
+                return None;
+            }
+        }
+        self.close(tag.name)?;
+        flush_paragraph(&mut body, &mut spans);
+        Some(body)
+    }
+
+    fn table(&mut self, tag: &Tag<'_>) -> Option<Vec<Vec<String>>> {
+        tag.allowed(&[])?;
+        self.members(tag, MAX_ROWS, |xml, row| {
+            if !matches!(row.name, "row" | "fuzukue:row") || row.empty {
+                return None;
+            }
+            row.allowed(&[])?;
+            xml.members(&row, MAX_CELLS, |xml, cell| {
+                if !matches!(cell.name, "cell" | "fuzukue:cell") || cell.empty {
+                    return None;
+                }
+                cell.allowed(&[])?;
+                let text = xml.text(MAX_LABEL)?;
+                xml.close(cell.name)?;
+                Some(text)
+            })
+        })
+    }
+
+    fn members<T>(
+        &mut self,
+        tag: &Tag<'_>,
+        limit: usize,
+        mut parse: impl FnMut(&mut Self, Tag<'a>) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        let mut members = Vec::new();
+        if !tag.empty {
+            self.whitespace();
+            while !self.rest.starts_with("</") {
+                if members.len() == limit {
+                    return None;
+                }
+                let member = self.open()?;
+                members.push(parse(self, member)?);
+                self.whitespace();
+            }
+            self.close(tag.name)?;
+        }
+        Some(members)
+    }
+
     fn take(&mut self, prefix: &str) -> Option<()> {
         self.rest = self.rest.strip_prefix(prefix)?;
         Some(())
@@ -163,27 +413,35 @@ impl<'a> Xml<'a> {
         let end = self
             .rest
             .bytes()
-            .take_while(|byte| byte.is_ascii_lowercase() || *byte == b'-')
+            .take_while(|byte| byte.is_ascii_lowercase() || matches!(*byte, b':' | b'-'))
             .count();
         let (name, rest) = self.rest.split_at(end);
         self.rest = rest;
         (!name.is_empty()).then_some(name)
     }
 
-    fn open(&mut self) -> Option<(&'a str, Vec<(&'a str, String)>, bool)> {
+    fn open(&mut self) -> Option<Tag<'a>> {
         self.take("<")?;
-        let tag = self.name()?;
+        let name = self.name()?;
         let mut attrs = Vec::new();
         loop {
             let before_space = self.rest.len();
             self.whitespace();
             if self.take("/>").is_some() {
-                return Some((tag, attrs, true));
+                return Some(Tag {
+                    name,
+                    attrs,
+                    empty: true,
+                });
             }
             if self.take(">").is_some() {
-                return Some((tag, attrs, false));
+                return Some(Tag {
+                    name,
+                    attrs,
+                    empty: false,
+                });
             }
-            if self.rest.len() == before_space || attrs.len() == 2 {
+            if self.rest.len() == before_space || attrs.len() == 6 {
                 return None;
             }
             let key = self.name()?;
@@ -199,14 +457,14 @@ impl<'a> Xml<'a> {
                 .next()
                 .filter(|ch| matches!(ch, '"' | '\''))?;
             let (value, rest) = self.rest[1..].split_once(quote)?;
-            attrs.push((key, decode(value, MAX_ATTRIBUTE)?));
+            attrs.push((key, decode(value, MAX_LABEL)?));
             self.rest = rest;
         }
     }
 
-    fn close(&mut self, tag: &str) -> Option<()> {
+    fn close(&mut self, name: &str) -> Option<()> {
         self.take("</")?;
-        if self.name()? != tag {
+        if self.name()? != name {
             return None;
         }
         self.whitespace();
@@ -219,48 +477,30 @@ impl<'a> Xml<'a> {
         self.rest = rest;
         decode(text, limit)
     }
+}
 
-    fn table(&mut self) -> Option<Vec<Vec<String>>> {
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        self.whitespace();
-        while self.take("<row>").is_some() {
-            if rows.len() == MAX_ROWS {
-                return None;
-            }
-            let mut cells = Vec::new();
-            self.whitespace();
-            while self.take("<cell>").is_some() {
-                if cells.len() == MAX_COLUMNS {
-                    return None;
-                }
-                cells.push(self.text(MAX_CELL)?);
-                self.close("cell")?;
-                self.whitespace();
-            }
-            self.close("row")?;
-            if cells.is_empty()
-                || rows
-                    .first()
-                    .is_some_and(|header| header.len() != cells.len())
-            {
-                return None;
-            }
-            rows.push(cells);
-            self.whitespace();
-        }
-        self.close("table")?;
-        (!rows.is_empty()).then_some(rows)
+fn paragraph(spans: Vec<Span>) -> Component {
+    Component::Text {
+        kind: TextKind::Body,
+        spans,
+    }
+}
+
+fn flush_paragraph(body: &mut Vec<Component>, spans: &mut Vec<Span>) {
+    if let Some(Span::Plain { text }) = spans.first_mut() {
+        *text = text.trim_start().to_owned();
+    }
+    if let Some(Span::Plain { text }) = spans.last_mut() {
+        text.truncate(text.trim_end().len());
+    }
+    spans.retain(|span| !span.text().is_empty());
+    if !spans.is_empty() {
+        body.push(paragraph(std::mem::take(spans)));
     }
 }
 
 fn decode(text: &str, limit: usize) -> Option<String> {
-    if text.len() > limit
-        || text.contains(['<', '\u{061c}', '\u{200e}', '\u{200f}'])
-        || text.chars().any(|ch| {
-            (ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
-                || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
-    {
+    if text.len() > limit || text.contains('<') || !ui_kit::safe_text(text) {
         return None;
     }
     let mut parts = text.split('&');
@@ -314,12 +554,16 @@ mod tests {
             Component::Callout {
                 severity: Severity::Warn,
                 title: "照合 & 確認".into(),
-                body: "Literal **Markdown** and <b>.".into(),
+                body: vec![paragraph(vec![Span::Plain {
+                    text: "Literal **Markdown** and <b>.".into(),
+                }])],
             },
-            Component::Table(vec![
-                vec!["Item".into(), "Result".into()],
-                vec!["Proof".into(), "Ready".into()],
-            ]),
+            Component::Table {
+                rows: vec![
+                    vec!["Item".into(), "Result".into()],
+                    vec!["Proof".into(), "Ready".into()],
+                ],
+            },
             Component::Finding {
                 deck: "research/concentration".into(),
                 id: "cb38ac8b-d670-47be-91e3-9c4ecdb61d26".into(),
@@ -366,7 +610,7 @@ mod tests {
         assert_eq!(first.value, "<future/>");
         assert!(matches!(
             parse_block(second, &source),
-            Some(Component::Table(_))
+            Some(Component::Table { .. })
         ));
         assert_eq!(components(&source).len(), 1);
     }
@@ -406,27 +650,152 @@ mod tests {
             components(&fence(
                 "<table><row><cell>&lt;script&gt; javascript:example()</cell></row></table>"
             )),
-            [Component::Table(vec![vec![
-                "<script> javascript:example()".into()
-            ]])]
+            [Component::Table {
+                rows: vec![vec!["<script> javascript:example()".into()]]
+            }]
         );
     }
 
     #[test]
     fn bounds_large_attributes_content_and_tables() {
-        let huge = "x".repeat(MAX_ATTRIBUTE + 1);
+        let huge = "x".repeat(MAX_LABEL + 1);
         let xml = format!(r#"<callout severity="error" title="{huge}">Body</callout>"#);
         assert!(components(&fence(&xml)).is_empty());
         assert!(components(&fence(&xml.repeat(MAX_BLOCK / xml.len() + 1))).is_empty());
 
         let rows = "<row><cell>x</cell></row>".repeat(MAX_ROWS + 1);
         assert!(components(&fence(&format!("<table>{rows}</table>"))).is_empty());
-        let columns = "<cell>x</cell>".repeat(MAX_COLUMNS + 1);
+        let columns = "<cell>x</cell>".repeat(MAX_CELLS + 1);
         assert!(components(&fence(&format!("<table><row>{columns}</row></table>"))).is_empty());
-        let cell = "x".repeat(MAX_CELL + 1);
+        let cell = "x".repeat(MAX_LABEL + 1);
         assert!(components(&fence(&format!(
             "<table><row><cell>{cell}</cell></row></table>"
         )))
         .is_empty());
+    }
+
+    #[test]
+    fn namespaced_and_legacy_core_tags_share_the_model() {
+        for legacy in [CALLOUT, TABLE, FINDING] {
+            let prefixed = legacy
+                .replace('<', "<fuzukue:")
+                .replace("<fuzukue:/", "</fuzukue:");
+            assert_eq!(components(&fence(&prefixed)), components(&fence(legacy)));
+        }
+        let tags: Vec<_> = capabilities()
+            .into_iter()
+            .map(|capability| {
+                assert_eq!(capability.version, 1);
+                capability.tag
+            })
+            .collect();
+        assert_eq!(tags, TAGS);
+    }
+
+    #[test]
+    fn nested_layout_and_inline_content_round_trip_through_json() {
+        let xml = r#"<fuzukue:card xmlns:fuzukue="urn:fuzukue:ui:v1" title="Proofs &amp; notes">
+<fuzukue:grid columns="2">
+  <fuzukue:stat label="Partial" value="10" unit=" proofs" tone="warn" hint="Reviewed"/>
+  <fuzukue:stat label="Open" value="3"/>
+</fuzukue:grid>
+<fuzukue:progress percent="76.9" caption="10 of 13">
+  <fuzukue:segment value="10" tone="success"/>
+  <fuzukue:segment value="20" tone="info"/>
+</fuzukue:progress>
+<fuzukue:divider/>
+<fuzukue:text style="heading">Use <fuzukue:code>&lt;x&gt;</fuzukue:code> and <fuzukue:kbd>Enter</fuzukue:kbd> <fuzukue:badge tone="accent">New</fuzukue:badge></fuzukue:text>
+<fuzukue:list kind="checklist"><fuzukue:item checked="true">First</fuzukue:item></fuzukue:list>
+<fuzukue:steps><fuzukue:step title="Prove" status="current">
+  <fuzukue:accordion title="More" open="true"><fuzukue:callout title="Read" severity="info">Check &quot;this&quot;.</fuzukue:callout></fuzukue:accordion>
+</fuzukue:step></fuzukue:steps>
+</fuzukue:card>"#;
+        let source = fence(xml);
+        let parsed = components(&source);
+        let [tree @ Component::Card { body, .. }] = parsed.as_slice() else {
+            panic!("{parsed:?}")
+        };
+        assert!(matches!(&body[0], Component::Grid { columns: 2, items } if items.len() == 2));
+        assert!(
+            matches!(&body[1], Component::Progress { value, max, segments, .. }
+            if *value == 76.9 && *max == 100.0 && segments.len() == 2)
+        );
+        assert!(
+            matches!(&body[3], Component::Text { kind: TextKind::Heading, spans }
+            if spans.iter().any(|span| matches!(span, Span::Code { text } if text == "<x>")))
+        );
+        assert!(tree.plain_text().contains("Use <x> and Enter New"));
+        assert!(tree.plain_text().contains("Check \"this\"."));
+        assert_eq!(
+            &ui_kit::from_json(&ui_kit::to_json(tree).unwrap()).unwrap(),
+            tree
+        );
+        for (end, _) in source.char_indices() {
+            assert!(components(&source[..end]).is_empty(), "prefix {end}");
+        }
+    }
+
+    #[test]
+    fn bounds_nesting_children_and_text() {
+        let nested = |count| {
+            format!(
+                "{}<fuzukue:divider/>{}",
+                r#"<fuzukue:card title="Nested">"#.repeat(count),
+                "</fuzukue:card>".repeat(count)
+            )
+        };
+        assert_eq!(components(&fence(&nested(MAX_DEPTH - 1))).len(), 1);
+        assert!(components(&fence(&nested(MAX_DEPTH))).is_empty());
+        let card = |body| format!(r#"<fuzukue:card title="Limits">{body}</fuzukue:card>"#);
+        assert!(
+            components(&fence(&card("<fuzukue:divider/>".repeat(MAX_CHILDREN + 1)))).is_empty()
+        );
+        assert!(components(&fence(&card("x".repeat(MAX_TEXT + 1)))).is_empty());
+        let split_text = format!("{}<fuzukue:kbd>X</fuzukue:kbd>y", "x".repeat(MAX_TEXT - 1));
+        assert!(components(&fence(&card(split_text))).is_empty());
+    }
+
+    #[test]
+    fn invalid_namespaces_links_and_malformed_nested_values_decline_the_whole_block() {
+        for xml in [
+            r#"<card title="Only legacy tags are unprefixed"/>"#,
+            r#"<fuzukue:card title="Other namespace" xmlns:fuzukue="urn:fuzukue:ui:v2"/>"#,
+            r#"<trpg:dice xmlns:trpg="urn:trpg:v1"/>"#,
+            r#"<fuzukue:card title="Nested declaration"><fuzukue:divider xmlns:fuzukue="urn:fuzukue:ui:v1"/></fuzukue:card>"#,
+            r#"<fuzukue:card title="Unknown"><fuzukue:future/><fuzukue:divider/></fuzukue:card>"#,
+            r#"<fuzukue:card title="Unclosed"><fuzukue:grid columns="2"></fuzukue:card>"#,
+            r#"<fuzukue:card title="Mismatched"></card>"#,
+            r#"<fuzukue:card title="Link" href="https://example.invalid"/>"#,
+            r#"<fuzukue:text><fuzukue:kbd xlink:href="javascript:example()">Enter</fuzukue:kbd></fuzukue:text>"#,
+            r#"<fuzukue:card title="Active contents"><script>run()</script></fuzukue:card>"#,
+            r#"<fuzukue:text>Invalid &external;</fuzukue:text>"#,
+            r#"<fuzukue:progress percent="101"/>"#,
+            r#"<fuzukue:progress value="NaN" max="1"/>"#,
+            r#"<fuzukue:progress value="1" max="0"/>"#,
+            r#"<fuzukue:progress percent="30"><fuzukue:segment tone="info" value="31"/></fuzukue:progress>"#,
+            r#"<fuzukue:list kind="ordered"><fuzukue:item checked="true">No</fuzukue:item></fuzukue:list>"#,
+        ] {
+            assert!(components(&fence(xml)).is_empty(), "{xml}");
+        }
+    }
+
+    #[test]
+    fn documented_examples_use_the_supported_grammar() {
+        let docs = include_str!("../../../docs/xml-components.md");
+        let counts: Vec<_> = docs
+            .split("````markdown\n")
+            .skip(1)
+            .map(|rest| {
+                let example = rest.split_once("\n````").unwrap().0;
+                components(example).len()
+            })
+            .collect();
+        assert_eq!(counts, [1, 1, 3]);
+        let example = docs.split_once("````json\n").unwrap().1;
+        let json = example.split_once("\n````").unwrap().0;
+        assert!(matches!(
+            ui_kit::from_json(json),
+            Ok(Component::Card { .. })
+        ));
     }
 }

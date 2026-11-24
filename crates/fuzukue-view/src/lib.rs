@@ -8,6 +8,7 @@ mod paper;
 pub mod server;
 pub mod style_notes;
 mod tex;
+pub mod ui_kit;
 pub mod xml_components;
 
 pub use paper::{paper_markdown, theorem_heading, theorem_heading_with_label};

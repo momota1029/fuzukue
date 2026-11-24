@@ -18,6 +18,7 @@ sudo apt install xvfb xauth x11-utils imagemagick python3 libvulkan1 mesa-vulkan
 scripts/shot.sh examples/lab tests/shots/chat.json
 scripts/shot.sh examples/lab tests/shots/chat-live.json
 scripts/shot.sh examples/lab tests/shots/xml-components.json
+scripts/shot.sh examples/lab tests/shots/ui-kit.json
 scripts/shot.sh examples/lab tests/shots/tiers.json
 scripts/shot.sh examples/lab tests/shots/trash.json
 scripts/shot.sh examples/lab tests/shots/rewrite.json

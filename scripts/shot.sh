@@ -144,7 +144,7 @@ if [[ $mode == fixture ]]; then
     prepare_shot_git_fixture "$run" "$root" "$scenario" "$git_fixture" "$workshop_fixture"
     cp "$root/tests/shots/"{claude,codex} "$run/bin/"
     cp "$root/tests/shots/fixtures/question-card.json" "$run/bin/question-card-input.json"
-    cp "$root/tests/shots/fixtures/xml-components.md" "$run/bin/xml-components.md"
+    cp "$root/tests/shots/fixtures/"{xml-components,ui-kit}.md "$run/bin/"
     # The change history keeps a shadow git repository in the server state.
     git_program=$(command -v git) || { echo "Missing dependency: git" >&2; exit 2; }
     [[ -e $run/bin/git ]] || ln -s "$git_program" "$run/bin/git"

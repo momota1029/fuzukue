@@ -274,7 +274,7 @@ pub(super) fn editor_style_note_warning(theme: &Theme) -> Hsla {
     style_note_warning(theme.warning, closest)
 }
 
-fn accessible_accent(color: Hsla, surface: Hsla, dark: bool, surface_ratio: f32) -> Hsla {
+pub(super) fn accessible_accent(color: Hsla, surface: Hsla, dark: bool, surface_ratio: f32) -> Hsla {
     let foreground = button_foreground(dark);
     let readable = |color| {
         contrast_ratio(color, foreground) >= 4.5 && contrast_ratio(color, surface) >= surface_ratio
