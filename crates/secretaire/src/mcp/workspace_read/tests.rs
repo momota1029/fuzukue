@@ -361,14 +361,15 @@ async fn read_tail_and_end_relative_ranges() -> Result<()> {
 async fn list_and_search_clamp_depth_context_and_result_count() -> Result<()> {
     let f = Fixture::new()?;
     let scope = f.worker()?;
-    fs::create_dir_all(f.worktree.join("nested/folder/sub"))?;
-    fs::write(f.worktree.join("nested/folder/sub/file"), "")?;
+    let nested = f.worktree.join("nested").join("folder/".repeat(63));
+    fs::create_dir_all(&nested)?;
+    fs::write(nested.join("file"), "")?;
     check_integer_argument(
         Tool::List,
         &scope,
         json!({"path": "nested"}),
         "depth",
-        [1, 3, 1],
+        [1, 64, 1],
         |result, expected| assert_eq!(result["entries"].as_array().unwrap().len(), expected),
     )
     .await?;
@@ -541,8 +542,14 @@ async fn listing_bounds_depth_hides_generated_entries_and_caps_results() -> Resu
         .await?;
     assert_eq!(capped["entries"].as_array().unwrap().len(), 500);
     assert!(capped["note"].as_str().unwrap().contains(TRUNCATED));
-    let max_depth = Tool::List.call(scope.clone(), &json!({"depth": 3})).await?;
-    assert_eq!(Tool::List.call(scope, &json!({"depth": 4})).await?, max_depth);
+    let deep = Tool::List
+        .call(scope.clone(), &json!({"recursive": true, "glob": "*.rs"}))
+        .await?;
+    assert_eq!(deep["entries"][0]["path"], "src/sub/deep/sample.rs");
+    assert_eq!(
+        Tool::List.call(scope, &json!({"depth": u64::MAX, "glob": "*.rs"})).await?,
+        deep
+    );
     Ok(())
 }
 
@@ -614,6 +621,260 @@ async fn search_output_modes_limit_files_and_count_matching_lines() -> Result<()
     assert_eq!(empty["counts"], json!([]));
     assert_eq!(empty["truncated"], false);
     assert!(Tool::Search.call(scope, &json!({"pattern": "hit", "output_mode": "unknown"})).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_types_globs_and_files_without_content() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    fs::create_dir_all(f.worktree.join("fixtures/deep"))?;
+    for name in [
+        "Cargo.lock", "a.rs", "notes.mdx", "app.tsx", "a.pyi", "build.gradle.kts", "z.toml",
+        "fixtures/deep/no.rs", "fixtures/keep.rs", "binary.dat",
+    ] {
+        fs::write(f.worktree.join(name), b"hit\0")?;
+    }
+    let files = Tool::Search.call(scope.clone(), &json!({
+        "output_mode": "files",
+        "types": ["rust", "ts", "md", "py", "toml", "kt"],
+        "exclude_types": ["py", "toml"],
+        "glob": "*",
+        "globs": ["!fixtures/", "fixtures/keep.rs", "!notes.*"],
+        "stats": true,
+    })).await?;
+    assert_eq!(files["files"], json!(["a.rs", "app.tsx", "build.gradle.kts", "fixtures/keep.rs"]));
+    assert_eq!(files["stats"]["files_searched"], 0);
+    assert_eq!(files["stats"]["bytes_scanned"], 0);
+    assert_eq!(files["truncated"], false);
+    let files = Tool::Search.call(scope.clone(), &json!({
+        "output_mode": "files", "types": ["toml"], "globs": ["!z.*"]
+    })).await?;
+    assert_eq!(files["files"], json!(["Cargo.lock"]));
+    let direct = Tool::Search.call(scope, &json!({
+        "output_mode": "files", "path": "binary.dat"
+    })).await?;
+    assert_eq!(direct["files"], json!(["binary.dat"]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_hidden_and_ignore_toggles_keep_the_read_scope() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    for dir in [".hidden", ".git", "target", "node_modules", "build", "src", "ignored-dir"] {
+        fs::create_dir_all(f.worktree.join(dir))?;
+        fs::write(f.worktree.join(dir).join("file.txt"), "inside\n")?;
+    }
+    for name in ["a.txt", "ignored.txt", "ignored-too.txt", "rescued.txt", "#name.txt", "name with space.txt"] {
+        fs::write(f.worktree.join(name), "inside\n")?;
+    }
+    fs::write(f.worktree.join(".env"), "protected\n")?;
+    fs::write(f.worktree.join(".gitignore"), "ignored*.txt\nignored-dir/\n/src/file.txt\nrescued.txt\n\\#name.txt\nname with space.txt  \n")?;
+    fs::write(f.worktree.join(".ignore"), "!rescued.txt\n")?;
+    fs::write(f.worktree.join("src/.gitignore"), "!file.txt\n")?;
+    symlink(&f.worktree, f.worktree.join("src/loop"))?;
+    symlink(&f.outside, f.worktree.join("escape"))?;
+    symlink(&f.outside, f.worktree.join("target/escape"))?;
+    fs::write(f.outside.join("outside.txt"), "outside\n")?;
+
+    let base = json!({"output_mode": "files", "glob": "*.txt"});
+    let normal = Tool::Search.call(scope.clone(), &base).await?;
+    assert_eq!(normal["files"], json!(["a.txt", "rescued.txt", "src/file.txt"]));
+    let mut hidden = base.clone();
+    hidden["include_hidden"] = json!(true);
+    assert_eq!(
+        Tool::Search.call(scope.clone(), &hidden).await?["files"],
+        json!([".hidden/file.txt", "a.txt", "rescued.txt", "src/file.txt"])
+    );
+    let mut ignored = base;
+    ignored["include_ignored"] = json!(true);
+    let listed = Tool::Search.call(scope.clone(), &ignored).await?;
+    assert_eq!(listed["files"], json!([
+        "#name.txt", "a.txt", "ignored-dir/file.txt", "ignored-too.txt", "ignored.txt",
+        "name with space.txt", "rescued.txt", "src/file.txt"
+    ]));
+    assert_eq!(listed["truncated"], false);
+
+    let inherited = Tool::Search.call(scope.clone(), &json!({"path": "src", "output_mode": "files", "glob": "*.txt"})).await?;
+    assert_eq!(inherited["files"], json!(["file.txt"]));
+    fs::remove_file(f.worktree.join("src/.gitignore"))?;
+    let inherited = Tool::Search.call(scope.clone(), &json!({"path": "src", "output_mode": "files", "glob": "*.txt"})).await?;
+    assert_eq!(inherited["files"], json!([]));
+
+    let explicit = Tool::Search.call(scope.clone(), &json!({
+        "path": "target", "pattern": "inside", "output_mode": "files_with_matches",
+        "include_hidden": true, "include_ignored": true,
+    })).await?;
+    assert_eq!(explicit["files"], json!(["file.txt"]));
+    for path in [f.outside.join("outside.txt"), "escape".into(), "../outside".into(), ".git".into(), ".env".into()] {
+        let error = Tool::Search.call(scope.clone(), &json!({
+            "path": path, "output_mode": "files", "include_hidden": true, "include_ignored": true
+        })).await.unwrap_err();
+        assert!(format!("{error:#}").contains("path"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_grep_modes_and_columns_use_the_same_matcher() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    fs::write(f.worktree.join("a.txt"), "below\né hit HIT hitting\n-HIT\nmiss\n")?;
+    fs::write(f.worktree.join("b.txt"), "miss\n")?;
+    fs::write(f.worktree.join("empty.txt"), "")?;
+
+    let rows = Tool::Search.call(scope.clone(), &json!({
+        "patterns": ["hit", "-hit"], "fixed_string": true, "smart_case": true,
+        "word": true, "only_matching": true, "column": true,
+        "line_number": false, "with_path": false,
+    })).await?;
+    assert_eq!(rows["matches"], json!([
+        {"text": "hit", "column": 4, "truncated": false},
+        {"text": "HIT", "column": 8, "truncated": false},
+        {"text": "-HIT", "column": 1, "truncated": false}
+    ]));
+
+    let exact = Tool::Search.call(scope.clone(), &json!({
+        "path": "a.txt", "pattern": "-HIT", "whole_line": true, "smart_case": true,
+        "context": 1, "before_context": 0, "after_context": 2,
+    })).await?;
+    assert_eq!(exact["matches"][0]["line"], 3);
+    assert_eq!(exact["matches"][0]["context"], json!([
+        {"line": 3, "text": "-HIT", "truncated": false},
+        {"line": 4, "text": "miss", "truncated": false}
+    ]));
+    assert_eq!(exact["matches"].as_array().unwrap().len(), 1);
+    let sensitive = Tool::Search.call(scope.clone(), &json!({
+        "pattern": "-Hit", "whole_line": true, "smart_case": true
+    })).await?;
+    assert_eq!(sensitive["matches"], json!([]));
+
+    let absent = Tool::Search.call(scope.clone(), &json!({
+        "pattern": "hit", "ignore_case": true, "output_mode": "files_without_matches",
+    })).await?;
+    assert_eq!(absent["files"], json!(["b.txt", "empty.txt"]));
+    let inverted = Tool::Search.call(scope.clone(), &json!({
+        "pattern": "HIT", "path": "a.txt", "invert": true, "column": true, "max_count": 1
+    })).await?;
+    assert_eq!(inverted["matches"][0]["line"], 1);
+    assert_eq!(inverted["matches"][0]["column"], Value::Null);
+    assert_eq!(inverted["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(inverted["truncated"], true);
+    let count = Tool::Search.call(scope, &json!({
+        "pattern": "hit", "ignore_case": true, "output_mode": "count", "max_count": 0, "with_path": false
+    })).await?;
+    assert_eq!(count["counts"], json!([{"count": 1}]));
+    assert_eq!(count["truncated"], true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_multiline_stays_within_files_and_reports_ranges() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    fs::write(f.worktree.join("a"), "foo\n")?;
+    fs::write(f.worktree.join("b"), "bar\n")?;
+    fs::write(f.worktree.join("c"), "before\r\né foo\r\nbar\r\nafter\nfoo")?;
+    let search = json!({
+        "pattern": "foo\\r?\\nbar", "multiline": true, "column": true, "before_context": 1, "after_context": 1
+    });
+    let result = Tool::Search.call(scope.clone(), &search).await?;
+    let hits = result["matches"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["path"], "c");
+    assert_eq!(hits[0]["line"], 2);
+    assert_eq!(hits[0]["end_line"], 3);
+    assert_eq!(hits[0]["column"], 4);
+    assert_eq!(hits[0]["context"][3]["text"], "after");
+    let mut only = search.clone();
+    only["only_matching"] = json!(true);
+    assert_eq!(Tool::Search.call(scope.clone(), &only).await?["matches"][0]["text"], "foo\r\nbar");
+    let mut inverted = search;
+    inverted["path"] = json!("c");
+    inverted["invert"] = json!(true);
+    let inverse = Tool::Search.call(scope, &inverted).await?;
+    let lines: Vec<_> = inverse["matches"].as_array().unwrap().iter().map(|row| &row["line"]).collect();
+    assert_eq!(lines, [&json!(1), &json!(4), &json!(5)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_sort_and_stats_cover_scanned_files_beyond_the_response_cap() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    let same_second = std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    for (path, text, millis) in [("a", "hit\n", 200), ("b", "hit\nhit\n", 100), ("c", "miss\n", 500)] {
+        let path = f.worktree.join(path);
+        fs::write(&path, text)?;
+        fs::File::open(path)?.set_modified(same_second + Duration::from_millis(millis))?;
+    }
+    let result = Tool::Search.call(scope, &json!({
+        "pattern": "hit", "output_mode": "count", "sort": "modified", "max_results": 1, "stats": true
+    })).await?;
+    assert_eq!(result["counts"], json!([{"path": "b", "count": 2}]));
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["stats"]["files_searched"], 3);
+    assert_eq!(result["stats"]["files_matched"], 2);
+    assert_eq!(result["stats"]["bytes_scanned"], 17);
+    assert!(result["stats"]["elapsed_ms"].is_u64());
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_marks_scan_byte_depth_and_ignore_limits() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    let megabyte = vec![b'x'; 1024 * 1024];
+    for index in 0..33 {
+        fs::write(f.worktree.join(format!("file{index:02}")), &megabyte)?;
+    }
+    let result = Tool::Search.call(scope.clone(), &json!({"pattern": "missing", "stats": true})).await?;
+    assert_eq!(result["matches"], json!([]));
+    assert_eq!(result["stats"]["files_searched"], 32);
+    assert_eq!(result["stats"]["bytes_scanned"], 32 * 1024 * 1024);
+    assert_eq!(result["truncated"], true);
+
+    let deep = "nest/".repeat(65);
+    fs::create_dir_all(f.worktree.join(&deep))?;
+    fs::write(f.worktree.join(deep).join("file.rs"), "hit")?;
+    fs::write(f.worktree.join("z.rs"), "hit")?;
+    let result = Tool::Search.call(scope.clone(), &json!({"output_mode": "files", "glob": "*.rs"})).await?;
+    assert_eq!(result["files"], json!(["z.rs"]));
+    assert_eq!(result["truncated"], true);
+
+    fs::write(f.worktree.join(".gitignore"), &megabyte)?;
+    let result = Tool::Search.call(scope, &json!({"output_mode": "files"})).await?;
+    assert_eq!(result["files"], json!([]));
+    assert_eq!(result["truncated"], true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_argument_errors_name_the_parameter_and_suggest_supported_syntax() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    for (args, parameter, hint) in [
+        (json!({"pattern": "hit", "before_context": "2"}), "before_context", "expected an integer"),
+        (json!({"pattern": "hit", "after_context": 2.5}), "after_context", "expected an integer"),
+        (json!({"pattern": "hit", "max_count": null}), "max_count", "expected an integer"),
+        (json!({"pattern": "hit", "stats": "yes"}), "stats", "boolean"),
+        (json!({"pattern": null}), "pattern", "string"),
+        (json!({"pattern": "hit", "sort": "size"}), "sort", "modified"),
+        (json!({"pattern": "hit", "types": [2]}), "types", "string"),
+        (json!({"pattern": "hit", "exclude_types": ["made-up"]}), "exclude_types[0]", "glob"),
+        (json!({"pattern": "hit", "globs": ["*.rs", "["]}), "globs[1]", "Invalid"),
+        (json!({"pattern": "hit", "-n": true}), "-n", "named arguments"),
+        (json!({"pattern": "look(?=ahead)"}), "pattern", "lookaround"),
+        (json!({"patterns": ["ok", "look(?<=behind)"]}), "patterns[1]", "context"),
+        (json!({"patterns": ["a\nb"]}), "patterns[0]", "multiline=true"),
+        (json!({"pattern": "hit", "output_mode": "files"}), "pattern", "Omit"),
+        (json!({}), "pattern", "output_mode=files"),
+    ] {
+        let error = Tool::Search.call(scope.clone(), &args).await.unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains(parameter) && error.contains(hint), "{error}");
+    }
     Ok(())
 }
 

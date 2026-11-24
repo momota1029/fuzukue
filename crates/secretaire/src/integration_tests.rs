@@ -1984,10 +1984,15 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             ("base_tip", "string"), ("cleanup", "boolean")], &["branch", "confirm"]),
         ("fs_read", &[("path", "string"), ("start_line", "integer"), ("end_line", "integer"),
             ("tail_lines", "integer"), ("max_bytes", "integer")], &["path"]),
-        ("fs_list", &[("path", "string"), ("depth", "integer"), ("glob", "string"), ("include_hidden", "boolean"),
-            ("include_ignored", "boolean")], &[]),
-        ("fs_search", &[("pattern", "string"), ("path", "string"), ("glob", "string"), ("fixed_string", "boolean"),
-            ("ignore_case", "boolean"), ("context", "integer"), ("max_results", "integer"), ("output_mode", "string")], &["pattern"]),
+        ("fs_list", &[("path", "string"), ("depth", "integer"), ("recursive", "boolean"), ("glob", "string"),
+            ("include_hidden", "boolean"), ("include_ignored", "boolean")], &[]),
+        ("fs_search", &[("pattern", "string"), ("patterns", "array"), ("path", "string"), ("glob", "string"),
+            ("globs", "array"), ("types", "array"), ("exclude_types", "array"), ("fixed_string", "boolean"),
+            ("ignore_case", "boolean"), ("smart_case", "boolean"), ("word", "boolean"), ("whole_line", "boolean"),
+            ("invert", "boolean"), ("only_matching", "boolean"), ("multiline", "boolean"), ("include_hidden", "boolean"),
+            ("include_ignored", "boolean"), ("line_number", "boolean"), ("column", "boolean"), ("with_path", "boolean"),
+            ("stats", "boolean"), ("context", "integer"), ("before_context", "integer"), ("after_context", "integer"),
+            ("max_count", "integer"), ("max_results", "integer"), ("output_mode", "string"), ("sort", "string")], &[]),
         ("git_show", &[("rev", "string"), ("path", "string"), ("repository", "string")], &["rev"]),
         ("plan_status", &[("deck", "string"), ("status", "string"), ("id_prefix", "string"), ("limit", "integer"),
             ("include_done", "boolean")], &[]),
@@ -2100,6 +2105,16 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         }
     }
     assert_eq!(schema("delegate")["touches"]["items"]["type"], "string");
+    let search = schema("fs_search");
+    assert_eq!(search["patterns"]["items"]["type"], "string");
+    assert_eq!(search["globs"]["items"]["type"], "string");
+    assert_eq!(search["output_mode"]["enum"], json!([
+        "content", "files_with_matches", "files_without_matches", "count", "files"
+    ]));
+    assert_eq!(search["sort"]["enum"], json!(["path", "modified"]));
+    assert_eq!(search["line_number"]["default"], true);
+    assert_eq!(search["max_count"]["maximum"], 100_000);
+    assert_eq!(schema("fs_list")["depth"]["maximum"], 64);
     assert_eq!(schema("list_jobs")["state"]["enum"], json!(["active", "queued", "running", "finished", "failed", "all"]));
     assert_eq!(schema("list_jobs")["limit"]["default"], 30);
     assert_eq!(schema("plan_status")["deck"]["default"], "roadmap");

@@ -9,6 +9,10 @@ use std::time::Instant;
 use crate::folder_grants::{self, Access, OutsideScope};
 use crate::worker_scope::{self, Scope};
 
+use super::ignores::Ignores;
+
+pub(super) const SCAN_DEPTH: usize = 64;
+
 #[derive(Clone)]
 pub(crate) struct ReadScope {
     pub(super) workspace: PathBuf,
@@ -200,6 +204,7 @@ pub(super) struct Entry {
     pub kind: &'static str,
     pub size: u64,
     pub mtime_unix_secs: i64,
+    pub mtime_nanos: u32,
 }
 
 pub(super) struct Scan<'a> {
@@ -209,6 +214,8 @@ pub(super) struct Scan<'a> {
     pub ignored: bool,
     pub deadline: Instant,
     remaining: usize,
+    search: bool,
+    rules: Option<Ignores>,
 }
 
 impl<'a> Scan<'a> {
@@ -226,7 +233,16 @@ impl<'a> Scan<'a> {
             ignored,
             deadline,
             remaining: 20_000,
+            search: false,
+            rules: None,
         }
+    }
+
+    pub fn for_search(scope: &'a ReadScope, hidden: bool, ignored: bool, deadline: Instant) -> Self {
+        let mut scan = Self::new(scope, SCAN_DEPTH, hidden, ignored, deadline);
+        scan.search = true;
+        scan.rules = (!ignored).then(Ignores::default);
+        scan
     }
 
     // The callback returns false when its result budget has been filled.
@@ -236,7 +252,22 @@ impl<'a> Scan<'a> {
         file: &File,
         emit: &mut impl FnMut(Entry) -> bool,
     ) -> Result<bool> {
-        self.directory(path, file, 0, emit)
+        if let Some(rules) = &mut self.rules {
+            // Inherit rules above a requested subdirectory up to the nearest scope boundary.
+            let ancestors: Vec<_> = path.ancestors().skip(1)
+                .take(SCAN_DEPTH)
+                .take_while(|parent| self.scope.check(parent).is_ok())
+                .collect();
+            for parent in ancestors.into_iter().rev() {
+                if Instant::now() >= self.deadline || !open(parent).is_ok_and(|handle| {
+                    rules.load(self.scope, parent, &handle, self.deadline)
+                }) {
+                    return Ok(false);
+                }
+            }
+        }
+        let mut complete = true;
+        Ok(self.directory(path, file, 0, &mut complete, emit)? && complete)
     }
 
     fn directory(
@@ -244,24 +275,35 @@ impl<'a> Scan<'a> {
         path: &Path,
         file: &File,
         depth: usize,
+        complete: &mut bool,
         emit: &mut impl FnMut(Entry) -> bool,
     ) -> Result<bool> {
+        let checkpoint = self.rules.as_ref().map_or(0, Ignores::checkpoint);
+        if let Some(rules) = &mut self.rules {
+            if !rules.load(self.scope, path, file, self.deadline) {
+                rules.restore(checkpoint);
+                *complete = false;
+                return Ok(true);
+            }
+        }
         let mut entries = Vec::new();
-        let mut complete = true;
         for item in Dir::read_from(file)? {
             let item = item?;
             let name = item.file_name().to_bytes();
             if matches!(name, b"." | b"..") {
                 continue;
             }
-            if self.remaining == 0 || Instant::now() >= self.deadline {
-                complete = false;
+            if Instant::now() >= self.deadline {
+                return Ok(false);
+            }
+            if self.remaining == 0 {
+                *complete = false;
                 break;
             }
             self.remaining -= 1;
             let git = name.eq_ignore_ascii_case(b".git");
-            if git && !self.ignored
-                || !self.ignored && matches!(name, b"target" | b"node_modules")
+            if git && (self.search || !self.ignored)
+                || !self.search && !self.ignored && matches!(name, b"target" | b"node_modules")
                 || !self.hidden && name.starts_with(b".") && !git
                 || secret(name)
             {
@@ -281,6 +323,11 @@ impl<'a> Scan<'a> {
                 FileType::Symlink => "symlink",
                 _ => continue,
             };
+            if self.search && kind == "directory" && generated(name.as_bytes())
+                || self.rules.as_mut().is_some_and(|rules| rules.excludes(&child, kind == "directory"))
+            {
+                continue;
+            }
             entries.push((
                 name.to_os_string(),
                 Entry {
@@ -288,32 +335,51 @@ impl<'a> Scan<'a> {
                     kind,
                     size: stat.st_size.max(0) as u64,
                     mtime_unix_secs: stat.st_mtime as i64,
+                    mtime_nanos: stat.st_mtime_nsec as u32,
                 },
                 git,
             ));
         }
         entries.sort_unstable_by(|(a, _, _), (b, _, _)| a.cmp(b));
         for (name, entry, git) in entries {
+            if Instant::now() >= self.deadline {
+                return Ok(false);
+            }
+            if self.depth == SCAN_DEPTH && entry.kind == "directory" && !git && depth + 1 == self.depth {
+                *complete = false;
+            }
             let descend = entry.kind == "directory" && !git && depth + 1 < self.depth;
             let child = entry.path.clone();
             if !emit(entry) {
                 return Ok(false);
             }
             if descend {
+                if self.remaining == 0 {
+                    *complete = false;
+                    continue;
+                }
                 self.scope.audit_read(&child)?;
                 let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
                 match unix::openat(file, &name, flags, Mode::empty()) {
                     Ok(handle) => {
-                        if !self.directory(&child, &File::from(handle), depth + 1, emit)? {
+                        if !self.directory(&child, &File::from(handle), depth + 1, complete, emit)? {
                             return Ok(false);
                         }
                     }
-                    Err(_) => complete = false,
+                    Err(_) => *complete = false,
                 }
             }
         }
-        Ok(complete)
+        if let Some(rules) = &mut self.rules {
+            rules.restore(checkpoint);
+        }
+        Ok(true)
     }
+}
+
+fn generated(name: &[u8]) -> bool {
+    matches!(name, b"target" | b"node_modules" | b"build" | b"dist" | b"out" | b"coverage"
+        | b".next" | b".nuxt" | b".svelte-kit" | b".gradle" | b".venv" | b"__pycache__")
 }
 
 pub(super) fn text(bytes: &[u8]) -> Result<&str> {

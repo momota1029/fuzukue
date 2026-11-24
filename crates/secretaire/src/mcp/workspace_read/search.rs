@@ -1,43 +1,98 @@
-use super::{
-    DEADLINE, MAX_BYTES, ReadScope, TRUNCATED, dot, glob, matches_glob, paths, utf8_prefix,
-};
-use super::range::{IntegerRange, optional_integer};
-use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
-use serde_json::{Value, json};
+mod filters;
+mod matcher;
+mod schema;
+
+pub(super) use schema::definition;
+
+use super::range::{optional_integer, IntegerRange};
+use super::{dot, paths, utf8_prefix, ReadScope, DEADLINE, MAX_BYTES, TRUNCATED};
+use anyhow::{ensure, Context, Result};
+use filters::Filters;
+use matcher::{FileText, Hit, Matcher};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::io::AsyncReadExt;
 
 const FILE_BYTES: usize = 1024 * 1024;
 const SEARCH_BYTES: usize = 32 * FILE_BYTES;
 const MATCH_TEXT_BYTES: usize = 1000;
-pub(super) const DEFAULT_CONTEXT: usize = 0;
-pub(super) const DEFAULT_RESULTS: usize = 100;
-pub(super) const CONTEXT: IntegerRange = IntegerRange::new(0, 5);
-pub(super) const RESULTS: IntegerRange = IntegerRange::new(1, 200);
+const MATCH_WINDOW_LINES: usize = 32;
+const DEFAULT_CONTEXT: usize = 0;
+const DEFAULT_RESULTS: usize = 100;
+const CONTEXT: IntegerRange = IntegerRange::new(0, 5);
+const RESULTS: IntegerRange = IntegerRange::new(1, 200);
+const COUNT: IntegerRange = IntegerRange::new(1, 100_000);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Args {
-    pattern: String,
+    #[serde(default, deserialize_with = "optional_string")]
+    pattern: Option<String>,
+    #[serde(default)]
+    patterns: Vec<String>,
     #[serde(default = "dot")]
     path: PathBuf,
     glob: Option<String>,
     #[serde(default)]
+    globs: Vec<String>,
+    #[serde(default)]
+    types: Vec<String>,
+    #[serde(default)]
+    exclude_types: Vec<String>,
+    #[serde(default)]
     fixed_string: bool,
     #[serde(default)]
     ignore_case: bool,
+    #[serde(default)]
+    smart_case: bool,
+    #[serde(default)]
+    word: bool,
+    #[serde(default)]
+    whole_line: bool,
+    #[serde(default)]
+    invert: bool,
+    #[serde(default)]
+    only_matching: bool,
+    #[serde(default)]
+    multiline: bool,
+    #[serde(default)]
+    include_hidden: bool,
+    #[serde(default)]
+    include_ignored: bool,
+    #[serde(default = "enabled")]
+    line_number: bool,
+    #[serde(default)]
+    column: bool,
+    #[serde(default = "enabled")]
+    with_path: bool,
+    #[serde(default)]
+    stats: bool,
     #[serde(default, deserialize_with = "optional_integer")]
     context: Option<i128>,
     #[serde(default, deserialize_with = "optional_integer")]
+    before_context: Option<i128>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    after_context: Option<i128>,
+    #[serde(default, deserialize_with = "optional_integer")]
     max_results: Option<i128>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    max_count: Option<i128>,
     #[serde(default)]
     output_mode: OutputMode,
+    #[serde(default)]
+    sort: Sort,
+}
+
+fn enabled() -> bool {
+    true
+}
+
+fn optional_string<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(value).map(Some)
 }
 
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -46,226 +101,360 @@ enum OutputMode {
     #[default]
     Content,
     FilesWithMatches,
+    FilesWithoutMatches,
     Count,
+    Files,
 }
 
-#[derive(Default)]
-struct Corpus {
-    text: String,
-    files: Vec<Source>,
-    lines: usize,
-    incomplete: bool,
+impl OutputMode {
+    fn result_key(self) -> &'static str {
+        match self {
+            Self::Content => "matches",
+            Self::Count => "counts",
+            Self::Files | Self::FilesWithMatches | Self::FilesWithoutMatches => "files",
+        }
+    }
 }
 
-struct Source {
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Sort {
+    #[default]
+    Path,
+    Modified,
+}
+
+struct Candidate {
     path: PathBuf,
-    byte: usize,
-    line: usize,
+    label: PathBuf,
+    modified: (i64, u32),
 }
 
-impl Corpus {
-    fn add(&mut self, path: &Path, label: &Path, file: &File) -> Result<bool> {
-        let meta = paths::regular(file)?;
-        if meta.len() > FILE_BYTES as u64 || paths::media(path).is_err() {
-            return Ok(true);
-        }
-        let mut bytes = Vec::new();
-        file.take((FILE_BYTES + 1) as u64).read_to_end(&mut bytes)?;
-        if bytes.len() > FILE_BYTES {
-            return Ok(true);
-        }
-        let Ok(text) = paths::text(&bytes) else {
-            return Ok(true);
-        };
-        if text.is_empty() {
-            return Ok(true);
-        }
-        if self.text.len() + text.len() + 1 > SEARCH_BYTES {
-            return Ok(false);
-        }
-        self.files.push(Source {
-            path: label.into(),
-            byte: self.text.len(),
-            line: self.lines,
-        });
-        self.lines += text.lines().count();
-        self.text.push_str(text);
-        if !text.ends_with('\n') {
-            self.text.push('\n');
-        }
-        Ok(true)
-    }
-
-    fn collect(scope: &ReadScope, args: &Args, deadline: Instant) -> Result<Self> {
-        let base = scope.resolve(&args.path)?;
-        let handle = paths::open(&base)?;
-        let glob = glob(args.glob.as_deref())?;
-        let mut corpus = Self::default();
-        if handle.metadata()?.is_dir() {
-            let mut scan = paths::Scan::new(scope, 64, false, false, deadline);
-            let mut skipped_at_depth = false;
-            corpus.incomplete = !scan.visit(&base, &handle, &mut |entry| {
-                let relative = entry
-                    .path
-                    .strip_prefix(&base)
-                    .expect("scan returns descendants");
-                if entry.kind == "directory" && relative.components().count() >= 64 {
-                    skipped_at_depth = true;
-                }
-                if entry.kind != "file" || !matches_glob(glob.as_ref(), relative) {
-                    return true;
-                }
-                match scope.audit_read(&entry.path)
-                    .and_then(|()| paths::open(&entry.path))
-                    .and_then(|file| corpus.add(&entry.path, relative, &file))
-                {
-                    Ok(has_space) => has_space,
-                    Err(_) => {
-                        corpus.incomplete = true;
-                        true
-                    }
-                }
-            })? || corpus.incomplete
-                || skipped_at_depth;
-        } else if matches_glob(
-            glob.as_ref(),
-            Path::new(base.file_name().context("Missing file name")?),
-        ) {
-            paths::media(&args.path)?;
-            paths::media(&base)?;
-            corpus.add(&base, &args.path, &handle)?;
-        }
-        Ok(corpus)
-    }
-}
-
-pub(super) async fn search(scope: ReadScope, args: Args) -> Result<Value> {
-    let limit = RESULTS.resolve(args.max_results, DEFAULT_RESULTS);
-    let context = CONTEXT.resolve(args.context, DEFAULT_CONTEXT);
-    ensure!(
-        args.pattern.len() <= 4096 && !args.pattern.contains(['\r', '\n', '\0']),
-        "Supply a single-line pattern of at most 4096 bytes"
-    );
-    let path = args.path.clone();
-    let deadline = Instant::now() + DEADLINE;
-    let (corpus, args) = tokio::task::spawn_blocking(move || {
-        Ok::<_, anyhow::Error>((Corpus::collect(&scope, &args, deadline)?, args))
-    })
-    .await??;
-    if args.output_mode != OutputMode::Content {
-        return tokio::task::spawn_blocking(move || summarize(path, &corpus, &args, limit, deadline)).await?;
-    }
-    let (lines, engine) = match ripgrep("rg", &corpus.text, &args, limit + 1).await? {
-        Some(lines) => (lines, "ripgrep"),
-        None => {
-            let (corpus, lines, timed_out) = tokio::task::spawn_blocking(move || {
-                let (lines, timed_out) = builtin(
-                    &corpus.text,
-                    &args.pattern,
-                    args.fixed_string,
-                    args.ignore_case,
-                    limit + 1,
-                )?;
-                Ok::<_, anyhow::Error>((corpus, lines, timed_out))
-            })
-            .await??;
-            return Ok(render(
-                path, corpus, lines, limit, context, "builtin", timed_out,
-            ));
-        }
-    };
-    Ok(render(
-        path,
-        corpus,
-        lines,
-        limit,
-        context,
-        engine,
-        false,
-    ))
-}
-
-// Match a bounded UTF-8 stream assembled from files opened by ReadScope. rg
-// never receives an on-disk search path, so ignore files, symlink races, and
-// option-like paths cannot change what it reads.
-async fn ripgrep(
-    program: &str,
-    corpus: &str,
+fn candidates(
+    scope: &ReadScope,
     args: &Args,
+    filters: &Filters,
+    deadline: Instant,
+) -> Result<(Vec<Candidate>, Option<File>, bool)> {
+    let base = scope.resolve(&args.path).context("Invalid path")?;
+    let handle = paths::open(&base).context("Could not open path")?;
+    let mut candidates = Vec::new();
+    if !handle.metadata()?.is_dir() {
+        if filters.matches(Path::new(
+            base.file_name().context("path has no file name")?,
+        )) {
+            paths::regular(&handle)?;
+            if args.output_mode != OutputMode::Files {
+                paths::media(&args.path)?;
+                paths::media(&base)?;
+            }
+            candidates.push(Candidate {
+                path: base,
+                label: args.path.clone(),
+                modified: (0, 0),
+            });
+        }
+        return Ok((candidates, Some(handle), true));
+    }
+
+    let mut scan =
+        paths::Scan::for_search(scope, args.include_hidden, args.include_ignored, deadline);
+    let complete = scan.visit(&base, &handle, &mut |entry| {
+        let relative = entry
+            .path
+            .strip_prefix(&base)
+            .expect("scan returns descendants");
+        if entry.kind == "file" && filters.matches(relative) {
+            let label = relative.into();
+            candidates.push(Candidate {
+                path: entry.path,
+                label,
+                modified: (entry.mtime_unix_secs, entry.mtime_nanos),
+            });
+        }
+        true
+    })?;
+    candidates.sort_unstable_by(|a, b| match args.sort {
+        Sort::Path => a.label.as_os_str().cmp(b.label.as_os_str()),
+        Sort::Modified => a
+            .modified
+            .cmp(&b.modified)
+            .then_with(|| a.label.as_os_str().cmp(b.label.as_os_str())),
+    });
+    Ok((candidates, None, complete))
+}
+
+enum FileRead {
+    Skipped,
+    BudgetExceeded,
+    Bytes(Vec<u8>),
+}
+
+fn read_file(file: &File, scanned: &mut usize) -> Result<FileRead> {
+    let remaining = SEARCH_BYTES - *scanned;
+    let size = paths::regular(file)?.len();
+    if size > FILE_BYTES as u64 {
+        return Ok(FileRead::Skipped);
+    }
+    if size > remaining as u64 {
+        return Ok(FileRead::BudgetExceeded);
+    }
+    let mut bytes = Vec::new();
+    let read = file
+        .take((FILE_BYTES + 1).min(remaining) as u64)
+        .read_to_end(&mut bytes);
+    *scanned += bytes.len();
+    read?;
+    if bytes.len() == remaining && file.metadata()?.len() > remaining as u64 {
+        return Ok(FileRead::BudgetExceeded);
+    }
+    if bytes.len() > FILE_BYTES {
+        return Ok(FileRead::Skipped);
+    }
+    Ok(FileRead::Bytes(bytes))
+}
+
+#[derive(Default, Serialize)]
+struct Stats {
+    files_searched: usize,
+    files_matched: usize,
+    bytes_scanned: usize,
+    elapsed_ms: u128,
+}
+
+struct Results {
+    rows: Vec<Value>,
+    bytes: usize,
     limit: usize,
-) -> Result<Option<Vec<usize>>> {
-    let mut command = Command::new(program);
-    command
-        .args([
-            "--no-config",
-            "--no-follow",
-            "--max-filesize",
-            "1M",
-            "--color",
-            "never",
-            "--line-number",
-            "--no-filename",
-            "--no-heading",
-            "--crlf",
-            "--max-count",
-        ])
-        .arg(limit.to_string());
-    if args.fixed_string {
-        command.arg("--fixed-strings");
+    full: bool,
+    truncated: bool,
+}
+
+impl Results {
+    fn push(&mut self, make_row: impl FnOnce() -> Value) {
+        if self.full || self.rows.len() == self.limit {
+            self.full = true;
+            self.truncated = true;
+            return;
+        }
+        let row = make_row();
+        let bytes = row.to_string().len() + 1;
+        if bytes > MAX_BYTES - self.bytes {
+            self.full = true;
+            self.truncated = true;
+        } else {
+            self.bytes += bytes;
+            self.rows.push(row);
+        }
     }
-    if args.ignore_case {
-        command.arg("--ignore-case");
+}
+
+struct Content {
+    before: usize,
+    after: usize,
+    line_number: bool,
+    column: bool,
+    with_path: bool,
+    only_matching: bool,
+    multiline: bool,
+}
+
+impl Content {
+    fn new(args: &Args) -> Self {
+        let context = CONTEXT.resolve(args.context, DEFAULT_CONTEXT);
+        Self {
+            before: CONTEXT.resolve(args.before_context, context),
+            after: CONTEXT.resolve(args.after_context, context),
+            line_number: args.line_number,
+            column: args.column,
+            with_path: args.with_path,
+            only_matching: args.only_matching,
+            multiline: args.multiline,
+        }
     }
-    command.args(["-e", &args.pattern, "--", "-"]);
-    let mut child = match command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Could not start ripgrep"),
-    };
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let (status, output, error, ()) = tokio::time::timeout(DEADLINE, async {
-        tokio::try_join!(
-            child.wait(),
-            collect(stdout, SEARCH_BYTES + 16 * limit),
-            collect(stderr, 4096),
-            async {
-                match stdin.write_all(corpus.as_bytes()).await {
-                    Err(error) if error.kind() != ErrorKind::BrokenPipe => Err(error),
-                    _ => {
-                        drop(stdin);
-                        Ok(())
-                    }
+
+    fn push(&self, output: &mut Results, path: &Path, hit: Hit<'_>, lines: &[&str]) {
+        let mut clipped = false;
+        output.push(|| {
+            let mut row = json!({});
+            if self.with_path {
+                row["path"] = json!(path.to_string_lossy());
+            }
+            if self.line_number {
+                row["line"] = json!(hit.first + 1);
+                if self.multiline {
+                    row["end_line"] = json!(hit.last + 1);
                 }
-            },
-        )
-    })
-    .await
-    .context("Workspace search timed out")??;
-    match status.code() {
-        Some(0 | 1) => {}
-        _ => bail!("ripgrep failed: {}", String::from_utf8_lossy(&error).trim()),
+            }
+            if self.column {
+                row["column"] = json!(hit.column);
+            }
+            if self.only_matching {
+                let text = hit.text.expect("a substring hit");
+                let prefix = utf8_prefix(text, MATCH_TEXT_BYTES);
+                clipped = prefix.len() < text.len();
+                row["text"] = json!(prefix);
+                row["truncated"] = json!(clipped);
+            } else {
+                let end = (hit.last + 1 + self.after).min(lines.len());
+                let visible_end = (hit.first + MATCH_WINDOW_LINES).min(hit.last + 1);
+                clipped = visible_end <= hit.last;
+                let window: Vec<_> = (hit.first.saturating_sub(self.before)..visible_end)
+                    .chain(hit.last + 1..end)
+                    .map(|i| {
+                        let text = lines[i];
+                        let prefix = utf8_prefix(text, MATCH_TEXT_BYTES);
+                        let line_clipped = prefix.len() < text.len();
+                        clipped |= line_clipped;
+                        let mut row = json!({"text": prefix, "truncated": line_clipped});
+                        if self.line_number {
+                            row["line"] = json!(i + 1);
+                        }
+                        row
+                    })
+                    .collect();
+                row["context"] = json!(window);
+                if self.multiline {
+                    row["truncated"] = json!(clipped);
+                }
+            }
+            row
+        });
+        output.truncated |= clipped;
     }
-    let lines = std::str::from_utf8(&output)?
-        .lines()
-        .map(|line| {
-            let (number, _) = line
-                .split_once(':')
-                .context("Invalid ripgrep line number")?;
-            Ok(number
-                .parse::<usize>()?
-                .checked_sub(1)
-                .context("Invalid ripgrep line number")?)
-        })
-        .collect::<Result<_>>()?;
-    Ok(Some(lines))
+}
+
+pub(super) async fn search(scope: ReadScope, input: &Value) -> Result<Value> {
+    let args = super::parse_named_args(input).context(
+        "fs_search takes named arguments. Pass option-like search text in pattern. The tool description maps grep flags to arguments",
+    )?;
+    tokio::task::spawn_blocking(move || run(&scope, &args)).await?
+}
+
+fn run(scope: &ReadScope, args: &Args) -> Result<Value> {
+    let start = Instant::now();
+    let deadline = start + DEADLINE;
+    let filters = Filters::new(args)?;
+    let matcher = if args.output_mode == OutputMode::Files {
+        ensure!(
+            args.pattern.is_none() && args.patterns.is_empty(),
+            "Omit pattern and patterns in output_mode=files, or use output_mode=files_with_matches"
+        );
+        None
+    } else {
+        Some(Matcher::new(args)?)
+    };
+    let (candidates, direct, complete) = candidates(scope, args, &filters, deadline)?;
+    let mut output = Results {
+        rows: Vec::new(),
+        bytes: 0,
+        limit: RESULTS.resolve(args.max_results, DEFAULT_RESULTS),
+        full: false,
+        truncated: !complete,
+    };
+    let content = Content::new(args);
+    let max_count = args
+        .max_count
+        .map_or(usize::MAX, |count| COUNT.clamp(count));
+    let mut stats = Stats::default();
+    for candidate in candidates {
+        if Instant::now() >= deadline {
+            output.truncated = true;
+            break;
+        }
+        let label = candidate.label.to_string_lossy();
+        let Some(matcher) = &matcher else {
+            output.push(|| json!(label));
+            if output.full {
+                break;
+            }
+            continue;
+        };
+        if paths::media(&candidate.path).is_err() {
+            continue;
+        }
+        let read = if let Some(file) = &direct {
+            read_file(file, &mut stats.bytes_scanned).context("Could not read path")?
+        } else {
+            match scope
+                .audit_read(&candidate.path)
+                .and_then(|()| paths::open(&candidate.path))
+                .and_then(|file| read_file(&file, &mut stats.bytes_scanned))
+            {
+                Ok(read) => read,
+                Err(_) => {
+                    output.truncated = true;
+                    continue;
+                }
+            }
+        };
+        let bytes = match read {
+            FileRead::Skipped => continue,
+            FileRead::BudgetExceeded => {
+                output.truncated = true;
+                break;
+            }
+            FileRead::Bytes(bytes) => bytes,
+        };
+        let Ok(text) = paths::text(&bytes) else {
+            continue;
+        };
+        stats.files_searched += 1;
+        let file = FileText::new(text);
+        let mut count = 0;
+        let mut last_counted = None;
+        let complete = matcher.visit(&file, deadline, |hit| {
+            if last_counted.is_none_or(|last| last < hit.first) {
+                if count == max_count {
+                    output.truncated = true;
+                    return false;
+                }
+                count += 1;
+            }
+            last_counted = Some(last_counted.map_or(hit.last, |last| hit.last.max(last)));
+            if args.output_mode == OutputMode::Content
+                && (!args.only_matching || hit.text.is_some_and(|text| !text.is_empty()))
+            {
+                content.push(&mut output, &candidate.label, hit, &file.lines);
+            }
+            !matches!(
+                args.output_mode,
+                OutputMode::FilesWithMatches | OutputMode::FilesWithoutMatches
+            ) && (!output.full || args.stats)
+        });
+        output.truncated |= !complete;
+        stats.files_matched += usize::from(count != 0);
+        match args.output_mode {
+            OutputMode::FilesWithMatches if count != 0 => output.push(|| json!(label)),
+            OutputMode::FilesWithoutMatches if complete && count == 0 => {
+                output.push(|| json!(label))
+            }
+            OutputMode::Count if count != 0 => output.push(|| {
+                let mut row = json!({"count": count});
+                if args.with_path {
+                    row["path"] = json!(label);
+                }
+                row
+            }),
+            _ => {}
+        }
+        if !complete || (output.full && !args.stats) {
+            break;
+        }
+    }
+
+    let mut response = json!({
+        "path": args.path,
+        (args.output_mode.result_key()): output.rows,
+        "engine": "builtin",
+        "truncated": output.truncated,
+        "note": output.truncated.then_some(format!("{TRUNCATED} Narrow path, globs, pattern, or context.")),
+    });
+    if args.stats {
+        stats.elapsed_ms = start.elapsed().as_millis();
+        response["stats"] = json!(stats);
+    }
+    Ok(response)
 }
 
 pub(super) async fn collect(
@@ -280,169 +469,5 @@ pub(super) async fn collect(
             return Ok(bytes);
         }
         bytes.extend_from_slice(&buffer[..count.min(limit.saturating_sub(bytes.len()))]);
-    }
-}
-
-fn builtin(
-    text: &str,
-    pattern: &str,
-    fixed: bool,
-    ignore_case: bool,
-    limit: usize,
-) -> Result<(Vec<usize>, bool)> {
-    let matcher = line_matcher(pattern, fixed, ignore_case)?;
-    let deadline = Instant::now() + DEADLINE;
-    let mut matches = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        if Instant::now() >= deadline {
-            return Ok((matches, true));
-        }
-        if matcher.is_match(line) {
-            matches.push(index);
-            if matches.len() == limit {
-                break;
-            }
-        }
-    }
-    Ok((matches, false))
-}
-
-fn line_matcher(pattern: &str, fixed: bool, ignore_case: bool) -> Result<regex::Regex> {
-    let literal;
-    let pattern = if fixed {
-        literal = regex::escape(pattern);
-        &literal
-    } else {
-        pattern
-    };
-    Ok(regex::RegexBuilder::new(pattern)
-        .case_insensitive(ignore_case)
-        .size_limit(2 * 1024 * 1024)
-        .build()?)
-}
-
-// Produce one row per matching file without allocating a result for each matching line.
-fn summarize(path: PathBuf, corpus: &Corpus, args: &Args, limit: usize, deadline: Instant) -> Result<Value> {
-    let matcher = line_matcher(&args.pattern, args.fixed_string, args.ignore_case)?;
-    let count_lines = args.output_mode == OutputMode::Count;
-    let mut results = Vec::new();
-    let mut output_bytes = 0;
-    let mut truncated = corpus.incomplete;
-    let mut sources = corpus.files.iter().peekable();
-    'files: while let Some(file) = sources.next() {
-        let end = sources.peek().map_or(corpus.text.len(), |next| next.byte);
-        let mut count = 0;
-        for line in corpus.text[file.byte..end].lines() {
-            if Instant::now() >= deadline {
-                truncated = true;
-                break 'files;
-            }
-            if matcher.is_match(line) {
-                count += 1;
-                if !count_lines || results.len() == limit {
-                    break;
-                }
-            }
-        }
-        if count == 0 {
-            continue;
-        }
-        let result = if count_lines {
-            json!({"path": file.path, "count": count})
-        } else {
-            json!(file.path)
-        };
-        output_bytes += result.to_string().len();
-        if results.len() == limit || output_bytes > MAX_BYTES {
-            truncated = true;
-            break;
-        }
-        results.push(result);
-    }
-    let field = if count_lines { "counts" } else { "files" };
-    Ok(json!({"path": path, (field): results, "engine": "builtin", "truncated": truncated,
-        "note": truncated.then(|| format!("{TRUNCATED} Narrow fs_search path, glob, or pattern."))}))
-}
-
-fn render(
-    path: PathBuf,
-    corpus: Corpus,
-    lines: Vec<usize>,
-    limit: usize,
-    context: usize,
-    engine: &str,
-    timed_out: bool,
-) -> Value {
-    let mut results = Vec::new();
-    let mut truncated = corpus.incomplete || lines.len() > limit || timed_out;
-    let mut output_bytes = 0;
-    let mut sources = corpus.files.iter().peekable();
-    let mut matches = lines.into_iter().take(limit).peekable();
-    while let Some(file) = sources.next() {
-        let end = sources.peek().map_or(corpus.text.len(), |next| next.byte);
-        let last_line = sources.peek().map_or(corpus.lines, |next| next.line);
-        if matches.peek().is_none_or(|line| *line >= last_line) {
-            continue;
-        }
-        let local = corpus.text[file.byte..end].lines().collect::<Vec<_>>();
-        while matches.peek().is_some_and(|line| *line < last_line) {
-            let index = matches.next().unwrap() - file.line;
-            let first = index.saturating_sub(context);
-            let last = (index + context + 1).min(local.len());
-            let window = (first..last)
-                .map(|i| {
-                    let line = local[i];
-                    let prefix = utf8_prefix(line, MATCH_TEXT_BYTES);
-                    json!({"line": i + 1, "text": prefix, "truncated": prefix.len() < line.len()})
-                })
-                .collect::<Vec<_>>();
-            let data =
-                json!({"path": file.path.to_string_lossy(), "line": index + 1, "context": window});
-            output_bytes += data.to_string().len();
-            if output_bytes > MAX_BYTES {
-                truncated = true;
-                break;
-            }
-            results.push(data);
-        }
-        if output_bytes > MAX_BYTES {
-            break;
-        }
-    }
-    json!({"path": path, "matches": results, "engine": engine, "truncated": truncated,
-        "note": truncated.then(|| format!("{TRUNCATED} Narrow path, glob, pattern, or context."))})
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn missing_ripgrep_allows_builtin_literal_and_regex_search() -> Result<()> {
-        let args = Args {
-            pattern: "-x".into(),
-            path: dot(),
-            glob: None,
-            fixed_string: true,
-            ignore_case: true,
-            context: None,
-            max_results: Some(1),
-            output_mode: OutputMode::Content,
-        };
-        let text = "before\n-X\r\n-x\n";
-        assert!(
-            ripgrep("/missing/fs-search-rg", text, &args, 2)
-                .await?
-                .is_none()
-        );
-        assert_eq!(
-            builtin(text, &args.pattern, true, true, 2)?,
-            (vec![1, 2], false)
-        );
-        assert_eq!(
-            builtin(text, "^before$", false, false, 2)?,
-            (vec![0], false)
-        );
-        Ok(())
     }
 }

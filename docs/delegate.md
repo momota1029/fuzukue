@@ -17,9 +17,36 @@
 
 `fs_read` の出力は最大 400 行、本文は最大 64 KiB です。ファイル全体が 16 MiB の走査上限内なら `total_lines` を返します。上限を超えるファイルは先頭からの範囲を読み取れますが、末尾からの指定には全体の読み取りが必要です。続きがある場合は `next_start_line` を次の呼び出しに渡せます。
 
-`fs_search` は `rg` や `grep` の代わりに使えます。たとえば `{"path":"src","pattern":"TODO","glob":"*.rs","context":2}` で前後 2 行を表示します。 `output_mode: "files_with_matches"` は `rg -l` と同様に `files` に一致したファイルのパスを返し、`output_mode: "count"` は `rg -c` と同様に `counts` にファイルごとの一致行数を返します。集計モードの `max_results` はファイル数の上限で、検索対象は 1 MiB 以下の UTF-8 ファイルです。 `truncated: true` のときは、パスやパターンを絞ってください。
+### `fs_search` と `rg` / `grep`
 
-`fs_list` は `ls` や浅い `find` の代わりに使えます。 `{"path":"src","depth":2,"glob":"*.rs"}` は各項目のパス、種類、`size`（バイト）、`mtime_unix_secs`（Unix 秒）を返します。
+`fs_search` はディレクトリを既定で再帰検索します。例として `{"path":"src","pattern":"TODO","types":["rust"],"context":2}` は `rg -t rust -C 2 TODO src` に相当します。パターンの先頭が `-` の場合も `pattern` にそのまま渡せます。 `patterns` は複数の `-e` に相当し、いずれかに一致する行を選びます。 `rg -S` は `smart_case: true` で、パターンに大文字を含む場合は大文字と小文字を区別します。 `ignore_case: true` を同時に指定した場合は常に区別しません。
+
+| フラグ | 引数 |
+| --- | --- |
+| `grep -r` / `-R` | ディレクトリを再帰検索。走査中に見つけたシンボリックリンクはたどりません。 |
+| `-n` / `-i` | `line_number: true`（既定） / `ignore_case: true` |
+| `-l` / `grep -L` / `-c` | `output_mode: "files_with_matches"` / `"files_without_matches"` / `"count"` |
+| `-E` / `-F` | 正規表現が既定 / `fixed_string: true` |
+| `-v` / `-w` / `-x` | `invert: true` / `word: true` / `whole_line: true` |
+| `-A` / `-B` / `-C` | `after_context` / `before_context` / `context` |
+| `-m` | ファイルごとの `max_count` |
+| `--include` / `--exclude` / `--exclude-dir` | `globs: ["*.rs","!sample.rs","!fixtures/"]` |
+| `-o` / `-h` / `-H` | `only_matching: true` / `with_path: false` / `with_path: true` |
+| `-q` | `output_mode: "count"` と `max_results: 1`。一致があれば集計行が返ります。 |
+| `rg --files` | `output_mode: "files"`。パターンを省略し、ファイル内容を読み取らずパスを返します。 |
+| `rg -t` / `-T` | `types` / `exclude_types`。例は `rust`、`ts`、`md`、`py`、`toml`、`kt`。 |
+| `rg --column` / `--sort modified` / `--stats` | `column: true` / `sort: "modified"` / `stats: true` |
+| `rg --hidden` / `--no-ignore` | `include_hidden: true` / `include_ignored: true` |
+
+`glob` を先に評価し、`globs` の最後に一致した規則を適用します。先頭が `!` の規則は除外します。通常は読み取り範囲内の `.gitignore` と `.ignore` を適用します。 `target`、`node_modules`、`build`、`dist` などの生成先を検索するときは `path` に明示します。Git の内部データや保護対象は読み取り範囲外です。
+
+`before_context` と `after_context` は指定した側の `context` を上書きし、各値は 0〜5 に丸めます。 `max_count` は指定時に 1〜100,000、`max_results` は 1〜200 に丸めます。 `column` は 1 始まりのバイト位置を返し、`invert` では `null` を返します。 `only_matching` は空でない一致部分を個別の行として返します。複数行の検索には `multiline: true`（`rg -U`）を指定します。一致範囲はファイル内に収まり、通常の本文出力には最初と最後の行番号が付きます。複数行モードの `count` では、同じ行を共有する一致範囲を一つに数えます。 `grep -P` の先読み・後読み・後方参照を使う式は、周辺の文字を消費する式や前後の行を含む検索に置き換えられます。
+
+本文検索は 1 MiB 以下の UTF-8 ファイルを合計 32 MiB まで読みます。一覧と本文検索は最大 64 階層、20,000 項目、5 秒を目安に打ち切ります。 `stats` は検索した UTF-8 ファイル数、一致したファイル数、本文の読み取りバイト数、経過ミリ秒を返します。 `truncated: true` のときは、表示または検索の上限に達しています。
+
+### `fs_list` と `ls` / `find`
+
+`fs_list` は `ls`、`ls -R`、`find` の代わりに使えます。 `{"path":"src","recursive":true,"glob":"*.rs"}` は最大 64 階層から一致する項目のパス、種類、`size`（バイト）、`mtime_unix_secs`（Unix 秒）を返します。 `depth` で階層数を 1〜64 に指定でき、通常は直下の 1 階層を一覧します。
 
 ## ファイルの書き込みと終了時の照合
 

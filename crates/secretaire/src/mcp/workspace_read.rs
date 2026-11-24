@@ -2,6 +2,7 @@
 
 pub(crate) mod git_read;
 mod history;
+mod ignores;
 mod paths;
 mod plan_status;
 pub(super) mod range;
@@ -17,9 +18,9 @@ pub(super) use paths::{check_git_path, worktree_relative};
 pub(crate) use review::{ReviewLease, claude_config as review_claude_config, is_review_launch};
 pub(super) use review::{dispatch as dispatch_review, is_review};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use globset::{GlobBuilder, GlobMatcher};
-use serde::Deserialize;
+use serde::{Deserialize, de::{DeserializeOwned, value::MapDeserializer}};
 use serde_json::{Value, json};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -43,7 +44,7 @@ const DEFAULT_DEPTH: usize = 1;
 const READ_LINE: IntegerRange = IntegerRange::new(1, READ_SCAN_BYTES);
 const TAIL_LINES: IntegerRange = IntegerRange::new(1, LINE_WINDOW);
 const READ_BYTES: IntegerRange = IntegerRange::new(1, MAX_BYTES);
-const LIST_DEPTH: IntegerRange = IntegerRange::new(1, 3);
+const LIST_DEPTH: IntegerRange = IntegerRange::new(1, paths::SCAN_DEPTH);
 const DEADLINE: Duration = Duration::from_secs(5);
 const TRUNCATED: &str = "… [truncated]";
 
@@ -113,32 +114,18 @@ impl Tool {
             }
             Self::List => (
                 harness_text!(
-                    "Use instead of ls or a shallow find. Lists paths, types, sizes in bytes, and mtimes in Unix seconds without following symlinks. Try path=\"src\", depth=2, glob=\"*.rs\" to find Rust files.",
-                    "ls や浅い find の代わりに使う。パス、種類、バイト数、更新時刻（Unix 秒）を一覧する。シンボリックリンクはたどらない。たとえば path=\"src\"、depth=2、glob=\"*.rs\" で Rust ファイルを探す。"
+                    "Use instead of ls, ls -R, or find. Lists paths, types, sizes in bytes, and mtimes in Unix seconds without following symlinks. Use recursive=true for up to 64 levels, or specify depth. Try path=\"src\", depth=2, glob=\"*.rs\" to find Rust files.",
+                    "ls、ls -R、find の代わりに使う。パス、種類、バイト数、更新時刻（Unix 秒）を一覧する。シンボリックリンクはたどらない。recursive=true では 64 階層まで一覧し、depth で階層数を指定できる。たとえば path=\"src\"、depth=2、glob=\"*.rs\" で Rust ファイルを探す。"
                 ),
                 json!({"path": {"type": "string", "default": ".", "description": scoped_path}, "depth": LIST_DEPTH.property(DEFAULT_DEPTH),
-                    "glob": {"type": "string"}, "include_hidden": {"type": "boolean", "default": false},
+                    "glob": {"type": "string"}, "recursive": {"type": "boolean", "default": false},
+                    "include_hidden": {"type": "boolean", "default": false},
                     "include_ignored": {"type": "boolean", "default": false,
                         "description": harness_text!("Include target, node_modules, and the .git entry. Git metadata stays protected.",
                             "target、node_modules、.git の項目も含める。Git の内部データは保護される。")}}),
                 &[],
             ),
-            Self::Search => (
-                harness_text!(
-                    "Use instead of rg or grep for a single-line regex or literal search in scoped UTF-8 files. Try pattern=\"TODO\", glob=\"*.rs\", context=2 (rg -C 2). Use output_mode=files_with_matches for rg -l or output_mode=count for rg -c. Traversal skips hidden and generated directories.",
-                    "rg や grep の代わりに使い、作業範囲内の UTF-8 ファイルを一行の正規表現または文字列で検索する。たとえば pattern=\"TODO\"、glob=\"*.rs\"、context=2 は rg -C 2 に相当する。rg -l は output_mode=files_with_matches、rg -c は output_mode=count を指定する。再帰検索では隠し項目と生成先ディレクトリを除く。"
-                ),
-                json!({"pattern": {"type": "string", "maxLength": 4096}, "path": {"type": "string", "default": ".", "description": scoped_path},
-                    "glob": {"type": "string"}, "fixed_string": {"type": "boolean", "default": false},
-                    "ignore_case": {"type": "boolean", "default": false}, "context": search::CONTEXT.property(search::DEFAULT_CONTEXT),
-                    "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "default": "content",
-                        "description": harness_text!(
-                            "Content returns matching lines and context. Files with matches returns paths once each. Count returns matching-line counts per matching file. max_results caps lines in content mode and files in the other modes.",
-                            "content は一致行と前後の行、files_with_matches は重複のないパス、count は一致したファイルごとの一致行数を返す。max_results は content では行数、他のモードではファイル数を制限する。"
-                        )},
-                    "max_results": search::RESULTS.property(search::DEFAULT_RESULTS)}),
-                &["pattern"],
-            ),
+            Self::Search => search::definition(scoped_path),
             Self::PlanStatus => return plan_status::definition(self.name()),
             Self::GitShow => (
                 harness_text!(
@@ -161,10 +148,10 @@ impl Tool {
                 tokio::task::spawn_blocking(move || read(&scope, args)).await?
             }
             Self::List => {
-                let args = super::parse_args(args)?;
+                let args = parse_named_args(args)?;
                 tokio::task::spawn_blocking(move || list(&scope, args)).await?
             }
-            Self::Search => search::search(scope, super::parse_args(args)?).await,
+            Self::Search => search::search(scope, args).await,
             Self::GitShow => history::show(scope, super::parse_args(args)?).await,
             Self::PlanStatus => {
                 let args = super::parse_args(args)?;
@@ -172,6 +159,19 @@ impl Tool {
             }
         }
     }
+}
+
+// These tools have defaults for every field, so a failed decode can identify the
+// malformed argument by decoding each field independently without cloning its value.
+fn parse_named_args<T: DeserializeOwned>(args: &Value) -> Result<T> {
+    let result = super::parse_args(args);
+    if let (Err(_), Some(fields)) = (&result, args.as_object()) {
+        for (name, value) in fields {
+            let field = MapDeserializer::<_, serde_json::Error>::new(std::iter::once((name.as_str(), value)));
+            T::deserialize(field).with_context(|| format!("Invalid {name}"))?;
+        }
+    }
+    result
 }
 
 #[derive(Deserialize)]
@@ -285,6 +285,8 @@ struct ListArgs {
     path: PathBuf,
     #[serde(default, deserialize_with = "optional_integer")]
     depth: Option<i128>,
+    #[serde(default)]
+    recursive: bool,
     glob: Option<String>,
     #[serde(default)]
     include_hidden: bool,
@@ -293,11 +295,12 @@ struct ListArgs {
 }
 
 fn list(scope: &ReadScope, args: ListArgs) -> Result<Value> {
-    let depth = LIST_DEPTH.resolve(args.depth, DEFAULT_DEPTH);
-    let path = scope.resolve(&args.path)?;
+    let default_depth = if args.recursive { paths::SCAN_DEPTH } else { DEFAULT_DEPTH };
+    let depth = LIST_DEPTH.resolve(args.depth, default_depth);
+    let path = scope.resolve(&args.path).context("Invalid path")?;
     let file = paths::open(&path)?;
     ensure!(file.metadata()?.is_dir(), "Use fs_read to read a UTF-8 file. fs_list expects a directory.");
-    let glob = glob(args.glob.as_deref())?;
+    let glob = glob(args.glob.as_deref()).context("Invalid glob")?;
     let mut scan = paths::Scan::new(
         scope,
         depth,
