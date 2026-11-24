@@ -41,3 +41,7 @@ links:
 
 1. 作業ツリーの実装、[PC の撮影シナリオ](../../tests/shots)、[Android の AppShotTest](../../android/app/src/test/java/dev/labgui/remote/AppShotTest.kt) を確認。`tests/` に PNG はなく、Android の既存 PNG は `android/app/build/shots/app.png`（52×24 の旧ロゴ表示）のみ。現行画面の画像比較と再撮影は未実施。
 2. Android 実機なし。日本語 IME、添付／カメラ、通知の到達・操作、実機の数式・文字サイズ、接続／復帰は未確認。
+
+## フォルダーの読み取り許可
+
+v65 のフォルダーアクセス依頼は、両端末の会話内で既存の承認カードに表示する。Android では 1 時間の許可または拒否を選べる。期間の選択、許可の追加と取り消し、読み取り履歴の表示は現在デスクトップのスレッド詳細で行う。 [フォルダーの読み取り許可](../../docs/folder-grants.md)

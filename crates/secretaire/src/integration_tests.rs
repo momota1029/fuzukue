@@ -1768,6 +1768,72 @@ async fn mcp_review_findings_record_close_and_reopen_per_deck() -> Result<()> {
 }
 
 #[tokio::test]
+async fn mcp_folder_grants_require_approval_and_audit_granted_reads() -> Result<()> {
+    use fuzukue_proto::FolderGrantExpiry;
+    let project = TempProject::new()?;
+    let app = mcp_app(&project);
+    let thread = app.hub.edit_threads(|threads| threads.create(None))?;
+    let other = app.hub.edit_threads(|threads| threads.create(None))?;
+    let external = tempfile::tempdir()?;
+    let folder = external.path().canonicalize()?;
+    let note = folder.join("notes.md");
+    std::fs::write(&note, "folder grant regression")?;
+    let call = |session: &str, name: &str, args| {
+        let app = app.clone();
+        let session = session.to_owned();
+        let params = json!({"name": name, "arguments": args});
+        async move { mcp_request_for(&app, &session, "tools/call", params).await }
+    };
+    let rejected = call(&thread, "fs_read", json!({"path": note})).await;
+    assert_eq!(rejected["isError"], true);
+    assert!(rejected.to_string().contains("pending in the thread's approvals"));
+    let request = call(&thread, "folder_grants", json!({"action":"request", "path":folder})).await;
+    let request_id = mcp_data(&request)["request_id"].as_str().unwrap();
+    assert!(rejected.to_string().contains(request_id), "duplicate requests must reuse the same approval");
+    assert!(crate::resolve_approval(&app, request_id.into(), "accept".into(), true).await.is_err());
+    app.hub.decide_folder_access(request_id, Some(FolderGrantExpiry::NoExpiry), "test-user")?;
+    assert!(app.hub.decide_folder_access(request_id, Some(FolderGrantExpiry::NoExpiry), "test-user").is_err());
+
+    for (tool, args) in [
+        ("fs_read", json!({"path": note})),
+        ("fs_list", json!({"path": folder})),
+        ("fs_search", json!({"path": folder, "pattern": "regression"})),
+    ] {
+        let result = call(&thread, tool, args).await;
+        assert_eq!(result["isError"], false, "{tool}: {result}");
+    }
+    assert_eq!(call(&other, "fs_read", json!({"path": note})).await["isError"], true);
+
+    let git = |args: &[&str]| -> Result<()> {
+        let result = std::process::Command::new("git").current_dir(&folder).args(args).output()?;
+        anyhow::ensure!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        Ok(())
+    };
+    git(&["init", "-q"])?;
+    git(&["add", "notes.md"])?;
+    git(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"])?;
+    let history = call(&thread, "git_show", json!({"rev":"HEAD", "repository":folder, "path":"notes.md"})).await;
+    assert!(mcp_data(&history)["text"].as_str().unwrap().contains("regression"));
+    let rejected_git = call(&other, "git_show", json!({"rev":"HEAD", "repository":folder, "path":"notes.md"})).await;
+    assert_eq!(rejected_git["isError"], true);
+
+    let listed = call(&thread, "folder_grants", json!({"action":"list"})).await;
+    let listed = mcp_data(&listed);
+    let grant = &listed["grants"][0];
+    assert_eq!(grant["granted_by"], "test-user");
+    assert_eq!(grant["path"], json!(folder));
+    let id = grant["id"].as_str().unwrap();
+    let audit = listed["audit"].as_array().unwrap();
+    assert!(audit.len() >= 6);
+    assert!(audit.iter().all(|row| row["session"] == thread && row["grant_id"] == id && row["time"].is_i64()));
+    assert!(audit.iter().any(|row| row["path"] == json!(note)));
+    assert!(app.hub.revoke_folder_grant(&other, id).is_err());
+    assert_eq!(call(&thread, "folder_grants", json!({"action":"revoke", "grant_id":id})).await["isError"], false);
+    assert_eq!(call(&thread, "fs_read", json!({"path":note})).await["isError"], true);
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> {
     let project = TempProject::new()?;
     let listed = mcp_request(&mcp_app(&project), "tools/list", json!({})).await;
@@ -1888,7 +1954,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             ("remote", "string"), ("kind", "string"), ("interval", "integer"), ("wake", "string"),
             ("attention_patterns", "array"), ("attention_marked_lines", "boolean"), ("sources", "array")],
             &["action"]),
-        ("delegate", &[("prompt", "string"), ("title", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
+        ("delegate", &[("prompt", "string"), ("title", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("folder_grants", "array"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
             ("isolation", "string"), ("backend", "string"), ("model", "string"), ("artifacts", "array")], &["prompt"]),
         ("plan", &[("goal", "string"), ("context", "string"), ("long_running", "boolean"), ("pace", "string"), ("tier", "string"), ("min_tier", "string")],
             &["goal", "context"]),
@@ -1945,7 +2011,8 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             ("include_ignored", "boolean")], &[]),
         ("fs_search", &[("pattern", "string"), ("path", "string"), ("glob", "string"), ("fixed_string", "boolean"),
             ("ignore_case", "boolean"), ("context", "integer"), ("max_results", "integer")], &["pattern"]),
-        ("git_show", &[("rev", "string"), ("path", "string")], &["rev"]),
+        ("git_show", &[("rev", "string"), ("path", "string"), ("repository", "string")], &["rev"]),
+        ("folder_grants", &[("action", "string"), ("path", "string"), ("grant_id", "string"), ("audit_before", "integer")], &["action"]),
         ("research_issue_create", &[("title", "string"), ("cards", "array"), ("kind", "string"),
             ("acceptance", "string"), ("assignee", "string"), ("producer", "string")],
             &["title", "cards", "kind", "acceptance"]),

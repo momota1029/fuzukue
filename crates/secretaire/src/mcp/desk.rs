@@ -181,7 +181,7 @@ impl Tool {
                 let Archive { id, archived } = parse_args(args)?;
                 let id = id.as_deref().unwrap_or(session);
                 app.hub
-                    .edit_threads(|store| store.set_archived(id, archived))?;
+                    .set_thread_archived(id, archived)?;
                 json!({"id": id, "archived": archived})
             }
             Self::PinThread => {

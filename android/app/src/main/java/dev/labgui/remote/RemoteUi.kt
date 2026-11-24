@@ -876,7 +876,9 @@ private fun ApprovalPanel(
         }
         Row(Modifier.align(Alignment.End), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = { onResolve(request.requestId, false) }, enabled = enabled) { Text(stringResource(R.string.deny)) }
-            Button(onClick = { onResolve(request.requestId, true) }, enabled = enabled) { Text(stringResource(R.string.allow)) }
+            Button(onClick = { onResolve(request.requestId, true) }, enabled = enabled) {
+                Text(stringResource(if (request.isFolderAccess) R.string.allow_folder_one_hour else R.string.allow))
+            }
         }
         if (directory != null && onRemember != null) {
             TextButton(onClick = {

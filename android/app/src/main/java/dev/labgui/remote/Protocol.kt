@@ -8,9 +8,10 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.decodeFromJsonElement
 
-const val PROTOCOL_VERSION = 64
+const val PROTOCOL_VERSION = 65
 internal const val MIN_PROTOCOL_VERSION = 18
 internal const val THREAD_HISTORY_PROTOCOL = 62
+internal const val FOLDER_ACCESS_REQUEST = "folder-access-"
 private const val COMPOSER_NOTICE_ITEM = "composer-status"
 
 @Serializable
@@ -67,6 +68,12 @@ sealed interface ClientMessage {
 
     @Serializable @SerialName("stop_worker")
     data class StopWorker(val session: String, val job: String) : ClientMessage
+
+    @Serializable @SerialName("decide_folder_access")
+    data class DecideFolderAccess(
+        @SerialName("request_id") val requestId: String,
+        val expiry: String?,
+    ) : ClientMessage
 
     @Serializable @SerialName("resolve")
     data class Resolve(@SerialName("request_id") val requestId: String, val decision: String) : ClientMessage
@@ -245,7 +252,9 @@ sealed interface ServerEvent {
     data class ApprovalRequested(override val session: String, @SerialName("request_id") val requestId: String,
                                  val summary: String,
                                  @SerialName("shell_directory") val shellDirectory: String? = null,
-                                 @SerialName("shell_prefix") val shellPrefix: String? = null) : InThread
+                                 @SerialName("shell_prefix") val shellPrefix: String? = null) : InThread {
+        val isFolderAccess: Boolean get() = requestId.startsWith(FOLDER_ACCESS_REQUEST)
+    }
 
     @Serializable
     data class ApprovalResolved(@SerialName("request_id") val requestId: String) : ServerEvent

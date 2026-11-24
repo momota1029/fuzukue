@@ -1,0 +1,20 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1000},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "folder-grants fixture"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "approval_requested"},
+    {"action": "wait_event", "event": "turn_ended"},
+    {"action": "screenshot", "name": "folder-access-request"},
+    {"action": "resolve_approval", "decision": "accept"},
+    {"action": "wait_event", "event": "approval_resolved"},
+    {"action": "click", "id": "thread-info-toggle"},
+    {"action": "wait_event", "event": "folder_grants"},
+    {"action": "wait_element", "id": "thread-folders"},
+    {"action": "screenshot", "name": "thread-folders"}
+  ]
+}

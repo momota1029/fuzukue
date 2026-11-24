@@ -98,7 +98,8 @@ impl Corpus {
                 if entry.kind != "file" || !matches_glob(glob.as_ref(), relative) {
                     return true;
                 }
-                match paths::open(&entry.path)
+                match scope.audit_read(&entry.path)
+                    .and_then(|()| paths::open(&entry.path))
                     .and_then(|file| corpus.add(&entry.path, relative, &file))
                 {
                     Ok(has_space) => has_space,

@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::questions::{self, QuestionReply};
 
 mod notifications;
+mod folder_grants;
 
 const BACKLOG: usize = 10_000;
 
@@ -33,6 +34,7 @@ struct Inner {
     writer: Option<crate::state::TimelineWriter>,
     threads: Option<crate::threads::Store>,
     partner_started: HashMap<String, Observed>,
+    folder_grants: Option<crate::folder_grants::Store>,
     running: HashSet<String>,
     github_auth_requests: HashMap<String, crate::github_auth::mcp::Tool>,
     compactions: HashMap<String, (Arc<crate::cancellation::Cancellation>, i64)>,
@@ -95,6 +97,7 @@ struct WorkerActivity {
 
 enum ApprovalWaiter {
     Backend,
+    Folder,
     Local(Weak<()>),
     Restored,
 }
@@ -102,7 +105,7 @@ enum ApprovalWaiter {
 impl PendingApproval {
     fn live(&self) -> bool {
         match &self.waiter {
-            ApprovalWaiter::Backend => true,
+            ApprovalWaiter::Backend | ApprovalWaiter::Folder => true,
             ApprovalWaiter::Local(waiter) => waiter.strong_count() != 0,
             ApprovalWaiter::Restored => false,
         }
@@ -119,7 +122,7 @@ pub(crate) fn worker_approval(request_id: &str, actor: &Actor) -> bool {
 impl Hub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, partner_started: Default::default(), running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
+        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
             epoch: format!("{:032x}", rand::random::<u128>()),
         }
     }
@@ -278,7 +281,7 @@ impl Hub {
                 blockers.push(blocker(BlockerKind::Worker, Some(session), id, worker.title.clone(), started_at));
             }
         }
-        for approval in inner.approvals.values().filter(|approval| approval.live()) {
+        for approval in inner.approvals.values().filter(|approval| approval.live() && !matches!(approval.waiter, ApprovalWaiter::Folder)) {
             if let ServerEvent::ApprovalRequested { session, request_id, .. } = &approval.envelope.event {
                 blockers.push(blocker(BlockerKind::Approval, Some(session), request_id,
                     thread_title(session), approval.observed.timestamp));
@@ -490,6 +493,9 @@ impl Hub {
                 inner.running.remove(session);
                 inner.github_auth_requests.remove(session);
                 inner.partner_started.remove(session);
+                if inner.folder_grants.as_mut().is_some_and(|store| store.end_turn(session)) {
+                    let _ = self.tx.send(crate::snapshot(ServerEvent::FolderGrantsChanged { session: session.clone() }));
+                }
                 self.close_approvals(inner, "cancelled", |approval| {
                     matches!(approval.waiter, ApprovalWaiter::Backend)
                         && matches!(&approval.envelope.event, ServerEvent::ApprovalRequested {
@@ -560,7 +566,9 @@ impl Hub {
         let mut records = crate::state::load_sessions(state_dir);
         let mut store = crate::threads::Store::load(project, state_dir, &records);
         store.restore_sessions(&mut records);
-        self.inner.lock().unwrap().threads = Some(store);
+        let mut inner = self.inner.lock().unwrap();
+        inner.threads = Some(store);
+        inner.folder_grants = Some(crate::folder_grants::Store::load(state_dir));
         records
     }
 
@@ -727,6 +735,9 @@ impl Hub {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let store = inner.threads.as_mut().expect("Workspace initializes the thread store");
+        anyhow::ensure!(store.contains(session), "Thread not found");
+        self.end_folder_grants(&mut inner, session, true)?;
+        let store = inner.threads.as_mut().unwrap();
         store.trash(app, trash, session)?;
         let snapshot = store.snapshot();
         let _ = self.tx.send(crate::snapshot(snapshot));

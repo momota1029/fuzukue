@@ -6,6 +6,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
+use crate::folder_grants::{self, Access, OutsideScope};
 use crate::worker_scope::{self, Scope};
 
 #[derive(Clone)]
@@ -15,6 +16,8 @@ pub(crate) struct ReadScope {
     scratch: Option<PathBuf>,
     roots: Vec<PathBuf>,
     protected: Vec<PathBuf>,
+    sensitive_aliases: Vec<PathBuf>,
+    access: Option<Access>,
 }
 
 impl ReadScope {
@@ -31,14 +34,21 @@ impl ReadScope {
             scratch,
             roots,
             protected: worker_scope::protected_roots(state),
+            sensitive_aliases: folder_grants::protected_aliases(),
+            access: None,
         })
     }
 
-    pub(super) fn check(&self, path: &Path) -> Result<()> {
-        ensure!(
-            self.roots.iter().any(|root| path.starts_with(root)),
-            "Path is outside the workspace read scope"
-        );
+    pub(crate) fn with_grants(mut self, access: Access) -> Self {
+        self.access = Some(access);
+        self
+    }
+
+    pub(super) fn in_scope(&self, path: &Path) -> bool {
+        self.roots.iter().any(|root| path.starts_with(root))
+    }
+
+    fn check_protected(&self, path: &Path) -> Result<()> {
         ensure!(
             !path
                 .components()
@@ -59,20 +69,64 @@ impl ReadScope {
                     .is_some_and(|scratch| path.starts_with(scratch)),
             "Access denied to Fuzukue configuration or state"
         );
+        ensure!(
+            !folder_grants::sensitive(path) && !self.sensitive_aliases.iter().any(|root| path.starts_with(root)),
+            "Access denied to a sensitive path"
+        );
         Ok(())
     }
 
-    pub(super) fn resolve(&self, path: &Path) -> Result<PathBuf> {
+    fn granted(&self, path: &Path, audit: bool) -> Result<bool> {
+        match &self.access {
+            Some(access) => access.hub.folder_read(
+                &access.session, path, access.worker_grants.as_deref(), audit,
+            ),
+            None => Ok(false),
+        }
+    }
+
+    pub(super) fn check(&self, path: &Path) -> Result<()> {
+        self.check_protected(path)?;
+        ensure!(self.in_scope(path) || self.granted(path, false)?, OutsideScope(path.into()));
+        Ok(())
+    }
+
+    /// Call immediately before traversing a directory or reading a file discovered by a scan.
+    pub(super) fn audit_read(&self, path: &Path) -> Result<()> {
+        self.check_protected(path)?;
+        ensure!(self.in_scope(path) || self.granted(path, true)?, "Folder access expired or was revoked");
+        Ok(())
+    }
+
+    pub(crate) fn resolve(&self, path: &Path) -> Result<PathBuf> {
+        self.resolve_checked(path, true)
+    }
+
+    pub(super) fn resolve_checked(&self, path: &Path, audit: bool) -> Result<PathBuf> {
         ensure!(
             !path.components().any(|part| part == Component::ParentDir),
             "Parent-directory components (..) are outside the workspace path policy"
         );
         let absolute = self.cwd.join(path);
-        self.check(&absolute)?;
-        let resolved = absolute
-            .canonicalize()
-            .context("Could not resolve workspace path")?;
-        self.check(&resolved)?;
+        self.check_protected(&absolute)?;
+        if !self.in_scope(&absolute) && self.access.is_none() {
+            return Err(OutsideScope(absolute).into());
+        }
+        let resolved = absolute.canonicalize().context("Could not resolve workspace path")?;
+        self.check_protected(&resolved)?;
+        if self.in_scope(&absolute) {
+            ensure!(self.in_scope(&resolved), "Symlink target is outside the workspace read scope");
+        } else {
+            // Refuse aliases for externally granted reads. The descriptor walk also
+            // refuses symlinks introduced after this check.
+            ensure!(absolute == resolved, "Symlink is outside the workspace read scope for folder grants");
+            if !self.granted(&resolved, audit)? {
+                let folder = if resolved.is_dir() { resolved } else {
+                    resolved.parent().context("No parent folder")?.to_path_buf()
+                };
+                return Err(OutsideScope(folder).into());
+            }
+        }
         Ok(resolved)
     }
 }
@@ -193,7 +247,7 @@ impl<'a> Scan<'a> {
             }
             let name = std::ffi::OsStr::from_bytes(name);
             let child = path.join(name);
-            if !git && self.scope.check(&child).is_err() {
+            if (git && !self.scope.in_scope(path)) || (!git && self.scope.check(&child).is_err()) {
                 continue;
             }
             let Ok(stat) = unix::statat(file, name, AtFlags::SYMLINK_NOFOLLOW) else {
@@ -223,6 +277,7 @@ impl<'a> Scan<'a> {
                 return Ok(false);
             }
             if descend {
+                self.scope.audit_read(&child)?;
                 let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
                 match unix::openat(file, &name, flags, Mode::empty()) {
                     Ok(handle) => {

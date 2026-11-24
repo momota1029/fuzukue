@@ -470,9 +470,16 @@ pub async fn start(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, agent: Option<&str>, caller: AgentCaller, routing: TierRequest,
     touches: Option<Vec<String>>,
 ) -> Result<String> {
+    start_with_grants(app, session, prompt, title, agent, caller, routing, touches, Vec::new()).await
+}
+
+pub(crate) async fn start_with_grants(
+    app: &Arc<App>, session: &str, prompt: String, title: Option<String>, agent: Option<&str>, caller: AgentCaller,
+    routing: TierRequest, touches: Option<Vec<String>>, folder_grants: Vec<String>,
+) -> Result<String> {
     let request = Assignment {
         prompt, title, worktree: None, agent: agent.map(str::to_owned),
-        selection: None, caller: Some(caller), adopted: None, routing, touches, issue: None, isolation: None,
+        selection: None, caller: Some(caller), adopted: None, routing, touches, issue: None, isolation: None, folder_grants,
     };
     start_assignment(app, session, request).await
 }
@@ -494,14 +501,14 @@ async fn start_assignment(app: &Arc<App>, session: &str, request: Assignment) ->
 
 pub async fn start_for_issue(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, agent: Option<&str>, caller: AgentCaller, number: u64, routing: TierRequest,
-    touches: Option<Vec<String>>,
+    touches: Option<Vec<String>>, folder_grants: Vec<String>,
 ) -> Result<String> {
     let link = crate::issue_threads::link(app, number)?;
     ensure!(app.hub.read_threads(|store| store.github_state(session)).is_some_and(|state| state.links.contains(&link)),
         "Link the issue before delegating in its worktree");
     let request = Assignment {
         prompt, title, worktree: Some(crate::github::worktree_path(&app.project_dir, number)?), agent: agent.map(str::to_owned),
-        selection: None, caller: Some(caller), adopted: None, routing, touches, issue: Some(number), isolation: None,
+        selection: None, caller: Some(caller), adopted: None, routing, touches, issue: Some(number), isolation: None, folder_grants,
     };
     start_assignment(app, session, request).await
 }
@@ -522,7 +529,7 @@ pub(crate) async fn queue_issue_assignment(
     let job = format!("{DELEGATE_JOB}{}", mail::session_key());
     let assignment = Assignment {
         prompt, title: None, worktree: Some(directory), agent: None, selection: Some(selection),
-        caller: None, adopted: None, routing: Default::default(), touches: None, issue: None, isolation: None,
+        caller: None, adopted: None, routing: Default::default(), touches: None, issue: None, isolation: None, folder_grants: Vec::new(),
     };
     let (_, run) = launch_assignment(app, session, job, assignment, false).await?;
     Ok(run)
@@ -553,7 +560,7 @@ async fn launch(
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
     let _accept = app.admit_work()?;
     let job = format!("{DELEGATE_JOB}{}", mail::session_key());
-    let request = Assignment { prompt, title, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None };
+    let request = Assignment { prompt, title, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None, folder_grants: Vec::new() };
     launch_assignment(app, session, job, request, false).await
 }
 
@@ -573,6 +580,8 @@ pub(crate) struct Assignment {
     issue: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     isolation: Option<blind::Isolation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    folder_grants: Vec<String>,
 }
 
 impl Assignment {
@@ -601,8 +610,9 @@ pub(crate) async fn restore_assignment(app: &Arc<App>, session: String, id: Stri
 async fn launch_assignment(
     app: &Arc<App>, session: &str, job: String, request: Assignment, restore: bool,
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
-    let Assignment { prompt, title, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation } = request.clone();
+    let Assignment { prompt, title, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, folder_grants } = request.clone();
     let blind = isolation.is_some();
+    app.hub.validate_worker_grants(session, &folder_grants)?;
     let is_planner = request.is_planner();
     let agent = agent.as_deref();
     ensure!(!prompt.trim().is_empty(), "委譲する作業を指定する");
@@ -610,7 +620,7 @@ async fn launch_assignment(
     ensure!(agent != Some(planner::ROLE), "方針には plan または replan を使う");
     if blind {
         ensure!(agent.is_none() && worktree.is_none() && adopted.is_none() && issue.is_none()
-            && caller == Some(AgentCaller::FrontDesk) && touches.as_ref().is_some_and(Vec::is_empty)
+            && folder_grants.is_empty() && caller == Some(AgentCaller::FrontDesk) && touches.as_ref().is_some_and(Vec::is_empty)
             && selection.as_ref().and_then(|selection| selection.model.as_deref()).is_some(),
             "Invalid blind review assignment");
     }
@@ -864,6 +874,9 @@ async fn launch_assignment(
             let can_search = mcp_url.is_some() && tools.iter().any(|tool| tool == "search_library");
             let can_add_memo = mcp_url.is_some() && tools.iter().any(|tool| tool == "add_memo");
             let can_read = mcp_url.is_some() && tools.iter().any(|tool| crate::mcp::workspace_read::Tool::named(tool).is_some());
+            let access = crate::folder_grants::Access {
+                hub: app.hub.clone(), session: session.clone(), worker_grants: Some(folder_grants.into()),
+            };
             let state = app.state_dir.clone();
             let workspace = app.project_dir.clone();
             let lean_task = role == "lean" || prompt.split(|c: char| !c.is_ascii_alphanumeric())
@@ -872,7 +885,10 @@ async fn launch_assignment(
                 std::fs::create_dir_all(&state)?;
                 let scratch = tempfile::Builder::new().prefix("worker-").tempdir_in(&state)?;
                 let scope = crate::worker_scope::Scope::open(&workspace, &project, scratch.path())?;
-                let read_scope = can_read.then(|| crate::mcp::workspace_read::ReadScope::new(&workspace, &state, Some(&scope))).transpose()?;
+                let read_scope = can_read.then(|| {
+                    crate::mcp::workspace_read::ReadScope::new(&workspace, &state, Some(&scope))
+                        .map(|scope| scope.with_grants(access))
+                }).transpose()?;
                 let rules = crate::rules::resolve(&project)?;
                 let mut instructions = rules.policy(&project)?;
                 if lean_task || crate::lean_reading::is_lean_workspace(&project) {

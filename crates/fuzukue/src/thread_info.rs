@@ -7,12 +7,13 @@ use fuzukue_i18n::STATUS_SEPARATOR;
 use gpui_kit::base::{Disableable as _, Selectable as _, StyledExt as _};
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
+    input::{Input, InputState},
     scroll::ScrollableElement as _,
     menu::{DropdownMenu as _, PopupMenuItem},
     h_flex, v_flex, ActiveTheme as _, Sizable as _,
 };
-use gpui_kit::{div, prelude::*, px, relative, ClipboardItem, Context, SharedString, Window};
-use fuzukue_proto::{ClientMsg, GoalPace, GoalParallelLimits, GoalProgress, Plan, PlanStatus, ServerEvent, ThreadArtifact};
+use gpui_kit::{div, prelude::*, px, relative, ClipboardItem, Context, Entity, Focusable, SharedString, Window};
+use fuzukue_proto::{ClientMsg, GoalPace, GoalParallelLimits, GoalProgress, Plan, PlanStatus, ServerEvent, ThreadArtifact, FolderGrant, FolderGrantExpiry, FolderGrantRead};
 
 use crate::{appearance::UI_LINE_HEIGHT, chat::{permission_label, AgentTarget}, icons::Symbol, Workbench};
 use crate::chat::chat_activity::{status_row, status_speech};
@@ -31,6 +32,36 @@ pub(super) struct ThreadInfo {
     pub agents: Vec<fuzukue_proto::AgentInfo>,
     agent_open: Option<String>,
     pub git: crate::workspace_git::WorkspaceGit,
+    pub folders: HashMap<String, FolderDetails>,
+    folder_draft: Option<(String, Entity<InputState>)>,
+    folder_audit_open: Option<String>,
+}
+
+pub(super) struct FolderDetails {
+    pub grants: Vec<FolderGrant>,
+    pub audit: Vec<FolderGrantRead>,
+    pub audit_before: Option<u64>,
+}
+
+pub(super) const FOLDER_EXPIRIES: [FolderGrantExpiry; 5] = [
+    FolderGrantExpiry::ThisTurn, FolderGrantExpiry::OneHour, FolderGrantExpiry::Today,
+    FolderGrantExpiry::UntilThreadEnds, FolderGrantExpiry::NoExpiry,
+];
+
+pub(super) fn folder_expiry_label(expiry: FolderGrantExpiry) -> &'static str {
+    match expiry {
+        FolderGrantExpiry::ThisTurn => tr!("folder-grant-this-turn"),
+        FolderGrantExpiry::OneHour => tr!("folder-grant-one-hour"),
+        FolderGrantExpiry::Today => tr!("folder-grant-today"),
+        FolderGrantExpiry::UntilThreadEnds => tr!("folder-grant-until-thread-ends"),
+        FolderGrantExpiry::NoExpiry => tr!("folder-grant-no-expiry"),
+    }
+}
+
+fn folder_time(time: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(time)
+        .map(|at| at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default()
 }
 
 const BLOCKER_ATTENTION_AGE: Duration = Duration::from_secs(30 * 60);
@@ -103,10 +134,109 @@ impl Workbench {
             let _ = self.out.send(ClientMsg::GetThreadArtifacts {
                 session: self.active.clone(),
             });
+            self.request_folder_grants(None);
             if self.protocol >= 14 && self.thread_info.agents.is_empty() {
                 let _ = self.out.send(ClientMsg::ListAgents);
             }
         }
+    }
+
+    pub(super) fn request_folder_grants(&self, audit_before: Option<u64>) {
+        if self.thread_info_visible() && self.protocol >= fuzukue_proto::FOLDER_GRANTS_PROTOCOL {
+            let _ = self.out.send(ClientMsg::ListFolderGrants { session: self.active.clone(), audit_before });
+        }
+    }
+
+    fn render_thread_folders(&self, archived: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let details = self.thread_info.folders.get(&self.active);
+        let audit_open = self.thread_info.folder_audit_open.as_ref() == Some(&self.active);
+        let draft = self.thread_info.folder_draft.as_ref()
+            .filter(|(session, _)| session == &self.active).map(|(_, input)| input.clone());
+        let muted = cx.theme().muted_foreground;
+        let now = chrono::Utc::now().timestamp_millis();
+        let grants = details.into_iter().flat_map(|details| details.grants.iter())
+            .filter(|grant| grant.expires_at.is_none_or(|at| at > now));
+        let no_grants = grants.clone().next().is_none();
+        v_flex().id("thread-folders").gap_2()
+            .child(div().font_bold().child(tr!("folder-grant-heading")))
+            .children(no_grants.then(|| status_row(tr!("folder-grant-empty"), muted)))
+            .children(grants.map(|grant| {
+                let grant_id = grant.id.clone();
+                let session = grant.session.clone();
+                let until = grant.expires_at.map(folder_time);
+                v_flex().gap_1().min_w_0()
+                    .child(div().w_full().text_sm().whitespace_normal().child(grant.path.clone()))
+                    .child(status_row(&tr!("folder-grant-duration", expiry = folder_expiry_label(grant.expiry)), muted))
+                    .children(until.map(|at| status_row(&tr!("folder-grant-expires-at", time = at), muted)))
+                    .child(status_row(&tr!("folder-grant-granted-by", principal = grant.granted_by.clone()), muted))
+                    .child(Button::new(SharedString::from(format!("revoke-folder-{grant_id}")))
+                        .ghost().xsmall().self_start().label(tr!("folder-grant-revoke"))
+                        .on_click(cx.listener(move |this, _, _, _| {
+                            let _ = this.out.send(ClientMsg::RevokeFolderGrant {
+                                session: session.clone(), grant_id: grant_id.clone(),
+                            });
+                        })))
+            }))
+            .when(!archived && draft.is_none(), |section| section.child(
+                Button::new("add-folder-grant").secondary().xsmall().self_start().label(tr!("folder-grant-add"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let input = cx.new(|cx| InputState::new(window, cx).placeholder(tr!("folder-grant-path")));
+                        input.read(cx).focus_handle(cx).focus(window, cx);
+                        this.thread_info.folder_draft = Some((this.active.clone(), input));
+                        cx.notify();
+                    })),
+            ))
+            .children(draft.map(|input| {
+                v_flex().gap_1()
+                    .child(Input::new(&input))
+                    .child(div().text_sm().child(tr!("folder-grant-allow-for")))
+                    .child(h_flex().flex_wrap().gap_1()
+                        .children(FOLDER_EXPIRIES.into_iter()
+                            .filter(|expiry| *expiry != FolderGrantExpiry::ThisTurn || self.chats[&self.active].busy)
+                            .enumerate().map(|(index, expiry)| {
+                                let input = input.clone();
+                                Button::new(("add-folder-expiry", index)).secondary().xsmall()
+                                    .label(folder_expiry_label(expiry))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let path = input.read(cx).value().trim().to_owned();
+                                        if path.is_empty() {
+                                            return;
+                                        }
+                                        let _ = this.out.send(ClientMsg::AddFolderGrant {
+                                            session: this.active.clone(), path, expiry,
+                                        });
+                                        this.thread_info.folder_draft = None;
+                                        cx.notify();
+                                    }))
+                            })))
+                    .child(Button::new("cancel-folder-grant").ghost().xsmall().self_start().label(tr!("folder-grant-cancel"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.thread_info.folder_draft = None;
+                            cx.notify();
+                        })))
+            }))
+            .child(disclosure("folder-grant-audit", tr!("folder-grant-audit").into(), audit_open)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.thread_info.folder_audit_open = (!audit_open).then(|| this.active.clone());
+                    if !audit_open {
+                        this.request_folder_grants(None);
+                    }
+                    cx.notify();
+                })))
+            .when(audit_open, |section| {
+                let audit = details.map_or(&[][..], |details| details.audit.as_slice());
+                section.children(audit.is_empty().then(|| status_row(tr!("folder-grant-audit-empty"), muted)))
+                    .children(audit.iter().map(|entry| v_flex().min_w_0()
+                        .child(div().w_full().whitespace_normal().child(entry.path.clone()))
+                        .child(status_row(&folder_time(entry.time), muted))))
+                    .child(h_flex().flex_wrap().gap_1()
+                        .child(Button::new("folder-audit-refresh").ghost().xsmall().label(tr!("folder-grant-audit-latest"))
+                            .on_click(cx.listener(|this, _, _, _| this.request_folder_grants(None))))
+                        .children(details.and_then(|details| details.audit_before).map(|before| {
+                            Button::new("folder-audit-older").ghost().xsmall().label(tr!("folder-grant-audit-older"))
+                                .on_click(cx.listener(move |this, _, _, _| this.request_folder_grants(Some(before))))
+                        })))
+            })
     }
 
     pub(super) fn thread_info_toggle(&self, cx: &mut Context<Self>) -> Button {
@@ -648,6 +778,8 @@ impl Workbench {
                             .children((self.protocol >= 14).then_some(agents))
                             .child(attachments)
                             .child(artifacts)
+            .children((self.protocol >= fuzukue_proto::FOLDER_GRANTS_PROTOCOL)
+                .then(|| self.render_thread_folders(thread.archived, cx)))
                             .child(context)
                             .child(compact)
                             .child(tools),

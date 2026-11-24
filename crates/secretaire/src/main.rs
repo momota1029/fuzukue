@@ -40,6 +40,7 @@ mod history;
 mod branch_review;
 mod lean_reading;
 mod hub;
+mod folder_grants;
 mod mail;
 mod inbox;
 mod routing;
@@ -765,8 +766,10 @@ async fn ws_handler(
     // Browser scripts set Origin on WebSockets. Only native desktop connections
     // may use the stored OAuth credential, including on the loopback listener.
     let github_report_client = !headers.contains_key(axum::http::header::ORIGIN);
+    let grant_principal = device.as_ref().map(|device| format!("device:{}", device.0.id()))
+        .unwrap_or_else(|| if ip.is_loopback() { "local_user" } else { "shared_token_user" }.into());
     ws.on_upgrade(move |socket| async move {
-        let serve = client_loop(socket, app, ip, github_report_client);
+        let serve = client_loop(socket, app, ip, github_report_client, grant_principal);
         if let Some(axum::Extension(device)) = device {
             device.run(serve).await;
         } else {
@@ -791,7 +794,7 @@ async fn file_handler(
     tokio::fs::read(&full).await.map_err(|e| not_found(e.into()))
 }
 
-async fn client_loop(socket: WebSocket, registry: Arc<App>, peer: std::net::IpAddr, github_report_client: bool) {
+async fn client_loop(socket: WebSocket, registry: Arc<App>, peer: std::net::IpAddr, github_report_client: bool, grant_principal: String) {
     let (mut tx, mut rx) = socket.split();
     let (protocol, resume_from, requested, locale, platform, build_id, thread_history, mut transcripts) = match rx.next().await {
         Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(&t) {
@@ -883,7 +886,7 @@ async fn client_loop(socket: WebSocket, registry: Arc<App>, peer: std::net::IpAd
     let mut notices = (protocol >= fuzukue_proto::NOTIFICATIONS_PROTOCOL).then(|| registry.notices.subscribe());
     let mut first = true;
     loop {
-        let Some(next) = serve_workspace(&mut tx, &mut rx, &registry, app, (protocol, resume, first, thread_history), transcripts.as_ref(), &locale, manifest.take(), &mut distribution, (platform.as_deref(), build_id.as_deref()), github_report_client, &mut notices).await else { break };
+        let Some(next) = serve_workspace(&mut tx, &mut rx, &registry, app, (protocol, resume, first, thread_history), transcripts.as_ref(), &locale, manifest.take(), &mut distribution, (platform.as_deref(), build_id.as_deref()), github_report_client, &grant_principal, &mut notices).await else { break };
         first = false;
         app = next;
         resume = 0;
@@ -1035,6 +1038,7 @@ async fn serve_workspace(
     distribution: &mut Option<(std::net::IpAddr, tokio::sync::broadcast::Receiver<Option<std::net::IpAddr>>)>,
     client_version: (Option<&str>, Option<&str>),
     github_report_client: bool,
+    grant_principal: &str,
     notices: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
 ) -> Option<Arc<Workspace>> {
     let locale_for_wire = || *locale.read().unwrap();
@@ -1112,6 +1116,11 @@ async fn serve_workspace(
             return false;
         }
         match env.event {
+            ServerEvent::FolderGrants { .. } | ServerEvent::FolderGrantsChanged { .. } =>
+                github_report_client && protocol >= fuzukue_proto::FOLDER_GRANTS_PROTOCOL,
+            ServerEvent::ApprovalRequested { ref request_id, .. } | ServerEvent::ApprovalResolved { ref request_id, .. }
+                if request_id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST) =>
+                github_report_client && protocol >= fuzukue_proto::FOLDER_GRANTS_PROTOCOL,
             ServerEvent::ClientCommand { .. } | ServerEvent::Consulting { .. } =>
                 protocol >= fuzukue_proto::CLIENT_COMMAND_PROTOCOL,
             ServerEvent::GitHubItems { .. } | ServerEvent::GitHubActivity { .. } | ServerEvent::GitHubReply { .. } =>
@@ -1551,6 +1560,32 @@ async fn serve_workspace(
                 other => other,
             };
             match msg {
+                Ok(ClientMsg::ListFolderGrants { .. } | ClientMsg::AddFolderGrant { .. }
+                    | ClientMsg::RevokeFolderGrant { .. } | ClientMsg::DecideFolderAccess { .. })
+                    if protocol < fuzukue_proto::FOLDER_GRANTS_PROTOCOL || !github_report_client || canary() => {}
+                Ok(ClientMsg::ListFolderGrants { session, audit_before }) => {
+                    match app.hub.list_folder_grants(&session, audit_before) {
+                        Ok((grants, audit, audit_before)) => {
+                            let _ = reply.send(ServerEvent::FolderGrants { session, grants, audit, audit_before });
+                        }
+                        Err(error) => { let _ = reply.send(ServerEvent::Error { message: error.to_string() }); }
+                    }
+                }
+                Ok(ClientMsg::AddFolderGrant { session, path, expiry }) => {
+                    if let Err(error) = app.hub.add_folder_grant(&session, std::path::Path::new(&path), expiry, grant_principal) {
+                        let _ = reply.send(ServerEvent::Error { message: error.to_string() });
+                    }
+                }
+                Ok(ClientMsg::RevokeFolderGrant { session, grant_id }) => {
+                    if let Err(error) = app.hub.revoke_folder_grant(&session, &grant_id) {
+                        let _ = reply.send(ServerEvent::Error { message: error.to_string() });
+                    }
+                }
+                Ok(ClientMsg::DecideFolderAccess { request_id, expiry }) => {
+                    if let Err(error) = app.hub.decide_folder_access(&request_id, expiry, grant_principal) {
+                        let _ = reply.send(ServerEvent::Error { message: error.to_string() });
+                    }
+                }
                 Ok(ClientMsg::AnswerQuestion { .. }) if protocol < fuzukue_proto::QUESTION_PROTOCOL => {}
                 Ok(ClientMsg::SelfUpdateStatus) if canary() && protocol >= fuzukue_proto::SELF_UPDATE_PROTOCOL => {
                     let _ = reply.send(ServerEvent::SelfUpdateStatus { status: canary_snapshot() });
@@ -2154,7 +2189,7 @@ async fn serve_workspace(
                     let _ = reply.send(ServerEvent::ThreadArtifacts { session, artifacts });
                 }
                 Ok(ClientMsg::ArchiveThread { id, archived }) if protocol >= 7 => {
-                    if let Err(e) = app.hub.edit_threads(|store| store.set_archived(&id, archived)) {
+                    if let Err(e) = app.hub.set_thread_archived(&id, archived) {
                         let _ = reply.send(ServerEvent::Error { message: format!("{e:#}") });
                     }
                 }
@@ -3223,6 +3258,8 @@ async fn handle_from_client(
                 s.resume(true).await?;
             }
         }
+        ClientMsg::ListFolderGrants { .. } | ClientMsg::AddFolderGrant { .. }
+        | ClientMsg::RevokeFolderGrant { .. } | ClientMsg::DecideFolderAccess { .. } => {}
         ClientMsg::Resolve { request_id, decision } => {
             resolve_approval(app, request_id, decision, false).await?;
         }
@@ -3264,6 +3301,8 @@ async fn remember_shell_approval(app: &Workspace, request_id: &str, prefix: Opti
 }
 
 async fn resolve_approval(app: &Workspace, request_id: String, decision: String, automatic: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(!request_id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST),
+        "Use decide_folder_access for a folder request");
     if app.delegates.resolve_approval(&request_id, &decision, automatic)? {
         return Ok(());
     }
@@ -3309,6 +3348,7 @@ fn auto_approve(app: Arc<Workspace>) {
             if let ServerEvent::ApprovalRequested { session, request_id, actor, .. } = env.event {
                 if hub::worker_approval(&request_id, &actor) || request_id.starts_with(fuzukue_proto::GIT_APPROVAL)
                     || request_id.starts_with(fuzukue_proto::RESEARCH_ISSUE_APPROVAL) || request_id.starts_with(issue_threads::APPROVAL)
+                    || request_id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST)
                 {
                     continue;
                 }

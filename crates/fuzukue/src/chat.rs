@@ -2370,7 +2370,11 @@ impl Workbench {
                                         &tr!("chat-awaiting-approval", summary = details.into_owned()),
                                         theme.muted_foreground,
                                     ).text_sm().whitespace_normal())
-                                    .child(approval_buttons(&approval.request_id, &entity)),
+                                    .child(if approval.request_id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST) {
+                                        folder_approval_buttons(&approval.request_id, &entity, chat.busy).into_any_element()
+                                    } else {
+                                        approval_buttons(&approval.request_id, &entity).into_any_element()
+                                    }),
                             );
                         }
                         if group.open {
@@ -2924,6 +2928,30 @@ fn disclosure_row(
             }
             toggle(cx);
         })
+}
+
+fn folder_approval_buttons(request_id: &str, entity: &Entity<Workbench>, running: bool) -> impl IntoElement {
+    use fuzukue_proto::FolderGrantExpiry;
+    let button = |expiry, label| {
+        let id = match expiry {
+            Some(FolderGrantExpiry::OneHour) => format!("accept-{request_id}"),
+            Some(other) => format!("folder-access-{other:?}-{request_id}"),
+            None => format!("decline-{request_id}"),
+        };
+        let request_id = request_id.to_owned();
+        let entity = entity.clone();
+        Button::new(SharedString::from(id)).secondary().xsmall().label(label)
+            .on_click(move |_, _, cx| {
+                let _ = entity.read(cx).out.send(ClientMsg::DecideFolderAccess { request_id: request_id.clone(), expiry });
+            })
+    };
+    v_flex().gap_1()
+        .child(div().text_sm().child(tr!("folder-grant-allow-for")))
+        .child(h_flex().flex_wrap().gap_1()
+            .children(crate::thread_info::FOLDER_EXPIRIES.into_iter()
+                .filter(|expiry| *expiry != FolderGrantExpiry::ThisTurn || running)
+                .map(|expiry| button(Some(expiry), crate::thread_info::folder_expiry_label(expiry))))
+            .child(button(None, tr!("chat-deny"))))
 }
 
 pub(super) fn approval_buttons(request_id: &str, entity: &Entity<Workbench>) -> impl IntoElement {

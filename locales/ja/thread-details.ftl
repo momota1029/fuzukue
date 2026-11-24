@@ -76,3 +76,24 @@ command-parallel-setting = 並行数: { $setting ->
     [economy] { thread-details-pace-economy }
    *[unset] { thread-details-goal-pace-unset }
     }
+
+folder-grant-heading = フォルダー
+folder-grant-empty = 有効なフォルダー許可はありません
+folder-grant-add = フォルダーを追加
+folder-grant-path = サーバー上のフォルダーの絶対パス
+folder-grant-allow-for = 読み取りを許可する期間
+folder-grant-this-turn = このターンだけ
+folder-grant-one-hour = 1 時間
+folder-grant-today = 今日中
+folder-grant-until-thread-ends = スレッド終了まで
+folder-grant-no-expiry = 無期限
+folder-grant-duration = 読み取り専用（{ $expiry }）
+folder-grant-expires-at = 有効期限 { $time }
+folder-grant-granted-by = 許可した利用者 { $principal }
+folder-grant-revoke = 取り消す
+folder-grant-cancel = キャンセル
+folder-grant-audit = 読み取り履歴
+folder-grant-audit-empty = フォルダー許可を使った読み取りはありません
+folder-grant-audit-latest = 最新
+folder-grant-audit-older = 以前
+server-folder-access-request = { $path } の読み取り許可

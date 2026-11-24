@@ -162,4 +162,5 @@
     <string name="attachment_png_budget">小さい PNG 画像の合計は 16 MiB まで。メッセージを分けて送ってください。</string>
     <string name="attachment_share_thread">共有した内容を入れるスレッドを選んでください。</string>
     <string name="attachment_share_dismiss">共有を取り消す</string>
+    <string name="allow_folder_one_hour">1 時間許可</string>
 </resources>

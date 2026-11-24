@@ -2,7 +2,7 @@ use super::{DEADLINE, MAX_BYTES, ReadScope, TRUNCATED, paths, search};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -12,9 +12,10 @@ use tokio::process::Command;
 pub(super) struct Args {
     rev: String,
     path: Option<String>,
+    repository: Option<PathBuf>,
 }
 
-pub(super) async fn show(scope: ReadScope, args: Args) -> Result<Value> {
+pub(super) async fn show(mut scope: ReadScope, args: Args) -> Result<Value> {
     ensure!(
         !args.rev.starts_with('-')
             && !args.rev.is_empty()
@@ -25,13 +26,37 @@ pub(super) async fn show(scope: ReadScope, args: Args) -> Result<Value> {
                 .all(|b| b.is_ascii_alphanumeric() || b"/_+.-@{}^~".contains(&b)),
         "Supply a commit revision such as HEAD, HEAD~1, a ref, or a commit hash"
     );
+    let external = if let Some(repository) = &args.repository {
+        crate::folder_grants::absolute(repository)?;
+        let directory = scope.resolve_checked(repository, false)?;
+        if directory == scope.cwd {
+            false
+        } else {
+            scope.cwd = directory;
+            true
+        }
+    } else {
+        false
+    };
     if let Some(path) = &args.path {
         check_path(&scope, path)?;
     }
-    let metadata = metadata_for(&scope)?;
+    let snapshot;
+    let metadata = if external {
+        scope.audit_read(&scope.cwd)?;
+        if let Some(path) = &args.path {
+            scope.audit_read(&scope.cwd.join(path))?;
+        }
+        let repository = scope.cwd.clone();
+        snapshot = tokio::task::spawn_blocking(move || snapshot_metadata(&repository)).await??;
+        snapshot.path().to_path_buf()
+    } else {
+        metadata_for(&scope)?
+    };
+    let worktree = if external { &metadata } else { &scope.cwd };
     let revision = format!("{}^{{commit}}", args.rev);
     let id = git(
-        &scope,
+        worktree,
         &metadata,
         &["rev-parse", "--verify", "--end-of-options", &revision],
         128,
@@ -40,7 +65,7 @@ pub(super) async fn show(scope: ReadScope, args: Args) -> Result<Value> {
     let id = object_id(std::str::from_utf8(&id)?.trim_end())?;
     let mut bytes = if let Some(path) = &args.path {
         let entry = git(
-            &scope,
+            worktree,
             &metadata,
             &["ls-tree", "--full-tree", "-z", id, "--", path],
             8192,
@@ -59,10 +84,10 @@ pub(super) async fn show(scope: ReadScope, args: Args) -> Result<Value> {
             "Only regular files can be read from a revision"
         );
         let blob = object_id(fields.next().context("Git did not return a blob ID")?)?;
-        git(&scope, &metadata, &["cat-file", "blob", blob], MAX_BYTES).await?
+        git(worktree, &metadata, &["cat-file", "blob", blob], MAX_BYTES).await?
     } else {
         git(
-            &scope,
+            worktree,
             &metadata,
             &[
                 "show",
@@ -112,7 +137,7 @@ fn check_path(scope: &ReadScope, name: &str) -> Result<()> {
     for ancestor in absolute.ancestors() {
         match ancestor.symlink_metadata() {
             Ok(_) => {
-                let resolved = scope.resolve(ancestor)?;
+                let resolved = scope.resolve_checked(ancestor, false)?;
                 paths::media(&resolved)?;
                 break;
             }
@@ -121,6 +146,76 @@ fn check_path(scope: &ReadScope, name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Git must never open links, configuration, or alternate object stores from an
+/// external repository. Supply a bounded copy of only the refs and objects.
+fn snapshot_metadata(repository: &Path) -> Result<tempfile::TempDir> {
+    let dot_git = repository.join(".git");
+    ensure!(paths::open(&dot_git)?.metadata()?.is_dir(),
+        "External Git history requires a standalone repository with a .git directory");
+    let snapshot = tempfile::tempdir()?;
+    let mut budget = SnapshotBudget {
+        files: 30_000,
+        bytes: 256 * 1024 * 1024,
+        deadline: std::time::Instant::now() + DEADLINE,
+    };
+    for name in ["HEAD", "packed-refs", "refs", "objects"] {
+        let source = dot_git.join(name);
+        if name == "packed-refs" && matches!(source.symlink_metadata(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+            continue;
+        }
+        budget.copy(&source, &snapshot.path().join(name), 0, name == "objects")?;
+    }
+    Ok(snapshot)
+}
+
+struct SnapshotBudget {
+    files: usize,
+    bytes: u64,
+    deadline: std::time::Instant,
+}
+
+impl SnapshotBudget {
+    fn copy(&mut self, source: &Path, dest: &Path, depth: usize, objects: bool) -> Result<()> {
+        use rustix::fs::Dir;
+        use std::os::unix::ffi::OsStrExt;
+
+        ensure!(depth < 32 && self.files > 0 && std::time::Instant::now() < self.deadline,
+            "External Git metadata exceeded the snapshot limits");
+        self.files -= 1;
+        let file = paths::open(source)?;
+        if file.metadata()?.is_dir() {
+            std::fs::create_dir(dest)?;
+            for item in Dir::read_from(&file)? {
+                let item = item?;
+                let name = item.file_name().to_bytes();
+                if matches!(name, b"." | b"..") || objects && depth == 0 && name == b"info" {
+                    continue;
+                }
+                let name = std::ffi::OsStr::from_bytes(name);
+                self.copy(&source.join(name), &dest.join(name), depth + 1, objects)?;
+            }
+        } else {
+            let metadata = paths::regular(&file)?;
+            ensure!(metadata.len() <= self.bytes, "External Git metadata exceeded 256 MiB");
+            let mut output = std::fs::File::create(dest)?;
+            let mut input = file.take(self.bytes + 1);
+            let mut buffer = [0; 64 * 1024];
+            loop {
+                ensure!(std::time::Instant::now() < self.deadline, "External Git metadata snapshot timed out");
+                let bytes = input.read(&mut buffer)?;
+                if bytes == 0 {
+                    break;
+                }
+                ensure!(bytes as u64 <= self.bytes, "External Git metadata exceeded 256 MiB");
+                self.bytes -= bytes as u64;
+                output.write_all(&buffer[..bytes])?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn metadata_for(scope: &ReadScope) -> Result<PathBuf> {
@@ -203,7 +298,7 @@ fn object_id(id: &str) -> Result<&str> {
     Ok(id)
 }
 
-async fn git(scope: &ReadScope, metadata: &Path, args: &[&str], cap: usize) -> Result<Vec<u8>> {
+async fn git(worktree: &Path, metadata: &Path, args: &[&str], cap: usize) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command
         .env_clear()
@@ -223,7 +318,7 @@ async fn git(scope: &ReadScope, metadata: &Path, args: &[&str], cap: usize) -> R
         .arg("--git-dir")
         .arg(metadata)
         .arg("--work-tree")
-        .arg(&scope.cwd)
+        .arg(worktree)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

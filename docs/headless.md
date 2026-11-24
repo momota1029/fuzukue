@@ -42,6 +42,7 @@ scripts/shot.sh examples/lab tests/shots/math-select.json
 scripts/shot.sh examples/lab tests/shots/pdf-popup.json
 scripts/shot.sh examples/lab tests/shots/comment-side-thread.json
 scripts/shot.sh examples/lab tests/shots/thread-info.json
+scripts/shot.sh examples/lab tests/shots/folder-grants.json
 scripts/shot.sh examples/lab tests/shots/right-pane-resize.json
 scripts/shot.sh tests/shots/fixtures/card-markdown tests/shots/card-markdown.json
 scripts/shot.sh examples/lab tests/shots/chat-scroll-growth.json

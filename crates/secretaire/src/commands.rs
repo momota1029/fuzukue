@@ -179,7 +179,7 @@ async fn execute(app: &Arc<Workspace>, session: &str, spec: Spec, args: &str) ->
         }
         Archive => {
             app.hub
-                .edit_threads(|store| store.set_archived(session, true))?;
+                .set_thread_archived(session, true)?;
             message("command-archived")
         }
         Pin => {

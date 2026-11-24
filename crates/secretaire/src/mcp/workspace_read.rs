@@ -99,10 +99,10 @@ impl Tool {
             ),
             Self::GitShow => (
                 harness_text!(
-                    "Read a commit's metadata or one UTF-8 file at that commit. Paths are relative to the assigned worktree.",
-                    "コミットの情報、またはその版の UTF-8 ファイル一件を読む。パスは割り当てられた作業ツリーからの相対パス。"
+                    "Read a commit or a UTF-8 file at that commit. For an external folder, supply the absolute repository path; the file path is relative to that repository.",
+                    "コミットの情報、またはその版の UTF-8 ファイル一件を読む。外部のフォルダーにはリポジトリの絶対パスを指定する。ファイルのパスはリポジトリからの相対パス。"
                 ),
-                json!({"rev": {"type": "string"}, "path": {"type": "string"}}),
+                json!({"rev": {"type": "string"}, "path": {"type": "string"}, "repository": {"type": "string"}}),
                 &["rev"],
             ),
         };

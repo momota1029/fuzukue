@@ -587,6 +587,8 @@ pub(crate) struct DeviceSession {
 }
 
 impl DeviceSession {
+    pub(crate) fn id(&self) -> &str { &self.id }
+
     async fn revoked(&self) {
         let mut ticks = tokio::time::interval(DEVICE_CHECK_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

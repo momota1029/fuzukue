@@ -82,3 +82,24 @@ command-parallel-setting = Parallel jobs: { $setting ->
     [economy] { thread-details-pace-economy }
    *[unset] { thread-details-goal-pace-unset }
     }
+
+folder-grant-heading = Folders
+folder-grant-empty = No active folder grants
+folder-grant-add = Add folder
+folder-grant-path = Absolute folder path on the server
+folder-grant-allow-for = Allow read-only access for
+folder-grant-this-turn = This turn
+folder-grant-one-hour = 1 hour
+folder-grant-today = Today
+folder-grant-until-thread-ends = Until the thread ends
+folder-grant-no-expiry = No expiry
+folder-grant-duration = Read-only for { $expiry }
+folder-grant-expires-at = Expires at { $time }
+folder-grant-granted-by = Granted by { $principal }
+folder-grant-revoke = Revoke
+folder-grant-cancel = Cancel
+folder-grant-audit = Read history
+folder-grant-audit-empty = No reads using folder grants
+folder-grant-audit-latest = Latest
+folder-grant-audit-older = Older
+server-folder-access-request = Read-only access to { $path }

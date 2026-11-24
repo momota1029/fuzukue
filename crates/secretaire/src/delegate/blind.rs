@@ -66,6 +66,7 @@ pub(crate) async fn start(
             touches: Some(Vec::new()),
             issue: None,
             isolation: Some(Isolation::Blind),
+            folder_grants: Vec::new(),
         },
     )
     .await
@@ -421,6 +422,7 @@ mod tests {
                 touches: Some(Vec::new()),
                 issue: None,
                 isolation: Some(Isolation::Blind),
+                folder_grants: Vec::new(),
             },
             false,
         )

@@ -337,7 +337,13 @@ internal class RemoteRepository(
     }
 
     fun resolve(id: String, accept: Boolean) {
-        resolve(id, ClientMessage.Resolve(id, if (accept) "accept" else "decline"))
+        val request = state.value.approvals[id] ?: return
+        val message = if (request.isFolderAccess) {
+            ClientMessage.DecideFolderAccess(id, if (accept) "one_hour" else null)
+        } else {
+            ClientMessage.Resolve(id, if (accept) "accept" else "decline")
+        }
+        resolve(id, message)
     }
 
     fun resolveNotification(approval: ApprovalNotice, accept: Boolean) {

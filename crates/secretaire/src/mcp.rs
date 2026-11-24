@@ -49,6 +49,7 @@ pub(crate) enum Tool {
     Consult,
     Desk(desk::Tool),
     WorkspaceRead(workspace_read::Tool),
+    FolderGrants,
     ListAgents,
     AgentStats,
     TierStats,
@@ -225,7 +226,7 @@ impl Tool {
         Self::ALL.into_iter().chain(desk::Tool::ALL.map(Self::Desk))
             .chain(crate::recipes::Tool::ALL.map(Self::Recipe))
             .chain(crate::graph::mcp::Tool::ALL.map(Self::Graph)).chain(Self::GIT)
-            .chain(workspace_read::Tool::ALL.map(Self::WorkspaceRead))
+            .chain(workspace_read::Tool::ALL.map(Self::WorkspaceRead)).chain([Self::FolderGrants])
             .chain(crate::workshop::mcp::Tool::ALL.map(Self::Research))
             .chain(crate::issue_threads::Tool::ALL.map(Self::GitHub))
             .chain(crate::github_auth::mcp::Tool::ALL.map(Self::GitHubAuth))
@@ -252,6 +253,7 @@ impl Tool {
             Self::Consult => "consult",
             Self::Desk(tool) => tool.name(),
             Self::WorkspaceRead(tool) => tool.name(),
+            Self::FolderGrants => "folder_grants",
             Self::ListAgents => "list_agents",
             Self::AgentStats => "agent_stats",
             Self::TierStats => "tier_stats",
@@ -433,6 +435,8 @@ impl Tool {
                     "tier": {"type": "string", "enum": ["light", "standard", "heavy"]},
                     "min_tier": {"type": "string", "enum": ["light", "standard", "heavy"]},
                     "issue": {"type": "integer", "minimum": 1, "description": harness_text!("Linked GitHub issue number. Run in its worktree.", "紐づく Issue 番号。その作業ツリーで実行する。")},
+                    "folder_grants": {"type": "array", "maxItems": 100, "uniqueItems": true,
+                        "items": {"type": "string"}, "description": harness_text!("Active folder grant IDs to share with this worker's MCP read tools.", "この作業役の MCP 読み取りツールに引き継ぐ、有効なフォルダー許可の ID。")},
                     "plan_step": { "type": "boolean", "description": harness_text!("Set to true to execute a step from next. Pass its agent and task unchanged as agent and prompt.", "方針の next を実行する場合に true。agent と prompt にはその手順の agent と task をそのまま渡す。") } }),
                 &["prompt"],
             ),
@@ -450,6 +454,16 @@ impl Tool {
             ), json!({"question":{"type":"string"}, "context":{"type":"string"}}), &["question"]),
             Self::Desk(tool) => tool.schema(),
             Self::WorkspaceRead(tool) => return tool.definition(),
+            Self::FolderGrants => (
+                harness_text!(
+                    "Request read-only folder access for this thread (requires user approval), list active grants and read audit entries, or revoke a grant by ID.",
+                    "このスレッドのフォルダーの読み取り許可を利用者に求める。有効な許可と読み取り履歴の一覧、ID による許可の取り消しも行う。"
+                ),
+                json!({"action": {"type": "string", "enum": ["request", "list", "revoke"]},
+                    "path": {"type": "string"}, "grant_id": {"type": "string"},
+                    "audit_before": {"type": "integer", "minimum": 0}}),
+                &["action"],
+            ),
             Self::ListAgents => (harness_text!("List available workers, their roles, and when to use them.", "仕事を依頼できる作業役の名前、役目、使う場面を一覧する。"), json!({}), &[]),
             Self::AgentStats => (harness_text!("Show 7-day and 30-day worker counts, success rates, median durations, and token counts for this workspace. Include last use and unused workers. Use list_jobs for live job state.", "この作業場での作業役の使用回数・成功率・時間の中央値・トークン数を7日間と30日間で集計し、最終使用日時と未使用の一覧を返す。現在のジョブの状態は list_jobs を使う。"),
                 json!({"agent": {"type": "string", "description": harness_text!("Limit statistics to this worker.", "指定した名前だけを集計する。")}}), &[]),
@@ -985,7 +999,8 @@ pub(crate) fn codex_tool_policy(allow: Option<&[String]>) -> Value {
     // fuzukue authorizes for the job, planner, or active front desk turn.
     let tools = worker_tools().filter(|tool| !matches!(tool, Tool::Recipe(_)))
         .chain(PLANNER_TOOLS).chain([Tool::Escalate, Tool::Consult])
-        .chain(allow.is_none().then_some(Tool::Desk(desk::Tool::Queue)));
+        .chain(allow.is_none().then_some(Tool::Desk(desk::Tool::Queue)))
+        .chain(allow.is_none().then_some(Tool::FolderGrants));
     for tool in tools {
         let name = tool.name();
         let permitted = match allow {
@@ -1175,13 +1190,13 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
             let (job, allow) = worker.unwrap();
             let params = &req["params"];
             let name = params["name"].as_str().unwrap_or_default();
-            let result = if !allow.iter().any(|tool| tool == name) {
+            let result = if name == Tool::FolderGrants.name() || !allow.iter().any(|tool| tool == name) {
                 Err(anyhow::anyhow!("作業役にツール {name} は許可されていない"))
             } else if let Some(tool) = workspace_read::Tool::named(name) {
                 async {
                     let scope = app.delegates.workspace_read_scope(job)?;
                     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                    Ok(data_result(tool.call(scope, &args).await?, false))
+                    Ok(data_result(call_read_tool(&app, &q.session, tool, scope, &args).await?, false))
                 }.await
             } else if name == Tool::Escalate.name() {
                 (|| {
@@ -1329,6 +1344,8 @@ struct DelegateArgs {
     backend: Option<fuzukue_proto::AgentBackend>,
     model: Option<String>,
     artifacts: Option<Vec<crate::delegate::blind::Artifact>>,
+    #[serde(default)]
+    folder_grants: Vec<String>,
     #[serde(default)]
     plan_step: bool,
 }
@@ -1566,6 +1583,33 @@ fn import_paths(project: &Path, args: &ImportLatexArgs) -> Result<(PathBuf, Path
     Ok((main, output))
 }
 
+async fn call_read_tool(
+    app: &Workspace, session: &str, tool: workspace_read::Tool, scope: workspace_read::ReadScope, args: &Value,
+) -> Result<Value> {
+    match tool.call(scope, args).await {
+        Err(error) if !crate::canary() => {
+            let Some(outside) = error.downcast_ref::<crate::folder_grants::OutsideScope>() else {
+                return Err(error);
+            };
+            match app.hub.request_folder_access(session, &outside.0) {
+                Ok(id) => anyhow::bail!(
+                    "{error}. Folder access request {id} is pending in the thread's approvals. Ask the user to approve it there, then retry. Delegated workers need the grant ID explicitly listed in their assignment."
+                ),
+                Err(request_error) => anyhow::bail!("{error}. Could not request folder access: {request_error}"),
+            }
+        }
+        result => result,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum FolderGrantAction {
+    Request { path: PathBuf },
+    List { audit_before: Option<u64> },
+    Revoke { grant_id: String },
+}
+
 async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>, params: &Value) -> Result<Value> {
     let name = params["name"].as_str().context("ツール名を指定する")?;
     if name.contains('.') {
@@ -1690,8 +1734,26 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         Tool::GitDiff => json!({"diff": Box::pin(app.git_diff(parse_args(args)?)).await?}),
         Tool::GitLog => json!({"commits": Box::pin(app.git_log(parse_args(args)?)).await?}),
         Tool::WorkspaceRead(tool) => {
-            let scope = workspace_read::ReadScope::new(project, &app.state_dir, None)?;
-            Box::pin(tool.call(scope, args)).await?
+            let scope = workspace_read::ReadScope::new(project, &app.state_dir, None)?
+                .with_grants(crate::folder_grants::Access { hub: app.hub.clone(), session: session.into(), worker_grants: None });
+            Box::pin(call_read_tool(app, session, tool, scope, args)).await?
+        }
+        Tool::FolderGrants => {
+            // The front desk branch has already authenticated the session in dispatch.
+            match parse_args(args)? {
+                FolderGrantAction::Request { path } => json!({
+                    "request_id": app.hub.request_folder_access(session, &path)?,
+                    "status": "pending",
+                }),
+                FolderGrantAction::List { audit_before } => {
+                    let (grants, audit, audit_before) = app.hub.list_folder_grants(session, audit_before)?;
+                    json!({"grants": grants, "audit": audit, "audit_before": audit_before})
+                }
+                FolderGrantAction::Revoke { grant_id } => {
+                    app.hub.revoke_folder_grant(session, &grant_id)?;
+                    json!({"revoked": true})
+                }
+            }
         }
         Tool::GitCommit => json!({"hash": Box::pin(app.git_commit(parse_args(args)?)).await?}),
         Tool::GitBranch => Box::pin(app.git_branch(branch.context("ブランチ操作がない")?)).await?,
@@ -1715,7 +1777,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             let job = if args.isolation.is_some() {
                 ensure!(!args.plan_step && args.issue.is_none() && args.agent.is_none()
                     && args.tier.is_none() && args.min_tier.is_none()
-                    && args.touches.as_ref().is_none_or(Vec::is_empty),
+                    && args.touches.as_ref().is_none_or(Vec::is_empty) && args.folder_grants.is_empty(),
                     "Blind review is a standalone job with a fixed backend and no write set");
                 Box::pin(crate::delegate::blind::start(
                     app, session, args.prompt, args.title,
@@ -1724,11 +1786,11 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 )).await?
             } else if let Some(number) = args.issue {
                 Box::pin(crate::delegate::start_for_issue(
-                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, number, routing, args.touches,
+                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, number, routing, args.touches, args.folder_grants,
                 )).await?
             } else {
-                Box::pin(crate::delegate::start(
-                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, routing, args.touches,
+                Box::pin(crate::delegate::start_with_grants(
+                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants,
                 )).await?
             };
             if claude.is_some() || codex.is_some() {

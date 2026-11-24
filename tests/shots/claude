@@ -85,6 +85,14 @@ while line := (queued or sys.stdin.readline()):
         emit("assistant", message={"id": message_id, "content": [{"type": "text", "text": answer}]})
         emit("result", is_error=False, session_id=session)
         continue
+    if "folder-grants fixture" in prompt:
+        folder = Path.home() / "reading-material"
+        folder.mkdir(exist_ok=True)
+        args = {"action": "request", "path": str(folder)}
+        result = call_labo("folder_grants", args)
+        assert not result["isError"], result
+        emit("result", is_error=False, session_id=session)
+        continue
     if "paper batch failure fixture" in prompt:
         tool_id = f"paper-batch-{number}"
         emit("assistant", message={"content": [

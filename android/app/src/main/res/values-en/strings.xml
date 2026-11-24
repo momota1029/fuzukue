@@ -163,4 +163,5 @@
     <string name="attachment_png_budget">Small PNG images can total up to 16 MiB. Send them in separate messages.</string>
     <string name="attachment_share_thread">Choose a conversation for the shared content.</string>
     <string name="attachment_share_dismiss">Discard shared content</string>
+    <string name="allow_folder_one_hour">Allow for 1 hour</string>
 </resources>

@@ -2137,6 +2137,14 @@ impl Workbench {
                     }
                 }
             }
+            ServerEvent::FolderGrants { session, grants, audit, audit_before } => {
+                self.thread_info.folders.insert(session, thread_info::FolderDetails { grants, audit, audit_before });
+            }
+            ServerEvent::FolderGrantsChanged { session } => {
+                if self.active == session {
+                    self.request_folder_grants(None);
+                }
+            }
             ServerEvent::ApprovalRequested { session: _, request_id, actor: fuzukue_proto::Actor::System, summary, localized, .. }
                 if request_id.starts_with(fuzukue_proto::RESEARCH_ISSUE_APPROVAL) => {
                 if !self.workshop.approvals.iter().any(|(id, _)| id == &request_id) {

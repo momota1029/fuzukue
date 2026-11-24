@@ -63,7 +63,11 @@ pub const TRANSLATION_DRIFT_PROTOCOL: u32 = 62;
 /// Opt-in thread history paging supported alongside protocol 62.
 pub const THREAD_HISTORY_PROTOCOL: u32 = 62;
 pub const REVIEW_FINDINGS_PROTOCOL: u32 = 63;
-pub const PROTOCOL_VERSION: u32 = 64;
+pub const FOLDER_GRANTS_PROTOCOL: u32 = 65;
+pub const PROTOCOL_VERSION: u32 = FOLDER_GRANTS_PROTOCOL;
+
+mod folder_grants;
+pub use folder_grants::*;
 pub const MAX_OPEN_FILE_BYTES: u64 = 200 * 1024 * 1024;
 
 mod files;
@@ -956,6 +960,23 @@ pub enum ClientMsg {
     Prompt { session: String, text: String },
     SetDelegateSettings { settings: DelegateSettings },
     SetWorkerApprovalPolicy { policy: WorkerApprovalPolicy },
+    ListFolderGrants {
+        session: String,
+        audit_before: Option<u64>,
+    },
+    AddFolderGrant {
+        session: String,
+        path: String,
+        expiry: FolderGrantExpiry,
+    },
+    RevokeFolderGrant {
+        session: String,
+        grant_id: String,
+    },
+    DecideFolderAccess {
+        request_id: String,
+        expiry: Option<FolderGrantExpiry>,
+    },
     RememberShellApproval {
         request_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2284,6 +2305,15 @@ pub enum ServerEvent {
     },
     ToolCall { session: String, item: String, actor: Actor, name: String, input: serde_json::Value },
     ToolResult { session: String, item: String, ok: bool, output: String },
+    FolderGrants {
+        session: String,
+        grants: Vec<FolderGrant>,
+        audit: Vec<FolderGrantRead>,
+        audit_before: Option<u64>,
+    },
+    FolderGrantsChanged {
+        session: String,
+    },
     ApprovalRequested {
         session: String,
         request_id: String,
@@ -2472,6 +2502,7 @@ impl ServerEvent {
     pub fn is_live_only(&self) -> bool {
         matches!(self, Self::OpenFile { .. } | Self::OpenPaper { .. } | Self::ClientCommand { .. }
             | Self::Notify { .. } | Self::IssueIntakeMove { .. }
+            | Self::FolderGrants { .. } | Self::FolderGrantsChanged { .. }
             | Self::ThreadHistoryStart { .. } | Self::ThreadHistoryPage { .. }
             | Self::ThreadHistoryFailed { .. } | Self::ThreadTail { .. } | Self::ThreadSync { .. })
             || matches!(self, Self::LocalNotice { item, .. } if item == COMPOSER_NOTICE_ITEM)

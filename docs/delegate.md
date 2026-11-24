@@ -9,6 +9,8 @@
 進行中の方針では、同じ目標を指定した `plan` または `replan` の `pace` に `full`、`normal`、`economy` を渡すと、履歴と次の手順を保ったまま並行数設定を変更できます。
 
 
+作業役にスレッド外の資料の読み取りを渡すときは、`delegate.folder_grants` に有効な許可 ID を明示します。 [フォルダーの読み取り許可](folder-grants.md)
+
 ## デッキの節を査読する
 
 `request_review` に掲載順の `cards` と `kind: "math"`、`"output"`、または `"both"` を渡します。講義の節は必要に応じて `section` で明示します。`"both"` は同じ時点の写しから数学の根拠と出力のビルド結果を準備し、両方の査読をまとめて受け付けます。依頼の応答には共通の `reviewed_version` と査読ごとの `session`、`input_hash` が含まれます。 [数学査読で辿る参照](graph.md#節の数学査読で辿る参照)

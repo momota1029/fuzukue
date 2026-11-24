@@ -5,8 +5,29 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ProtocolTest {
+    @Test fun folderAccessUsesApprovalAndUnknownSnapshotsAreIgnored() {
+        val request = decodeEvent(
+            """{"type":"approval_requested","session":"s","request_id":"folder-access-1","summary":"Read-only access"}""",
+        ) as ServerEvent.ApprovalRequested
+        assertTrue(request.isFolderAccess)
+        assertMessage(
+            """{"type":"decide_folder_access","request_id":"folder-access-1","expiry":"one_hour"}""",
+            ClientMessage.DecideFolderAccess(request.requestId, "one_hour"),
+        )
+        assertMessage(
+            """{"type":"decide_folder_access","request_id":"folder-access-1"}""",
+            ClientMessage.DecideFolderAccess(request.requestId, null),
+        )
+        assertEquals(ServerEvent.Unknown("folder_grants"), decodeEvent(
+            """{"type":"folder_grants","session":"s","grants":[]}""",
+        ))
+        assertEquals(ServerEvent.Unknown("folder_grants_changed"), decodeEvent(
+            """{"type":"folder_grants_changed","session":"s"}""",
+        ))
+    }
+
     @Test fun handshakeAndWorkspaceCommands() {
-        assertMessage("""{"type":"hello","protocol":64,"workspace":"lab","locale":"en","platform":"android","thread_history":true,"selection_scoped_transcripts":true}""", ClientMessage.Hello(workspace = "lab", locale = "en"))
+        assertMessage("""{"type":"hello","protocol":65,"workspace":"lab","locale":"en","platform":"android","thread_history":true,"selection_scoped_transcripts":true}""", ClientMessage.Hello(workspace = "lab", locale = "en"))
         assertEquals(ServerEvent.Welcome(MIN_PROTOCOL_VERSION), Protocol.decode(
             """{"seq":0,"event":{"type":"welcome","protocol":$MIN_PROTOCOL_VERSION,"server":"secretaire"}}""",
         ).event)
@@ -125,9 +146,9 @@ class ProtocolTest {
         ))
     }
 
-    @Test fun protocol64IgnoresAdditiveFieldsAndEvents() {
-        assertEquals(ServerEvent.Welcome(64), Protocol.decode(
-            """{"seq":0,"future_envelope_field":true,"event":{"type":"welcome","protocol":64,"server":"secretaire","future_event_field":true}}""",
+    @Test fun protocol65IgnoresAdditiveFieldsAndEvents() {
+        assertEquals(ServerEvent.Welcome(65), Protocol.decode(
+            """{"seq":0,"future_envelope_field":true,"event":{"type":"welcome","protocol":65,"server":"secretaire","future_event_field":true}}""",
         ).event)
         assertEquals(ServerEvent.Unknown("cards"), decodeEvent(
             """{"type":"cards","deck":"paper","cards":[{"id":"translated","translation":{"status":"stale"}}],"diagnostics":[]}""",
