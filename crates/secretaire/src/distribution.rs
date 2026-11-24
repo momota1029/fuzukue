@@ -9,14 +9,17 @@ use anyhow::{ensure, Context, Result};
 use axum::{
     body::Body,
     extract::{Path as RoutePath, Query, State},
-    http::{header, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderMap, Method, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use fuzukue_proto::{ClientManifest, CLIENT_PLATFORMS, DISTRIBUTION_PROTOCOL};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncReadExt, sync::broadcast};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    sync::broadcast,
+};
 
 use crate::workspaces::App;
 
@@ -171,7 +174,9 @@ pub async fn binary(
     RoutePath(platform): RoutePath<String>,
     State(app): State<Arc<App>>,
     Query(query): Query<BuildQuery>,
-) -> Result<impl IntoResponse, StatusCode> {
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
     let manifest = app
         .distribution
         .manifest(&platform)
@@ -181,7 +186,7 @@ pub async fn binary(
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(StatusCode::NOT_FOUND);
     }
-    let file = tokio::fs::File::open(app.distribution.root.join(platform).join(sha))
+    let mut file = tokio::fs::File::open(app.distribution.root.join(platform).join(&sha))
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     let size = file
@@ -189,20 +194,84 @@ pub async fn binary(
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?
         .len();
-    let stream = futures_util::stream::try_unfold(file, |mut file| async move {
+    let etag = format!("\"{sha}\"");
+    let common = [
+        (header::ACCEPT_RANGES, "bytes".to_owned()),
+        (header::ETAG, etag.clone()),
+        (header::CACHE_CONTROL, "no-store".to_owned()),
+    ];
+    let if_range_matches = headers.get(header::IF_RANGE).is_none_or(|value| {
+        value.as_bytes() == etag.as_bytes() && headers.get_all(header::IF_RANGE).iter().count() == 1
+    });
+    let range = if method == Method::GET && if_range_matches {
+        headers.get(header::RANGE)
+            .map_or(Ok(None), |value| byte_range(value.as_bytes(), size))
+    } else {
+        Ok(None)
+    };
+    let (status, length, content_range) = match range {
+        Ok(None) => (StatusCode::OK, size, None),
+        Ok(Some((start, end))) => {
+            file.seek(io::SeekFrom::Start(start))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            (StatusCode::PARTIAL_CONTENT, end - start + 1, Some(format!("bytes {start}-{end}/{size}")))
+        }
+        Err(()) => return Ok((
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            common,
+            [
+                (header::CONTENT_RANGE, format!("bytes */{size}")),
+                (header::CONTENT_LENGTH, "0".to_owned()),
+            ],
+        ).into_response()),
+    };
+
+    let stream = futures_util::stream::try_unfold(file.take(length), |mut file| async move {
         let mut bytes = vec![0; 64 * 1024];
         let count = file.read(&mut bytes).await?;
         bytes.truncate(count);
         Ok::<_, io::Error>((count > 0).then_some((bytes, file)))
     });
-    Ok((
+    let mut response = (
+        status,
+        common,
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
-            (header::CONTENT_LENGTH, size.to_string()),
-            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (header::CONTENT_LENGTH, length.to_string()),
         ],
         Body::from_stream(stream),
-    ))
+    ).into_response();
+    if let Some(value) = content_range {
+        response.headers_mut().insert(header::CONTENT_RANGE, value.parse().unwrap());
+    }
+    Ok(response)
+}
+
+// A full representation is a valid fallback for unsupported units or multiple ranges.
+fn byte_range(value: &[u8], size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let value = std::str::from_utf8(value).map_err(|_| ())?;
+    let (unit, bounds) = value.split_once('=').ok_or(())?;
+    if !unit.eq_ignore_ascii_case("bytes") || bounds.contains(',') {
+        return Ok(None);
+    }
+    let last = size.checked_sub(1).ok_or(())?;
+    let (start, end) = bounds.trim().split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = range_number(end)?;
+        return (suffix > 0).then_some(Some((size.saturating_sub(suffix), last))).ok_or(());
+    }
+    let start = range_number(start)?;
+    let end = if end.is_empty() { last } else { range_number(end)?.min(last) };
+    (start <= end).then_some(Some((start, end))).ok_or(())
+}
+
+fn range_number(value: &str) -> Result<u64, ()> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(());
+    }
+    // A decimal beyond u64 is still a valid bound. Clamp it to the representable limit.
+    Ok(value.parse().unwrap_or(u64::MAX))
 }
 
 #[derive(Deserialize)]

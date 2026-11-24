@@ -1,9 +1,10 @@
 use std::{
     cell::Cell,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use futures::{channel::mpsc, StreamExt as _};
 use fuzukue_proto::ClientManifest;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
@@ -71,6 +72,7 @@ pub struct Distribution {
     pub handoff: Option<updater::UpdateHandoff>,
     checking: bool,
     updating: bool,
+    update_progress: Option<updater::DownloadProgress>,
     rollback: Option<RollbackNotice>,
     update_error: Option<String>,
     peers: Vec<Peer>,
@@ -117,6 +119,7 @@ impl Distribution {
         self.manifest = None;
         self.rollback = None;
         self.update_error = None;
+        self.update_progress = None;
         self.public_url = None;
         self.checking = false;
     }
@@ -202,6 +205,7 @@ impl Workbench {
         });
         if self.distribution.manifest != manifest {
             self.distribution.update_error = None;
+            self.distribution.update_progress = None;
             self.distribution.manifest = manifest;
         }
         if self.distribution.update_error.is_none() && self.appearance.settings.server.auto_update {
@@ -217,25 +221,47 @@ impl Workbench {
             return;
         };
         self.distribution.updating = true;
+        self.distribution.update_progress = None;
         self.distribution.update_error = None;
         let http = self.http.clone();
-        let epoch = self.connection_epoch;
-        let commit = manifest.commit.clone();
+        let download_http = http.clone();
+        let download_manifest = manifest.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { updater::prepare(&http, &manifest) })
-                .await;
+            let (progress_tx, mut progress_rx) = mpsc::unbounded::<updater::DownloadProgress>();
+            let task = cx.background_executor().spawn(async move {
+                let mut last = None;
+                updater::prepare(&download_http, &download_manifest, |progress| {
+                    let now = Instant::now();
+                    if last.is_none_or(|(phase, time)| {
+                        phase != progress.phase || now - time >= Duration::from_millis(250)
+                    }) || progress.bytes == progress.total
+                    {
+                        let _ = progress_tx.unbounded_send(progress);
+                        last = Some((progress.phase, now));
+                    }
+                })
+            });
+            while let Some(progress) = progress_rx.next().await {
+                if this.update(cx, |this, cx| {
+                    if this.http.same_distribution_server(&http)
+                        && this.distribution.manifest.as_ref() == Some(&manifest)
+                    {
+                        this.distribution.update_progress = Some(progress);
+                        cx.notify();
+                    }
+                }).is_err() {
+                    break;
+                }
+            }
+            let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.distribution.updating = false;
-                if epoch == this.connection_epoch
-                    && this
-                        .distribution
-                        .manifest
-                        .as_ref()
-                        .is_some_and(|manifest| manifest.commit == commit)
+                this.distribution.update_progress = None;
+                // Workspace replay may advance the connection epoch during an HTTP download.
+                if this.http.same_distribution_server(&http)
+                    && this.distribution.manifest.as_ref() == Some(&manifest)
                 {
-                    match result.and_then(|file| updater::launch_helper(file, &commit)) {
+                    match result.and_then(|file| updater::launch_helper(file, &manifest.commit)) {
                         Ok(handoff) => {
                             this.distribution.handoff = Some(handoff);
                             cx.quit();
@@ -266,6 +292,21 @@ impl Workbench {
     pub(super) fn preview_client_rollback(&mut self) {
         self.distribution.manifest = None;
         self.distribution.set_rollback(Some("preview"), None);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+    pub(super) fn preview_client_download(&mut self, resuming: bool) {
+        self.distribution.updating = true;
+        self.distribution.update_progress = Some(updater::DownloadProgress {
+            bytes: 47_392_768,
+            total: 120_000_000,
+            retries: 2,
+            phase: if resuming {
+                updater::DownloadPhase::Resuming
+            } else {
+                updater::DownloadPhase::Retrying { timed_out: true }
+            },
+        });
     }
 
     pub fn render_update_notice(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
@@ -317,6 +358,28 @@ impl Workbench {
                         .disabled(self.distribution.updating)
                         .on_click(cx.listener(|this, _, _, cx| this.replace_client(cx))),
                 )
+                .children(self.distribution.update_progress.map(|progress| {
+                    let status = match progress.phase {
+                        updater::DownloadPhase::Downloading if progress.retries == 0 => None,
+                        updater::DownloadPhase::Downloading => Some(tr!(
+                            "distribution-update-retry-count", retries = progress.retries
+                        )),
+                        updater::DownloadPhase::Resuming => Some(tr!(
+                            "distribution-update-resuming", retries = progress.retries
+                        )),
+                        updater::DownloadPhase::Retrying { timed_out: false } => Some(tr!(
+                            "distribution-update-retrying", retries = progress.retries
+                        )),
+                        updater::DownloadPhase::Retrying { timed_out: true } => Some(tr!(
+                            "distribution-update-timeout-retrying", retries = progress.retries
+                        )),
+                    };
+                    v_flex()
+                        .id("client-update-progress")
+                        .child(tr!("distribution-update-bytes",
+                            bytes = progress.bytes.to_string(), total = progress.total.to_string()))
+                        .children(status)
+                }))
                 .children(
                     self.distribution
                         .update_error

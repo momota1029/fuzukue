@@ -84,6 +84,7 @@ enum Step {
     Connect,
     ModelSetupFixture,
     DistributionPreview,
+    ClientDownloadPreview { resuming: bool },
     ClientRollbackPreview,
     GitHubReportPreview,
     ScreenshotCaptureFixture,
@@ -472,6 +473,12 @@ impl Runner {
                         sha256: String::new(),
                         size: 1,
                     });
+                    cx.notify();
+                })?;
+            }
+            Step::ClientDownloadPreview { resuming } => {
+                self.update(cx, |view, _, cx| {
+                    view.preview_client_download(resuming);
                     cx.notify();
                 })?;
             }

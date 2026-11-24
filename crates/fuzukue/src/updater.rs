@@ -9,9 +9,11 @@ use std::{
 
 use anyhow::{ensure, Context as _, Result};
 use fuzukue_proto::{ClientManifest, CLIENT_PLATFORMS};
-use sha2::{Digest, Sha256};
 
 use crate::conn::HttpTarget;
+
+mod download;
+pub(super) use download::{download, prepare, DownloadPhase, DownloadProgress};
 
 pub const BUILD_ID: &str = env!("FUZUKUE_CLIENT_BUILD_ID");
 const HEALTH_ENV: &str = "FUZUKUE_UPDATE_PENDING_COMMIT";
@@ -58,38 +60,6 @@ pub fn manifest(http: &HttpTarget, platform: &str) -> Result<Option<ClientManife
     }
 }
 
-pub fn download(http: &HttpTarget, manifest: &ClientManifest, output: &mut fs::File) -> Result<()> {
-    let sha = &manifest.sha256;
-    ensure!(CLIENT_PLATFORMS.contains(&manifest.platform.as_str()));
-    ensure!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
-    let response =
-        http.distribution("GET", &format!("{}?sha256={sha}", manifest.platform), None)?;
-    verify(response.into_reader(), &mut *output, manifest)?;
-    output.sync_all()?;
-    Ok(())
-}
-
-fn verify(input: impl Read, mut output: impl Write, manifest: &ClientManifest) -> Result<()> {
-    let mut input = input.take(manifest.size.saturating_add(1));
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    let mut size = 0;
-    loop {
-        let count = input.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        size += count as u64;
-        hash.update(&buffer[..count]);
-        output.write_all(&buffer[..count])?;
-    }
-    ensure!(
-        size == manifest.size && format!("{:x}", hash.finalize()) == manifest.sha256,
-        tr!("distribution-hash-mismatch")
-    );
-    Ok(())
-}
-
 fn sidecar(exe: &Path, suffix: &str) -> PathBuf {
     let mut name = exe.as_os_str().to_os_string();
     name.push(suffix);
@@ -101,17 +71,6 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
     }
-}
-
-pub fn prepare(http: &HttpTarget, manifest: &ClientManifest) -> Result<tempfile::TempPath> {
-    let exe = std::env::current_exe()?;
-    let mut staged =
-        tempfile::NamedTempFile::new_in(exe.parent().context("missing executable directory")?)?;
-    download(http, manifest, staged.as_file_mut())?;
-    staged
-        .as_file()
-        .set_permissions(fs::metadata(exe)?.permissions())?;
-    Ok(staged.into_temp_path())
 }
 
 pub fn launch_helper(staged: tempfile::TempPath, commit: &str) -> Result<UpdateHandoff> {
@@ -349,6 +308,7 @@ fn welcome_timed_out(elapsed: Duration, restart: &Path, commit: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn fixture() -> ClientManifest {
         ClientManifest {
@@ -415,14 +375,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&exe)?, "new");
         assert_eq!(fs::read_to_string(&backup)?, "old");
         Ok(())
-    }
-
-    #[test]
-    fn rejects_a_corrupt_download_before_replacement() {
-        let manifest = fixture();
-        assert!(verify(b"evil".as_slice(), io::sink(), &manifest).is_err());
-        assert!(verify(b"good+".as_slice(), io::sink(), &manifest).is_err());
-        assert!(verify(b"good".as_slice(), io::sink(), &manifest).is_ok());
     }
 
     #[test]

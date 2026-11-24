@@ -179,15 +179,56 @@ impl HttpTarget {
         format!("{}/ws", self.base.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1))
     }
 
+    pub(super) fn same_distribution_server(&self, other: &Self) -> bool {
+        self.base == other.base && self.authorization == other.authorization
+    }
+
     pub fn distribution(&self, method: &str, route: &str, json: Option<&str>) -> Result<ureq::Response, ureq::Error> {
-        let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(60)).build();
-        let mut request = agent.request(method, &format!("{}/client/{route}", self.base));
-        if let Some(auth) = &self.authorization {
-            request = request.set("Authorization", auth);
-        }
+        let builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(60));
+        let request = self.distribution_request(builder, method, route);
         match json {
             Some(json) => request.set("Content-Type", "application/json").send_string(json),
             None => request.call(),
+        }
+    }
+
+    pub(super) fn download_client(
+        &self,
+        platform: &str,
+        sha: &str,
+        offset: u64,
+        etag: &str,
+        idle_timeout: Duration,
+    ) -> Result<ureq::Response, Box<ureq::Error>> {
+        // The socket can stay busy for much longer than one read timeout.
+        let builder = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(idle_timeout)
+            .timeout_write(idle_timeout);
+        let mut request = self.distribution_request(builder, "GET", platform)
+            .query("sha256", sha)
+            .set("Accept-Encoding", "identity");
+        if offset > 0 {
+            request = request.set("Range", &format!("bytes={offset}-")).set("If-Range", etag);
+        }
+        request.call().map_err(Box::new)
+    }
+
+    fn distribution_request(&self, builder: ureq::AgentBuilder, method: &str, route: &str) -> ureq::Request {
+        let agent = builder.redirects(0).build();
+        let request = agent.request(method, &format!("{}/client/{route}", self.base));
+        match &self.authorization {
+            Some(auth) => request.set("Authorization", auth),
+            None => request,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_distribution_test(address: SocketAddr) -> Self {
+        Self {
+            base: format!("http://{address}"),
+            authorization: Some("Bearer fixture".into()),
+            ..Self::default()
         }
     }
 
@@ -802,7 +843,10 @@ impl Worker {
             if let Some(control) = self.wait(Duration::ZERO) {
                 return Ok(Transfer::Control(control));
             }
-            while welcomed {
+            loop {
+                if !welcomed {
+                    break;
+                }
                 match self.out_rx.try_recv() {
                     Ok(msg) => {
                         let request = match &msg {

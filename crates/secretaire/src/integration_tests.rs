@@ -8517,8 +8517,52 @@ async fn distribution_auth_welcome_notice_and_rejected_websocket() -> Result<()>
         fs::write(&binary, b"replacement")?;
         let next = crate::distribution::publish(&app.state_dir, platform, &binary, commit)?;
         assert_ne!(next.sha256, manifest.sha256);
-        let response = router.clone().oneshot(request(&format!("{binary_path}?sha256={}", manifest.sha256), true)).await?;
+        let pinned = format!("{binary_path}?sha256={}", manifest.sha256);
+        let etag = format!("\"{}\"", manifest.sha256);
+        let response = router.clone().oneshot(request(&pinned, true)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["etag"], etag);
+        assert_eq!(response.headers()["accept-ranges"], "bytes");
+        assert_eq!(response.headers()["content-length"], "17");
+        assert!(!response.headers().contains_key("content-range"));
         assert_eq!(to_bytes(response.into_body(), 1024).await?, &b"client executable"[..]);
+
+        for (range, content_range, expected) in [
+            ("bytes=7-", "bytes 7-16/17", &b"executable"[..]),
+            ("bytes=0-5", "bytes 0-5/17", &b"client"[..]),
+            ("bytes=-4", "bytes 13-16/17", &b"able"[..]),
+        ] {
+            let mut req = request(&pinned, true);
+            req.headers_mut().insert("range", range.parse()?);
+            req.headers_mut().insert("if-range", etag.parse()?);
+            let response = router.clone().oneshot(req).await?;
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(response.headers()["content-range"], content_range);
+            assert_eq!(response.headers()["content-length"], expected.len().to_string());
+            assert_eq!(response.headers()["etag"], etag);
+            assert_eq!(to_bytes(response.into_body(), 1024).await?, expected);
+        }
+
+        for invalid in ["bytes=17-", "bytes=7-2", "bytes=nonsense"] {
+            let mut req = request(&pinned, true);
+            req.headers_mut().insert("range", invalid.parse()?);
+            let response = router.clone().oneshot(req).await?;
+            assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(response.headers()["content-range"], "bytes */17");
+            assert_eq!(response.headers()["content-length"], "0");
+            assert!(to_bytes(response.into_body(), 1024).await?.is_empty());
+        }
+
+        for validator in ["\"different\"".to_owned(), format!("W/{etag}")] {
+            let mut req = request(&pinned, true);
+            req.headers_mut().insert("range", "bytes=17-".parse()?);
+            req.headers_mut().insert("if-range", validator.parse()?);
+            let response = router.clone().oneshot(req).await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-length"], "17");
+            assert!(!response.headers().contains_key("content-range"));
+            assert_eq!(to_bytes(response.into_body(), 1024).await?, &b"client executable"[..]);
+        }
 
         let update = crate::self_update::test_gate(project.path());
         assert!(registry.self_update.set(update.clone()).is_ok());

@@ -157,7 +157,7 @@ pub fn send(http: &HttpTarget, peer: &Peer, job: &SendJob) -> Result<()> {
     } else {
         "fuzukue"
     });
-    updater::download(http, &manifest, &mut std::fs::File::create(&binary)?)?;
+    updater::download(http, &manifest, &binary)?;
     let mut settings = AppearanceSettings::default();
     settings.server.mode = ServerMode::Remote;
     settings.server.url.clone_from(&job.url);

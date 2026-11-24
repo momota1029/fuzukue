@@ -16,6 +16,11 @@
     {"action": "screenshot", "name": "distribution-keep-enabled"},
     {"action": "click", "id": "distribution-host"},
     {"action": "screenshot", "name": "distribution-host-disabled"},
+    {"action": "client_download_preview", "resuming": false},
+    {"action": "wait_element", "id": "client-update-progress"},
+    {"action": "screenshot", "name": "distribution-update-retrying"},
+    {"action": "client_download_preview", "resuming": true},
+    {"action": "screenshot", "name": "distribution-update-resuming"},
     {"action": "client_rollback_preview"},
     {"action": "wait_element", "id": "client-update-rollback-dismiss"},
     {"action": "screenshot", "name": "distribution-rollback"}
