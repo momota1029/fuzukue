@@ -1,0 +1,46 @@
+approval-dock-title = 承認ドック
+approval-dock-pending = { $count }件の承認待ち
+approval-dock-pending-badge = { $count } 件の承認待ち
+approval-dock-awaiting-result = { $count }件の結果を待機中
+approval-dock-selected = { $count }件を選択中
+approval-dock-review-count = { $count }件の依頼
+approval-dock-applied = { $count }件反映
+approval-dock-conflicts = { $count }件はすでに解決済み
+approval-dock-interrupted = { $count }件は送信結果を確認できず
+approval-dock-fetch-error = 承認一覧を取得できなかった
+approval-dock-collapse = 折りたたむ
+approval-dock-expand = 展開
+approval-dock-retry = 再取得
+approval-dock-dismiss = 閉じる
+approval-dock-details = 詳細
+approval-dock-deselect = 選択解除
+approval-dock-select = 選択
+approval-dock-requester = 依頼元
+approval-dock-grant-scope = 許可の有効範囲
+approval-dock-grant-once = この操作を一度だけ
+approval-dock-scope = 範囲
+approval-dock-arguments = 引数
+approval-dock-diff = 差分
+approval-dock-job = ジョブ
+approval-dock-expires = 期限
+approval-dock-bulk-allow = 一括許可
+approval-dock-bulk-deny = 一括拒否
+approval-dock-clear-selection = 選択を解除
+approval-dock-target = 対象
+approval-dock-already-resolved = 解決済み
+approval-dock-back = 戻る
+approval-dock-confirm = 確定
+approval-dock-no-target = 対象の指定なし
+approval-dock-risk-low = 低リスク
+approval-dock-risk-mid = 中リスク
+approval-dock-risk-high = 高リスク
+approval-dock-allow = 許可
+approval-dock-deny = 拒否
+approval-dock-allowed = 許可
+approval-dock-denied = 拒否
+approval-dock-withdrawn = 撤回
+approval-dock-expired = 期限切れ
+approval-dock-resolution = { $actor ->
+    [you] { $state }（あなた） · { $tool } · { $id }
+   *[other] { $state } · { $tool } · { $id }
+}

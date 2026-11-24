@@ -19,14 +19,13 @@ enum Tone {
 }
 
 fn risk_badge(risk: ApprovalRisk, theme: &Theme) -> Div {
-    let (ja, en) = risk_labels(risk);
     let color = match risk {
         ApprovalRisk::Low => theme.muted_foreground,
         ApprovalRisk::Mid => theme.warning,
         ApprovalRisk::High => theme.danger,
     };
     div().flex_none().px_1().rounded_md().bg(theme.secondary)
-        .text_xs().text_color(color).child(label(ja, en))
+        .text_xs().text_color(color).child(risk_label(risk, crate::i18n::current()))
 }
 
 fn field(title: &str, value: String, theme: &Theme) -> Div {
@@ -35,24 +34,16 @@ fn field(title: &str, value: String, theme: &Theme) -> Div {
     ).child(value)
 }
 
-fn decision_count(count: usize, ja: &str, en: &str) -> String {
-    if crate::i18n::current() == fuzukue_i18n::Locale::JAPANESE {
-        format!("{count}件{ja}")
-    } else {
-        format!("{count} {en}")
-    }
-}
-
 fn feedback_text(feedback: &Feedback) -> Option<String> {
     let mut parts = Vec::new();
     if feedback.bulk {
-        parts.push(decision_count(feedback.applied, "反映", "applied"));
+        parts.push(tr!("approval-dock-applied", count = feedback.applied));
     }
     if feedback.conflicts > 0 {
-        parts.push(decision_count(feedback.conflicts, "はすでに解決済み", "already resolved"));
+        parts.push(tr!("approval-dock-conflicts", count = feedback.conflicts));
     }
     if feedback.interrupted > 0 {
-        parts.push(decision_count(feedback.interrupted, "は送信結果を確認できず", "could not be confirmed"));
+        parts.push(tr!("approval-dock-interrupted", count = feedback.interrupted));
     }
     parts.extend(feedback.errors.iter().cloned());
     (!parts.is_empty()).then(|| parts.join(" · "))
@@ -87,7 +78,7 @@ impl Workbench {
         let focused = window.focused(cx);
 
         let theme = cx.theme();
-        let heading = decision_count(ids.len(), "の承認待ち", "pending");
+        let heading = tr!("approval-dock-pending", count = ids.len());
         let first = self.approvals.thread(&self.active).next();
         let expanded = !self.approvals.collapsed;
         let reviewing = self.approvals.review.is_some();
@@ -96,7 +87,7 @@ impl Workbench {
             .children(first.map(|item| div().min_w_0().flex_1().truncate().text_sm()
                 .text_color(theme.muted_foreground).child(format!("{} · {}", item.action.tool, target(item)))))
             .when(!ids.is_empty() && !reviewing, |header| header.child(self.dock_button(
-                "", "toggle", if expanded { label("折りたたむ", "Collapse") } else { label("展開", "Expand") },
+                "", "toggle", if expanded { tr!("approval-dock-collapse") } else { tr!("approval-dock-expand") },
                 true, Tone::Default, cx,
                 |this, _, cx| { this.approvals.collapsed = !this.approvals.collapsed; cx.notify(); },
             ).aria_expanded(expanded)));
@@ -104,7 +95,7 @@ impl Workbench {
         let body_height = (window.viewport_size().height * 0.34).min(px(252.));
         let mut dock = v_flex().id("approval-dock").w_full().min_w_0().gap_1().p_2().flex_none()
             .rounded_md().border_1().border_color(theme.border).bg(theme.secondary)
-            .role(Role::Region).aria_label(label("承認ドック", "Approval dock"))
+            .role(Role::Region).aria_label(tr!("approval-dock-title"))
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 if event.keystroke.key != "escape" || event.keystroke.modifiers.number_of_modifiers() != 0 {
                     return;
@@ -136,18 +127,18 @@ impl Workbench {
         if let Some(error) = &self.approvals.queue_error {
             dock = dock.child(h_flex().gap_2().flex_wrap()
                 .child(div().min_w_0().text_sm().text_color(theme.danger).child(error.clone()))
-                .child(self.dock_button("", "retry", label("再取得", "Retry"), true, Tone::Default, cx,
+                .child(self.dock_button("", "retry", tr!("approval-dock-retry"), true, Tone::Default, cx,
                     |this, _, cx| { this.refresh_approvals(); cx.notify(); })));
         }
         if let Some(submission) = self.approvals.submitted.as_ref().filter(|item| item.thread == self.active) {
             let count = submission.outstanding.len();
             dock = dock.child(div().text_sm().text_color(theme.muted_foreground)
-                .child(decision_count(count, "の結果を待機中", "awaiting a result")));
+                .child(tr!("approval-dock-awaiting-result", count = count)));
         }
         if let Some(feedback) = feedback {
             dock = dock.child(h_flex().gap_2().items_start().flex_wrap()
                 .child(div().min_w_0().text_sm().text_color(theme.muted_foreground).child(feedback))
-                .child(self.dock_button("", "dismiss", label("閉じる", "Dismiss"), true, Tone::Default, cx,
+                .child(self.dock_button("", "dismiss", tr!("approval-dock-dismiss"), true, Tone::Default, cx,
                     |this, _, cx| { this.approvals.feedback.remove(&this.active); cx.notify(); })));
         }
         self.approvals.last_focus = focused;
@@ -181,7 +172,7 @@ impl Workbench {
 
         let controls = h_flex().gap_1().items_center().flex_wrap()
             .child(self.dock_button(
-                id, "details", label("詳細", "Details"), true, Tone::Default, cx,
+                id, "details", tr!("approval-dock-details"), true, Tone::Default, cx,
                 move |this, _, cx| {
                     this.approvals.detail = (this.approvals.detail.as_ref() != Some(&disclosure)).then(|| disclosure.clone());
                     cx.notify();
@@ -189,7 +180,7 @@ impl Workbench {
             ).aria_expanded(detail))
             .children((same_batch(item, item) && selected_kind.is_none_or(|first| same_batch(first, item))).then(|| {
                 self.dock_button(
-                    id, "select", if selected { label("選択解除", "Deselect") } else { label("選択", "Select") },
+                    id, "select", if selected { tr!("approval-dock-deselect") } else { tr!("approval-dock-select") },
                     self.can_decide(), Tone::Default, cx,
                     move |this, _, cx| { this.toggle_selection(&select); cx.notify(); },
                 ).aria_selected(selected)
@@ -213,17 +204,17 @@ impl Workbench {
         let details = detail.then(|| {
             let diff = args.get("diff").or_else(|| item.action.scope.get("diff"));
             v_flex().id("approval-request-details").w_full().gap_1().p_2().rounded_md().bg(surface.code)
-                .child(field(label("依頼元", "Requester"), item.owner.requester.clone(), theme))
-                .child(field(label("許可の有効範囲", "Grant scope"), label("この操作を一度だけ", "This action once").to_owned(), theme))
-                .child(field(label("範囲", "Scope"), scope.clone(), theme))
-                .child(field(label("引数", "Arguments"), serde_json::to_string_pretty(args).unwrap_or_else(|_| json(args)), theme))
-                .children(diff.map(|diff| field(label("差分", "Diff"), json(diff), theme)))
+                .child(field(tr!("approval-dock-requester"), item.owner.requester.clone(), theme))
+                .child(field(tr!("approval-dock-grant-scope"), tr!("approval-dock-grant-once").to_owned(), theme))
+                .child(field(tr!("approval-dock-scope"), scope.clone(), theme))
+                .child(field(tr!("approval-dock-arguments"), serde_json::to_string_pretty(args).unwrap_or_else(|_| json(args)), theme))
+                .children(diff.map(|diff| field(tr!("approval-dock-diff"), json(diff), theme)))
         });
 
         v_flex().w_full().min_w_0().gap_1()
             .children(first_in_job.then(|| div().text_sm().font_weight(FontWeight::SEMIBOLD).min_w_0().truncate()
                 .text_color(theme.muted_foreground)
-                .child(format!("{} · {}", label("ジョブ", "Job"), item.owner.job))))
+                .child(format!("{} · {}", tr!("approval-dock-job"), item.owner.job))))
             .child(
                 v_flex().id(SharedString::from(format!("approval-row-{id}")))
                     .role(Role::Group).aria_label(format!("{} · {}", item.action.tool, target(item)))
@@ -234,10 +225,10 @@ impl Workbench {
                         .child(risk_badge(item.risk, theme)))
                     .child(div().text_sm().min_w_0().whitespace_normal().child(target(item)))
                     .child(div().text_xs().min_w_0().truncate().text_color(theme.muted_foreground)
-                        .child(format!("{} · {scope}", label("範囲", "Scope"))))
+                        .child(format!("{} · {scope}", tr!("approval-dock-scope"))))
                     .child(div().text_sm().min_w_0().whitespace_normal().child(item.reason.clone()))
                     .child(div().text_xs().text_color(theme.muted_foreground)
-                        .child(format!("{} · {}", label("期限", "Expires"), expiry(item))))
+                        .child(format!("{} · {}", tr!("approval-dock-expires"), expiry(item))))
                     .child(controls)
                     .children(details),
             )
@@ -251,12 +242,12 @@ impl Workbench {
 
     fn render_bulk_controls(&self, count: usize, cx: &Context<Self>) -> impl IntoElement {
         h_flex().gap_1().items_center().flex_wrap()
-            .child(div().text_sm().child(decision_count(count, "を選択中", "selected")))
-            .child(self.dock_button("", "bulk-allow", label("一括許可", "Allow selected"), self.can_decide(),
+            .child(div().text_sm().child(tr!("approval-dock-selected", count = count)))
+            .child(self.dock_button("", "bulk-allow", tr!("approval-dock-bulk-allow"), self.can_decide(),
                 Tone::Default, cx, |this, window, cx| { this.review_batch(ALLOW, window, cx); cx.notify(); }))
-            .child(self.dock_button("", "bulk-deny", label("一括拒否", "Deny selected"), self.can_decide(),
+            .child(self.dock_button("", "bulk-deny", tr!("approval-dock-bulk-deny"), self.can_decide(),
                 Tone::Default, cx, |this, window, cx| { this.review_batch(DENY, window, cx); cx.notify(); }))
-            .child(self.dock_button("", "cancel-selection", label("選択を解除", "Clear selection"), true,
+            .child(self.dock_button("", "cancel-selection", tr!("approval-dock-clear-selection"), true,
                 Tone::Default, cx, |this, _, cx| { this.approvals.selected.clear(); cx.notify(); }))
     }
 
@@ -265,20 +256,20 @@ impl Workbench {
         let rows = Self::dock_scroll(&self.approvals.scroll, height).children(review.requests.iter().map(|item| {
             let still_pending = self.approvals.thread(&self.active).any(|current| current.approval_id == item.approval_id);
             v_flex().gap_1().p_2().rounded_md().bg(theme.popover)
-                .child(field(label("対象", "Target"), target(item), theme))
-                .child(field(label("範囲", "Scope"), json(&item.action.scope), theme))
+                .child(field(tr!("approval-dock-target"), target(item), theme))
+                .child(field(tr!("approval-dock-scope"), json(&item.action.scope), theme))
                 .children((!still_pending).then(|| div().text_sm().text_color(theme.warning)
-                    .child(label("解決済み", "Already resolved"))))
+                    .child(tr!("approval-dock-already-resolved"))))
         }));
         v_flex().id("approval-bulk-review").gap_1()
             .child(div().font_weight(FontWeight::SEMIBOLD).text_sm().child(format!("{} · {} · {}",
                 decision_label(review.decision), review.requests[0].action.tool,
-                decision_count(review.requests.len(), "の依頼", "requests"))))
+                tr!("approval-dock-review-count", count = review.requests.len()))))
             .child(self.scrollbar(rows))
             .child(h_flex().gap_1().flex_wrap()
-                .child(self.dock_button("", "back", label("戻る", "Back"), true, Tone::Default, cx,
+                .child(self.dock_button("", "back", tr!("approval-dock-back"), true, Tone::Default, cx,
                     |this, window, cx| { this.cancel_batch(window, cx); cx.notify(); }))
-                .child(self.dock_button("", "confirm", label("確定", "Confirm"), self.can_decide(),
+                .child(self.dock_button("", "confirm", tr!("approval-dock-confirm"), self.can_decide(),
                     Tone::Primary, cx, |this, window, cx| { this.confirm_batch(window, cx); cx.notify(); })))
     }
 

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use fuzukue_i18n::Locale;
 use fuzukue_proto::{
     ApprovalDecision, ApprovalGrantScope, ApprovalRisk, ApprovalState, ApprovalSummary,
     ApprovalUnattended, ClientMsg, NotificationKind, ServerEvent,
@@ -198,20 +199,20 @@ fn same_batch(first: &ApprovalSummary, second: &ApprovalSummary) -> bool {
         && first.action.scope == second.action.scope
 }
 
-fn label(ja: &'static str, en: &'static str) -> &'static str {
-    if crate::i18n::current() == fuzukue_i18n::Locale::JAPANESE { ja } else { en }
-}
-
-fn risk_labels(risk: ApprovalRisk) -> (&'static str, &'static str) {
-    match risk {
-        ApprovalRisk::Low => ("低リスク", "Low risk"),
-        ApprovalRisk::Mid => ("中リスク", "Medium risk"),
-        ApprovalRisk::High => ("高リスク", "High risk"),
-    }
+fn risk_label(risk: ApprovalRisk, locale: Locale) -> &'static str {
+    locale.text(match risk {
+        ApprovalRisk::Low => "approval-dock-risk-low",
+        ApprovalRisk::Mid => "approval-dock-risk-mid",
+        ApprovalRisk::High => "approval-dock-risk-high",
+    })
 }
 
 fn decision_label(decision: ApprovalDecision) -> &'static str {
-    if decision == ALLOW { label("許可", "Allow") } else { label("拒否", "Deny") }
+    if decision == ALLOW {
+        tr!("approval-dock-allow")
+    } else {
+        tr!("approval-dock-deny")
+    }
 }
 
 fn json(value: &Value) -> String {
@@ -226,7 +227,7 @@ fn target(item: &ApprovalSummary) -> String {
             keys.iter().find_map(|key| value.get(key).filter(|value| !value.is_null()))
         })
         .map(json)
-        .unwrap_or_else(|| label("対象の指定なし", "No target specified").to_owned())
+        .unwrap_or_else(|| tr!("approval-dock-no-target").to_owned())
 }
 
 fn expiry(item: &ApprovalSummary) -> String {
@@ -238,17 +239,23 @@ fn expiry(item: &ApprovalSummary) -> String {
 impl Resolution {
     fn event(&self) -> ServerEvent {
         let state = match self.state {
-            ApprovalState::Granted => label("許可", "Allowed"),
-            ApprovalState::Denied => label("拒否", "Denied"),
-            ApprovalState::Withdrawn => label("撤回", "Withdrawn"),
-            ApprovalState::Expired => label("期限切れ", "Expired"),
+            ApprovalState::Granted => tr!("approval-dock-allowed"),
+            ApprovalState::Denied => tr!("approval-dock-denied"),
+            ApprovalState::Withdrawn => tr!("approval-dock-withdrawn"),
+            ApprovalState::Expired => tr!("approval-dock-expired"),
             ApprovalState::Pending => unreachable!(),
         };
-        let by = if self.local { label("（あなた）", " by you") } else { "" };
+        let text = tr!(
+            "approval-dock-resolution",
+            state = state,
+            actor = if self.local { "you" } else { "other" },
+            tool = self.tool.as_str(),
+            id = self.id.as_str(),
+        );
         ServerEvent::LocalNotice {
             session: self.thread.clone(),
             item: format!("approval-dock:{}:{:?}", self.id, self.state),
-            text: format!("{state}{by} · {} · {}", self.tool, self.id),
+            text,
             localized: None,
         }
     }
@@ -268,7 +275,7 @@ impl Workbench {
             self.approvals.fetching = Some(request);
         } else {
             self.approvals.fetching = None;
-            self.approvals.queue_error = Some(label("承認一覧を取得できなかった", "Could not request approvals").to_owned());
+            self.approvals.queue_error = Some(tr!("approval-dock-fetch-error").to_owned());
         }
     }
 
@@ -420,7 +427,7 @@ impl Workbench {
     pub(super) fn approval_badge(&self, count: usize, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         div().id("thread-approval-badge").role(Role::Group)
-            .aria_label(format!("{count} {}", label("件の承認待ち", "pending approvals")))
+            .aria_label(tr!("approval-dock-pending-badge", count = count))
             .flex_none().px_1().rounded_md().bg(theme.secondary)
             .text_color(theme.warning).text_xs().child(count.to_string())
     }

@@ -255,6 +255,40 @@ fn model_setup_and_weekly_usage_are_localized() {
 }
 
 #[test]
+fn approval_dock_formats_counts_and_resolution_notices() {
+    let ja = Locale::JAPANESE;
+    let en = Locale::supported("en").unwrap();
+    let mut args = FluentArgs::new();
+    args.set("count", 2);
+    for (key, japanese, english) in [
+        ("approval-dock-pending", "2件の承認待ち", "2 pending"),
+        ("approval-dock-pending-badge", "2 件の承認待ち", "2 pending approvals"),
+        ("approval-dock-review-count", "2件の依頼", "2 requests"),
+        ("approval-dock-conflicts", "2件はすでに解決済み", "2 already resolved"),
+    ] {
+        assert_eq!(ja.format(key, &args), japanese);
+        assert_eq!(en.format(key, &args), english);
+    }
+    args.set("count", 1);
+    assert_eq!(en.format("approval-dock-pending-badge", &args), "1 pending approval");
+    assert_eq!(en.format("approval-dock-review-count", &args), "1 request");
+
+    let mut args = FluentArgs::new();
+    args.set("tool", "fs_write");
+    args.set("id", "approval-1");
+    for (locale, local, remote) in [
+        (ja, "許可（あなた） · fs_write · approval-1", "許可 · fs_write · approval-1"),
+        (en, "Allowed by you · fs_write · approval-1", "Allowed · fs_write · approval-1"),
+    ] {
+        args.set("state", locale.text("approval-dock-allowed"));
+        args.set("actor", "you");
+        assert_eq!(locale.format("approval-dock-resolution", &args), local);
+        args.set("actor", "other");
+        assert_eq!(locale.format("approval-dock-resolution", &args), remote);
+    }
+}
+
+#[test]
 fn desktop_status_catalogs_use_rendered_separators() {
     for locale in Locale::available() {
         for file in ["chat.ftl", "settings.ftl", "thread-details.ftl", "agents.ftl", "tiers.ftl"] {

@@ -107,7 +107,13 @@ fn fresh_snapshot_reconciles_after_disconnect_and_stale_replies_are_ignored() {
 
 #[test]
 fn each_risk_has_a_distinct_text_label() {
-    assert_eq!(risk_labels(ApprovalRisk::Low), ("低リスク", "Low risk"));
-    assert_eq!(risk_labels(ApprovalRisk::Mid), ("中リスク", "Medium risk"));
-    assert_eq!(risk_labels(ApprovalRisk::High), ("高リスク", "High risk"));
+    let en = Locale::supported("en").unwrap();
+    for (risk, key, english) in [
+        (ApprovalRisk::Low, "approval-dock-risk-low", "Low risk"),
+        (ApprovalRisk::Mid, "approval-dock-risk-mid", "Medium risk"),
+        (ApprovalRisk::High, "approval-dock-risk-high", "High risk"),
+    ] {
+        assert_eq!(risk_label(risk, Locale::JAPANESE), Locale::JAPANESE.text(key));
+        assert_eq!(risk_label(risk, en), english);
+    }
 }
