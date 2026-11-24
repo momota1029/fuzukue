@@ -242,7 +242,7 @@ impl Batch {
 }
 
 pub(super) async fn relay_progress(
-    app: Arc<App>, session: String, job: String, title: Option<String>, mut events: tokio::sync::broadcast::Receiver<Envelope>,
+    app: Arc<App>, session: String, job: String, mut events: tokio::sync::broadcast::Receiver<Envelope>,
 ) {
     let mut batch = Batch::default();
     loop {
@@ -262,7 +262,7 @@ pub(super) async fn relay_progress(
             } => batch.finish_prose(&mut digest)
         }
         if !digest.is_empty() {
-            digest.title.clone_from(&title);
+            digest.title = app.delegates.jobs.get(&job).and_then(|record| record.lock().unwrap().display.label.clone());
             digest.revision = app.delegates.jobs.digest_ready(&job).unwrap_or_default();
             enqueue_desk(&app, &session, DeskTurn::WorkerDigest(Digests::from([(job.clone(), digest)])));
         }

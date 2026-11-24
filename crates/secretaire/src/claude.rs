@@ -1614,7 +1614,8 @@ async fn run_read_only(
 /// Run a delegated job in a fresh Claude session.
 pub(crate) async fn run_worker(
     app: &Workspace, cwd: &Path, session: &str, job: &str, settings: ChatSettings, prompt: &str,
-    steering: &mut crate::delegate::JobInput, launch: &crate::delegate::WorkerLaunch, metadata: &mut RunMetadata,
+    steering: &mut crate::delegate::JobInput, launch: &crate::delegate::WorkerLaunch,
+    metadata: &mut RunMetadata, on_model: impl Fn(&RunMetadata) + Send,
 ) -> Result<String> {
     if !steering.paced {
         if let Some((until, reason)) = app.usage.blocked("claude") {
@@ -1722,6 +1723,7 @@ pub(crate) async fn run_worker(
                 };
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue };
                 stream.stats.observe_invocation(metadata, &frame);
+                on_model(metadata);
                 stream.map_event_for(session, &frame, &app.hub, Some(job));
                 match frame["type"].as_str() {
                     Some("rate_limit_event") => app.usage.update_claude(&frame["rate_limit_info"]),

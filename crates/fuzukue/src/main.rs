@@ -1858,6 +1858,9 @@ impl Workbench {
                 self.thread_info.parallel_limits = parallel_limits;
                 self.thread_info.update_plan(session, plan, progress);
             }
+            ServerEvent::DelegateRenamed { session, job, change } if render => {
+                self.chat(&session, cx).delegate_renamed(&job, &change, cx);
+            }
             ServerEvent::DelegateProgress { session, job, summary } if render => {
                 self.chat(&session, cx).delegate_progress(&job, summary, cx);
             }

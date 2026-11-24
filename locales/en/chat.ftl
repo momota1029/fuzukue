@@ -171,6 +171,23 @@ chat-status-details = { $status } Show details
 chat-activity-details = Details
 chat-activity-send = Send
 chat-activity-full-message = Full message
+chat-job-list = Jobs
+chat-job-name = Display name
+chat-job-rename = Rename
+chat-job-save = Save name
+chat-job-cancel = Cancel
+chat-job-name-help = Up to { $columns } display columns. A longer name is shortened in the list and kept in details.
+chat-job-copy-id = Copy ID
+chat-job-open-report = Open report
+chat-job-default = Default
+chat-job-model = Model ({ $value })
+chat-job-effort = Effort ({ $value })
+chat-job-tier = Tier ({ $value })
+chat-job-backend = Backend ({ $value })
+chat-job-tool-count = { $count ->
+    [one] { $count } tool call
+   *[other] { $count } tool calls
+    }
 chat-activity-last = Latest activity: { $activity }
 chat-activity-elapsed = Elapsed: { $elapsed }
 chat-attachment-enlarge = Enlarge { $name }
@@ -217,7 +234,7 @@ command-escalate = Use the escalation model for one reply
 command-escalation-unavailable = Could not use the escalation model. { $detail }
 chat-send-escalated = Send with escalation
 chat-escalate-action = Escalate
-chat-escalated-reply = Escalated · { $model }
+chat-escalated-reply = Escalated ({ $model })
 chat-use-workspace-model = Use the workspace model and effort
 command-archive = Archive this thread
 command-pin = Pin this thread

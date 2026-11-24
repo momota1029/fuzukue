@@ -5621,6 +5621,7 @@ mod tests {
         gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
             gpui_kit::init(cx);
             math::init(cx);
+            cx.set_global(gpui_kit::ShotClipboard::default());
             let (handle, view) = open_workbench(cx).unwrap();
             let (out, messages) = std::sync::mpsc::channel();
             let session = "thread-roles";
@@ -5665,7 +5666,10 @@ mod tests {
                         view.on_event(ServerEvent::ToolCall {
                             session: session.into(), item: "delegate:test".into(), actor: Actor::System,
                             name: "delegate".into(), input: serde_json::json!({
-                                "model": CLAUDE_OPUS, "started_at_ms": 1
+                                "title": "R-81 Check the citations", "label": "Check citations", "card_id": "R-81",
+                                "model": CLAUDE_OPUS, "started_at_ms": 1,
+                                "selection": {"backend": "claude", "model": CLAUDE_OPUS, "effort": "high"},
+                                "routing": {"tier": "heavy", "reason": "Escalated"}
                             }),
                         }, cx);
                         for (item, ok) in [("delegate:test:read", true), ("delegate:test:check", false)] {
@@ -5739,6 +5743,10 @@ mod tests {
                                 && (icon.center().y - label.center().y).abs() <= px(0.5))
                     })?);
                     assert!(visible(&runner, cx, "chat-tail-activity-job-error-0")?);
+                    for part in ["card", "model", "effort", "tier", "backend", "last-tool"] {
+                        let id = format!("chat-tail-activity-job-{part}-0");
+                        assert!(runner.update(cx, |_, window, _| window.shot_element_bounds(&id).is_some())?);
+                    }
                     assert!(!visible(&runner, cx, "chat-tail-activity-job-tool-status-0")?);
                     runner.step(Step::Hover { id: "chat-tail-activity-job-details-0".into() }, cx).await?;
                     pause(cx, 350).await;
@@ -5831,6 +5839,37 @@ mod tests {
                     assert!(visible(&runner, cx, tool)?);
                     assert!(!visible(&runner, cx, "chat-tail-activity-job-label-0")?);
 
+                    runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-trigger".into() })?;
+                    runner.step(Step::WaitElement { id: "chat-tail-activity-job-report-0".into() }, cx).await?;
+                    runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-job-copy-0".into() })?;
+                    let copied = runner.update(cx, |_, _, cx| cx.read_from_clipboard().and_then(|value| value.text()))?;
+                    assert_eq!(copied.as_deref(), Some("delegate:test"));
+                    runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-job-rename-0".into() })?;
+                    runner.step(Step::WaitElement { id: "rename-job-dialog".into() }, cx).await?;
+                    runner.key(cx, "Ctrl+a")?;
+                    runner.step(Step::Type { text: "Checked references".into() }, cx).await?;
+                    runner.click(cx, ClickTarget::Element { id: "rename-job-save".into() })?;
+                    assert!(messages.try_iter().any(|message| matches!(message,
+                        ClientMsg::RenameJob { session: id, job, label }
+                        if id == session && job == "delegate:test" && label == "Checked references"
+                    )));
+                    runner.update(cx, |view, _, cx| view.on_event(ServerEvent::DelegateRenamed {
+                        session: session.into(), job: "delegate:test".into(),
+                        change: fuzukue_proto::DelegateNameChange {
+                            at_ms: 1, source: "desktop".into(), previous_label: Some("Check citations".into()),
+                            label: "Checked references".into(), label_source: None,
+                        },
+                    }, cx))?;
+                    runner.frame(cx)?;
+                    if !visible(&runner, cx, "chat-tail-activity-job-report-0")? {
+                        runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-trigger".into() })?;
+                    }
+                    runner.step(Step::WaitElement { id: "chat-tail-activity-job-report-0".into() }, cx).await?;
+                    runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-job-report-0".into() })?;
+                    runner.step(Step::WaitElement { id: "job-report-dialog".into() }, cx).await?;
+                    runner.key(cx, "escape")?;
+                    runner.frame(cx)?;
+
                     runner.update(cx, |view, _, cx| {
                         for index in 0..30 {
                             view.on_event(ServerEvent::ToolCall {
@@ -5856,10 +5895,10 @@ mod tests {
                         window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position, ..Default::default() }), cx);
                         window.dispatch_event(PlatformInput::Scroll(ScrollEvent { position, delta, ..Default::default() }), cx);
                     });
-                    wheel(cx, -2_000.)?;
+                    wheel(cx, -5_000.)?;
                     runner.frame(cx)?;
                     assert!(visible(&runner, cx, "chat-tail-activity-job-label-29")?);
-                    wheel(cx, 2_000.)?;
+                    wheel(cx, 5_000.)?;
                     runner.frame(cx)?;
                     assert!(visible(&runner, cx, "chat-tail-activity-job-label-0")?);
                     for _ in 0..29 {

@@ -304,7 +304,16 @@ impl Transcript {
                         tool.ok = None;
                         tool.output = None;
                     }
-                    tool.input = Some(input.clone());
+                    let mut input = input.clone();
+                    if let Some(previous) = &tool.input {
+                        preserve_delegate_name(previous, &mut input);
+                    }
+                    tool.input = Some(input);
+                }
+            }
+            ServerEvent::DelegateRenamed { job, change, .. } => {
+                if let Some(input) = self.delegate_input_mut(job) {
+                    record_delegate_name(input, change);
                 }
             }
             ServerEvent::DelegateProgress { job, summary, .. } => {
@@ -429,8 +438,14 @@ impl Transcript {
         (!summary.is_empty()).then(|| summary.join("\n"))
     }
 
+    fn delegate_input_mut(&mut self, job: &str) -> Option<&mut serde_json::Value> {
+        let &index = self.index.get(job)?;
+        let tool = self.items[index].meta.tool.as_mut().filter(|tool| tool.name == "delegate")?;
+        tool.input.as_mut().filter(|input| input.is_object())
+    }
+
     fn merge(&mut self, recovered: Self) {
-        for entry in recovered.items {
+        for mut entry in recovered.items {
             if let Some(&i) = self.index.get(&entry.meta.item) {
                 let saved = &mut self.items[i];
                 if entry.text.starts_with(&saved.text) {
@@ -442,6 +457,12 @@ impl Transcript {
                     .as_ref()
                     .is_some_and(|tool| tool.ok.is_some())
                 {
+                    if let (Some(saved), Some(recovered)) = (
+                        saved.meta.tool.as_ref().and_then(|tool| tool.input.as_ref()),
+                        entry.meta.tool.as_mut().and_then(|tool| tool.input.as_mut()),
+                    ) {
+                        preserve_delegate_name(saved, recovered);
+                    }
                     saved.meta.tool = entry.meta.tool;
                 }
                 if entry.meta.application.as_ref().is_some_and(|application| {
@@ -910,6 +931,31 @@ pub fn is_legacy_session(session: &str) -> bool {
     session == "main" || session.starts_with("tab-") || session.starts_with("issue-")
 }
 
+fn preserve_delegate_name(previous: &serde_json::Value, input: &mut serde_json::Value) {
+    let Some(history) = previous["rename_history"].as_array() else { return };
+    let Some(object) = input.as_object_mut() else { return };
+    if object.get("rename_history").and_then(serde_json::Value::as_array)
+        .is_some_and(|current| current.len() >= history.len())
+    {
+        return;
+    }
+    object.insert("rename_history".into(), previous["rename_history"].clone());
+    object.insert("label".into(), previous["label"].clone());
+    object.insert("label_source".into(), previous["label_source"].clone());
+}
+
+fn record_delegate_name(input: &mut serde_json::Value, change: &fuzukue_proto::DelegateNameChange) {
+    let change_value = serde_json::json!(change);
+    if input["rename_history"].as_array().and_then(|history| history.last()) == Some(&change_value) {
+        return;
+    }
+    let mut history = input["rename_history"].as_array().cloned().unwrap_or_default();
+    history.push(change_value);
+    input["rename_history"] = history.into();
+    input["label"] = serde_json::json!(change.label);
+    input["label_source"] = serde_json::json!(change.label_source);
+}
+
 pub fn history_session(event: &ServerEvent) -> Option<&str> {
     match event {
         ServerEvent::LocalNotice { session, .. }
@@ -921,6 +967,7 @@ pub fn history_session(event: &ServerEvent) -> Option<&str> {
         | ServerEvent::CommentApplication { session, .. }
         | ServerEvent::TurnActivity { session, .. }
         | ServerEvent::DelegateProgress { session, .. }
+        | ServerEvent::DelegateRenamed { session, .. }
         | ServerEvent::ToolCall { session, .. }
         | ServerEvent::ToolResult { session, .. }
         | ServerEvent::ApprovalRequested { session, .. }
@@ -1298,6 +1345,66 @@ impl Store {
         }
         let (events, first) = thread.transcript.replay_before(id, before, &|event| event);
         Some((events, (first != 0).then_some(first as u64)))
+    }
+
+    pub(crate) fn delegate_target(&self, query: &str, session: Option<&str>) -> Result<(String, String)> {
+        use fuzukue_proto::DELEGATE_JOB;
+        let query = query.trim();
+        ensure!(!query.is_empty(), "Specify a job ID or name");
+        let prefix = query.strip_prefix(DELEGATE_JOB).unwrap_or(query);
+        ensure!(!prefix.is_empty(), "Specify a job ID or name");
+        let name = query.to_lowercase();
+        let mut ids = Vec::new();
+        let mut names = Vec::new();
+        for (id, thread) in self.threads.iter().filter(|(id, _)| session.is_none_or(|session| session == *id)) {
+            for entry in &thread.transcript.items {
+                let job = &entry.meta.item;
+                let Some(nonce) = job.strip_prefix(DELEGATE_JOB) else { continue };
+                let Some(input) = entry.meta.tool.as_ref().filter(|tool| tool.name == "delegate")
+                    .and_then(|tool| tool.input.as_ref()) else { continue };
+                if job == query {
+                    return Ok((id.clone(), job.clone()));
+                }
+                if nonce.starts_with(prefix) {
+                    ids.push((id, job));
+                } else if ["label", "title"].iter().any(|key| {
+                    input[*key].as_str().is_some_and(|value| value.to_lowercase().contains(&name))
+                }) {
+                    names.push((id, job));
+                }
+            }
+        }
+        let matches = if ids.is_empty() { names } else { ids };
+        match matches.as_slice() {
+            [(session, job)] => Ok(((*session).clone(), (*job).clone())),
+            [] => anyhow::bail!("Job {query:?} was not found in this workspace"),
+            _ => anyhow::bail!("Ambiguous job {query:?}. Use a full job ID."),
+        }
+    }
+
+    pub(crate) fn delegate_record(&self, session: &str, job: &str) -> Option<(&serde_json::Value, Option<bool>, Option<&str>)> {
+        let thread = self.threads.get(session)?;
+        let &index = thread.transcript.index.get(job)?;
+        let tool = thread.transcript.items[index].meta.tool.as_ref().filter(|tool| tool.name == "delegate")?;
+        Some((tool.input.as_ref()?, tool.ok, tool.output.as_deref()))
+    }
+
+    pub(crate) fn rename_delegate(
+        &mut self, session: &str, job: &str, label: String, label_source: Option<String>, source: &str,
+    ) -> Result<fuzukue_proto::DelegateNameChange> {
+        let thread = self.threads.get_mut(session).context("Thread not found")?;
+        let input = thread.transcript.delegate_input_mut(job).context("Job not found in this thread")?;
+        let previous = input.clone();
+        let previous_label = input["label"].as_str().or_else(|| input["title"].as_str()).map(str::to_owned);
+        let change = fuzukue_proto::DelegateNameChange {
+            at_ms: now().timestamp_millis(), source: source.into(), previous_label, label, label_source,
+        };
+        record_delegate_name(input, &change);
+        if let Err(error) = thread.save() {
+            *thread.transcript.delegate_input_mut(job).unwrap() = previous;
+            return Err(error);
+        }
+        Ok(change)
     }
 
     pub(crate) fn previous_delegate_touches(&self, session: &str, job: &str) -> Option<Vec<String>> {

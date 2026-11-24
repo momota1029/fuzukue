@@ -37,6 +37,7 @@ pub(crate) async fn start(
     session: &str,
     prompt: String,
     title: Option<String>,
+    label: Option<String>,
     backend: AgentBackend,
     model: String,
     artifacts: Vec<Artifact>,
@@ -53,6 +54,7 @@ pub(crate) async fn start(
         super::Assignment {
             prompt: review_input(prompt, &artifacts)?,
             title,
+            label,
             worktree: None,
             agent: None,
             adopted: None,
@@ -409,6 +411,7 @@ mod tests {
             super::super::Assignment {
                 prompt: "Read AGENTS.md".into(),
                 title: None,
+                label: None,
                 worktree: None,
                 agent: None,
                 adopted: None,

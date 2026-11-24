@@ -1203,6 +1203,7 @@ async fn serve_workspace(
             ServerEvent::Handoffs { .. } | ServerEvent::HandoffOpened { .. } | ServerEvent::HandoffDetail { .. }
             | ServerEvent::HandoffWorkerUpdated { .. } | ServerEvent::HandoffGenerated { .. } | ServerEvent::HandoffFailed { .. } => protocol >= fuzukue_proto::HANDOFF_PROTOCOL,
             ServerEvent::PlanChanged { .. } => protocol >= fuzukue_proto::PLAN_PROTOCOL,
+            ServerEvent::DelegateRenamed { .. } => protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL,
             ServerEvent::Agents { .. } | ServerEvent::AgentSettingsChanged { .. } | ServerEvent::DelegateProgress { .. } => protocol >= 14,
             ServerEvent::InboxFiled { .. } | ServerEvent::DeckSearchResults { .. } | ServerEvent::ReviewSettingsChanged { .. } => protocol >= 13,
             ServerEvent::HistoryChanged { .. } | ServerEvent::HistoryResult { .. } => protocol >= fuzukue_proto::CHANGE_HISTORY_PROTOCOL,
@@ -1986,6 +1987,7 @@ async fn serve_workspace(
                 Ok(ClientMsg::ListAgents | ClientMsg::SetAgentOverride { .. } | ClientMsg::SetThreadAgentOverride { .. }
                     | ClientMsg::SetSummaryModel { .. } | ClientMsg::WorkerPrompt { .. } | ClientMsg::StopWorker { .. })
                     if protocol < 14 => {}
+                Ok(ClientMsg::RenameJob { .. }) if protocol < fuzukue_proto::JOB_LABEL_PROTOCOL => {}
                 Ok(ClientMsg::SetAgentRoleModel { .. }) if protocol < fuzukue_proto::AGENT_MODELS_PROTOCOL => {}
                 Ok(ClientMsg::SetAgentRoleModel { role: fuzukue_proto::AgentModelRole::Escalation, .. }
                     | ClientMsg::UseDefaultThreadModel { .. }) if protocol < fuzukue_proto::LIVE_MODELS_PROTOCOL => {}
@@ -3241,6 +3243,9 @@ async fn handle_from_client(
                     Err(error) => app.hub.publish(ServerEvent::Error { message: format!("方針の見直し: {error:#}") }),
                 }
             });
+        }
+        ClientMsg::RenameJob { session, job, label } => {
+            app.delegates.rename_job(app, &job, Some(&session), &label, "desktop")?;
         }
         ClientMsg::StopWorker { session, job } => {
             anyhow::ensure!(app.delegates.interrupt_job(&session, &job), "作業役のジョブは終了した");

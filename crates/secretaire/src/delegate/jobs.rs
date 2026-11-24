@@ -85,6 +85,7 @@ pub(super) struct Job {
     pub(super) id: String,
     pub(super) session: String,
     pub(super) title: String,
+    pub(super) display: fuzukue_proto::DelegateDisplay,
     pub(super) agent: String,
     pub(super) isolation: Option<super::blind::Isolation>,
     pub(super) prompt: String,
@@ -109,6 +110,7 @@ pub(super) struct Timeline {
     lines: VecDeque<Line>,
     tools: HashMap<String, (String, Value)>,
     tool_count: usize,
+    last_tool: Option<String>,
     had_error: bool,
     changed_files: BTreeSet<String>,
     latest_digest: u64,
@@ -116,6 +118,10 @@ pub(super) struct Timeline {
 }
 
 impl Timeline {
+    pub(super) fn tool_activity(&self) -> fuzukue_proto::DelegateToolActivity {
+        fuzukue_proto::DelegateToolActivity { count: self.tool_count, last_tool: self.last_tool.clone() }
+    }
+
     fn push(&mut self, line: Line) {
         self.lines.push_back(line);
         if self.lines.len() > 5 {
@@ -161,6 +167,7 @@ impl Job {
                 })
             }
             Some(Activity::Tool { item, name, input }) => {
+                self.activity.last_tool = Some(truncate(name, 120));
                 if self
                     .activity
                     .tools
@@ -255,7 +262,8 @@ impl Job {
             (self.finished_at.unwrap_or(now) - self.started_at.unwrap_or(self.queued_at)).max(0);
         let mut status = json!({
             "id": self.id, "short_id": self.short_id(),
-            "title": self.title, "agent": self.agent, "tier": self.tier,
+            "title": self.title, "label": self.display.label, "card_id": self.display.card_id,
+            "label_source": self.display.label_source, "agent": self.agent, "tier": self.tier,
             "thread": self.session, "session": self.session, "state": state,
             "queued_at": self.queued_at, "started_at": self.started_at, "finished_at": self.finished_at,
             "elapsed_ms": elapsed, "error": state == State::Failed || self.activity.had_error,
@@ -281,7 +289,7 @@ impl Job {
         let mut value = self.status_header(now);
         let mut summary = json!({
             "last_activity_at": last_at, "last_activity": last.map(|line| line.text.replace(['\n', '\r'], " ")),
-            "tool_count": self.activity.tool_count,
+            "tool_count": self.activity.tool_count, "last_tool": self.activity.last_tool,
             "touches": {"declared": self.declared, "effective": self.effective.touches, "source": self.effective.source},
             "changed_files": files.iter().take(8).collect::<Vec<_>>(), "changed_file_count": files.len(),
             "wait": self.wait,
@@ -370,7 +378,7 @@ pub(super) fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-type Record = Arc<Mutex<Job>>;
+pub(super) type Record = Arc<Mutex<Job>>;
 
 #[derive(Default)]
 pub(super) struct Inventory {
@@ -378,6 +386,10 @@ pub(super) struct Inventory {
 }
 
 impl Inventory {
+    pub(super) fn get(&self, id: &str) -> Option<Record> {
+        self.records.lock().unwrap().get(id).cloned()
+    }
+
     pub(super) fn insert(&self, job: Job) -> Record {
         let id = job.id.clone();
         let record = Arc::new(Mutex::new(job));
@@ -443,7 +455,9 @@ impl Inventory {
             let nonce = job.id.strip_prefix(DELEGATE_JOB).unwrap_or(&job.id);
             if nonce.starts_with(prefix) {
                 ids.push((job.id.clone(), record.clone()));
-            } else if job.title.to_lowercase().contains(&title) {
+            } else if job.title.to_lowercase().contains(&title)
+                || job.display.label.as_ref().is_some_and(|label| label.to_lowercase().contains(&title))
+            {
                 titles.push((job.id.clone(), record.clone()));
             }
         }
@@ -544,7 +558,7 @@ impl Inventory {
                 "{} | {}{note} | {} | {activity}",
                 job.short_id(),
                 job.state().label(),
-                job.title
+                job.display.label.as_deref().unwrap_or(&job.title)
             ));
             jobs.push(row);
         }
@@ -557,7 +571,7 @@ impl Inventory {
         (
             json!({"jobs": jobs, "total": total}),
             format!(
-                "{lines}\n\n{} of {total} jobs\nID | STATE | TITLE | WAIT OR ACTIVITY\n{table}",
+                "{lines}\n\n{} of {total} jobs\nID | STATE | LABEL | WAIT OR ACTIVITY\n{table}",
                 jobs.len()
             ),
         )
@@ -577,6 +591,7 @@ mod tests {
         Job {
             id: format!("{DELEGATE_JOB}{id}"),
             title: title.into(),
+            display: fuzukue_proto::DelegateDisplay::from_title(Some(title), None),
             session: session.into(),
             agent: "worker".into(),
             isolation: None,
@@ -657,6 +672,7 @@ mod tests {
             interrupted: false,
             changes: String::new(),
             attempts: vec![],
+            tool_activity: None,
             files: Some(DelegateFileObservation {
                 changed_files: Some((0..10).map(|i| format!("file-{i}")).collect()),
                 ..finished.effective.clone()
@@ -763,6 +779,7 @@ mod tests {
             changes: "Edited source files.".into(),
             interrupted: false,
             attempts: vec![],
+            tool_activity: None,
             files: Some(DelegateFileObservation {
                 changed_files: Some(changed_files.clone()),
                 ..job.effective.clone()

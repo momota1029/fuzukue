@@ -65,6 +65,13 @@ class TimelineTest {
         ) as ServerEvent.InThread)
         assertEquals(job.copy(ok = true, report = JobReport(9100, "確認済み")), finished.rows.values.single())
         assertFalse(finished.reduce(ServerEvent.TurnEnded("s", Actor("claude"))).running)
+        val renamed = finished.reduce(decodeEvent(
+            """{"type":"delegate_renamed","session":"s","job":"delegate:2","change":{"label":"数式の再確認"}}""",
+        ) as ServerEvent.InThread)
+        val renamedJob = renamed.rows.values.single() as TimelineRow.Job
+        assertEquals("数式の再確認", renamedJob.info.displayTitle)
+        assertEquals("gpt-6.2-sol", renamedJob.info.model)
+        assertEquals(JobReport(9100, "確認済み"), renamedJob.report)
     }
 
     @Test fun planAttentionUsesDistinctBlockerReasonsAndDoesNotRefreshOnSnapshots() {

@@ -10,7 +10,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.decodeFromJsonElement
 
-const val PROTOCOL_VERSION = 65
+const val PROTOCOL_VERSION = 67
 internal const val MIN_PROTOCOL_VERSION = 18
 internal const val THREAD_HISTORY_PROTOCOL = 62
 internal const val FOLDER_ACCESS_REQUEST = "folder-access-"
@@ -130,9 +130,14 @@ data class JobInfo(
     val agent: String? = null,
     @SerialName("started_at_ms") val startedAt: Long? = null,
     val title: String? = null,
+    val label: String? = null,
+    @SerialName("card_id") val cardId: String? = null,
 ) {
-    val displayTitle: String get() = title?.takeIf { it.isNotBlank() } ?: agent ?: model
+    val displayTitle: String get() = label ?: title?.takeIf { it.isNotBlank() && it != cardId } ?: agent ?: model
 }
+
+@Serializable
+data class JobNameChange(val label: String)
 
 @Serializable
 data class JobReport(@SerialName("elapsed_ms") val elapsed: Long, val text: String)
@@ -318,6 +323,9 @@ sealed interface ServerEvent {
     data class DelegateProgress(override val session: String, val job: String, val summary: String) : InThread
 
     @Serializable
+    data class DelegateRenamed(override val session: String, val job: String, val change: JobNameChange) : InThread
+
+    @Serializable
     data class PlanChanged(override val session: String, val plan: Plan, val progress: GoalProgress? = null) : InThread
 
     @Serializable
@@ -401,6 +409,7 @@ object Protocol {
             "tool_call" -> json.decodeFromJsonElement<ServerEvent.ToolCall>(event)
             "tool_result" -> json.decodeFromJsonElement<ServerEvent.ToolResult>(event)
             "delegate_progress" -> json.decodeFromJsonElement<ServerEvent.DelegateProgress>(event)
+            "delegate_renamed" -> json.decodeFromJsonElement<ServerEvent.DelegateRenamed>(event)
             "plan_changed" -> json.decodeFromJsonElement<ServerEvent.PlanChanged>(event)
             "approval_requested" -> json.decodeFromJsonElement<ServerEvent.ApprovalRequested>(event)
             "approval_resolved" -> json.decodeFromJsonElement<ServerEvent.ApprovalResolved>(event)

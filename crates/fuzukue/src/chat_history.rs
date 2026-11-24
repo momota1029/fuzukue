@@ -50,7 +50,7 @@ fn history_item(event: &ServerEvent) -> Option<Cow<'_, str>> {
         | ServerEvent::ToolCall { item, .. } | ServerEvent::ToolResult { item, .. }
         | ServerEvent::MessageDetails { item, .. } | ServerEvent::LocalNotice { item, .. }
         | ServerEvent::GitHubActivity { item, .. } => Some(Cow::Borrowed(item)),
-        ServerEvent::DelegateProgress { job, .. } => Some(Cow::Borrowed(job)),
+        ServerEvent::DelegateProgress { job, .. } | ServerEvent::DelegateRenamed { job, .. } => Some(Cow::Borrowed(job)),
         ServerEvent::CommentApplication { application, .. } => Some(Cow::Owned(format!("comments-{}", application.thread))),
         _ => None,
     }
@@ -640,6 +640,7 @@ impl Chat {
                 self.user_prompt(item, text, paths, to_worker, cx),
             ServerEvent::ToolResult { item, ok, output, .. } => self.tool_result(&item, ok, output, cx),
             ServerEvent::DelegateProgress { job, summary, .. } => self.delegate_progress(&job, summary, cx),
+            ServerEvent::DelegateRenamed { job, change, .. } => self.delegate_renamed(&job, &change, cx),
             ServerEvent::LocalNotice { item, text, localized, .. } if item != fuzukue_proto::COMPOSER_NOTICE_ITEM =>
                 self.local_notice(item, text, localized, cx),
             ServerEvent::GitHubActivity { item, events, .. } => self.github_activity(item, events, cx),

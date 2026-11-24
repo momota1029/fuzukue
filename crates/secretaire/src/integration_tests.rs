@@ -1925,7 +1925,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             ("remote", "string"), ("kind", "string"), ("interval", "integer"), ("wake", "string"),
             ("attention_patterns", "array"), ("attention_marked_lines", "boolean"), ("sources", "array")],
             &["action"]),
-        ("delegate", &[("prompt", "string"), ("title", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("folder_grants", "array"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
+        ("delegate", &[("prompt", "string"), ("title", "string"), ("label", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("folder_grants", "array"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
             ("isolation", "string"), ("backend", "string"), ("model", "string"), ("effort", "string"), ("artifacts", "array")], &["prompt"]),
         ("plan", &[("goal", "string"), ("context", "string"), ("long_running", "boolean"), ("pace", "string"), ("tier", "string"), ("min_tier", "string")],
             &["goal", "context"]),
@@ -1950,6 +1950,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("job_status", &[("job", "string"), ("view", "string")], &["job"]),
         ("job_write_audit", &[("job", "string"), ("before", "string"), ("limit", "integer")], &["job"]),
         ("cancel_job", &[("job", "string"), ("reason", "string")], &["job", "reason"]),
+        ("rename_job", &[("job", "string"), ("label", "string")], &["job", "label"]),
         ("desk_queue", &[("job_ids", "array"), ("offset", "integer"), ("limit", "integer")], &[]),
         ("desk_redeliver", &[("id", "string"), ("confirm", "boolean")], &["id", "confirm"]),
         ("list_recipes", &[], &[]),
@@ -5625,7 +5626,7 @@ for line in sys.stdin:
         let text = listed["content"][0]["text"].as_str().unwrap();
         let (lines, table) = text.split_once("\n\n").unwrap();
         assert_eq!(lines.lines().map(serde_json::from_str).collect::<serde_json::Result<Vec<Value>>>()?, *jobs);
-        assert!(table.contains("ID | STATE | TITLE | WAIT OR ACTIVITY"));
+        assert!(table.contains("ID | STATE | LABEL | WAIT OR ACTIVITY"));
         if want < 8 {
             let waiting = jobs.iter().find(|job| job["state"] == "queued").unwrap();
             if paced {
@@ -5684,9 +5685,13 @@ async fn front_desk_cancels_queued_and_running_delegates_through_approval() -> R
         mcp_request_for(&app, &session, "tools/call", json!({"name": name, "arguments": args})).await
     };
     let mut ids = Vec::new();
+    let long_title = format!("R-81 {}", "見直し".repeat(10));
     for i in 0..5 {
-        let result = call("delegate", json!({"prompt": "Edit chat.rs", "title": format!("Cancel fixture {i}")})).await;
-        ids.push(mcp_data(&result)["job"].as_str().unwrap().to_owned());
+        let title = if i == 0 { long_title.clone() } else { format!("Cancel fixture {i}") };
+        let result = call("delegate", json!({"prompt": "Edit chat.rs", "title": title})).await;
+        let data = mcp_data(&result);
+        assert_eq!(data["label_shortened"], i == 0);
+        ids.push(data["job"].as_str().unwrap().to_owned());
     }
     let listed = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
@@ -5703,6 +5708,16 @@ async fn front_desk_cancels_queued_and_running_delegates_through_approval() -> R
     for state in ["queued", "running"] {
         let job = listed.iter().find(|job| job["state"] == state).unwrap();
         let id = job["id"].as_str().unwrap();
+        let new_label = format!("Recheck {state} {}", "仮定".repeat(14));
+        let renamed = call("rename_job", json!({"job": job["short_id"], "label": new_label})).await;
+        let renamed = mcp_data(&renamed);
+        assert_eq!(renamed["label_shortened"], true, "{renamed}");
+        assert_eq!(renamed["label_source"], new_label);
+        let status = call("job_status", json!({"job": id})).await;
+        let status = mcp_data(&status);
+        assert_eq!(status["label"], renamed["label"]);
+        assert_eq!(status["title"], job["title"]);
+        assert_eq!(status["rename_history"][0]["source"], "front_desk");
         let cancel = async |decision: &str| {
             let (_, mut live) = app.hub.subscribe(u64::MAX);
             tokio::join!(call("cancel_job", json!({"job": job["short_id"], "reason": "Superseded by a new request"})), async {
@@ -5746,7 +5761,21 @@ async fn front_desk_cancels_queued_and_running_delegates_through_approval() -> R
         assert_eq!(job["cancel_reason"], "Superseded by a new request");
         assert!(job["final_report"].as_str().unwrap().contains("Superseded"));
         assert_eq!(call("cancel_job", json!({"job": id, "reason": "Already ended"})).await["isError"], true);
+        handle(&app, ClientMsg::RenameJob { session: session.clone(), job: id.into(), label: "Reviewed".into() }).await?;
+        let status = call("job_status", json!({"job": id})).await;
+        let job = mcp_data(&status);
+        assert_eq!(job["label"], "Reviewed");
+        assert_eq!(job["rename_history"][1]["source"], "desktop");
+        let saved = threads::Store::load(project.path(), &app.state_dir, &Default::default());
+        let (input, ok, report) = saved.delegate_record(&session, id).unwrap();
+        assert_eq!(input["label"], "Reviewed");
+        assert_eq!(input["rename_history"].as_array().unwrap().len(), 2);
+        assert_eq!(ok, Some(false));
+        assert!(report.unwrap().contains("Superseded"));
     }
+    let initial = call("job_status", json!({"job": ids[0]})).await;
+    assert_eq!(mcp_data(&initial)["title"], long_title);
+    assert_eq!(mcp_data(&initial)["card_id"], "R-81");
     Ok(())
 }
 

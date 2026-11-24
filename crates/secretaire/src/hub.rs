@@ -444,6 +444,18 @@ impl Hub {
         }).collect()
     }
 
+    pub(crate) fn rename_delegate(
+        &self, session: &str, job: &str, label: String, label_source: Option<String>, source: &str,
+    ) -> anyhow::Result<fuzukue_proto::DelegateNameChange> {
+        let mut inner = self.inner.lock().unwrap();
+        let change = inner.threads.as_mut().expect("Workspace initializes the thread store")
+            .rename_delegate(session, job, label, label_source, source)?;
+        self.publish_locked(&mut inner, ServerEvent::DelegateRenamed {
+            session: session.into(), job: job.into(), change: change.clone(),
+        }, None, ApprovalWaiter::Backend);
+        Ok(change)
+    }
+
     pub fn publish(&self, event: ServerEvent) {
         self.publish_event(event, None);
     }
@@ -540,6 +552,16 @@ impl Hub {
             }
             if was_idle != inner.running.is_empty() {
                 if let Some(changed) = &inner.activity { changed.send_replace(()); }
+            }
+        }
+        if let ServerEvent::ToolCall { session, item, name, input, .. } = &mut event {
+            if name == "delegate" && item.starts_with(fuzukue_proto::DELEGATE_JOB) {
+                if let Some((saved, _, _)) = inner.threads.as_ref().and_then(|store| store.delegate_record(session, item)) {
+                    if saved.get("rename_history").is_some() {
+                        input["label"] = saved["label"].clone();
+                        input["label_source"] = saved["label_source"].clone();
+                    }
+                }
             }
         }
         let replayable = retain_replay_event(&mut event);
@@ -1033,8 +1055,14 @@ fn observe_worker(workers: &mut BTreeMap<(String, String), WorkerActivity>, even
             if name == "delegate" && item.starts_with(fuzukue_proto::DELEGATE_JOB) => {
             workers.insert((session.clone(), item.clone()), WorkerActivity {
                 started_at: input["started_at_ms"].as_i64(),
-                title: input["title"].as_str().filter(|title| !title.trim().is_empty()).map(str::to_owned),
+                title: input["label"].as_str().or_else(|| input["title"].as_str())
+                    .filter(|title| !title.trim().is_empty()).map(str::to_owned),
             });
+        }
+        ServerEvent::DelegateRenamed { session, job, change } => {
+            if let Some(worker) = workers.get_mut(&(session.clone(), job.clone())) {
+                worker.title = Some(change.label.clone());
+            }
         }
         ServerEvent::ToolResult { session, item, .. } if item.starts_with(fuzukue_proto::DELEGATE_JOB) => {
             workers.remove(&(session.clone(), item.clone()));

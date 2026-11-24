@@ -7,7 +7,8 @@ internal data class TranscriptUpdate(val seq: ULong, val event: ServerEvent.InTh
 internal val ServerEvent.InThread.isSavedTranscriptEvent: Boolean
     get() = when (this) {
         is ServerEvent.TextDelta, is ServerEvent.UserPrompt, is ServerEvent.ToolCall, is ServerEvent.ToolResult,
-        is ServerEvent.DelegateProgress, is ServerEvent.ReplySuperseded, is ServerEvent.TurnEnded -> true
+        is ServerEvent.DelegateProgress, is ServerEvent.DelegateRenamed,
+        is ServerEvent.ReplySuperseded, is ServerEvent.TurnEnded -> true
         else -> false
     }
 
@@ -17,6 +18,7 @@ private fun ServerEvent.InThread.rowKey(): String? = when (this) {
     is ServerEvent.ToolCall -> item
     is ServerEvent.ToolResult -> item
     is ServerEvent.DelegateProgress -> job
+    is ServerEvent.DelegateRenamed -> job
     else -> null
 }
 

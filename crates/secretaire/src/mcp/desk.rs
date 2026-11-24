@@ -28,12 +28,13 @@ pub(crate) enum Tool {
     JobStatus,
     JobWriteAudit,
     CancelJob,
+    RenameJob,
     Queue,
     Redeliver,
 }
 
 impl Tool {
-    pub(super) const ALL: [Self; 14] = [
+    pub(super) const ALL: [Self; 15] = [
         Self::ListThreads,
         Self::ArchiveThread,
         Self::PinThread,
@@ -46,6 +47,7 @@ impl Tool {
         Self::JobStatus,
         Self::JobWriteAudit,
         Self::CancelJob,
+        Self::RenameJob,
         Self::Queue,
         Self::Redeliver,
     ];
@@ -64,6 +66,7 @@ impl Tool {
             Self::JobStatus => "job_status",
             Self::JobWriteAudit => "job_write_audit",
             Self::CancelJob => "cancel_job",
+            Self::RenameJob => "rename_job",
             Self::Queue => "desk_queue",
             Self::Redeliver => "desk_redeliver",
         }
@@ -83,8 +86,8 @@ impl Tool {
         )});
         let job = || {
             json!({"type": "string", "description": harness_text!(
-                "Full job ID, unique ID prefix, or unique title substring from list_jobs.",
-                "list_jobs に表示されるジョブ ID、ID の一意な先頭部分、または題名の一意な一部分。"
+                "Full job ID, unique ID prefix, or unique label or title substring from list_jobs.",
+                "list_jobs に表示されるジョブ ID、ID の一意な先頭部分、または名前や題名の一意な一部分。"
             )})
         };
         match self {
@@ -164,6 +167,10 @@ impl Tool {
                 "Use when the user asks to stop a queued or running delegated job. Record why it was stopped.",
                 "利用者が待機中または実行中の委譲ジョブの停止を頼んだときに使う。停止した理由を記録する。"
             ), json!({"job": job(), "reason": {"type": "string", "minLength": 1}}), &["job", "reason"]),
+            Self::RenameJob => (harness_text!(
+                "Use when the user asks to rename a queued, running, or finished delegated job. Keep the label within 40 display columns (20 full-width characters). Longer labels are shortened, with the full name preserved in details and the change recorded.",
+                "利用者が待機中、実行中、または完了済みのジョブの改名を頼んだときに使う。表示名は表示幅 40 桁（全角 20 字）以内。長い表示名は短縮し、詳細に全文を保存して改名を記録する。"
+            ), json!({"job": job(), "label": {"type": "string", "minLength": 1}}), &["job", "label"]),
             Self::Queue => front_desk_light::queue_schema(),
             Self::Redeliver => front_desk_light::redeliver_schema(),
             Self::BlockStep => (harness_text!(
@@ -212,6 +219,13 @@ impl Tool {
             Self::CancelJob => {
                 let Cancel { job, reason } = parse_args(args)?;
                 app.delegates.cancel_job(&job, &reason)?
+            }
+            Self::RenameJob => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Rename { job: String, label: String }
+                let Rename { job, label } = parse_args(args)?;
+                app.delegates.rename_job(app, &job, None, &label, "front_desk")?
             }
             Self::ListThreads => {
                 let _: NoArgs = parse_args(args)?;

@@ -65,7 +65,8 @@ pub const THREAD_HISTORY_PROTOCOL: u32 = 62;
 pub const REVIEW_FINDINGS_PROTOCOL: u32 = 63;
 pub const FOLDER_GRANTS_PROTOCOL: u32 = 65;
 pub const LIVE_MODELS_PROTOCOL: u32 = 66;
-pub const PROTOCOL_VERSION: u32 = LIVE_MODELS_PROTOCOL;
+pub const JOB_LABEL_PROTOCOL: u32 = 67;
+pub const PROTOCOL_VERSION: u32 = JOB_LABEL_PROTOCOL;
 
 mod approvals;
 pub use approvals::*;
@@ -368,9 +369,13 @@ pub struct TierAttempt {
 pub struct DelegateJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    /// Short label in the user's language, shown as the heading of the parallel work.
+    /// Original title shown in job details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(flatten)]
+    pub display: DelegateDisplay,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at_ms: Option<i64>,
     pub model: String,
     pub started_at_ms: Option<i64>,
     #[serde(default)]
@@ -383,6 +388,9 @@ pub struct DelegateJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<String>,
 }
+
+pub use job_labels::{DelegateDisplay, DelegateNameChange, JOB_LABEL_COLUMNS};
+mod job_labels;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -759,7 +767,15 @@ pub struct DelegateReport {
     #[serde(default)]
     pub attempts: Vec<TierAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_activity: Option<DelegateToolActivity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<DelegateFileObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateToolActivity {
+    pub count: usize,
+    pub last_tool: Option<String>,
 }
 
 impl DelegateReport {
@@ -770,6 +786,7 @@ impl DelegateReport {
             interrupted: true,
             changes: String::new(),
             attempts: Vec::new(),
+            tool_activity: None,
             files: None,
         }
     }
@@ -1014,6 +1031,7 @@ pub enum ClientMsg {
     PauseGoal { session: String },
     WorkerPrompt { session: String, job: String, text: String, paths: Vec<String> },
     StopWorker { session: String, job: String },
+    RenameJob { session: String, job: String, label: String },
     RolePrompt { session: String, text: String, paths: Vec<String>, to_worker: bool },
     SetChatSettings { session: String, settings: ChatSettings },
     /// チャンクは接続内で昇順に送る。最後のチャンクで受信済みパスを返す。
@@ -2326,6 +2344,7 @@ pub enum ServerEvent {
     AgentHistory { agent: Option<String>, session: Option<String>, entries: Vec<AgentInvocation> },
     AgentUsageChanged,
     DelegateProgress { session: String, job: String, summary: String },
+    DelegateRenamed { session: String, job: String, change: DelegateNameChange },
     PlanChanged {
         session: String,
         plan: Plan,
@@ -2523,6 +2542,7 @@ impl ServerEvent {
             Self::TextDelta { session, .. } | Self::UserPrompt { session, .. }
             | Self::ReplySuperseded { session, .. } | Self::GitHubActivity { session, .. }
             | Self::CommentApplication { session, .. } | Self::DelegateProgress { session, .. }
+            | Self::DelegateRenamed { session, .. }
             | Self::ToolCall { session, .. } | Self::ToolResult { session, .. }
             | Self::MessageDetails { session, .. } | Self::TurnEnded { session, .. } => Some(session),
             _ => None,

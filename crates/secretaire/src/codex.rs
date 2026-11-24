@@ -507,7 +507,8 @@ impl Codex {
 
     pub async fn run_worker(
         &self, cwd: &Path, session: &str, job: &str, settings: ChatSettings, prompt: &str,
-        steering: &mut crate::delegate::JobInput, launch: &crate::delegate::WorkerLaunch, metadata: &mut RunMetadata, resume: Option<&str>,
+        steering: &mut crate::delegate::JobInput, launch: &crate::delegate::WorkerLaunch,
+        metadata: &mut RunMetadata, on_model: impl Fn(&RunMetadata) + Send, resume: Option<&str>,
     ) -> Result<String> {
         anyhow::ensure!(launch.scope.is_some(), "worker filesystem scope is missing");
         let cancel = steering.cancellation();
@@ -515,6 +516,14 @@ impl Codex {
         let thread = self.start_thread_with_policy(
             cwd, session, Some(job.into()), false, Some(settings), resume, Some(launch),
         ).await?;
+        let observed = self.threads.lock().unwrap().get(&thread).map(|thread| RunMetadata {
+            model: thread.observed.model.clone(),
+            effort: thread.observed.effort.clone(),
+            ..Default::default()
+        });
+        if let Some(observed) = observed {
+            on_model(&observed);
+        }
         if resume.is_some() {
             crate::handoff::workers::update(&self.hub, session, &thread, fuzukue_proto::HandoffWorkerStatus::Adopted);
         }

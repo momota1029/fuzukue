@@ -27,7 +27,7 @@ class ProtocolTest {
     }
 
     @Test fun handshakeAndWorkspaceCommands() {
-        assertMessage("""{"type":"hello","protocol":65,"workspace":"lab","locale":"en","platform":"android","thread_history":true,"selection_scoped_transcripts":true}""", ClientMessage.Hello(workspace = "lab", locale = "en"))
+        assertMessage("""{"type":"hello","protocol":67,"workspace":"lab","locale":"en","platform":"android","thread_history":true,"selection_scoped_transcripts":true}""", ClientMessage.Hello(workspace = "lab", locale = "en"))
         assertEquals(ServerEvent.Welcome(MIN_PROTOCOL_VERSION), Protocol.decode(
             """{"seq":0,"event":{"type":"welcome","protocol":$MIN_PROTOCOL_VERSION,"server":"secretaire"}}""",
         ).event)

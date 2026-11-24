@@ -450,7 +450,8 @@ impl Tool {
                     "effort": {"type": "string", "description": harness_text!("Optional reasoning effort for the supplied model in an ordinary delegation.", "通常の委譲で、指定したモデルに使う任意の思考レベル。")},
                     "artifacts": {"type": "array", "description": harness_text!("Blind review only. Inline text and neutral labels such as A and B. Remove original paths and provenance before submitting.", "ブラインド査読専用。出所や元のパスを伏せ、A・B などのラベルと本文を渡す。"),
                         "items": {"type": "object", "properties": {"label": {"type": "string"}, "text": {"type": "string"}}, "required": ["label", "text"], "additionalProperties": false}},
-                    "title": { "type": "string", "description": harness_text!("Short label for this parallel work in the user's language, shown to the user as its heading (about 20 characters).", "利用者に見出しとして見せる、この並行作業の短い題。利用者の言語で 20 字程度。") },
+                    "title": { "type": "string", "description": harness_text!("Keep the title within 40 display columns (20 full-width characters). Put details in prompt. Longer titles are preserved in details and shortened for the list.", "題名は表示幅 40 桁（全角 20 字）以内。詳しい依頼は prompt に書く。長い題名は詳細に保存し、一覧では短く表示する。") },
+                    "label": { "type": "string", "description": harness_text!("Optional display name within 40 columns (20 full-width characters). The server derives it from title if omitted and reports any shortening.", "一覧で表示する任意の名前。表示幅 40 桁（全角 20 字）以内。省略時は題名から作り、短縮した場合は結果に記載する。") },
                     "agent": { "type": "string", "description": harness_text!("Name from list_agents or the plan’s next steps. Defaults to the thread’s worker.", "list_agents または方針の next にある名前。省略時はスレッドの既定の作業役。") },
                     "touches": { "type": "array", "items": { "type": "string" }, "description": harness_text!("Workspace-relative write globs. Use [] for read-only work. If omitted, the server estimates the write set from the prompt or previous job.", "変更予定のワークスペース相対パスの glob。読み取りだけの場合は []。省略時は依頼文または前の作業から推定する。") },
                     "tier": {"type": "string", "enum": ["light", "standard", "heavy"]},
@@ -1389,6 +1390,7 @@ struct DelegateArgs {
     prompt: String,
     touches: Option<Vec<String>>,
     title: Option<String>,
+    label: Option<String>,
     issue: Option<u64>,
     agent: Option<String>,
     isolation: Option<crate::delegate::blind::Isolation>,
@@ -1863,7 +1865,12 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             crate::inbox::file_and_report(app, session, args).await?
         }
         Tool::Delegate => {
-            let args: DelegateArgs = parse_args(args)?;
+            let mut args: DelegateArgs = parse_args(args)?;
+            ensure!(args.label.as_ref().is_none_or(|label| !label.trim().is_empty()), "Job label must contain text");
+            args.label = args.label.map(|label| label.trim().to_owned());
+            let display = fuzukue_proto::DelegateDisplay::from_title(args.title.as_deref(), args.label.as_deref());
+            let title_exceeds_limit = fuzukue_proto::DelegateDisplay::from_title(None, args.title.as_deref())
+                .label_source.is_some();
             let selection = if args.isolation.is_none() {
                 ensure!(args.backend.is_none() && args.artifacts.is_none(),
                     "backend and artifacts require isolation: blind");
@@ -1891,23 +1898,32 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                     && args.touches.as_ref().is_none_or(Vec::is_empty) && args.folder_grants.is_empty(),
                     "Blind review is a standalone job with a fixed backend and no write set");
                 Box::pin(crate::delegate::blind::start(
-                    app, session, args.prompt, args.title,
+                    app, session, args.prompt, args.title, args.label,
                     args.backend.context("Blind review requires backend")?,
                     args.model.context("Blind review requires model")?, args.artifacts.unwrap_or_default(),
                 )).await?
             } else if let Some(number) = args.issue {
                 Box::pin(crate::delegate::start_for_issue(
-                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, number, routing, args.touches, args.folder_grants, selection,
+                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, number, routing, args.touches, args.folder_grants, selection,
                 )).await?
             } else {
                 Box::pin(crate::delegate::start_with_grants(
-                    app, session, args.prompt, args.title, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection,
+                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection,
                 )).await?
             };
             if claude.is_some() || codex.is_some() {
                 crate::planner::desk_dispatched(app, session);
             }
-            json!({"job": job, "message": "作業を受け付けた。完了時に通知する。"})
+            json!({
+                "job": job, "message": "作業を受け付けた。完了時に通知する。",
+                "label": display.label, "label_shortened": display.label_source.is_some(),
+                "title_exceeds_limit": title_exceeds_limit,
+                "label_notice": (display.label_source.is_some() || title_exceeds_limit).then(|| harness_text!(
+                    "The list uses a compact label. Details retain the full title and any shortened label.",
+                    "一覧には短い表示名を使う。題名と短縮前の表示名は詳細に残した。"
+                )),
+                "label_columns": fuzukue_proto::JOB_LABEL_COLUMNS,
+            })
         }
         Tool::Plan => {
             let args: PlanArgs = parse_args(args)?;

@@ -476,6 +476,13 @@ impl Scheduler {
         }
     }
 
+    pub(super) fn rename(&self, job: &str, label: &str) {
+        if let Some(entry) = self.queue.lock().unwrap().jobs.iter_mut().find(|entry| entry.id == job) {
+            label.clone_into(&mut entry.label);
+            self.changed.send_replace(());
+        }
+    }
+
     pub(crate) fn register(
         self: &Arc<Self>,
         id: String,

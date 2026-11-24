@@ -122,6 +122,10 @@ data class Timeline(
             rows = rows - event.items,
             streamingSilencePrefixes = streamingSilencePrefixes - event.items,
         )
+        is ServerEvent.DelegateRenamed -> {
+            val previous = rows[event.job] as? TimelineRow.Job
+            if (previous == null) this else withRow(event.job, previous.copy(info = previous.info.copy(label = event.change.label)))
+        }
         is ServerEvent.DelegateProgress -> {
             val previous = rows[event.job] as? TimelineRow.Job
             if (previous == null) this else withRow(event.job, previous.copy(summary = event.summary))

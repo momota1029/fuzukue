@@ -806,7 +806,10 @@ private fun ActivityLine(
                     }
                     jobs.forEach { (item, job) ->
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text(job.info.displayTitle, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Column(Modifier.weight(1f).padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(job.info.displayTitle, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                if (job.info.model.isNotBlank()) StatusLabel(job.info.model)
+                            }
                             TextButton(onClick = { onStopWorker(session, item) }, enabled = state.canSend) {
                                 Text(stringResource(R.string.stop))
                             }
@@ -891,6 +894,7 @@ private fun JobPanel(job: TimelineRow.Job) {
             if (time != null) Text(elapsedLabel(time), style = MaterialTheme.typography.labelMedium)
             StatusLabel(status)
         }
+        if (job.info.model.isNotBlank()) StatusLabel(job.info.model)
         if (!detail.isNullOrBlank()) Text(detail, style = MaterialTheme.typography.bodyMedium)
     }
 }

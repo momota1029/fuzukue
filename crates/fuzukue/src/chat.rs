@@ -925,6 +925,15 @@ impl Chat {
                 matches!(entry, DelegateEntry::Text(text) if text.contains(needle)))))
     }
 
+    pub(super) fn delegate_renamed(&mut self, job: &str, change: &fuzukue_proto::DelegateNameChange, cx: &mut Context<Workbench>) {
+        if let Some(&row) = self.by_item.get(job) {
+            if let Content::Delegate(block) = &mut self.rows[row].content {
+                block.job.display.apply_rename(change);
+                self.remeasure(row, cx);
+            }
+        }
+    }
+
     pub(super) fn delegate_progress(&mut self, job: &str, summary: String, cx: &mut Context<Workbench>) {
         if summary.trim().is_empty() {
             return;
@@ -976,7 +985,10 @@ impl Chat {
         cx: &mut Context<Workbench>,
     ) {
         if item.starts_with(DELEGATE_JOB) && name == "delegate" {
-            if let Ok(job) = serde_json::from_value::<DelegateJob>(input.clone()) {
+            if let Ok(mut job) = serde_json::from_value::<DelegateJob>(input.clone()) {
+                if job.display.label.is_none() && job.display.card_id.is_none() {
+                    job.display = fuzukue_proto::DelegateDisplay::from_title(job.title.as_deref(), None);
+                }
                 let mut started = job.started_at_ms.is_some();
                 if let Some(&row) = self.by_item.get(&item) {
                     if let Content::Delegate(block) = &mut self.rows[row].content {
@@ -1581,6 +1593,8 @@ pub(super) fn attempt_details(attempt: &fuzukue_proto::TierAttempt) -> String {
 fn delegate_details(job: &DelegateJob, report: Option<&DelegateReport>) -> Vec<String> {
     let name = job.agent.as_deref().unwrap_or(tr!("chat-worker"));
     let mut lines = vec![tr!("tiers-role", role = name)];
+    lines.extend(job.title.iter().cloned());
+    lines.extend(job.display.label_source.iter().filter(|text| Some(*text) != job.title.as_ref()).cloned());
     lines.push(job.selection.as_ref().map_or_else(|| job.model.clone(), selection_details));
     if let Some(decision) = &job.routing {
         lines.push(tr!("tiers-decision", tier = tier_label(decision.tier), reason = decision.reason.as_str()));
@@ -1683,7 +1697,8 @@ fn waiting_label(waiting: TimedWait, now_ms: u64) -> String {
 }
 
 fn delegate_activity_name(job: &DelegateJob) -> &str {
-    job.title.as_deref().map(str::trim).filter(|title| !title.is_empty())
+    job.display.label.as_deref()
+        .or_else(|| job.title.as_deref().map(str::trim).filter(|title| !title.is_empty() && Some(*title) != job.display.card_id.as_deref()))
         .or_else(|| job.agent.as_deref().map(str::trim).filter(|agent| !agent.is_empty()))
         .unwrap_or(tr!("chat-worker"))
 }
@@ -2154,7 +2169,7 @@ impl Workbench {
                         };
                         let elapsed = elapsed.map(|ms| elapsed_label(Duration::from_millis(ms)));
                         let label = if block.report.is_some() {
-                            worker_heading(status, block.job.title.as_deref(), elapsed.as_deref())
+                            worker_heading(status, Some(delegate_activity_name(&block.job)), elapsed.as_deref())
                         } else {
                             delegate_activity_name(&block.job).to_owned()
                         };
@@ -2166,6 +2181,10 @@ impl Workbench {
                             } else {
                                 theme.muted_foreground
                             }))
+                            .when_some(block.job.display.card_id.clone(), |row, id| row.child(div().text_xs().child(id)))
+                            .when(this.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL, |row| {
+                                row.child(this.rename_job_button(&session, block, SharedString::from(format!("rename-{}", block.id))))
+                            })
                             .child(job_details(format!("delegate-details-{}", block.id),
                                 delegate_details(&block.job, block.report.as_ref().map(|(_, report)| report))));
                         body = body.child(header.id(SharedString::from(format!("delegate-block-{}", block.id))));
@@ -2730,13 +2749,16 @@ impl Workbench {
         let theme = cx.theme();
         let height = snap_chat_height(window.rem_size() * 1.5, window.scale_factor());
         let has_commands = self.chat_waiting.has_background_commands(&self.active);
-        let goal_status = self.chat_waiting.static_goal_status(&self.active, chat).filter(|_| !has_commands);
+        let has_finished_jobs = self.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL
+            && chat.rows.iter().any(|row| matches!(&row.content, Content::Delegate(block) if block.report.is_some()));
+        let goal_status = self.chat_waiting.static_goal_status(&self.active, chat)
+            .filter(|_| !has_commands && !has_finished_jobs);
         chat_column().id("chat-status-strip").relative().flex_none().h(height).flex().items_start().gap_2()
             .pt(CHAT_STATUS_TEXT_INSET).bg(theme.background)
             .children(goal_status.map(|status| div().id("chat-tail-activity").min_w_0().text_size(rems(0.75))
                 .line_height(UI_LINE_HEIGHT).text_color(theme.muted_foreground)
                 .child(status_row(&goal_tail_label(status), theme.muted_foreground).id("chat-tail-activity-label").truncate())))
-            .when(has_commands || goal_status.is_none() && chat.has_activity(self.chat_waiting.reason(&self.active)), |strip| {
+            .when(has_commands || has_finished_jobs || goal_status.is_none() && chat.has_activity(self.chat_waiting.reason(&self.active)), |strip| {
                 strip.child(self.render_chat_activity(&self.active, cx.weak_entity(), cx))
             })
             .children(chat.composer_notice.clone().map(|text| {
@@ -5596,6 +5618,7 @@ mod one_voice_tests {
     fn single_activity_summary_uses_worker_count_and_timing() {
         let running = DelegateJob {
             agent: Some("Reviewer".into()), title: Some("Check proof".into()), model: String::new(),
+            display: Default::default(), queued_at_ms: None,
             started_at_ms: Some(1000), selection: None, routing: None,
             touches: None, waiting: None,
         };
@@ -5701,6 +5724,7 @@ mod one_voice_tests {
         let tool_label = format!("{} +1", tr!("chat-tool-state-running", name = "Bash"));
         let worker = DelegateJob {
             agent: None, title: None, model: String::new(),
+            display: Default::default(), queued_at_ms: None,
             started_at_ms: Some(1_000), selection: None, routing: None,
             touches: None, waiting: None,
         };
@@ -5734,6 +5758,7 @@ mod one_voice_tests {
             agent: Some("custom-review-agent".into()),
             title: None,
             model: "test-configured-model".into(),
+            display: Default::default(), queued_at_ms: None,
             started_at_ms: Some(10),
             selection: Some(AgentSelection {
                 backend: AgentBackend::Codex, model: Some("test-configured-model".into()),
