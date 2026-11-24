@@ -50,6 +50,24 @@ To work with an agent, install its CLI and sign in with your own account in the 
 
 For Android source builds and signed APKs, follow the [Android guide](android/README.md). The repository includes an [Android release script](scripts/release-android.sh).
 
+## Add a custom skill
+
+Create `<workspace>/skills/<name>/SKILL.md` and keep any supporting files in the same skill folder. Give the file YAML front matter with a `description`. The optional `name` sets the role name and defaults to the folder name.
+
+```markdown
+---
+description: Review notation in a draft.
+---
+
+Check that each symbol is defined before its first use.
+```
+
+Fuzukue picks up the skill in that workspace. Select it as the worker role when delegating to pass its instructions to the worker. For the standard layers, later entries override earlier entries with the same name: built-ins, rule packs, personal extensions, project extensions, then workspace-local skills.
+
+Claude workers run with user settings and Claude Code's native skills disabled, so move skills from `~/.claude/skills` into the workspace's `skills/` directory or an extension. Adapt any Claude Code- or Codex-specific tool names and commands in `SKILL.md` to the worker's available tools.
+
+To reuse a skill across workspaces or share it with others, package it with `extension.toml` and `skills/`. Register the extension in `~/.config/fuzukue/extensions.toml` for personal use or in `fuzukue.toml` for a project. Either can use a local path or a Git source. See the [extension guide](docs/extensions.md) for setup and other extension options.
+
 ## Connect from another device
 
 For local use, the desktop client can connect over loopback at `ws://127.0.0.1:7878/ws`. Tailscale is optional.
