@@ -1555,6 +1555,10 @@ fn seed_github_report(view: &mut Workbench, login: Option<&str>, cx: &mut Contex
 mod card_markdown_tests;
 
 #[cfg(test)]
+#[path = "shot/xml_components_test.rs"]
+mod xml_components_test;
+
+#[cfg(test)]
 #[path = "shot/issue_intake_test.rs"]
 mod issue_intake_test;
 

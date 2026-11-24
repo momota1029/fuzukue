@@ -13,6 +13,7 @@ mod appearance;
 mod notifications;
 mod card_reading;
 mod chat;
+mod chat_components;
 mod chat_question;
 mod chat_quote;
 mod branch_review;

@@ -159,7 +159,7 @@ async fn large_thread_history_wire() -> Result<()> {
             let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
             let start = Instant::now();
             let hello = ClientMsg::Hello {
-                protocol, thread_history: paging, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new(), locale: Some("en".into()), resume_from: Some(after),
+                protocol, thread_history: paging, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new(), locale: Some("en".into()), resume_from: Some(after),
                 workspace: None, platform: (!paging).then(|| "android".into()), build_id: None,
             };
             socket.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;

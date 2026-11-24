@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 1000},
+    {"action": "locale", "locale": "en"},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread", "deck": "research/concentration"},
+    {"action": "click", "id": "open-attachment-research/concentration"},
+    {"action": "click", "id": "tabdeck-concentration"},
+    {"action": "wait_element", "id": "review-findings-row-q-product"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "xml-components fixture"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_idle"},
+    {"action": "wait_element", "id": "xml-component-callout-22"},
+    {"action": "wait_element", "id": "xml-component-table-167"},
+    {"action": "wait_element", "id": "xml-component-finding-376"},
+    {"action": "wait_element", "id": "xml-component-finding-preview-376"},
+    {"action": "wait_element", "id": "chat-code-copy"},
+    {"action": "assert_order", "above": "xml-component-callout-22", "below": "xml-component-table-167"},
+    {"action": "assert_order", "above": "xml-component-table-167", "below": "xml-component-finding-376"},
+    {"action": "screenshot", "name": "xml-components"}
+  ]
+}

@@ -2236,7 +2236,7 @@ async fn client_commands_reach_only_clients_that_negotiate_support() -> Result<(
             incoming.send(remote).await?;
             let (mut socket, _) = client_async("ws://localhost/ws", local).await?;
             let hello = ClientMsg::Hello { protocol, locale: None, resume_from: Some(0),
-                workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() };
+                workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() };
             socket.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
             // Threads comes from the snapshot after the workspace subscription is installed.
             loop {
@@ -2385,7 +2385,7 @@ print(json.dumps({"type": "result", "is_error": False, "result": json.dumps({"fi
         let (socket, _) = client_async("ws://localhost/ws", client).await?;
         let (mut tx, mut rx) = socket.split();
         let mut send = async |msg| tx.send(Message::Text(serde_json::to_string(&msg)?.into())).await.map_err(anyhow::Error::from);
-        send(ClientMsg::Hello { protocol: PROTOCOL_VERSION, locale: None, resume_from: Some(0), workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() }).await?;
+        send(ClientMsg::Hello { protocol: PROTOCOL_VERSION, locale: None, resume_from: Some(0), workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() }).await?;
         send(ClientMsg::SaveSource { request: 1, edit: SourceEdit {
             path: "cards/unrelated.md".into(), range: None, text: "Stale draft".into(), base_hash: "stale".into(),
         } }).await?;
@@ -2531,7 +2531,7 @@ async fn scoped_paper_refreshes_after_save_without_switching_other_clients() -> 
                 let (client, peer) = duplex(128 * 1024);
                 incoming.send(peer).await?;
                 let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
-                send(&mut socket, ClientMsg::Hello { protocol, locale: None, resume_from: Some(0), workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() }).await?;
+                send(&mut socket, ClientMsg::Hello { protocol, locale: None, resume_from: Some(0), workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() }).await?;
                 let ServerEvent::Welcome { protocol: negotiated, .. } = receive(&mut socket).await? else {
                     anyhow::bail!("expected Welcome for protocol {protocol}");
                 };
@@ -2697,7 +2697,7 @@ async fn session_stats_are_live_and_replayed_only_for_v2_clients() -> Result<()>
                 request
             };
             let (mut socket, _) = client_async(request, client).await?;
-            let hello = ClientMsg::Hello { protocol, locale: None, resume_from: Some(resume_from), workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() };
+            let hello = ClientMsg::Hello { protocol, locale: None, resume_from: Some(resume_from), workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() };
             socket.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
             let welcome: fuzukue_proto::Envelope = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
             assert!(matches!(welcome.event, ServerEvent::Welcome { protocol: p, .. } if p == protocol));
@@ -2776,7 +2776,7 @@ async fn thread_replay_and_settings_are_compatible_with_v4_and_v5() -> Result<()
             let (client, peer) = duplex(64 * 1024);
             incoming.send(peer).await?;
             let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
-            let hello = ClientMsg::Hello { protocol, locale: None, resume_from: Some(0), workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() };
+            let hello = ClientMsg::Hello { protocol, locale: None, resume_from: Some(0), workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() };
             socket.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
             let welcome: Envelope = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
             assert!(matches!(welcome.event, ServerEvent::Welcome { protocol: p, .. } if p == protocol));
@@ -5771,7 +5771,7 @@ async fn switching_workspaces_scopes_chat_builds_and_pdf_maps() -> Result<()> {
         incoming.send(peer).await?;
         let (mut legacy, _) = client_async("ws://localhost/ws", client).await?;
         legacy.send(Message::Text(serde_json::to_string(&ClientMsg::Hello {
-            protocol: 10, locale: None, resume_from: None, workspace: Some(second_id.clone()), platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new(),
+            protocol: 10, locale: None, resume_from: None, workspace: Some(second_id.clone()), platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new(),
         })?.into())).await?;
         let welcome: Envelope = serde_json::from_str(legacy.next().await.unwrap()?.to_text()?)?;
         assert!(matches!(welcome.event, ServerEvent::Welcome { protocol: 10, .. }));
@@ -5797,7 +5797,7 @@ async fn switching_workspaces_scopes_chat_builds_and_pdf_maps() -> Result<()> {
         let (socket, _) = client_async("ws://localhost/ws", client).await?;
         let (mut send, mut receive) = socket.split();
         send.send(Message::Text(serde_json::to_string(&ClientMsg::Hello {
-            protocol: PROTOCOL_VERSION, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new(),
+            protocol: PROTOCOL_VERSION, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new(),
         })?.into())).await?;
         let mut stage = 0;
         let (mut received_chat, mut received_delegate, mut received_map, mut received_build) = (false, false, false, false);
@@ -6890,7 +6890,7 @@ for line in sys.stdin:
         incoming.send(peer).await?;
         let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
         let hello = ClientMsg::Hello { protocol: fuzukue_proto::PROTOCOL_VERSION, locale: None, resume_from: Some(0),
-            workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() };
+            workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() };
         socket.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
         let mut replies = 0;
         loop {
@@ -7023,7 +7023,7 @@ async fn late_research_and_work_reports_replay_once_in_the_originating_threads()
             incoming.send(peer).await?;
             let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
             let hello = ClientMsg::Hello { protocol: PROTOCOL_VERSION, locale: None, resume_from: Some(cursor),
-                workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() };
+                workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() };
             socket.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
             let welcome: Envelope = serde_json::from_str(socket.next().await.context("missing welcome")??.to_text()?)?;
             assert!(matches!(welcome.event, ServerEvent::Welcome { protocol: PROTOCOL_VERSION, .. }));
@@ -7776,7 +7776,7 @@ async fn library_search_round_trip_is_paginated_and_protocol_gated() -> Result<(
             incoming.send(peer).await?;
             let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
             socket.send(Message::Text(serde_json::to_string(&ClientMsg::Hello {
-                protocol, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new(),
+                protocol, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new(),
             })?.into())).await?;
             assert!(matches!(read(&mut socket).await?.event, ServerEvent::Welcome { protocol: v, .. } if v == protocol));
 
@@ -7913,7 +7913,7 @@ async fn memos_round_trip_over_websocket_and_share_the_mcp_index() -> Result<()>
                 let (client, peer) = duplex(128 * 1024);
                 incoming.send(peer).await?;
                 let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
-                send(&mut socket, ClientMsg::Hello { protocol, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() }).await?;
+                send(&mut socket, ClientMsg::Hello { protocol, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() }).await?;
                 let welcome = receive(&mut socket, |_| true).await?;
                 assert!(matches!(welcome, ServerEvent::Welcome { protocol: v, .. } if v == protocol));
                 Ok::<_, anyhow::Error>(socket)
@@ -8033,7 +8033,7 @@ async fn external_review_reports_websocket_confirmation_fix_search_and_protocol_
             let (client, peer) = duplex(128 * 1024);
             incoming.send(peer).await?;
             let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
-            send(&mut socket, ClientMsg::Hello { protocol, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() }).await?;
+            send(&mut socket, ClientMsg::Hello { protocol, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() }).await?;
             wait(&mut socket, |event| matches!(event, ServerEvent::Welcome { protocol: v, .. } if *v == protocol)).await?;
             if protocol < REVIEW_REPORTS_PROTOCOL {
                 send(&mut socket, command(Action::List)).await?;
@@ -8171,7 +8171,7 @@ print(json.dumps({"type": "result", "is_error": False, "result": json.dumps(labe
             let (client, peer) = duplex(128 * 1024);
             incoming.send(peer).await?;
             let (mut socket, _) = client_async("ws://localhost/ws", client).await?;
-            send(&mut socket, ClientMsg::Hello { protocol, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() }).await?;
+            send(&mut socket, ClientMsg::Hello { protocol, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() }).await?;
             assert!(matches!(read(&mut socket).await?, ServerEvent::Welcome { protocol: v, .. } if v == protocol));
 
             if protocol < LEDGER_PROTOCOL {
@@ -8282,7 +8282,7 @@ async fn extension_grant_view_and_mcp_tool_share_the_workspace() -> Result<()> {
         incoming.send(peer).await?;
         let (mut socket, _) = timeout(WEBSOCKET_TIMEOUT, client_async("ws://localhost/ws", client))
             .await.context("opening extension WebSocket")??;
-        send(&mut socket, ClientMsg::Hello { protocol: EXTENSIONS_PROTOCOL, locale: Some("en".into()), resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() }).await?;
+        send(&mut socket, ClientMsg::Hello { protocol: EXTENSIONS_PROTOCOL, locale: Some("en".into()), resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() }).await?;
         let ServerEvent::ExtensionPermissionPrompt { item } = receive(&mut socket, |event| matches!(event, ServerEvent::ExtensionPermissionPrompt { .. })).await? else {
             anyhow::bail!("expected extension permission prompt");
         };
@@ -8533,7 +8533,7 @@ printf '%s\n' '{"type":"result","is_error":false}'
             anyhow::bail!("WebSocket ended before history response")
         };
         send(ClientMsg::Hello {
-            protocol: CHANGE_HISTORY_PROTOCOL, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new(),
+            protocol: CHANGE_HISTORY_PROTOCOL, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new(),
         }).await?;
         send(ClientMsg::SaveFile { path: "note.txt".into(), text: "after\n".into() }).await?;
         send(ClientMsg::History { id: 1, request: HistoryRequest::List { scope: HistoryScope::Global } }).await?;
@@ -8630,7 +8630,7 @@ done
             }};
         }
         send(ClientMsg::Hello {
-            protocol: PROTOCOL_VERSION, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new(),
+            protocol: PROTOCOL_VERSION, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new(),
         }).await?;
         receive!(ServerEvent::Workspaces { workspaces } if workspaces.iter().any(|ws| ws.id == other_id) => ());
         send(ClientMsg::RemoveWorkspace { id: other_id.clone() }).await?;
@@ -8704,7 +8704,7 @@ done
         incoming.send(remote).await?;
         let (mut older, _) = client_async("ws://localhost/ws", older).await?;
         for request in [
-            ClientMsg::Hello { protocol: fuzukue_proto::CLOSE_TRASH_PROTOCOL - 1, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, cached_sessions: Vec::new() },
+            ClientMsg::Hello { protocol: fuzukue_proto::CLOSE_TRASH_PROTOCOL - 1, locale: None, resume_from: None, workspace: None, platform: None, build_id: None, thread_history: false, selection_scoped_transcripts: false, epoch: None, markdown_components: Vec::new(), cached_sessions: Vec::new() },
             ClientMsg::Trash { action: TrashAction::List },
             ClientMsg::ListWorkspaces,
         ] {

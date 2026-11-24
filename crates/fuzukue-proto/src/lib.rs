@@ -886,6 +886,13 @@ pub enum ThreadHistoryFailure {
     Stale,
 }
 
+/// A read-only component schema understood by the connecting client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkdownComponentCapability {
+    pub tag: String,
+    pub version: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
@@ -906,6 +913,8 @@ pub enum ClientMsg {
     ExtensionUiEvent { id: String, request: u64, element: String, value: Option<String> },
     Hello {
         protocol: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        markdown_components: Vec<MarkdownComponentCapability>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         thread_history: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2472,6 +2481,29 @@ impl ServerEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_markdown_components_are_additive() {
+        let legacy = serde_json::json!({"type": "hello", "protocol": PROTOCOL_VERSION, "resume_from": null});
+        let hello: ClientMsg = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(&hello, ClientMsg::Hello { markdown_components, .. } if markdown_components.is_empty()));
+        assert_eq!(serde_json::to_value(hello).unwrap(), legacy);
+
+        let mut offered = legacy.clone();
+        offered["markdown_components"] = serde_json::json!([{"tag": "callout", "version": 1}]);
+        let hello: ClientMsg = serde_json::from_value(offered.clone()).unwrap();
+        assert!(matches!(&hello, ClientMsg::Hello { markdown_components, .. }
+            if markdown_components == &[MarkdownComponentCapability { tag: "callout".into(), version: 1 }]));
+        assert_eq!(serde_json::to_value(hello).unwrap(), offered);
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LegacyClient {
+            Hello { protocol: u32 },
+        }
+        let LegacyClient::Hello { protocol } = serde_json::from_value(offered).unwrap();
+        assert_eq!(protocol, PROTOCOL_VERSION);
+    }
 
     #[test]
     fn saved_shell_approval_fields_are_optional_and_updates_use_request_ids() {

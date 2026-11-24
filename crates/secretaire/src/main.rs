@@ -797,7 +797,8 @@ async fn client_loop(socket: WebSocket, registry: Arc<App>, peer: std::net::IpAd
         Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(&t) {
             Ok(ClientMsg::Hello {
                 protocol, resume_from, workspace, locale, platform, build_id, thread_history,
-                selection_scoped_transcripts, epoch, cached_sessions,
+                // Component fences already travel as ordinary Markdown code blocks.
+                selection_scoped_transcripts, epoch, cached_sessions, ..
             }) => {
                 let agreed = protocol.min(PROTOCOL_VERSION);
                 let thread_history = thread_history && agreed >= fuzukue_proto::THREAD_HISTORY_PROTOCOL;

@@ -779,6 +779,7 @@ impl Worker {
             ws,
             &ClientMsg::Hello {
                 protocol: PROTOCOL_VERSION,
+                markdown_components: fuzukue_view::xml_components::capabilities(),
                 thread_history: true,
                 selection_scoped_transcripts: true,
                 epoch,

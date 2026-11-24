@@ -70,6 +70,21 @@ while line := (queued or sys.stdin.readline()):
         continue
     content = request["message"]["content"]
     prompt = json.dumps(content, ensure_ascii=False)
+    if "xml-components fixture" in prompt:
+        fixtures = Path(__file__).resolve().parent
+        file = fixtures / "xml-components.md"
+        if not file.is_file():
+            file = fixtures / "fixtures/xml-components.md"
+        answer = file.read_text(encoding="utf-8")
+        message_id = f"xml-components-{number}"
+        split = answer.index("</callout>") + len("</callout>\n~~")
+        emit("stream_event", event={"type": "message_start", "message": {"id": message_id}})
+        for text in (answer[:split], answer[split:]):
+            emit("stream_event", event={"type": "content_block_delta", "index": 0,
+                                       "delta": {"type": "text_delta", "text": text}})
+        emit("assistant", message={"id": message_id, "content": [{"type": "text", "text": answer}]})
+        emit("result", is_error=False, session_id=session)
+        continue
     if "paper batch failure fixture" in prompt:
         tool_id = f"paper-batch-{number}"
         emit("assistant", message={"content": [

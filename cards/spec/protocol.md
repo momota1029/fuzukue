@@ -16,4 +16,5 @@ files: [crates/fuzukue-proto/src/lib.rs]
 - v59 の `Notify { session, kind, title? }` はライブ接続専用。エンベロープの `workspace` が通知元を示し、現在選択中のワークスペース以外からも届く。履歴への記録、連番、再送はなく、表示と抑制はクライアントが決める（[[notifications]]）。
 - v62 の履歴ページ取得の仕様は [選択したスレッドの履歴取得](../../docs/thread-transcripts.md) を参照。
 - v63 の `ReviewFindings { deck, outcome }` は、接続が表示するデッキの指摘台帳のスナップショットまたは読み込みエラーを返す。初回の接続、デッキの変更、表示中のデッキの `review-findings.toml` の変更で送る。v62 以下を交渉した接続には配信しない。 [指摘台帳](../../docs/review-findings.md)
+- `Hello.markdown_components` は省略可能な `[{tag, version}]`。省略時は対応タグが空で、古いサーバーは項目を読み飛ばす。部品は通常の Markdown フェンスで配信する。 [XML 部品](../../docs/xml-components.md)
 - v64 で選択したスレッドの履歴取得を追加。合意値 62 以上で `Hello.thread_history` と `Hello.selection_scoped_transcripts` がともに真なら、対応サーバーは `Welcome.selection_scoped_transcripts` を返す。一覧と稼働状態を `ThreadSync` で区切り、選択したスレッドの `GetThreadTail` にだけ `ThreadTail` を返す。再接続では `epoch`・`resume_from`・`cached_sessions` でキャッシュを照合する。Android は R-18 まで従来の履歴配信を使う。 [選択したスレッドの履歴取得](../../docs/thread-transcripts.md)

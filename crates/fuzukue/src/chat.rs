@@ -53,7 +53,9 @@ use super::chat_question::QuestionCard;
 use super::composer_markdown::{command_candidates, continue_line, visual_edge_target, CommandKey};
 use super::icons::Symbol;
 use super::settings_file;
-use super::{composing, math, scroll_list_by_key, Workbench};
+use super::{composing, scroll_list_by_key, Workbench};
+#[cfg(test)]
+use super::math;
 
 #[path = "clipboard_attach.rs"]
 mod clipboard_attach;
@@ -517,6 +519,7 @@ impl Chat {
         let scroller = ListState::new(0, ListAlignment::Top, px(0.));
         scroller.set_follow_mode(FollowMode::Tail);
         let workbench = cx.weak_entity();
+        let markdown = super::chat_components::extensions(&[], workbench.clone());
         scroller.set_scroll_handler(move |_, _, cx| {
             let workbench = workbench.clone();
             cx.defer(move |cx| {
@@ -550,7 +553,7 @@ impl Chat {
             quote_position: None,
             disclosure_press: Rc::default(),
             math_macros: Vec::new(),
-            markdown: math::extensions(),
+            markdown,
         }
     }
 
@@ -1845,7 +1848,7 @@ impl Workbench {
             }
             if chat.math_macros != thread.math_macros {
                 chat.math_macros.clone_from(&thread.math_macros);
-                chat.markdown = math::extensions_with_macros(&chat.math_macros);
+                chat.markdown = super::chat_components::extensions(&chat.math_macros, cx.weak_entity());
                 chat.transcript.invalidate_markdown();
                 chat.scroller.remeasure_items(0..chat.scroller.item_count());
             }

@@ -180,6 +180,11 @@ style-note-ja-no-redundant-expression = This phrase can be shortened
 style-note-no-exclamation-question-mark = Use question and exclamation marks sparingly in technical writing
 style-note-no-hankaku-kana = This text uses half-width katakana
 
+xml-component-info = Info
+xml-component-warn = Warning
+xml-component-error = Error
+xml-component-table = Table
+xml-component-finding-unavailable = Finding unavailable in the open deck
 findings-title = Review findings
 findings-open-count = { $count ->
     [one] { $count } open finding

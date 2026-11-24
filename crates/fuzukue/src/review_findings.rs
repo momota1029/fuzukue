@@ -50,6 +50,14 @@ fn severity_label(severity: ReviewFindingSeverity) -> &'static str {
     }
 }
 
+fn finding_state_label(finding: &ReviewFinding) -> String {
+    format!(
+        "{} · {}",
+        severity_label(finding.content.severity),
+        status_label(finding.status)
+    )
+}
+
 fn file_label(location: &ReviewFindingLocation) -> Option<String> {
     let mut label = location.file.clone()?;
     if let Some([start, end]) = location.lines {
@@ -67,6 +75,7 @@ impl Workbench {
             self.findings.outcome = Some(outcome);
             self.read_list
                 .remeasure_items(0..self.read_list.item_count());
+            self.remeasure_finding_previews();
         }
     }
 
@@ -74,6 +83,13 @@ impl Workbench {
         self.findings.outcome = None;
         self.read_list
             .remeasure_items(0..self.read_list.item_count());
+        self.remeasure_finding_previews();
+    }
+
+    fn remeasure_finding_previews(&self) {
+        if let Some(chat) = self.chats.get(&self.active) {
+            chat.scroller.remeasure();
+        }
     }
 
     fn findings_snapshot(&self) -> Option<&ReviewFindingsSnapshot> {
@@ -81,6 +97,23 @@ impl Workbench {
             Some(ReviewFindingsOutcome::Loaded { snapshot }) => Some(snapshot),
             _ => None,
         }
+    }
+
+    pub(super) fn finding_chat_preview(&self, deck: &str, id: &str, cx: &App) -> Option<(String, AnyElement)> {
+        if wire_deck(deck) != wire_deck(&self.deck.replace('\\', "/")) {
+            return None;
+        }
+        let finding = self.findings_snapshot()?.findings.iter().find(|finding| finding.id == id)?;
+        let summary = &finding.content.summary;
+        let status = finding_state_label(finding);
+        Some((
+            format!("{summary}\n{status}"),
+            v_flex()
+                .gap_1()
+                .child(div().text_sm().font_semibold().child(summary.clone()))
+                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(status))
+                .into_any_element(),
+        ))
     }
 
     fn findings_status(&self) -> Option<String> {
@@ -291,11 +324,7 @@ impl Workbench {
                     .font_semibold()
                     .child(content.summary.clone()),
             )
-            .child(muted(format!(
-                "{} · {}",
-                severity_label(content.severity),
-                status_label(finding.status)
-            )))
+            .child(muted(finding_state_label(finding)))
             .child(div().text_sm().child(content.detail.clone()))
             .child(self.finding_locations(&content.locations, cx))
             .children(assessment.map(|label| muted(label.into())))

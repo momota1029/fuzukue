@@ -167,6 +167,11 @@ style-note-ja-no-redundant-expression = 短くできる言い回しです
 style-note-no-exclamation-question-mark = 「？」「！」は技術文書では控えめに
 style-note-no-hankaku-kana = 半角カタカナが使われています
 
+xml-component-info = 情報
+xml-component-warn = 注意
+xml-component-error = エラー
+xml-component-table = 表
+xml-component-finding-unavailable = 開いているデッキで指摘を表示できません
 findings-title = 指摘台帳
 findings-open-count = 未対応の指摘 { $count } 件
 findings-loading = 指摘台帳を読み込み中…

@@ -38,8 +38,8 @@ import androidx.compose.ui.unit.em
 import io.ratex.RaTeXSpan
 import kotlinx.coroutines.CancellationException
 
-private enum class BlockStyle { Paragraph, Heading, Quote, Code, Formula }
-private data class Block(val text: String, val style: BlockStyle, val size: Float = 1f)
+internal enum class BlockStyle { Paragraph, Heading, Quote, Code, Formula }
+internal data class Block(val text: String, val style: BlockStyle, val size: Float = 1f)
 private data class Formula(val source: String, val display: Boolean) {
     val contentId get() = if (display) "display/$source" else "inline/$source"
 }
@@ -141,7 +141,7 @@ internal fun Markdown(source: String) {
     }
 }
 
-private fun markdownBlocks(source: String): List<Block> = buildList {
+internal fun markdownBlocks(source: String): List<Block> = buildList {
     fun plainText(text: String) {
         text.trim('\n').split(Regex("""\n\s*\n""")).forEach { paragraph ->
             val lines = mutableListOf<String>()
@@ -182,6 +182,7 @@ private fun markdownBlocks(source: String): List<Block> = buildList {
     }
 
     var end = 0
+    // Component fences use the same literal rendering as other fenced code.
     for (fence in fencedBlock.findAll(source)) {
         textAndMath(source.substring(end, fence.range.first))
         add(Block(fence.groupValues[2].trimEnd('\n'), BlockStyle.Code))
