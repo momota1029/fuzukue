@@ -1,6 +1,7 @@
 use super::{
     DEADLINE, MAX_BYTES, ReadScope, TRUNCATED, dot, glob, matches_glob, paths, utf8_prefix,
 };
+use super::range::{IntegerRange, optional_integer};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -15,6 +16,10 @@ use tokio::process::Command;
 const FILE_BYTES: usize = 1024 * 1024;
 const SEARCH_BYTES: usize = 32 * FILE_BYTES;
 const MATCH_TEXT_BYTES: usize = 1000;
+pub(super) const DEFAULT_CONTEXT: usize = 0;
+pub(super) const DEFAULT_RESULTS: usize = 100;
+pub(super) const CONTEXT: IntegerRange = IntegerRange::new(0, 5);
+pub(super) const RESULTS: IntegerRange = IntegerRange::new(1, 200);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,9 +32,10 @@ pub(super) struct Args {
     fixed_string: bool,
     #[serde(default)]
     ignore_case: bool,
-    #[serde(default)]
-    context: usize,
-    max_results: Option<i64>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    context: Option<i128>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    max_results: Option<i128>,
 }
 
 #[derive(Default)]
@@ -123,8 +129,8 @@ impl Corpus {
 }
 
 pub(super) async fn search(scope: ReadScope, args: Args) -> Result<Value> {
-    let limit = args.max_results.unwrap_or(100).clamp(1, 200) as usize;
-    ensure!(args.context <= 5, "context must be at most 5");
+    let limit = RESULTS.resolve(args.max_results, DEFAULT_RESULTS);
+    let context = CONTEXT.resolve(args.context, DEFAULT_CONTEXT);
     ensure!(
         args.pattern.len() <= 4096 && !args.pattern.contains(['\r', '\n', '\0']),
         "Supply a single-line pattern of at most 4096 bytes"
@@ -138,7 +144,6 @@ pub(super) async fn search(scope: ReadScope, args: Args) -> Result<Value> {
     let (lines, engine) = match ripgrep("rg", &corpus.text, &args, limit + 1).await? {
         Some(lines) => (lines, "ripgrep"),
         None => {
-            let context = args.context;
             let (corpus, lines, timed_out) = tokio::task::spawn_blocking(move || {
                 let (lines, timed_out) = builtin(
                     &corpus.text,
@@ -160,7 +165,7 @@ pub(super) async fn search(scope: ReadScope, args: Args) -> Result<Value> {
         corpus,
         lines,
         limit,
-        args.context,
+        context,
         engine,
         false,
     ))
@@ -357,7 +362,7 @@ mod tests {
             glob: None,
             fixed_string: true,
             ignore_case: true,
-            context: 0,
+            context: None,
             max_results: Some(1),
         };
         let text = "before\n-X\r\n-x\n";

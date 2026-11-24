@@ -4,6 +4,7 @@ pub(crate) mod git_read;
 mod history;
 mod paths;
 mod plan_status;
+pub(super) mod range;
 pub(super) use paths::{open as open_no_symlinks, secret as secret_name};
 mod review;
 mod search;
@@ -24,6 +25,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use self::range::{IntegerRange, optional_integer};
+
 /// Open a checked source path without following links.
 pub(crate) fn open_regular_source(path: &Path) -> Result<std::fs::File> {
     let file = paths::open(path)?;
@@ -34,6 +37,12 @@ pub(crate) fn open_regular_source(path: &Path) -> Result<std::fs::File> {
 const MAX_BYTES: usize = 64 * 1024;
 const READ_SCAN_BYTES: usize = 16 * 1024 * 1024;
 const LINE_WINDOW: usize = 400;
+const DEFAULT_START_LINE: usize = 1;
+const DEFAULT_DEPTH: usize = 1;
+// At least one scanned byte is needed per line.
+const READ_LINE: IntegerRange = IntegerRange::new(1, READ_SCAN_BYTES);
+const READ_BYTES: IntegerRange = IntegerRange::new(1, MAX_BYTES);
+const LIST_DEPTH: IntegerRange = IntegerRange::new(1, 3);
 const DEADLINE: Duration = Duration::from_secs(5);
 const TRUNCATED: &str = "… [truncated]";
 
@@ -71,22 +80,31 @@ impl Tool {
             "割り当てられた作業ディレクトリからの相対パス、または読み取り範囲内の絶対パス。"
         );
         let (description, properties, required): (_, _, &[&str]) = match self {
-            Self::Read => (
-                harness_text!(
-                    "Read numbered UTF-8 lines in the workspace scope. Line ranges are one-based and inclusive.",
-                    "作業範囲内の UTF-8 テキストを行番号付きで読む。行範囲は 1 始まりで両端を含む。"
-                ),
-                json!({"path": {"type": "string", "description": scoped_path}, "start_line": {"type": "integer", "minimum": 1, "default": 1},
-                    "end_line": {"type": "integer", "minimum": 1},
-                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_BYTES, "default": MAX_BYTES}}),
-                &["path"],
-            ),
+            Self::Read => {
+                let mut end_line = READ_LINE.schema();
+                let offset = LINE_WINDOW - 1;
+                end_line["description"] = json!(harness_format!(
+                    "Defaults to start_line plus {}, capped at the maximum. Integers outside the range are clamped to the nearest bound. The resulting end_line must be at least start_line.",
+                    "省略時は start_line に {} を足した値を上限で抑える。範囲外の整数は最寄りの境界値に丸める。丸めた後の end_line は start_line 以上とする。",
+                    offset
+                ));
+                (
+                    harness_text!(
+                        "Read numbered UTF-8 lines in the workspace scope. Line ranges are one-based and inclusive.",
+                        "作業範囲内の UTF-8 テキストを行番号付きで読む。行範囲は 1 始まりで両端を含む。"
+                    ),
+                    json!({"path": {"type": "string", "description": scoped_path},
+                        "start_line": READ_LINE.property(DEFAULT_START_LINE), "end_line": end_line,
+                        "max_bytes": READ_BYTES.property(MAX_BYTES)}),
+                    &["path"],
+                )
+            }
             Self::List => (
                 harness_text!(
                     "List workspace entries without following symlinks. Globs match paths relative to the requested directory.",
                     "作業範囲内の項目を一覧する。シンボリックリンクはたどらない。glob は起点ディレクトリからの相対パスに適用する。"
                 ),
-                json!({"path": {"type": "string", "default": ".", "description": scoped_path}, "depth": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
+                json!({"path": {"type": "string", "default": ".", "description": scoped_path}, "depth": LIST_DEPTH.property(DEFAULT_DEPTH),
                     "glob": {"type": "string"}, "include_hidden": {"type": "boolean", "default": false},
                     "include_ignored": {"type": "boolean", "default": false,
                         "description": harness_text!("Include target, node_modules, and the .git entry. Git metadata stays protected.",
@@ -100,8 +118,8 @@ impl Tool {
                 ),
                 json!({"pattern": {"type": "string", "maxLength": 4096}, "path": {"type": "string", "default": ".", "description": scoped_path},
                     "glob": {"type": "string"}, "fixed_string": {"type": "boolean", "default": false},
-                    "ignore_case": {"type": "boolean", "default": false}, "context": {"type": "integer", "minimum": 0, "maximum": 5, "default": 0},
-                    "max_results": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100}}),
+                    "ignore_case": {"type": "boolean", "default": false}, "context": search::CONTEXT.property(search::DEFAULT_CONTEXT),
+                    "max_results": search::RESULTS.property(search::DEFAULT_RESULTS)}),
                 &["pattern"],
             ),
             Self::PlanStatus => return plan_status::definition(self.name()),
@@ -143,24 +161,21 @@ impl Tool {
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
     path: PathBuf,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-    max_bytes: Option<usize>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    start_line: Option<i128>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    end_line: Option<i128>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    max_bytes: Option<i128>,
 }
 
 fn read(scope: &ReadScope, args: ReadArgs) -> Result<Value> {
-    let start = args.start_line.unwrap_or(1);
-    let end = args
-        .end_line
-        .unwrap_or_else(|| start.saturating_add(LINE_WINDOW - 1));
-    let max_bytes = args.max_bytes.unwrap_or(MAX_BYTES);
+    let start = READ_LINE.resolve(args.start_line, DEFAULT_START_LINE);
+    let end = READ_LINE.resolve(args.end_line, start + LINE_WINDOW - 1);
+    let max_bytes = READ_BYTES.resolve(args.max_bytes, MAX_BYTES);
     ensure!(
-        start > 0 && end >= start,
-        "Use a positive and increasing line range"
-    );
-    ensure!(
-        (1..=MAX_BYTES).contains(&max_bytes),
-        "max_bytes must be between 1 and {MAX_BYTES}"
+        end >= start,
+        "end_line must be at least start_line after clamping"
     );
     let path = scope.resolve(&args.path)?;
     paths::media(&args.path)?;
@@ -201,8 +216,9 @@ fn read(scope: &ReadScope, args: ReadArgs) -> Result<Value> {
                 content.push_str(&format!("{number}: {prefix}\n"));
                 clipped_line = true;
                 // Resume at the next complete line, if the file has one.
-                next =
-                    Some(number + 1).filter(|_| text.lines().nth(number).is_some() || scan_capped);
+                next = Some(number + 1).filter(|&next| {
+                    next <= READ_SCAN_BYTES && (text.lines().nth(number).is_some() || scan_capped)
+                });
             } else {
                 next = Some(number);
             }
@@ -231,7 +247,8 @@ fn read(scope: &ReadScope, args: ReadArgs) -> Result<Value> {
 struct ListArgs {
     #[serde(default = "dot")]
     path: PathBuf,
-    depth: Option<i64>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    depth: Option<i128>,
     glob: Option<String>,
     #[serde(default)]
     include_hidden: bool,
@@ -240,7 +257,7 @@ struct ListArgs {
 }
 
 fn list(scope: &ReadScope, args: ListArgs) -> Result<Value> {
-    let depth = args.depth.unwrap_or(1).clamp(1, 3) as usize;
+    let depth = LIST_DEPTH.resolve(args.depth, DEFAULT_DEPTH);
     let path = scope.resolve(&args.path)?;
     let file = paths::open(&path)?;
     ensure!(file.metadata()?.is_dir(), "Select a directory to list");

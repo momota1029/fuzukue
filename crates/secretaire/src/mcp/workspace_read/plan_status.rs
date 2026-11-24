@@ -8,12 +8,14 @@ use fuzukue_cards::{Card, DeckConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::range::{IntegerRange, optional_integer};
 use super::{DEADLINE, ReadScope, open_regular_source, paths};
 use crate::graph::{requires_cycles, structure_card_order};
 
 const DEFAULT_DECK: &str = "roadmap";
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 100;
+const LIMIT: IntegerRange = IntegerRange::new(1, MAX_LIMIT);
 const MAX_CARD_LINKS: usize = 16;
 const MAX_SOURCE_BYTES: u64 = 256 * 1024;
 
@@ -33,7 +35,7 @@ pub(super) fn definition(name: &str) -> Value {
                 )},
                 "status": {"type": "string", "description": harness_text!("Exact card status.", "カードの状態に完全一致。")},
                 "id_prefix": {"type": "string", "description": harness_text!("Case-sensitive card ID prefix.", "大文字小文字を区別するカード ID の接頭辞。")},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT},
+                "limit": LIMIT.property(DEFAULT_LIMIT),
                 "include_done": {"type": "boolean", "default": false, "description": harness_text!(
                     "Include done cards in the status lists. An explicit done filter also includes them.",
                     "状態別一覧に done を含める。status に done を明示した場合も表示する。"
@@ -51,7 +53,8 @@ pub(super) struct Args {
     deck: Option<PathBuf>,
     status: Option<String>,
     id_prefix: Option<String>,
-    limit: Option<i64>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    limit: Option<i128>,
     #[serde(default)]
     include_done: bool,
 }
@@ -455,10 +458,7 @@ pub(super) fn status(scope: &ReadScope, args: Args) -> Result<Value> {
     };
     let deps = dependencies(&cards, &deck);
     let (ready, order, unscheduled) = remaining_order(&cards, &deps);
-    let limit = args
-        .limit
-        .unwrap_or(DEFAULT_LIMIT as i64)
-        .clamp(1, MAX_LIMIT as i64) as usize;
+    let limit = LIMIT.resolve(args.limit, DEFAULT_LIMIT);
 
     let mut counts = BTreeMap::new();
     for card in cards.iter().filter(|card| !card.status.is_empty()) {

@@ -19,12 +19,12 @@ use crate::delegate::touches::WriteSet;
 use crate::folder_grants;
 use crate::worker_scope;
 
-use super::workspace_read::{open_no_symlinks, worktree_relative};
+use super::workspace_read::{open_no_symlinks, range::IntegerRange, worktree_relative};
 
 const FILE_LIMIT: usize = 256 * 1024;
 const PATCH_LIMIT: usize = 768 * 1024;
 const RECOVERY: &str = "delegate-recovery";
-const AUDIT_LIMIT: i64 = 100;
+pub(super) const AUDIT_LIMIT: IntegerRange = IntegerRange::new(1, 100);
 static COMMIT: Mutex<()> = Mutex::new(());
 
 pub(crate) const GUIDANCE: &str = "\n\nUse fuzukue fs_write, fs_edit, or fs_apply_patch for worktree edits. Avoid shell redirection, heredocs, and Python for writing files. Changes outside the job's touches require approval.";
@@ -740,7 +740,7 @@ pub(crate) fn audit_page(
     state: &Path,
     job: &str,
     before: Option<&str>,
-    limit: i64,
+    limit: i128,
 ) -> Result<Value> {
     let audit = recovery_dir(state, job)?.join("write-audit");
     let mut entries = match fs::read_dir(&audit) {
@@ -750,7 +750,7 @@ pub(crate) fn audit_page(
     };
     entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.file_name()));
     let mut rows = Vec::new();
-    let limit = limit.clamp(1, AUDIT_LIMIT) as usize;
+    let limit = AUDIT_LIMIT.clamp(limit);
     let mut next_before = None;
     for entry in entries {
         let Some(id) = entry

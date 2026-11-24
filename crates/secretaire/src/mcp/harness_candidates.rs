@@ -17,13 +17,15 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use super::workspace_read::open_no_symlinks;
+use super::workspace_read::range::{IntegerRange, optional_integer};
 use super::workspace_write::{read, replace};
 
 const DECK: &str = "harness-candidates";
 const COMMAND_BYTES: usize = 8192;
 const GOAL_BYTES: usize = 512;
 const DETAIL_BYTES: usize = 2048;
-const LIST_LIMIT: usize = 50;
+const DEFAULT_LIMIT: usize = 20;
+const LIST_LIMIT: IntegerRange = IntegerRange::new(1, 50);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
@@ -68,7 +70,7 @@ impl Tool {
                 ),
                 json!({
                     "status": {"type": "string", "enum": ["candidate", "accepted", "rejected", "merged"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": LIST_LIMIT, "default": 20},
+                    "limit": LIST_LIMIT.property(DEFAULT_LIMIT),
                 }),
                 &[],
             ),
@@ -213,7 +215,8 @@ struct Metadata {
 #[serde(deny_unknown_fields)]
 struct ListArgs {
     status: Option<Status>,
-    limit: Option<usize>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    limit: Option<i128>,
 }
 
 fn cards_dir(project: &Path) -> Result<Option<File>> {
@@ -346,11 +349,7 @@ fn propose(project: &Path, proposal: Proposal, job: Option<String>) -> Result<Va
 }
 
 fn list(project: &Path, args: ListArgs) -> Result<Value> {
-    let limit = args.limit.unwrap_or(20);
-    ensure!(
-        (1..=LIST_LIMIT).contains(&limit),
-        "limit must be between 1 and {LIST_LIMIT}"
-    );
+    let limit = LIST_LIMIT.resolve(args.limit, DEFAULT_LIMIT);
     let mut cards = Vec::new();
     if let Some(dir) = cards_dir(project)? {
         fs::flock(&dir, FlockOperation::LockShared)?;

@@ -5,8 +5,14 @@ use fuzukue_proto::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::workspace_read::range::{IntegerRange, optional_integer};
+use super::workspace_write::AUDIT_LIMIT;
 use super::{front_desk_light, parse_args, NoArgs};
 use crate::{delegate::{JobFilter, JobView}, Workspace};
+
+const DEFAULT_JOB_LIMIT: usize = 30;
+const JOB_LIMIT: IntegerRange = IntegerRange::new(1, 100);
+const DEFAULT_AUDIT_LIMIT: usize = 30;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
@@ -128,7 +134,7 @@ impl Tool {
             ), json!({
                 "state": {"type": "string", "enum": ["active", "queued", "running", "finished", "failed", "all"], "default": "active"},
                 "thread": {"type": "string", "description": harness_text!("Exact thread ID. Defaults to all workspace threads.", "スレッド ID。省略するとワークスペース内の全スレッド。")},
-                "limit": {"type": "integer", "minimum": 1, "default": 30}
+                "limit": JOB_LIMIT.property(DEFAULT_JOB_LIMIT)
             }), &[]),
             Self::JobStatus => (harness_text!(
                 "Read one job's state and timings. Use report for the final report, summary for the change summary, or full for activity and files.",
@@ -140,7 +146,7 @@ impl Tool {
             ), json!({
                 "job": {"type": "string", "description": harness_text!("Full delegate job ID.", "委譲ジョブの完全な ID。")},
                 "before": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 30}
+                "limit": AUDIT_LIMIT.property(DEFAULT_AUDIT_LIMIT)
             }), &["job"]),
             Self::CancelJob => (harness_text!(
                 "Use when the user asks to stop a queued or running delegated job. Record why it was stopped.",
@@ -178,10 +184,16 @@ impl Tool {
                 struct AuditPage {
                     job: String,
                     before: Option<String>,
-                    limit: Option<i64>,
+                    #[serde(default, deserialize_with = "optional_integer")]
+                    limit: Option<i128>,
                 }
                 let args: AuditPage = parse_args(args)?;
-                super::workspace_write::audit_page(&app.state_dir, &args.job, args.before.as_deref(), args.limit.unwrap_or(30))?
+                super::workspace_write::audit_page(
+                    &app.state_dir,
+                    &args.job,
+                    args.before.as_deref(),
+                    args.limit.unwrap_or(DEFAULT_AUDIT_LIMIT as i128),
+                )?
             }
             Self::Queue => front_desk_light::queue(app, args)?,
             Self::Redeliver => front_desk_light::redeliver(app, session, args)?,
@@ -275,8 +287,7 @@ pub(super) fn list_jobs(app: &Workspace, args: &Value) -> Result<(Value, String)
         thread,
         limit,
     } = parse_args(args)?;
-    let limit = limit.unwrap_or(30);
-    ensure!(limit > 0, "limit must be positive");
+    let limit = JOB_LIMIT.resolve(limit, DEFAULT_JOB_LIMIT);
     Ok(app.delegates.list_jobs(state, thread.as_deref(), limit))
 }
 
@@ -293,7 +304,8 @@ struct ListJobs {
     #[serde(default)]
     state: JobFilter,
     thread: Option<String>,
-    limit: Option<usize>,
+    #[serde(default, deserialize_with = "optional_integer")]
+    limit: Option<i128>,
 }
 
 #[derive(Deserialize)]
@@ -373,4 +385,55 @@ struct GroupState {
 #[serde(deny_unknown_fields)]
 struct Settings {
     review: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::workspace_read::range::tests::{boundary_cases, wrong_types};
+
+    #[tokio::test]
+    async fn list_jobs_and_write_audit_clamp_their_limits() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let app = Workspace::new(
+            project.path().into(),
+            "127.0.0.1:7878".into(),
+            state.path().into(),
+            std::sync::Arc::new(crate::Hub::new()),
+        );
+        let job = "delegate:numeric-arguments";
+        let audit =
+            crate::mcp::workspace_write::recovery_dir(&app.state_dir, job)?.join("write-audit");
+        std::fs::create_dir_all(&audit)?;
+        for i in 0..101 {
+            std::fs::write(audit.join(format!("{i:03}.json")), "{}")?;
+        }
+
+        for (limit, expected) in boundary_cases(1, 100, 30) {
+            let mut args = json!({});
+            if let Some(limit) = limit {
+                args["limit"] = limit;
+            }
+            let parsed: ListJobs = parse_args(&args)?;
+            assert_eq!(JOB_LIMIT.resolve(parsed.limit, DEFAULT_JOB_LIMIT), expected);
+            assert_eq!(list_jobs(&app, &args)?.0["jobs"], json!([]));
+
+            args["job"] = json!(job);
+            let result = Tool::JobWriteAudit.call(&app, "thread", &args).await?;
+            assert_eq!(result["writes"].as_array().unwrap().len(), expected);
+            assert!(result["next_before"].is_string());
+        }
+
+        for limit in wrong_types() {
+            let error = list_jobs(&app, &json!({"limit": limit})).unwrap_err();
+            assert!(format!("{error:#}").contains("expected an integer"));
+            let error = Tool::JobWriteAudit
+                .call(&app, "thread", &json!({"job": job, "limit": limit}))
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("expected an integer"));
+        }
+        Ok(())
+    }
 }

@@ -4,10 +4,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::parse_args;
+use super::workspace_read::range::{IntegerRange, optional_integer};
 use crate::Workspace;
 
-const QUEUE_LIMIT: usize = 50;
-const MAX_QUEUE_LIMIT: usize = 100;
+const DEFAULT_LIMIT: usize = 50;
+const DEFAULT_OFFSET: usize = 0;
+const QUEUE_LIMIT: IntegerRange = IntegerRange::new(1, 100);
+const QUEUE_OFFSET: IntegerRange = IntegerRange::new(0, u32::MAX as usize);
 const MAX_JOB_IDS: usize = 32;
 const MAX_LOG_LINES: usize = 40;
 const MAX_LOG_BYTES: usize = 2048;
@@ -20,8 +23,8 @@ pub(super) fn queue_schema() -> (&'static str, Value, &'static [&'static str]) {
         ),
         json!({
             "job_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 128}, "maxItems": MAX_JOB_IDS},
-            "offset": {"type": "integer", "minimum": 0, "default": 0},
-            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_QUEUE_LIMIT, "default": QUEUE_LIMIT},
+            "offset": QUEUE_OFFSET.property(DEFAULT_OFFSET),
+            "limit": QUEUE_LIMIT.property(DEFAULT_LIMIT),
         }),
         &[],
     )
@@ -44,20 +47,18 @@ pub(super) fn queue(app: &Workspace, args: &Value) -> Result<Value> {
     struct Args {
         #[serde(default)]
         job_ids: Vec<String>,
-        #[serde(default)]
-        offset: usize,
-        limit: Option<usize>,
+        #[serde(default, deserialize_with = "optional_integer")]
+        offset: Option<i128>,
+        #[serde(default, deserialize_with = "optional_integer")]
+        limit: Option<i128>,
     }
     let Args {
         job_ids,
         offset,
         limit,
     } = parse_args(args)?;
-    let limit = limit.unwrap_or(QUEUE_LIMIT);
-    ensure!(
-        (1..=MAX_QUEUE_LIMIT).contains(&limit),
-        "limit must be between 1 and {MAX_QUEUE_LIMIT}"
-    );
+    let limit = QUEUE_LIMIT.resolve(limit, DEFAULT_LIMIT);
+    let offset = QUEUE_OFFSET.resolve(offset, DEFAULT_OFFSET);
     ensure!(
         job_ids.len() <= MAX_JOB_IDS && job_ids.iter().all(|id| !id.is_empty() && id.len() <= 128),
         "Supply at most {MAX_JOB_IDS} full job IDs"
@@ -151,6 +152,57 @@ mod tests {
         SelfUpdateCanaryState, SelfUpdateCanaryStatus, SelfUpdateStep, SelfUpdateStepKind,
         SelfUpdateWait, SelfUpdateWaitReason,
     };
+
+    #[test]
+    fn desk_queue_clamps_page_limit_and_offset() -> Result<()> {
+        use crate::mcp::workspace_read::range::tests::{boundary_cases, wrong_types};
+        use crate::self_update::drain::Work;
+
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let app = Workspace::new(
+            project.path().into(),
+            "127.0.0.1:7878".into(),
+            state.path().into(),
+            std::sync::Arc::new(crate::Hub::new()),
+        );
+        for i in 0..101 {
+            app.drain.enqueue(
+                &app.state_dir,
+                "thread",
+                format!("item-{i}"),
+                Work::Checkpoint {
+                    result: "completed".into(),
+                    directory: ".".into(),
+                },
+            )?;
+        }
+        for (limit, expected) in boundary_cases(1, 100, 50) {
+            let args = limit.map_or_else(|| json!({}), |limit| json!({"limit": limit}));
+            let result = queue(&app, &args)?;
+            assert_eq!(result["items"].as_array().unwrap().len(), expected);
+        }
+        for (offset, expected) in boundary_cases(0, u32::MAX as usize, 0) {
+            let mut args = json!({"limit": 1});
+            if let Some(offset) = offset {
+                args["offset"] = offset;
+            }
+            let result = queue(&app, &args)?;
+            assert_eq!(
+                result["items"].as_array().unwrap().len(),
+                usize::from(expected == 0)
+            );
+        }
+        for field in ["offset", "limit"] {
+            for value in wrong_types() {
+                let mut args = json!({});
+                args[field] = value;
+                let error = queue(&app, &args).unwrap_err();
+                assert!(format!("{error:#}").contains("expected an integer"), "{field}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn compact_update_status_contains_step_state_and_wait_reason() -> Result<()> {

@@ -174,6 +174,178 @@ async fn read_scope_applies_to_all_filesystem_tools() -> Result<()> {
     Ok(())
 }
 
+async fn check_integer_argument(
+    tool: Tool,
+    scope: &ReadScope,
+    base: Value,
+    field: &str,
+    bounds: [usize; 3],
+    check: impl Fn(&Value, usize),
+) -> Result<()> {
+    let [min, max, default] = bounds;
+    let definition = tool.definition();
+    let property = &definition["inputSchema"]["properties"][field];
+    assert_eq!(property["minimum"], min);
+    assert_eq!(property["maximum"], max);
+    let description = property["description"].as_str().unwrap();
+    assert!(description.contains("clamped") || description.contains("丸める"));
+    if field == "end_line" {
+        assert!(description.contains("399"));
+    } else {
+        assert_eq!(property["default"], default);
+    }
+    for (value, expected) in range::tests::boundary_cases(min, max, default) {
+        let mut args = base.clone();
+        if let Some(value) = value {
+            args[field] = value;
+        }
+        let result = tool
+            .call(scope.clone(), &args)
+            .await
+            .with_context(|| format!("calling {} with {args}", tool.name()))?;
+        check(&result, expected);
+    }
+    for value in range::tests::wrong_types() {
+        let mut args = base.clone();
+        args[field] = value;
+        let error = tool.call(scope.clone(), &args).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("expected an integer"),
+            "{args}: {error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_clamps_line_numbers_and_byte_budget() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    fs::write(f.worktree.join("scan"), vec![b'\n'; READ_SCAN_BYTES])?;
+    check_integer_argument(
+        Tool::Read,
+        &scope,
+        json!({"path": "scan"}),
+        "start_line",
+        [1, 16 * 1024 * 1024, 1],
+        |result, expected| {
+            let text = result["text"].as_str().unwrap();
+            assert!(text.starts_with(&format!("{expected}: \n")));
+        },
+    )
+    .await?;
+
+    fs::write(f.worktree.join("lines"), "text\n".repeat(450))?;
+    check_integer_argument(
+        Tool::Read,
+        &scope,
+        json!({"path": "lines"}),
+        "end_line",
+        [1, 16 * 1024 * 1024, 400],
+        |result, expected| assert_eq!(result["next_start_line"], expected.min(400) + 1),
+    )
+    .await?;
+
+    fs::write(f.worktree.join("long"), "x".repeat(MAX_BYTES + 1))?;
+    check_integer_argument(
+        Tool::Read,
+        &scope,
+        json!({"path": "long"}),
+        "max_bytes",
+        [1, 65_536, 65_536],
+        |result, expected| {
+            let line = result["text"].as_str().unwrap().lines().next().unwrap();
+            assert_eq!(line.len(), "1: ".len() + expected);
+        },
+    )
+    .await?;
+
+    let mut scan_capped = vec![b'\n'; READ_SCAN_BYTES - 1];
+    scan_capped.extend_from_slice(b"xx\n");
+    fs::write(f.worktree.join("scan"), scan_capped)?;
+    let last = Tool::Read
+        .call(
+            scope.clone(),
+            &json!({"path": "scan", "start_line": READ_SCAN_BYTES, "max_bytes": 1}),
+        )
+        .await?;
+    assert_eq!(last["truncated"], true);
+    assert_eq!(last["next_start_line"], Value::Null);
+
+    let error = Tool::Read
+        .call(
+            scope,
+            &json!({"path": "lines", "start_line": 2, "end_line": 0}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("end_line must be at least start_line"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_and_search_clamp_depth_context_and_result_count() -> Result<()> {
+    let f = Fixture::new()?;
+    let scope = f.worker()?;
+    fs::create_dir_all(f.worktree.join("nested/folder/sub"))?;
+    fs::write(f.worktree.join("nested/folder/sub/file"), "")?;
+    check_integer_argument(
+        Tool::List,
+        &scope,
+        json!({"path": "nested"}),
+        "depth",
+        [1, 3, 1],
+        |result, expected| assert_eq!(result["entries"].as_array().unwrap().len(), expected),
+    )
+    .await?;
+
+    let padding = "line\n".repeat(5);
+    fs::write(f.worktree.join("single"), format!("{padding}hit\n{padding}"))?;
+    check_integer_argument(
+        Tool::Search,
+        &scope,
+        json!({"path": "single", "pattern": "hit"}),
+        "context",
+        [0, 5, 0],
+        |result, expected| {
+            let context = result["matches"][0]["context"].as_array().unwrap();
+            assert_eq!(context.len(), 2 * expected + 1);
+        },
+    )
+    .await?;
+
+    fs::write(f.worktree.join("many"), "hit\n".repeat(210))?;
+    check_integer_argument(
+        Tool::Search,
+        &scope,
+        json!({"path": "many", "pattern": "hit"}),
+        "max_results",
+        [1, 200, 100],
+        |result, expected| {
+            assert_eq!(result["matches"].as_array().unwrap().len(), expected);
+            assert_eq!(result["truncated"], true);
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plan_status_clamps_its_list_limit() -> Result<()> {
+    let f = Fixture::new()?;
+    fs::create_dir_all(f.worktree.join("roadmap/cards"))?;
+    fs::write(f.worktree.join("roadmap/deck.toml"), "")?;
+    check_integer_argument(
+        Tool::PlanStatus,
+        &f.worker()?,
+        json!({}),
+        "limit",
+        [1, 100, 50],
+        |result, expected| assert_eq!(result["limit"], expected),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn numbered_read_paginates_and_refuses_binary_and_media() -> Result<()> {
     let f = Fixture::new()?;

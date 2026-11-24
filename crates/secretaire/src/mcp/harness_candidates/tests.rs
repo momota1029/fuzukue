@@ -238,16 +238,6 @@ fn invalid_inputs_leave_the_deck_unchanged() -> Result<()> {
             .contains("reason")
     );
     assert_eq!(fs::read_dir(cards)?.count(), 0);
-    assert!(
-        list(
-            project.path(),
-            ListArgs {
-                status: None,
-                limit: Some(51)
-            }
-        )
-        .is_err()
-    );
     Ok(())
 }
 
@@ -293,6 +283,39 @@ fn only_the_fixed_deck_accepts_writes() -> Result<()> {
     fs::hard_link(&outside, &card)?;
     assert!(run().is_err());
     assert_eq!(fs::read_to_string(outside)?, "unchanged");
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_clamps_its_limit() -> Result<()> {
+    use crate::mcp::workspace_read::range::tests::{boundary_cases, wrong_types};
+
+    let project = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    deck(project.path())?;
+    for i in 0..51 {
+        let input = proposal("Count files", &format!("rg --files folder-{i}"));
+        propose(project.path(), input, None)?;
+    }
+    let app = crate::Workspace::new(
+        project.path().into(),
+        "127.0.0.1:7878".into(),
+        state.path().into(),
+        Arc::new(crate::Hub::new()),
+    );
+    for (limit, expected) in boundary_cases(1, 50, 20) {
+        let args = limit.map_or_else(|| json!({}), |limit| json!({"limit": limit}));
+        let result = Tool::List.call(&app, None, &args).await?;
+        assert_eq!(result["candidates"].as_array().unwrap().len(), expected);
+        assert_eq!(result["truncated"], true);
+    }
+    for limit in wrong_types() {
+        let error = Tool::List
+            .call(&app, None, &json!({"limit": limit}))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expected an integer"));
+    }
     Ok(())
 }
 
