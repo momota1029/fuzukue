@@ -24,7 +24,7 @@ use super::{
 
 type Reply = oneshot::Sender<Result<Value>>;
 const DIAGNOSTICS_WAIT: Duration = Duration::from_secs(10);
-const MAX_BUFFER: usize = 8 * 1024 * 1024;
+pub(super) const MAX_BUFFER: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(super) struct Endpoint(mpsc::UnboundedSender<Command>);

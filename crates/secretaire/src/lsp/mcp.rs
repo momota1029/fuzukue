@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 
 use super::{project, Manager, Request};
 
+const MAX_SYMBOL_LENGTH: usize = 1024;
+const MAX_POSITION: u32 = super::actor::MAX_BUFFER as u32 + 1;
+
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
     Definition,
@@ -65,12 +68,12 @@ impl Tool {
                 "ソースの位置で型情報とドキュメントを読む。"
             ),
             Self::Symbols => harness_text!(
-                "List document symbols (path), or search workspace symbols (query).",
-                "ファイル内の記号を一覧するか、ワークスペースの記号を検索する。"
+                "List a source file's declarations with path alone, or search loaded workspace symbols with a non-blank query.",
+                "ファイル内の宣言は path だけで一覧する。読み込み済みのワークスペース記号を探すには空白以外の query を指定する。"
             ),
             Self::Diagnostics => harness_text!(
-                "Read current language-server diagnostics for a source file.",
-                "ソースファイルの現在の診断を読む。"
+                "Read the language server's current diagnostics for one source file. An empty list means the server reported no items at that point.",
+                "一つのファイルについて言語サーバーの現在の診断を読む。空の一覧はその時点でサーバーが報告した診断項目が 0 件だったことを示す。"
             ),
             Self::CallHierarchy => harness_text!(
                 "Find incoming and outgoing calls for a source symbol.",
@@ -82,19 +85,24 @@ impl Tool {
             ),
         };
         let mut properties = json!({
-            "path": {"type":"string", "description":"Workspace-relative source path. To narrow a symbol search, provide a file or directory."},
+            "path": {"type":"string", "minLength":1, "description":"Workspace-relative source file. With query or symbol, a file or directory limits the projects searched."},
         });
         if matches!(self, Self::Symbols) {
-            properties["query"] = json!({"type":"string","description":"Search workspace symbols. Omit for document symbols."});
+            properties["query"] = json!({"type":"string","minLength":1,"maxLength":MAX_SYMBOL_LENGTH,
+                "description":"Workspace symbol search text. Add a source file path to use its project. Omit query to list declarations in path."});
         } else if !matches!(self, Self::Diagnostics) {
-            properties["line"] = json!({"type":"integer","minimum":1,"description":"1-based line. Provide path and col."});
+            properties["line"] = json!({"type":"integer","minimum":1,"maximum":MAX_POSITION,
+                "description":"1-based line containing the identifier. Pair with path and col."});
             properties["col"] =
-                json!({"type":"integer","minimum":1,"description":"1-based UTF-16 column."});
-            properties["symbol"] = json!({"type":"string","description":"Resolve an exact workspace symbol name instead of line and col."});
+                json!({"type":"integer","minimum":1,"maximum":MAX_POSITION,
+                    "description":"1-based UTF-16 column on the identifier. Pair with path and line."});
+            properties["symbol"] = json!({"type":"string","minLength":1,"maxLength":MAX_SYMBOL_LENGTH,
+                "description":"Exact, unique workspace symbol name. Omit line and col when using symbol."});
         } else {
-            properties["symbol"] = json!({"type":"string","description":"Find the source file of an exact workspace symbol name instead of giving a path."});
+            properties["symbol"] = json!({"type":"string","minLength":1,"maxLength":MAX_SYMBOL_LENGTH,
+                "description":"Exact, unique workspace symbol name whose file to diagnose."});
         }
-        properties["language"] = json!({"type":"string","description":"Limit workspace symbol search to a language, e.g. rust or lean."});
+        properties["language"] = json!({"type":"string","description":"Limit query or symbol lookup to a language such as rust. Direct file requests infer the language, and lean_goal uses Lean."});
         json!({"name":self.name(), "description":description, "inputSchema":{
             "type":"object", "properties":properties, "required":[], "additionalProperties":false
         }})
@@ -109,6 +117,15 @@ impl Tool {
             language,
             query,
         } = serde_json::from_value(args.clone())?;
+        for (name, text) in [("query", query.as_deref()), ("symbol", symbol.as_deref())] {
+            if let Some(text) = text {
+                ensure!(
+                    text.chars().take(MAX_SYMBOL_LENGTH + 1).count() <= MAX_SYMBOL_LENGTH
+                        && !text.trim().is_empty(),
+                    "{name} must contain 1–{MAX_SYMBOL_LENGTH} characters and cannot be blank"
+                );
+            }
+        }
         let language = if matches!(self, Self::LeanGoal) {
             Some("lean")
         } else {
@@ -120,7 +137,7 @@ impl Tool {
                 "symbols takes a path or a workspace query"
             );
             if query.is_some() || symbol.is_some() || path.is_none() {
-                let query = query.or(symbol).unwrap_or_default();
+                let query = query.or(symbol).context("provide a source path or workspace query")?;
                 return manager
                     .workspace_symbols(path.as_deref(), language, query)
                     .await;
@@ -153,10 +170,16 @@ impl Tool {
             found
         } else {
             let position = match (line, col) {
-                (Some(line), Some(col)) if line > 0 && col > 0 => Some(LspPosition {
-                    line: line - 1,
-                    character: col - 1,
-                }),
+                (Some(line), Some(col)) if line > 0 && col > 0 => {
+                    ensure!(
+                        line <= MAX_POSITION && col <= MAX_POSITION,
+                        "line or col exceeds the source size limit"
+                    );
+                    Some(LspPosition {
+                        line: line - 1,
+                        character: col - 1,
+                    })
+                }
                 (None, None) => None,
                 _ => anyhow::bail!("line and col must both be 1-based"),
             };

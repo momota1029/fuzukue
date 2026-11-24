@@ -205,6 +205,20 @@ async fn routes_editor_and_mcp_requests_and_scopes_locations_and_input() {
         .call(&manager, &json!({"path":"main.rs", "line":0,"col":1}))
         .await
         .is_err());
+    assert!(Tool::Hover
+        .call(&manager, &json!({"path":"main.rs", "line":1,"col":u32::MAX}))
+        .await
+        .is_err());
+    for args in [
+        json!({}),
+        json!({"path":"main.rs","query":" "}),
+        json!({"path":"main.rs","query":"é".repeat(1025)}),
+    ] {
+        assert!(Tool::Symbols.call(&manager, &args).await.is_err());
+    }
+    let long_symbol = json!({"symbol":"é".repeat(1025)});
+    let error = Tool::Definition.call(&manager, &long_symbol).await.unwrap_err();
+    assert!(error.to_string().starts_with("symbol must contain"));
     assert!(Tool::Hover.call(&manager, &pos).await.unwrap()["contents"].is_object());
     for tool in [Tool::Definition, Tool::References] {
         let result = tool.call(&manager, &pos).await.unwrap();

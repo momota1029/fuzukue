@@ -874,6 +874,9 @@ async fn launch_assignment(
             let can_search = mcp_url.is_some() && tools.iter().any(|tool| tool == "search_library");
             let can_add_memo = mcp_url.is_some() && tools.iter().any(|tool| tool == "add_memo");
             let can_read = mcp_url.is_some() && tools.iter().any(|tool| crate::mcp::workspace_read::Tool::named(tool).is_some());
+            let can_navigate = mcp_url.is_some() && crate::lsp::Tool::ALL.iter()
+                .filter(|tool| !matches!(tool, crate::lsp::Tool::LeanGoal))
+                .any(|tool| tools.iter().any(|name| name == tool.name()));
             let access = crate::folder_grants::Access {
                 hub: app.hub.clone(), session: session.clone(), worker_grants: Some(folder_grants.into()),
             };
@@ -909,6 +912,9 @@ async fn launch_assignment(
                 crate::worker_scope::append_environment_notes(&mut instructions, &workspace)?;
                 if can_read {
                     instructions.push_str(crate::mcp::workspace_read::GUIDANCE);
+                }
+                if can_navigate {
+                    instructions.push_str("\n\nFor Rust symbols, prefer the available LSP tools for definitions, references, types, and call hierarchy. Start with a workspace-relative source path and, for position queries, a 1-based line and UTF-16 column on the identifier. Use lsp_symbols with a file path for its declarations. Use fs_search when available for literal text, configuration, and locating an identifier to query, or when LSP gives no useful answer. Use lsp_diagnostics for file feedback and run the relevant Cargo check or test to verify build changes.");
                 }
                 instructions.push_str("\n\nIf tests are still failing after your attempt, verification rejects the change, or you lack confidence to proceed, report the reason with escalate (trigger tests, rejected, or confidence). Finish the turn after recording it. Report concrete evidence.");
                 instructions.push_str(worker_tests());
