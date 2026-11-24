@@ -94,6 +94,7 @@ impl UiTree<'_> {
                     .font_semibold()
                     .child(title.clone());
                 let panel = panel(id("card"), theme)
+                    .when(!theme.is_dark(), |panel| panel.bg(theme.background))
                     .rounded_lg()
                     .p_4()
                     .gap_3()
@@ -158,11 +159,16 @@ impl UiTree<'_> {
                 tone,
                 hint,
             } => {
+                let surface = if theme.is_dark() {
+                    theme.secondary
+                } else {
+                    theme.background.blend(theme.secondary.opacity(0.15))
+                };
                 let foreground = tone.map_or(theme.foreground, |tone| {
-                    tone_foreground(theme, tone, theme.secondary)
+                    tone_foreground(theme, tone, surface)
                 });
                 panel(id("stat"), theme)
-                    .bg(theme.secondary)
+                    .bg(surface)
                     .p_3()
                     .gap_1()
                     .child(
@@ -340,11 +346,16 @@ impl UiTree<'_> {
                     Severity::Warn => (theme.warning, tr!("xml-component-warn")),
                     Severity::Error => (theme.danger, tr!("xml-component-error")),
                 };
+                let surface = if theme.is_dark() {
+                    theme.muted.opacity(0.45)
+                } else {
+                    theme.background
+                };
                 let heading = format!("{level} · {title}");
                 let panel = panel(id("callout"), theme)
                     .border_l_4()
                     .border_color(color)
-                    .bg(theme.muted.opacity(0.45))
+                    .bg(surface)
                     .p_3()
                     .gap_1()
                     .child(div().font_semibold().child(heading));
