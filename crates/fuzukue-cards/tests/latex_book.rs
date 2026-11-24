@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use fuzukue_cards::{latex_book, DeckConfig, Graph};
 
+#[path = "../../../tests/support/tex.rs"]
+mod tex;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/latex-book/main.tex")
 }
@@ -59,8 +62,10 @@ fn imports_structure_labels_proofs_sources_and_assets() -> Result<()> {
 }
 
 #[test]
-#[ignore = "needs latexmk, upLaTeX, dvipdfmx and pdftotext"]
 fn latex_book_pdfs_match() -> Result<()> {
+    if !tex::ready("uplatex", &["latexmk", "dvipdfmx", "pdftotext", "gs"])? {
+        return Ok(());
+    }
     let tmp = tempfile::tempdir()?;
     let deck = tmp.path().join("book");
     let result = latex_book::import(&fixture(), &deck, true)?;

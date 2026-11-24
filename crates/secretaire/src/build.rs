@@ -992,22 +992,7 @@ mod tests {
         };
         use serde_json::{json, Value};
 
-        for tool in ["latexmk", "uplatex", "dvipdfmx", "kpsewhich"] {
-            match std::process::Command::new(tool).arg("--version").output() {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("skipping PDF fixture; missing {tool}");
-                    return Ok(());
-                }
-                result => {
-                    result?;
-                }
-            }
-        }
-        let format = std::process::Command::new("kpsewhich")
-            .args(["-engine=/", "-format=fmt", "uplatex.fmt"])
-            .output()?;
-        if !format.status.success() {
-            eprintln!("skipping PDF fixture; missing uplatex.fmt");
+        if !crate::test_support::tex::ready("uplatex", &["latexmk", "dvipdfmx"])? {
             return Ok(());
         }
 

@@ -251,7 +251,7 @@ async fn reading_page_generator_runs_private_mode_with_staged_input() -> Result<
     fs::write(website.join("public/index.html"), "public site")?;
     fs::write(
         website.join("generator/Cargo.toml"),
-        "[package]\nname = \"paper-site\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "[package]\nname = \"paper-site\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
     )?;
     fs::write(
         website.join("generator/Cargo.lock"),

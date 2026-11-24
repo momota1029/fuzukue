@@ -692,6 +692,34 @@ async fn safe_close_reports_active_threads_and_force_commits_only_the_matching_s
 #[tokio::test]
 async fn shutdown_restart_waits_for_trial_and_usage_then_replays_input_and_goal_once() -> Result<()>
 {
+    // The supervised worker can inherit a ready marker, which makes the fixture
+    // start in a pending trial. Isolate the test without changing other tests' environment.
+    const SERVICE_ENV: [&str; 6] = [
+        "FUZUKUE_SERVICE",
+        "FUZUKUE_SELF_UPDATE_READY",
+        "FUZUKUE_SELF_UPDATE_SOURCE",
+        "LABO_SERVICE",
+        "LABO_SELF_UPDATE_READY",
+        "LABO_SELF_UPDATE_SOURCE",
+    ];
+    if SERVICE_ENV.iter().any(|key| std::env::var_os(key).is_some()) {
+        const TEST: &str =
+            "self_update::drain_tests::shutdown_restart_waits_for_trial_and_usage_then_replays_input_and_goal_once";
+        let mut child = tokio::process::Command::new(std::env::current_exe()?);
+        child.args(["--exact", TEST, "--nocapture"]).kill_on_drop(true);
+        for key in SERVICE_ENV {
+            child.env_remove(key);
+        }
+        let output = child.output().await?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        ensure!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+
     let dir = tempfile::tempdir()?;
     let (app, update, workspace) = load(dir.path())?;
     let session = workspace.hub.edit_threads(|threads| threads.create(None))?;

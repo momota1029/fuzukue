@@ -975,15 +975,10 @@ html_out = "website/private/cards/sample-paper"
             workspace.join(EXTERNAL).join("facts/source.md")
         );
 
-        for tool in ["latexmk", "pdflatex"] {
-            if let Err(error) = std::process::Command::new(tool).arg("--version").output() {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    eprintln!("skipping harness PDF fixture; missing {tool}");
-                    return Ok(());
-                }
-                return Err(error.into());
-            }
+        if !crate::test_support::tex::ready("pdflatex", &["latexmk"])? {
+            return Ok(());
         }
+
         let app = std::sync::Arc::new(crate::Workspace::new(
             workspace.clone(),
             String::new(),

@@ -7,6 +7,9 @@ use std::{
 
 use super::*;
 
+#[path = "../../../../../tests/support/loopback.rs"]
+mod loopback;
+
 const QUICK: RetryPolicy = RetryPolicy {
     idle_timeout: Duration::from_secs(1),
     backoff: Duration::ZERO,
@@ -25,14 +28,7 @@ fn fixture() -> ClientManifest {
 fn serve(
     handler: impl FnOnce(TcpListener) + Send + 'static,
 ) -> Option<(HttpTarget, thread::JoinHandle<()>)> {
-    let listener = match TcpListener::bind("127.0.0.1:0") {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            eprintln!("skipping updater HTTP test: loopback TCP unavailable ({error})");
-            return None;
-        }
-        Err(error) => panic!("could not bind updater test server: {error}"),
-    };
+    let listener = loopback::listen().expect("bind updater test server")?;
     let http = HttpTarget::for_distribution_test(listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     Some((http, thread::spawn(move || handler(listener))))

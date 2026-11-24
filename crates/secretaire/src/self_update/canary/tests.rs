@@ -2,6 +2,9 @@ use super::*;
 use crate::self_update::{tests::source, CommandLine, Config, Status};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+#[path = "../../../../../tests/support/loopback.rs"]
+mod loopback;
+
 const TEST_PORT: u16 = 7879;
 
 #[test]
@@ -449,13 +452,8 @@ async fn mismatched_health_fails_and_preserves_the_candidate_log() -> Result<()>
 
 #[tokio::test]
 async fn tcp_health_checks_the_fake_shell_candidate() -> Result<()> {
-    let socket = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
-        Ok(socket) => socket,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("skipped loopback TCP check: {error}");
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
+    let Some(socket) = loopback::listen()? else {
+        return Ok(());
     };
     let addr = socket.local_addr()?;
     drop(socket);

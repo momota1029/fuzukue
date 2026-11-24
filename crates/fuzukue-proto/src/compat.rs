@@ -243,7 +243,27 @@ mod tests {
 
     #[test]
     fn migrates_config_and_state_under_a_temporary_home() -> io::Result<()> {
-        let home = tempfile::tempdir()?;
+        const TEST_HOME: &str = "FUZUKUE_TEST_HOME";
+        let Some(root) = std::env::var_os(TEST_HOME) else {
+            // The temporary directory can be under HOME, so allow it in this test process only.
+            let root = tempfile::tempdir()?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .env(TEST_HOME, root.path().canonicalize()?)
+                .args([
+                    "--exact",
+                    "compat::tests::migrates_config_and_state_under_a_temporary_home",
+                    "--nocapture",
+                ])
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        };
+        let home = tempfile::tempdir_in(root)?;
         for relative in [".config", ".local/state"] {
             let base = home.path().join(relative);
             let old = base.join(LEGACY_APP_DIR);

@@ -10,7 +10,7 @@ use fuzukue_proto::ServerEvent;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::test_support::TestDir;
+use crate::test_support::{tex, TestDir};
 
 fn fixture() -> TestDir {
     let dir = TestDir::new();
@@ -175,17 +175,9 @@ outputs = [out / p for p in ('lecture.pdf', 'lecture.log', 'lecture.aux', 'lectu
     Ok(())
 }
 
-fn latexmk_available() -> bool {
-    std::process::Command::new("latexmk")
-        .arg("-version")
-        .output()
-        .is_ok()
-}
-
 #[tokio::test]
 async fn paired_request_reviews_only_captured_files_and_records_the_shared_version() -> Result<()> {
-    if !latexmk_available() {
-        eprintln!("skipping recorder fixture; missing latexmk");
+    if !tex::tools(&["latexmk"])? {
         return Ok(());
     }
     let live = fixture();
@@ -316,8 +308,7 @@ async fn course_recovers_two_clean_section_reviews_in_a_fresh_process() -> Resul
         return Ok(());
     }
 
-    if !latexmk_available() {
-        eprintln!("skipping recorder fixture; missing latexmk");
+    if !tex::tools(&["latexmk"])? {
         return Ok(());
     }
     let live = TestDir::new();
@@ -498,27 +489,8 @@ print(json.dumps({{"type":"result", "result":"{{\"findings\":[]}}"}}))
 
 #[tokio::test]
 async fn paired_request_renders_frozen_inputs_and_records_two_clean_receipts() -> Result<()> {
-    for (tool, args) in [
-        ("latexmk", &["-v"][..]),
-        ("pdflatex", &["-v"][..]),
-        ("pdftotext", &["-v"][..]),
-        (
-            "kpsewhich",
-            &["-engine=pdftex", "-format=fmt", "pdflatex.fmt"][..],
-        ),
-    ] {
-        match std::process::Command::new(tool).args(args).output() {
-            Ok(output) if output.status.success() => {}
-            Ok(_) => {
-                eprintln!("skipping real section render; {tool} found no usable installation");
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("skipping real section render; missing {tool}");
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        }
+    if !tex::ready("pdflatex", &["latexmk", "pdftotext"])? {
+        return Ok(());
     }
 
     let live = fixture();

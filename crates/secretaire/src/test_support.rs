@@ -1,6 +1,6 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 pub(crate) async fn wait_for_path(path: &Path) -> anyhow::Result<()> {
@@ -11,21 +11,42 @@ pub(crate) async fn wait_for_path(path: &Path) -> anyhow::Result<()> {
     }).await.map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))
 }
 
-pub(crate) struct TestDir(PathBuf);
+#[path = "../../../tests/support/tex.rs"]
+pub(crate) mod tex;
+
+pub(crate) struct TestDir(tempfile::TempDir);
 
 impl TestDir {
     pub(crate) fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        loop {
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("secretaire-{}-{id}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Self(path.canonicalize().unwrap()),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => panic!("create {}: {err}", path.display()),
-            }
-        }
+        Self::try_new().expect("create isolated test directory")
+    }
+
+    pub(crate) fn try_new() -> io::Result<Self> {
+        let temp = std::env::temp_dir().canonicalize()?;
+        // Walkers and Git commands must see the fixture's own ignore rules.
+        // A checkout under another checkout can have more than one .git ancestor.
+        let root = match temp
+            .ancestors()
+            .filter(|path| path.join(".git").exists())
+            .last()
+        {
+            Some(repo) => repo.parent().ok_or_else(|| {
+                io::Error::other("set TMPDIR to a writable location outside the Git repository")
+            })?,
+            None => &temp,
+        };
+        tempfile::Builder::new()
+            .prefix("secretaire-test-")
+            .tempdir_in(root)
+            .map(Self)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; set TMPDIR to a writable directory outside any Git repository"
+                    ),
+                )
+            })
     }
 
     pub(crate) fn pilot() -> Self {
@@ -54,18 +75,12 @@ impl TestDir {
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        self.0.path()
     }
 
     pub(crate) fn write(&self, path: &str, text: &str) {
-        let path = self.0.join(path);
+        let path = self.path().join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }

@@ -8,6 +8,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[path = "../../../tests/support/tex.rs"]
+mod tex;
+
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/reading-companion"
@@ -743,8 +746,10 @@ fn proof_check_reports_invalid_review_tex_and_real_html_anchors() -> Result<()> 
 }
 
 #[test]
-#[ignore = "requires LuaLaTeX with luatex-ja and latexmk"]
 fn proof_book_builds_checks_and_links_every_formula() -> Result<()> {
+    if !tex::ready("lualatex", &["latexmk"])? || !tex::has_file("luatexja.sty", &[])? {
+        return Ok(());
+    }
     let dir = fixture("proof-book-example")?;
     let root = dir.path();
     let out = run(root, &["proof_book", "build", "."], true);

@@ -1,8 +1,7 @@
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -13,6 +12,7 @@ use axum::Json;
 use fuzukue_proto::{Actor, ClientMsg, CommentView, Envelope, ServerEvent};
 use serde_json::{json, Value};
 
+use crate::test_support::{tex, TestDir};
 use crate::{
     build, codex::Codex, comments, handle, hub::Hub, lean, mcp, reviewers, synctex, threads, workspace, Workspace,
 };
@@ -38,21 +38,11 @@ fn sample_lab() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lab")
 }
 
-struct TempProject(PathBuf);
+struct TempProject(TestDir);
 
 impl TempProject {
     fn new() -> io::Result<Self> {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        loop {
-            let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("secretaire-test-{}-{n}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err),
-            }
-        }
+        TestDir::try_new().map(Self)
     }
 
     fn copy_lab() -> Result<Self> {
@@ -80,13 +70,7 @@ impl TempProject {
     }
 
     fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempProject {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(self.path());
+        self.0.path()
     }
 }
 
@@ -478,20 +462,8 @@ fn lean_collects_sample_declarations() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires latexmk, uplatex, dvipdfmx, synctex, and pdfinfo"]
 async fn sample_pdf_builds_and_locates_first_definition() -> Result<()> {
-    let missing: Vec<_> = ["latexmk", "uplatex", "dvipdfmx", "synctex", "pdfinfo"]
-        .into_iter()
-        .filter(|tool| {
-            !Command::new("which")
-                .arg(tool)
-                .stdout(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        })
-        .collect();
-    if !missing.is_empty() {
-        eprintln!("skipping PDF test; missing tools: {}", missing.join(", "));
+    if !tex::ready("uplatex", &["latexmk", "dvipdfmx", "synctex", "pdfinfo"])? {
         return Ok(());
     }
 
@@ -1391,22 +1363,8 @@ async fn mcp_build_papers_returns_failures_and_optionally_writes_the_same_table(
 
 #[tokio::test]
 async fn mcp_build_papers_counts_final_warnings_and_leaves_inputs_untouched() -> Result<()> {
-    for (tool, args) in [
-        ("latexmk", &["-v"][..]),
-        ("kpsewhich", &["-engine=pdftex", "-format=fmt", "pdflatex.fmt"]),
-    ] {
-        match Command::new(tool).args(args).output() {
-            Ok(output) if output.status.success() => {}
-            Ok(_) => {
-                eprintln!("skipping PDF fixture; {tool} found no usable installation");
-                return Ok(());
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                eprintln!("skipping PDF fixture; missing {tool}");
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        }
+    if !tex::ready("pdflatex", &["latexmk"])? {
+        return Ok(());
     }
     let dir = crate::test_support::TestDir::new();
     let config = "kind = 'paper'\n[build]\ntex_root = 'manuscript/main.tex'\nengine = 'pdflatex'\n";
@@ -3384,8 +3342,10 @@ async fn mcp_pdf_audit_warnings_preserve_build_delivery() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires latexmk, pdflatex with its format and fonts, and synctex"]
 async fn mcp_audits_pdf_generated_by_latexmk() -> Result<()> {
+    if !tex::ready("pdflatex", &["latexmk", "synctex"])? {
+        return Ok(());
+    }
     let project = TempProject::new()?;
     let deck = project.path().join("paper");
     fs::create_dir(&deck)?;
@@ -3436,8 +3396,10 @@ async fn mcp_audits_pdf_generated_by_latexmk() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires latexmk, uplatex, dvipdfmx, synctex, and pdfinfo"]
 async fn mcp_builds_sample_pdf_and_locates_tex_from_page_one() -> Result<()> {
+    if !tex::ready("uplatex", &["latexmk", "dvipdfmx", "synctex", "pdfinfo"])? {
+        return Ok(());
+    }
     let project = TempProject::copy_lab()?;
     let app = mcp_app(&project);
     let (_, mut events) = app.hub.subscribe(0);
@@ -3483,8 +3445,10 @@ async fn mcp_builds_sample_pdf_and_locates_tex_from_page_one() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires latexmk, uplatex, dvipdfmx, synctex, and pdfinfo"]
 async fn mcp_builds_sample_slides_and_locates_external_and_local_cards() -> Result<()> {
+    if !tex::ready("uplatex", &["latexmk", "dvipdfmx", "synctex", "pdfinfo"])? {
+        return Ok(());
+    }
     let project = TempProject::copy_lab()?;
     let app = mcp_app(&project);
     let result = mcp_call(&app, "build_paper", json!({ "deck": SLIDES })).await;
@@ -3512,8 +3476,10 @@ async fn mcp_builds_sample_slides_and_locates_external_and_local_cards() -> Resu
 }
 
 #[tokio::test]
-#[ignore = "requires latexmk, uplatex, dvipdfmx, synctex, and pdfinfo"]
 async fn sample_document_builds_and_locates_report_paragraph() -> Result<()> {
+    if !tex::ready("uplatex", &["latexmk", "dvipdfmx", "synctex", "pdfinfo"])? {
+        return Ok(());
+    }
     let project = TempProject::copy_lab()?;
     let built = build::build(project.path(), REPORT).await?;
     assert!(built.ok, "latexmk failed:\n{}", built.log);
@@ -3871,8 +3837,10 @@ async fn mcp_reference_paths_cannot_escape() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires pdflatex and pdftotext"]
 async fn mcp_reads_reference_pdf_page_ranges() -> Result<()> {
+    if !tex::ready("pdflatex", &["pdftotext"])? {
+        return Ok(());
+    }
     let project = TempProject::new()?;
     let dir = project.path().join("reference/book");
     fs::create_dir_all(&dir)?;
@@ -4956,8 +4924,10 @@ async fn watcher_debounces_harness_card_changes() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires latexmk, pdflatex, pdfinfo and pdftotext"]
 async fn watcher_builds_a_harness_pdf_with_synctex_and_numbered_references() -> Result<()> {
+    if !tex::ready("pdflatex", &["latexmk", "pdfinfo", "pdftotext", "synctex"])? {
+        return Ok(());
+    }
     use std::time::Duration;
 
     let project = TempProject::new()?;
