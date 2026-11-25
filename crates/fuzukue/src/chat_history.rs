@@ -291,7 +291,7 @@ impl Workbench {
     }
 
     fn continue_history(&mut self, session: &str, loaded: Direction, empty_page: bool, cx: &mut Context<Self>) {
-        if session == self.active && let Some(direction) = self.chats[session].history.direction {
+        if let (true, Some(direction)) = (session == self.active, self.chats[session].history.direction) {
             self.prefetch_history(direction, empty_page && direction == loaded, cx);
         } else {
             self.schedule_history_trim(session, cx);
