@@ -7,10 +7,12 @@ tag=$2
 work=$(mktemp -d "${TMPDIR:-/tmp}/fuzukue-one-line.XXXXXXXX")
 work=$(cd "$work" && pwd -P)
 export HOME="$work/Test Home & Notes"
-export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export XDG_CONFIG_HOME="$HOME/.config"
+unset XDG_STATE_HOME
 unset FUZUKUE_SERVICE FUZUKUE_SELF_UPDATE_READY FUZUKUE_SELF_UPDATE_SOURCE FUZUKUE_SERVER_CONFIG
 for tool in sh bash awk codesign cp curl defaults id launchctl mkdir mktemp mv open osascript \
-    plutil rm shasum shlock sleep stat sw_vers sysctl tar touch uname xcode-select; do
+    plutil rm shasum shlock sleep stat sw_vers sysctl tar touch uname unzip xcode-select; do
     (PATH=/usr/bin:/bin:/usr/sbin:/sbin; command -v "$tool") || exit 1
 done
 fixture="$work/fixture"
@@ -21,11 +23,15 @@ server_label=com.fuzukue.desktop.server
 update_label=com.fuzukue.desktop.update
 domain="gui/$(id -u)"
 candidate="$fixture/assets/$tag"
-mkdir -p "$HOME/.local/bin" "$fixture/api" "$candidate" "$HOME/no-developer"
+mkdir -p "$HOME/.local/bin" "$fixture/api" "$candidate" "$HOME/no-developer" "$work/bin"
+export PATH="$work/bin:$PATH"
+# Ignore any gh preinstalled on the runner during the missing-tool test.
+printf '#!/bin/sh\nexit 1\n' > "$work/bin/gh"
+chmod 755 "$work/bin/gh"
 cp "$assets/"*.tar.gz "$assets/"macos-release-manifest.json "$assets/"SHA256SUMS-macos "$candidate"
 port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 
-flags=(--fixture "$fixture" --test-port "$port" --skip-agents)
+flags=(--fixture "$fixture" --test-port "$port")
 gui=false
 if launchctl print "$domain" >/dev/null 2>&1; then
     gui=true
@@ -86,7 +92,7 @@ offline_index "$tag"
 for backend in claude codex; do
     cat > "$HOME/.local/bin/$backend" <<'SH'
 #!/bin/sh
-case $1 in auth|login) exit 1 ;; esac
+case $1 in --version) echo 'fixture CLI 1.0'; exit 0 ;; auth|login) exit 1 ;; esac
 export DEVELOPER_DIR="$HOME/no-developer"
 case "$(command -v git)" in
     "$HOME/Applications/fuzukue.app/Contents/Resources/bin/git")
@@ -98,11 +104,92 @@ exit 1
 SH
     chmod 755 "$HOME/.local/bin/$backend"
 done
+
+case $(uname -m) in arm64) gh_arch=arm64 ;; x86_64) gh_arch=amd64 ;; esac
+gh_package="gh_2.105.0_macOS_$gh_arch"
+mkdir -p "$fixture/gh"
+python3 - "$fixture/gh/$gh_package" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+from zipfile import ZipFile
+
+base = Path(sys.argv[1])
+archive = Path(f"{base}.zip")
+with ZipFile(archive, "w") as out:
+    out.writestr(f"{base.name}/bin/gh", """#!/bin/sh
+[ "$1" = --version ] || exit 1
+echo 'gh version 2.105.0 (2026-11-18)'
+""")
+Path(f"{base}.sha256").write_text(sha256(archive.read_bytes()).hexdigest() + "\n")
+PY
+
+install_in_terminal() {
+    python3 - "$1" "$root/install.sh" "${flags[@]}" <<'PY'
+import errno
+import os
+import pty
+import select
+import signal
+import sys
+
+answer, *args = sys.argv[1:]
+replies = {
+    b"[y: install / Enter: exit]": answer.encode() + b"\n",
+    b"Enter the name to show in Git history.": b"Fixture Writer\n",
+}
+pid, tty = pty.fork()
+if pid == 0:
+    # Keep the installer on stdin and its answers on the controlling terminal.
+    os.execl("/bin/sh", "sh", "-c", 'installer=$1; shift; cat "$installer" | sh -s -- "$@"', "sh", *args)
+pending = b""
+try:
+    while select.select([tty], [], [], 60)[0]:
+        try:
+            chunk = os.read(tty, 4096)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            break
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        pending = (pending + chunk)[-8192:]
+        for prompt in list(replies):
+            if prompt in pending:
+                os.write(tty, replies.pop(prompt))
+    else:
+        os.killpg(pid, signal.SIGTERM)
+        raise SystemExit("Timed out waiting for the installer")
+finally:
+    os.close(tty)
+    _, status = os.waitpid(pid, 0)
+raise SystemExit(os.waitstatus_to_exitcode(status))
+PY
+}
+
 # A partially received command must never enter the function body.
 sed '$d' "$root/install.sh" | sh -s -- "${flags[@]}"
 [[ ! -e $base && ! -e $app ]]
-# A complete piped script follows the normal entry point.
-cat "$root/install.sh" | sh -s -- "${flags[@]}"
+# A declined or corrupt download never installs gh or opens the app.
+if install_in_terminal "" > "$work/gh-declined.log"; then exit 1; fi
+grep -F 'GitHub CLI (gh) is required' "$work/gh-declined.log"
+cp "$fixture/gh/$gh_package.zip" "$work/gh.zip"
+printf 'corruption' >> "$fixture/gh/$gh_package.zip"
+if install_in_terminal y > "$work/gh-corrupt.log"; then exit 1; fi
+grep -F 'The GitHub CLI download could not be verified' "$work/gh-corrupt.log"
+[[ ! -e $app && ! -e $base/bin/gh ]]
+mv "$work/gh.zip" "$fixture/gh/$gh_package.zip"
+install_in_terminal y > "$work/install.log"
+grep -F 'use the displayed code to sign in with your own GitHub account' "$work/install.log"
+grep -F 'auth login --hostname github.com --git-protocol https --web' "$work/install.log"
+[[ $("$base/bin/gh" --version) == 'gh version 2.105.0 (2026-11-18)' ]]
+project="$HOME/fuzukue-project"
+baseline=$(git -C "$project" rev-parse HEAD)
+[[ $(git -C "$project" config --local --get user.name) == 'Fixture Writer' ]]
+[[ $(git -C "$project" config --local --get user.email) == fuzukue@users.noreply.invalid ]]
+[[ $(git -C "$project" log -1 --format=%ae) == fuzukue@users.noreply.invalid ]]
+[[ -z $(git -C "$project" status --porcelain) ]]
 [[ -d $HOME/fuzukue-project && -f $base/secretaire && $(< "$base/release") == "$tag" ]]
 [[ -s $app/Contents/Resources/fuzukue.icns && -x $app/Contents/MacOS/fuzukue ]]
 codesign --verify --strict "$app"
@@ -114,6 +201,7 @@ plutil -lint "$agents/$server_label.plist" "$agents/$update_label.plist"
 plist_path=$(plutil -extract EnvironmentVariables.PATH raw "$agents/$server_label.plist")
 guard="$app/Contents/Resources/bin"
 [[ $plist_path == "$guard:"* ]]
+[[ $plist_path == *":$base/bin:"* ]]
 
 # Verify a clean Git resolution and that a real executable's status propagates.
 status=0
@@ -122,6 +210,7 @@ DEVELOPER_DIR="$HOME/no-developer" PATH="$guard:/usr/bin:/bin" "$guard/git" --ve
 guide=$(DEVELOPER_DIR="$HOME/no-developer" LC_ALL=ja_JP.UTF-8 \
     sh "$root/install.sh" --guide "${flags[@]}" --stage-only)
 [[ $guide == *'自分のアカウントでログイン'* ]]
+[[ $guide == *'変更履歴と取り消しには Git が必要'* && $guide == *'auth login'* ]]
 status=0
 mkdir -p "$work/real-git"
 printf '#!/bin/sh\n[ "$1" = --version ] && exit 41\nexit 42\n' > "$work/real-git/git"
@@ -144,6 +233,25 @@ else
     for _ in {1..30}; do if health_pid >/dev/null 2>&1; then break; fi; sleep 1; done
     [[ $(health_pid) == "$direct_server" ]]
 fi
+
+# The packaged server's Git PATH must also support the actual history journal.
+record=
+for attempt in {1..15}; do
+    history=$(find "$HOME" -type d -name history.git -print)
+    if [[ -n $history && -f $history/history.index ]]; then
+        printf 'history smoke %s\n' "$attempt" > "$project/history-smoke.txt"
+        sleep 1
+        record=$(git --git-dir="$history" for-each-ref --format='%(objectname)' --count=1 refs/history/)
+        if [[ -n $record ]]; then break; fi
+    else
+        sleep 1
+    fi
+done
+[[ -n $record ]]
+[[ $(git --git-dir="$history" diff-tree --no-commit-id --name-only -r "$record") == history-smoke.txt ]]
+[[ $(git -C "$project" rev-parse HEAD) == "$baseline" ]]
+rm "$project/history-smoke.txt"
+
 if "$gui"; then
     FUZUKUE_URL="ws://127.0.0.1:$port/ws" "$app/Contents/MacOS/fuzukue" > "$work/direct-client.log" 2>&1 &
     client_pid=$!
@@ -174,6 +282,9 @@ printf 'keep\n' > "$HOME/fuzukue-project/keep.txt"
 sh "$root/install.sh" "${flags[@]}"
 codesign --verify --strict "$app"
 [[ $(< "$HOME/fuzukue-project/keep.txt") == keep ]]
+[[ $(git -C "$project" rev-parse HEAD) == "$baseline" ]]
+[[ $(git -C "$project" config --local --get user.name) == 'Fixture Writer' ]]
+[[ $(git -C "$project" status --porcelain -- keep.txt) == '?? keep.txt' ]]
 if "$gui"; then [[ $(health_pid) != "$first_pid" ]]; fi
 
 # A failed settings write happens after replacing the bundle and starting the
@@ -248,6 +359,7 @@ codesign --verify --strict "$app"
 sh "$root/install.sh" --uninstall "${flags[@]}"
 [[ ! -e $app && ! -e $base/secretaire && ! -e $agents/$server_label.plist && ! -e $agents/$update_label.plist ]]
 [[ $(< "$HOME/fuzukue-project/keep.txt") == keep && -f $settings ]]
+[[ $(git -C "$project" rev-parse HEAD) == "$baseline" && -x $base/bin/gh ]]
 if "$gui"; then
     ! launchctl print "$domain/$server_label" >/dev/null 2>&1
     ! launchctl print "$domain/$update_label" >/dev/null 2>&1

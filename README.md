@@ -14,7 +14,7 @@ Paste this into Terminal on macOS 15 or later once a release with the Mac packag
 curl -fsSL https://raw.githubusercontent.com/momota1029/fuzukue/main/install.sh | sh
 ```
 
-The installer selects Apple Silicon or Intel, adds fuzukue to Applications in your home folder, starts the local server, and enables updates for both. [Mac installation guide (Japanese)](docs/install-mac.md)
+The installer selects Apple Silicon or Intel, adds fuzukue to Applications in your home folder, and starts the local server. It requires Git, GitHub CLI, and either Claude Code or Codex, and guides you through installing any that are missing. When Apple’s Command Line Tools finish installing, run the same command again. The installer initializes the default project with Git. You can sign in to GitHub later, when you need its online features. [Mac installation guide (Japanese)](docs/install-mac.md)
 
 ## Features
 

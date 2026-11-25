@@ -14,7 +14,7 @@ Mac 用のリリースが公開されたら、macOS 15 以降の「ターミナ�
 curl -fsSL https://raw.githubusercontent.com/momota1029/fuzukue/main/install.sh | sh
 ```
 
-Apple Silicon と Intel を自動判定し、ホームの「アプリケーション」に fuzukue を追加します。同じ Mac でサーバーを起動し、アプリとサーバーの自動更新も有効にします。[Mac のインストールガイド](docs/install-mac.md)
+Apple Silicon と Intel を自動判定し、ホームの「アプリケーション」に fuzukue を追加してサーバーを起動します。Git、GitHub CLI、Claude Code または Codex が必要で、足りないものはターミナルに案内が出ます。Apple のコマンドラインツールを入れた場合は、完了後に同じ一行をもう一度実行します。最初の作業フォルダーには Git の履歴を用意します。GitHub へのログインは、GitHub を使うときまであと回しにできます。[Mac のインストールガイド](docs/install-mac.md)
 
 ## 主な機能
 

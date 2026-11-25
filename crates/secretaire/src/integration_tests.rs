@@ -8973,6 +8973,18 @@ async fn change_history_round_trips_over_websocket() -> Result<()> {
     use tokio_tungstenite::{client_async, tungstenite::Message};
 
     let project = TempProject::new()?;
+    let git = |args: &[&str]| -> Result<Vec<u8>> {
+        let out = std::process::Command::new("git").current_dir(project.path())
+            .args(args).output()?;
+        anyhow::ensure!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(out.stdout)
+    };
+    // The one-line installer creates a local repository with an empty initial commit.
+    git(&["init", "--quiet", "--template="])?;
+    git(&["config", "--local", "user.name", "Test Writer"])?;
+    git(&["config", "--local", "user.email", "fuzukue@users.noreply.invalid"])?;
+    git(&["-c", "commit.gpgsign=false", "commit", "--quiet", "--only", "--allow-empty", "-m", "Initialize fuzukue project"])?;
+    let installed_head = git(&["rev-parse", "HEAD"])?;
     let file = project.path().join("note.txt");
     fs::write(&file, "before\n")?;
     let program = project.path().join("history-claude");
@@ -9048,6 +9060,7 @@ printf '%s\n' '{"type":"result","is_error":false}'
         assert_eq!(fs::read_to_string(file)?, "agent edit\n");
         let reopened = crate::history::History::new(&app.project_dir, &app.state_dir, Arc::new(Hub::new()));
         assert!(reopened.changed_turns()?[&thread].contains("history-reply:0"));
+        assert_eq!(git(&["rev-parse", "HEAD"])?, installed_head);
 
         let tools = mcp_request(&app, "tools/list", json!({})).await;
         assert!(tools["tools"].as_array().unwrap().iter().all(|tool| {

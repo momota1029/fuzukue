@@ -8,11 +8,38 @@ curl -fsSL https://raw.githubusercontent.com/momota1029/fuzukue/main/install.sh 
 
 このコマンドは、Apple Silicon・Intel 用のアプリとサーバーがそろったリリースが公開されてから使えます。公開前に試す場合は、下の[クローンからセットアップする](#クローンからセットアップする)手順を使います。
 
-ホームの「アプリケーション」（`~/Applications`）にアイコン付きの fuzukue が入ります。次回からは Finder で fuzukue をダブルクリックします。Mac にログインするとバックグラウンドでサーバーが起動します。アプリはそのサーバーにつながり、最初の作業フォルダーとして `~/fuzukue-project` が開きます。管理者権限、Git、Rust、Python、Xcode、Command Line Tools はアプリの導入や起動に不要です。
+ホームの「アプリケーション」（`~/Applications`）にアイコン付きの fuzukue が入ります。次回からは Finder で fuzukue をダブルクリックします。Mac にログインするとバックグラウンドでサーバーが起動します。最初の作業フォルダーは `~/fuzukue-project` です。
 
-- **会話を始める**。Claude Code と Codex の両方がなければ、インストール中にどちらかの公式インストーラーを選べます。アプリの案内に従い、ターミナルから自分のアカウントでログインします。ログイン後に fuzukue を開き直します。
-- **変更履歴と取り消しを使う**。Git がない場合、アプリは開けますが、変更履歴、取り消し、Git による差分の確認は使えません。その間の変更は fuzukue の履歴に残りません。使うには、ターミナルに `xcode-select --install` と入力し、Apple の案内に従います。Git がすでに使える Mac では、その Git を利用します。
-- **更新する**。Mac にログインしている間、fuzukue は約6時間ごとに新しい版を確認し、作業が止まっているときにサーバーとアプリを更新します。開いているアプリは次に開き直すと新しい版になります。今すぐ修復や更新をするには、上の一行をもう一度実行します。
+1. **Git を用意する。** Git が使えない場合は、ターミナルで `y` を入力して Return を押します。macOS の画面が開くので「インストール」を選びます。インストールにはしばらくかかります。Apple の画面が完了したら、ターミナルで上の一行をもう一度実行します。Git がすでに使える Mac ではこの手順を省けます。 [Apple の案内](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)
+2. **GitHub CLI（gh）を用意する。** 使える `gh` があれば、そのまま使います。なければ `y` と Return で公式版 2.105.0 をホームに導入します。インストーラーは Mac の種類に合う ZIP の SHA-256 を照合し、`gh` をホームの Application Support に置きます。この手順に `sudo` や Homebrew は不要です。 [GitHub CLI の配布ファイルと SHA-256](https://github.com/cli/cli/releases/expanded_assets/v2.105.0)
+3. **会話用ツールを用意する。** Claude Code と Codex の両方がなければ、どちらかの公式インストーラーを選びます。会話を始めるには、案内に表示されるコマンドをターミナルで実行し、自分のアカウントでログインします。その後、fuzukue を開き直します。
+4. **変更履歴に表示する名前を決める。** Git に名前の設定がなければ、ニックネームなどを入力します。メールアドレスの設定がない場合は、この作業フォルダーだけに配達不能な `fuzukue@users.noreply.invalid` を設定します。既存の Git の名前やメール設定は引き続き使います。初回は空のコミットを作り、もともとフォルダーにあったファイルや準備済みの変更はそのままにします。
+
+### GitHub へのログインはあとでできる
+
+原稿の編集、会話、ローカルの変更履歴には GitHub へのログインは不要です。GitHub CLI を使って GitHub の要望やプルリクエストを扱うときに、ターミナルの案内からログインの行をコピーします。すでに自分で入れた `gh` がターミナルで使える場合は、次の行でも始められます。
+
+```sh
+gh auth login --hostname github.com --git-protocol https --web
+```
+
+fuzukue のインストーラーで `gh` を入れた場合は、次の行を使います。
+
+```sh
+"$HOME/Library/Application Support/fuzukue/desktop-install/bin/gh" auth login --hostname github.com --git-protocol https --web
+```
+
+表示された一時コードを使い、開いたブラウザで自分の GitHub アカウントにログインして GitHub CLI を承認します。別の人のアカウントがブラウザに表示された場合は、自分のアカウントに切り替えます。 [GitHub CLI のログイン手順](https://cli.github.com/manual/gh_auth_login)
+
+### 変更履歴で戻せる範囲
+
+fuzukue の「変更履歴」は、エディタでの保存、記録対象のエージェント作業、サーバー稼働中に検知した外部編集などを、専用のローカル Git 履歴に記録します。差分を開き、対象の変更を取り消せます。既定の保持期間は 90 日で、件数の上限は 2,000 件です。Git の除外設定や生成物の除外も適用されます。
+
+作業フォルダーの通常の Git 履歴には、初期コミットと、明示的な操作やエージェントからの Git 操作で作成したコミットが入ります。保存のたびに通常の Git コミットを作る機能はありません。コミットしていない変更は、記録済みの fuzukue の変更履歴か、作業中のファイルに残ります。エディタで未保存の内容や、サーバー停止中または監視の合間に上書きされ、どちらの履歴にも記録されなかった中間版は履歴から取り戻せません。
+
+### 更新と削除
+
+Mac にログインしている間、fuzukue は約6時間ごとに新しい版を確認し、作業が止まっているときにサーバーとアプリを更新します。開いているアプリは次に開き直すと新しい版になります。今すぐ修復や更新をするには、上の一行をもう一度実行します。このインストーラーで入れた `gh` は、再実行時に新しい公式版が用意されていれば更新するか尋ねます。もともと入っていた `gh` は、その導入方法で更新します。
 
 自動更新を止めるには次を実行します。再開するには `--no-auto-update` を `--resume-auto-update` に置き換えます。
 
@@ -20,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/momota1029/fuzukue/main/install.sh 
 sh "$HOME/Applications/fuzukue.app/Contents/Resources/install.sh" --no-auto-update
 ```
 
-削除するときは fuzukue を閉じて、ターミナルで次を実行します。アプリ、サーバー、起動と更新の登録を削除し、作業フォルダー、履歴、設定、会話用ツールは保持します。
+削除するときは fuzukue を閉じて、ターミナルで次を実行します。アプリ、サーバー、起動と更新の登録を削除し、作業フォルダー、履歴、設定、会話用ツール、GitHub CLI は保持します。
 
 ```sh
 sh "$HOME/Applications/fuzukue.app/Contents/Resources/install.sh" --uninstall

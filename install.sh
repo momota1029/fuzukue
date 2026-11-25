@@ -30,7 +30,7 @@ install_fuzukue() (
         esac
         shift
     done
-    if [ -z "$fixture" ] && { "$stage_only" || [ "$port" != 7878 ]; }; then
+    if [ -z "$fixture" ] && { "$stage_only" || "$skip_agents" || [ "$port" != 7878 ]; }; then
         usage >&2
         exit 2
     fi
@@ -67,8 +67,12 @@ install_fuzukue() (
     domain="gui/$uid"
     endpoint="http://127.0.0.1:$port"
     support_script="$app/Contents/Resources/install.sh"
+    gh_bin="$base/bin"
     if [ -n "$fixture" ]; then
         fixture=$(cd "$fixture" && pwd -P) || exit 2
+    else
+        # Use the same system developer-tools selection as the LaunchAgent.
+        unset DEVELOPER_DIR
     fi
 
     local_error() {
@@ -382,6 +386,7 @@ PACKAGES
         # Store only absolute entries. Preserve paths such as nvm and Volta for the GUI session.
         path="$1:$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$HOME/.volta/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
         cli_path=
+        if [ -x "$gh_bin/gh" ]; then cli_path=$gh_bin; fi
         while [ -n "$path" ]; do
             dir=${path%%:*}
             case $path in *:*) path=${path#*:} ;; *) path= ;; esac
@@ -390,11 +395,11 @@ PACKAGES
             esac
         done
     }
-    probe_login() {
+    probe_cli() {
         backend=$1
         shift
         (
-            PATH="$app/Contents/Resources/bin:$cli_path"
+            PATH="${bundle:-$app}/Contents/Resources/bin:$cli_path"
             export PATH
             command "$backend" "$@" </dev/null >/dev/null 2>&1 &
             probe=$!
@@ -408,7 +413,7 @@ PACKAGES
         )
     }
     login_hint() {
-        if probe_login claude auth status || probe_login codex login status; then return 1; fi
+        if probe_cli claude auth status || probe_cli codex login status; then return 1; fi
         if (PATH=$cli_path command -v claude >/dev/null); then
             say '会話を始めるには、ターミナルで次の行を実行して自分のアカウントでログインしてください。' \
                 'To start a conversation, run this line in Terminal and sign in to your account.'
@@ -422,45 +427,176 @@ PACKAGES
                 'To start a conversation, run the install command again and choose Claude Code or Codex.'
         fi
     }
-    git_hint() {
-        (PATH="$app/Contents/Resources/bin:$cli_path" "$app/Contents/Resources/bin/git" --version >/dev/null 2>&1) &&
-            return 1
-        say '変更履歴、取り消し、Git を使う差分確認は利用できません。有効にするには、ターミナルで xcode-select --install を実行してください。' \
-            'Change history, undo, and Git-based diff previews are unavailable. To enable them, run xcode-select --install in Terminal.'
+    ask() {
+        answer=
+        ( : </dev/tty ) 2>/dev/null || return 1
+        say "$@" >/dev/tty && IFS= read -r answer </dev/tty
     }
-    offer_cli() {
-        "$skip_agents" && return 0
-        if (PATH=$cli_path command -v claude >/dev/null) || (PATH=$cli_path command -v codex >/dev/null); then
-            return 0
+    yes_answer() { case $answer in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac; }
+
+    git_hint() {
+        (PATH=$cli_path "$app/Contents/Resources/bin/git" --version >/dev/null 2>&1) && return 1
+        say '変更履歴と取り消しには Git が必要です。ターミナルでインストールコマンドをもう一度実行してください。' \
+            'Change history and undo require Git. Run the install command again in Terminal.'
+    }
+    require_git() {
+        git_guard="$bundle/Contents/Resources/bin/git"
+        (PATH=$cli_path "$git_guard" --version >/dev/null 2>&1) && return 0
+        if ask '原稿の変更履歴を残すには Git が必要です。Apple のコマンドラインツールを入れますか？ macOS の画面が開き、インストールにしばらくかかります。［y: 開く / Enter: 終了］' \
+            'Git protects your manuscript history. Install Apple’s command line tools? A macOS dialog will open, and installation may take a while. [y: open / Enter: exit]' &&
+            yes_answer; then
+            if xcode-select --install </dev/null; then
+                fail 'macOS の画面で「インストール」を選んでください。導入が終わったら、ターミナルで同じ fuzukue のインストールコマンドをもう一度実行してください。' \
+                     'Choose Install in the macOS dialog. When it finishes, run the same fuzukue install command again in Terminal.'
+            fi
+            fail 'Apple のインストール画面を開けませんでした。実行中の導入があれば完了を待ち、同じコマンドをもう一度実行してください。' \
+                 'The Apple installer could not be opened. If installation is already running, let it finish and run the same command again.'
         fi
-        if ! ( : </dev/tty ) 2>/dev/null; then return 0; fi
-        say '会話に使う公式ツールを選べます。1: Claude Code、2: Codex、Enter: あとで' \
-            'Choose an official tool for conversations. 1: Claude Code, 2: Codex, Enter: later.' >/dev/tty
-        IFS= read -r choice </dev/tty || return 0
-        case $choice in
-            1) url=https://claude.ai/install.sh; shell=/bin/bash ;;
-            2) url=https://chatgpt.com/codex/install.sh; shell=/bin/sh ;;
-            *) return 0 ;;
+        fail 'Git が必要です。Mac の「ターミナル」で同じインストールコマンドを実行し、Apple のツールの導入を選んでください。' \
+             'Git is required. Run the same install command in the Mac Terminal and choose to install Apple’s tools.'
+    }
+    setup_project_git() (
+        PATH="$bundle/Contents/Resources/bin:$cli_path"
+        export PATH
+        # Ignore Git context inherited from the folder where the installer was invoked.
+        git_env_keys=$(git rev-parse --local-env-vars) || local_error
+        for git_env_key in $git_env_keys; do unset "$git_env_key"; done
+        unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+        unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL
+        cd "$project" || local_error
+        if [ ! -e .git ] && [ ! -L .git ]; then
+            git init --quiet --template= || local_error
+        fi
+        # Compare physical paths on macOS, including when HOME is reached via a symlink.
+        repo_root=$(git rev-parse --show-toplevel) || local_error
+        [ "$(cd "$repo_root" && pwd -P)" = "$(pwd -P)" ] || local_error
+        if [ -z "$(git config --get user.name)" ]; then
+            ask '履歴に表示する名前を入力してください。ニックネームでもかまいません。' \
+                'Enter the name to show in Git history. A nickname is fine.' || answer=
+            case $answer in
+                *[![:space:]]*) git config --local --replace-all -- user.name "$answer" || local_error ;;
+                *) fail '履歴に表示する名前が必要です。ターミナルで同じインストールコマンドをもう一度実行してください。' \
+                        'Git needs a display name. Run the same install command again in Terminal.' ;;
+            esac
+        fi
+        if [ -z "$(git config --get user.email)" ]; then
+            git config --local --replace-all user.email fuzukue@users.noreply.invalid || local_error
+        fi
+        if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+            # Establish a baseline without sweeping up existing files or staged work.
+            git -c core.hooksPath=/dev/null -c commit.gpgsign=false commit --quiet \
+                --only --allow-empty -m 'Initialize fuzukue project' </dev/null || local_error
+            git rev-parse --verify HEAD >/dev/null || local_error
+        fi
+    )
+
+    gh_version_of() {
+        gh_version_output=$(GH_NO_UPDATE_NOTIFIER=1 "$1" --version </dev/null 2>/dev/null) || return 1
+        printf '%s\n' "$gh_version_output" | awk '
+            NR == 1 && $1 == "gh" && $2 == "version" && $3 ~ /^[0-9]+[.][0-9]+[.][0-9]+$/ { print $3; found=1 }
+            END { exit !found }'
+    }
+    require_gh() {
+        # Update the version and both SHA-256 digests together from cli/cli's release.
+        gh_version=2.105.0
+        case $platform in
+            macos-aarch64) gh_arch=arm64; gh_sha=2a5d03103ae444927383b93d9ffd65579a26e2eb900ce1cf11f55258d5319ded ;;
+            macos-x86_64) gh_arch=amd64; gh_sha=23602cbccbbdc6285a8520745b714cb927ce2ca621779373c2a20cd8e33fda66 ;;
         esac
-        if ! fetch "$url" "$work/provider.sh" ||
-            ! (PATH="$bundle/Contents/Resources/bin:$cli_path" "$shell" "$work/provider.sh" </dev/tty); then
-            say '会話用ツールを入れられませんでした。あとで同じインストールコマンドからもう一度試せます。' \
-                'The conversation tool could not be installed. Run the same install command to try again later.'
+        gh_command=$(PATH=$cli_path command -v gh) || gh_command=
+        gh_installed=
+        if [ -n "$gh_command" ]; then gh_installed=$(gh_version_of "$gh_command") || gh_installed=; fi
+        if [ -n "$gh_installed" ]; then
+            [ "$gh_command" = "$gh_bin/gh" ] || return 0
+            if awk -v have="$gh_installed" -v want="$gh_version" 'BEGIN {
+                split(have, h, "."); split(want, w, ".")
+                for (i = 1; i <= 3; i++) if (h[i]+0 != w[i]+0) exit !(h[i]+0 > w[i]+0)
+            }'; then return 0; fi
+            ask "GitHub CLI を公式版 $gh_version に更新しますか？［y: 更新 / Enter: あとで］" \
+                "Update GitHub CLI to official version $gh_version? [y: update / Enter: later]" &&
+                yes_answer || return 0
+        else
+            if ! ask "GitHub に要望や変更を送るための GitHub CLI（gh）を入れますか？ 公式版 $gh_version をホームに入れます。［y: インストール / Enter: 終了］" \
+                "Install GitHub CLI (gh) so you can send requests and proposed changes to GitHub? Official version $gh_version will be installed in your home folder. [y: install / Enter: exit]" ||
+                ! yes_answer; then
+                fail 'GitHub CLI（gh）が必要です。ターミナルで同じインストールコマンドを実行し、導入を選んでください。' \
+                     'GitHub CLI (gh) is required. Run the same install command in Terminal and choose to install it.'
+            fi
         fi
+        gh_package="gh_${gh_version}_macOS_$gh_arch"
+        if [ -n "$fixture" ]; then
+            cp "$fixture/gh/$gh_package.zip" "$work/gh.zip" &&
+                IFS= read -r gh_sha < "$fixture/gh/$gh_package.sha256" || network_error
+        else
+            fetch "https://github.com/cli/cli/releases/download/v$gh_version/$gh_package.zip" "$work/gh.zip" || network_error
+        fi
+        if [ "$(checksum "$work/gh.zip")" != "$gh_sha" ] ||
+            ! unzip -p "$work/gh.zip" "$gh_package/bin/gh" > "$transaction/gh" ||
+            ! chmod 755 "$transaction/gh" ||
+            [ "$(gh_version_of "$transaction/gh")" != "$gh_version" ]; then
+            fail 'GitHub CLI の配布ファイルを確認できませんでした。同じインストールコマンドをもう一度実行してください。' \
+                 'The GitHub CLI download could not be verified. Run the same install command again.'
+        fi
+        [ ! -L "$gh_bin" ] && [ ! -d "$gh_bin/gh" ] &&
+            mkdir -p "$gh_bin" && mv -f "$transaction/gh" "$gh_bin/gh" || local_error
+        cli_path_for "$cli_path"
+    }
+    gh_hint() {
+        gh_command=$(PATH=$cli_path command -v gh) || {
+            say 'GitHub CLI（gh）が見つかりません。ターミナルで fuzukue のインストールコマンドをもう一度実行してください。' \
+                'GitHub CLI (gh) is missing. Run the fuzukue install command again in Terminal.'
+            return 0
+        }
+        (unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_CONFIG_DIR
+         export GH_PROMPT_DISABLED=1
+         probe_cli gh auth status --hostname github.com) && return 1
+        say '原稿を読んだり書いたりするだけなら、GitHub へのログインはあとでかまいません。要望やプルリクエストを送るときは、ターミナルで次の行を実行し、表示されたコードを使ってブラウザで自分の GitHub アカウントにログインしてください。' \
+            'You can read and write locally before signing in to GitHub. To send requests or pull requests, run this line in Terminal and use the displayed code to sign in with your own GitHub account in the browser.'
+        if [ "$gh_command" = "$gh_bin/gh" ]; then
+            printf '%s\n' '"$HOME/Library/Application Support/fuzukue/desktop-install/bin/gh" auth login --hostname github.com --git-protocol https --web'
+        else
+            # The resolved tool may be outside the login shell's PATH.
+            quoted_gh=$(printf '%s\n' "$gh_command" | sed "s/'/'\\\\''/g")
+            printf "'%s' auth login --hostname github.com --git-protocol https --web\n" "$quoted_gh"
+        fi
+    }
+
+    require_cli() {
+        "$skip_agents" && return 0
+        if probe_cli claude --version || probe_cli codex --version; then return 0; fi
+        if ask '会話に使う公式ツールを選んでください。［1: Claude Code / 2: Codex / Enter: 終了］' \
+            'Choose an official tool for conversations. [1: Claude Code / 2: Codex / Enter: exit]'; then
+            case $answer in
+                1) url=https://claude.ai/install.sh; shell=/bin/bash; provider=claude ;;
+                2) url=https://chatgpt.com/codex/install.sh; shell=/bin/sh; provider=codex ;;
+                *) provider= ;;
+            esac
+            if [ -n "$provider" ] &&
+                { if [ -n "$fixture" ]; then cp "$fixture/$provider.sh" "$work/provider.sh"; else fetch "$url" "$work/provider.sh"; fi; } &&
+                (PATH="$bundle/Contents/Resources/bin:$cli_path" "$shell" "$work/provider.sh" </dev/tty) &&
+                probe_cli "$provider" --version; then
+                return 0
+            fi
+        fi
+        fail '会話には Claude Code か Codex が必要です。ターミナルで同じインストールコマンドをもう一度実行してください。' \
+             'Claude Code or Codex is required for conversations. Run the same install command again in Terminal.'
     }
 
     if [ "$mode" = guide ]; then
         saved_path=
         if [ -f "$base/cli-path" ]; then IFS= read -r saved_path < "$base/cli-path" || :; fi
         cli_path_for "$saved_path"
-        login=$(login_hint) || login=
-        git=$(git_hint) || git=
-        [ -n "$login$git" ] || exit 0
-        if [ -n "$login" ] && [ -n "$git" ]; then
-            message=$(printf '%s\n\n%s' "$login" "$git")
-        else
-            message="$login$git"
-        fi
+        message=
+        for hint in login_hint git_hint gh_hint; do
+            if guidance=$("$hint"); then
+                if [ -n "$message" ]; then
+                    message=$(printf '%s\n\n%s' "$message" "$guidance")
+                else
+                    message=$guidance
+                fi
+            fi
+        done
+        [ -n "$message" ] || exit 0
         if "$stage_only"; then printf '%s\n' "$message"; exit 0; fi
         osascript - "$message" >/dev/null <<'APPLESCRIPT'
 on run argv
@@ -584,8 +720,15 @@ APPLESCRIPT
 
     saved_path=
     if [ -f "$base/cli-path" ]; then IFS= read -r saved_path < "$base/cli-path" || :; fi
-    if [ "$mode" = install ]; then cli_path_for "$incoming_path:$saved_path"; else cli_path_for "$saved_path"; fi
-    if [ "$mode" = install ]; then offer_cli; fi
+    if [ "$mode" = install ]; then
+        cli_path_for "$incoming_path:$saved_path"
+        require_git
+        require_gh
+        require_cli
+        setup_project_git || exit 1
+    else
+        cli_path_for "$saved_path"
+    fi
     printf '%s\n' "$cli_path" > "$transaction/cli-path" || local_error
     printf '%s\n' "$tag" > "$transaction/release" || local_error
     mv "$bundle" "$app_stage/fuzukue.app" && mv "$work/secretaire" "$transaction/secretaire" || local_error
@@ -633,9 +776,11 @@ APPLESCRIPT
     rollback=false
 
     if [ "$mode" = install ]; then
+        bundle=$app
         say 'インストールできました。ホームの「アプリケーション」にある fuzukue を開けます。' \
             'fuzukue is installed. Open it from Applications in your home folder.'
-        if ! "$skip_agents"; then login_hint || :; git_hint || :; fi
+        if ! "$skip_agents"; then login_hint || :; fi
+        gh_hint || :
         if [ -z "$fixture" ]; then
             open "$app" >/dev/null 2>&1 ||
                 say 'Finder の「アプリケーション」から fuzukue を開いてください。' \
