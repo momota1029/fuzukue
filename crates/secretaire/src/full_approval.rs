@@ -145,33 +145,18 @@ pub(crate) async fn wait_for_end(lease: Option<(FullApprovalMode, tokio::sync::w
 
 /// The producer pins any preconditions in `args` and supplies a display-safe scope.
 /// A duplicated claim never restarts an operation whose outcome may be unknown.
-pub(crate) fn authorize(
-    hub: &Hub,
-    owner: ApprovalOwner,
-    tool: &str,
-    risk: ApprovalRisk,
-    args: Value,
-    scope: Value,
-) -> Result<bool> {
-    match claim(hub, owner, tool, risk, args, scope)? {
+pub(crate) fn authorize(hub: &Hub, registration: Registration) -> Result<bool> {
+    match hub.authorize_full_approval(registration)? {
         FullAuthorization::Human => Ok(false),
         FullAuthorization::Granted => Ok(true),
         FullAuthorization::AlreadyConsumed => bail!("This full approval was already consumed. Check the original operation before retrying."),
     }
 }
 
-fn claim(
-    hub: &Hub,
-    owner: ApprovalOwner,
-    tool: &str,
-    risk: ApprovalRisk,
-    args: Value,
-    scope: Value,
-) -> Result<FullAuthorization> {
-    if crate::canary() {
-        return Ok(FullAuthorization::Human);
-    }
-    let request = Registration {
+pub(crate) fn registration(
+    owner: ApprovalOwner, tool: &str, risk: ApprovalRisk, args: Value, scope: Value,
+) -> Registration {
+    Registration {
         owner,
         risk,
         unattended: ApprovalUnattended::DeferAndContinue,
@@ -180,8 +165,7 @@ fn claim(
         action: Action { tool: tool.into(), args, scope: scope.clone() },
         display_args: json!("[redacted]"),
         display_scope: scope,
-    };
-    hub.authorize_full_approval(request)
+    }
 }
 
 pub(crate) fn authorize_worker(
@@ -193,8 +177,13 @@ pub(crate) fn authorize_worker(
     request: &str,
     input: &Value,
 ) -> Result<FullAuthorization> {
-    claim(
-        hub,
+    hub.authorize_full_approval(worker_registration(session, job, backend, tool, request, input))
+}
+
+pub(crate) fn worker_registration(
+    session: &str, job: &str, backend: &str, tool: &str, request: &str, input: &Value,
+) -> Registration {
+    registration(
         ApprovalOwner { thread: session.into(), job: job.into(), requester: backend.into() },
         tool,
         ApprovalRisk::High,
@@ -205,15 +194,14 @@ pub(crate) fn authorize_worker(
 
 /// Backends using their native bypass mode report tool starts instead of approval RPCs.
 pub(crate) fn observe_worker_tool(hub: &Hub, session: &str, job: &str, backend: &str, tool: &str, id: &str) {
-    let result = claim(
-        hub,
+    let request = registration(
         ApprovalOwner { thread: session.into(), job: job.into(), requester: backend.into() },
         tool,
         ApprovalRisk::High,
         json!({"item": id}),
         json!({"backend": backend, "native": true}),
     );
-    if let Err(error) = result {
+    if let Err(error) = hub.authorize_full_approval(request) {
         tracing::warn!(%error, %job, %tool, "Could not record native full approval");
     }
 }

@@ -4,10 +4,10 @@ use std::time::Instant;
 use anyhow::{ensure, Context, Result};
 use fuzukue_proto::{
     Actor, FolderGrant, FolderGrantExpiry, FolderGrantRead, LocalizedMessage, ServerEvent,
-    FOLDER_ACCESS_REQUEST,
+    FOLDER_ACCESS_REQUEST, ApprovalRisk,
 };
 
-use super::{ApprovalWaiter, Hub, Inner, PendingApproval};
+use super::{ApprovalWaiter, Hub, Inner, PendingApproval, approval_store::Registration};
 use crate::folder_grants::{canonical_folder, Store};
 
 impl Inner {
@@ -51,20 +51,80 @@ fn request(approval: &PendingApproval) -> Option<(&str, &str)> {
     .then_some((session.as_str(), message.args.get("path")?.as_str()))
 }
 
+pub(super) fn full_registration(session: &str, job: Option<&str>, folder: &str, request: &str) -> Registration {
+    let mut owner = crate::full_approval::desk_owner(session);
+    if let Some(job) = job {
+        owner.job = job.into();
+        owner.requester = "worker".into();
+    }
+    crate::full_approval::registration(
+        owner, "folder_read", ApprovalRisk::Mid,
+        serde_json::json!({"expiry": "one_hour", "request": request}),
+        serde_json::json!({"folder": folder}),
+    )
+}
+
+pub(crate) enum AccessRequest {
+    Granted(String),
+    Pending(String),
+}
+
 impl Hub {
+    pub(super) fn plan_folder_sweep(&self, inner: &Inner) -> (Vec<FolderGrant>, Vec<String>) {
+        let mut grants = Vec::new();
+        let mut invalid = Vec::new();
+        let Ok(store) = inner.folder_store() else { return (grants, invalid) };
+        let protected = store.protected();
+        let now = chrono::Utc::now().timestamp_millis();
+        for (id, pending) in &inner.approvals {
+            let Some((session, path)) = request(pending) else { continue };
+            if !inner.live_thread(session)
+                || !canonical_folder(Path::new(path), &protected).is_ok_and(|folder| folder == path)
+                || store.active(session, now, inner.current_turn(session)).count()
+                    + grants.iter().filter(|grant: &&FolderGrant| grant.session == session).count() >= 100
+            {
+                invalid.push(id.clone());
+                continue;
+            }
+            grants.push(FolderGrant {
+                id: id.clone(),
+                session: session.into(),
+                path: path.into(),
+                expiry: FolderGrantExpiry::OneHour,
+                expires_at: Some(now + 60 * 60 * 1000),
+                granted_by: "full_mode".into(),
+            });
+        }
+        (grants, invalid)
+    }
+
+    pub(super) fn apply_folder_sweep(&self, inner: &mut Inner, grants: &[FolderGrant]) -> Result<Vec<String>> {
+        let protected = inner.folder_store()?.protected();
+        let now = chrono::Utc::now().timestamp_millis();
+        let live: Vec<_> = grants.iter().filter(|grant| {
+            inner.live_thread(&grant.session)
+                && grant.expires_at.is_none_or(|expiry| now < expiry)
+                && canonical_folder(Path::new(&grant.path), &protected).is_ok_and(|folder| folder == grant.path)
+        }).collect();
+        inner.folder_store_mut()?.apply_full_sweep(&live)?;
+        Ok(live.into_iter().map(|grant| grant.id.clone()).collect())
+    }
+
     /// Issue a one-hour grant for the exact folder of the current read. The worker
     /// caller receives this ID for its retry; its assignment grants stay unchanged.
     pub(crate) fn auto_folder_access(&self, session: &str, job: Option<&str>, path: &Path) -> Result<Option<String>> {
-        // Preserve the existing lock order: queue state is acquired under the Hub lock.
         let mut inner = self.inner.lock().unwrap();
+        self.auto_folder_access_locked(&mut inner, session, job, path)
+    }
+
+    fn auto_folder_access_locked(&self, inner: &mut Inner, session: &str, job: Option<&str>, path: &Path) -> Result<Option<String>> {
+        if crate::canary() {
+            return Ok(None);
+        }
+        self.finish_folder_sweep_locked(inner)?;
         let Some((mode, changes)) = self.full_approval_lease()? else { return Ok(None) };
         ensure!(inner.live_thread(session), "Thread is archived or missing");
         let folder = canonical_folder(path, &inner.folder_store()?.protected())?;
-        let mut owner = crate::full_approval::desk_owner(session);
-        if let Some(job) = job {
-            owner.job = job.into();
-            owner.requester = "worker".into();
-        }
         let turn = inner.current_turn(session);
         let grant = inner.folder_store()?.active(session, chrono::Utc::now().timestamp_millis(), turn)
             .find(|grant| grant.path == folder && grant.granted_by == "full_mode");
@@ -78,27 +138,27 @@ impl Hub {
             }
             grant.id.clone()
         } else {
-            if !crate::full_approval::authorize(
-                self, owner, "folder_read", fuzukue_proto::ApprovalRisk::Mid,
-                serde_json::json!({"expiry": "one_hour"}),
-                serde_json::json!({"folder": folder}),
-            )? {
+            let full = full_registration(session, job, &folder, &crate::mail::session_key());
+            if !crate::full_approval::authorize(self, full)? {
                 return Ok(None);
             }
-            self.add_folder_grant_locked(&mut inner, session, folder, FolderGrantExpiry::OneHour, "full_mode")?.id
+            self.add_folder_grant_locked(inner, session, folder, FolderGrantExpiry::OneHour, "full_mode")?.id
         };
         Ok(Some(id))
     }
 
-    pub(crate) fn request_folder_access(&self, session: &str, path: &Path) -> Result<String> {
+    pub(crate) fn request_folder_access(&self, session: &str, path: &Path) -> Result<AccessRequest> {
         let mut inner = self.inner.lock().unwrap();
+        if let Some(id) = self.auto_folder_access_locked(&mut inner, session, None, path)? {
+            return Ok(AccessRequest::Granted(id));
+        }
         ensure!(inner.live_thread(session), "Thread is archived or missing");
         let folder = canonical_folder(path, &inner.folder_store()?.protected())?;
         let mut pending = 0;
         for (id, approval) in &inner.approvals {
             if let Some((_, path)) = request(approval).filter(|(owner, _)| *owner == session) {
                 if path == folder {
-                    return Ok(id.clone());
+                    return Ok(AccessRequest::Pending(id.clone()));
                 }
                 pending += 1;
             }
@@ -122,7 +182,7 @@ impl Hub {
             None,
             ApprovalWaiter::Folder,
         );
-        Ok(request_id)
+        Ok(AccessRequest::Pending(request_id))
     }
 
     pub(crate) fn decide_folder_access(
@@ -132,6 +192,7 @@ impl Hub {
         principal: &str,
     ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        self.finish_folder_sweep_locked(&mut inner)?;
         let (session, path) = inner
             .approvals
             .get(request_id)
@@ -233,11 +294,9 @@ impl Hub {
     }
 
     pub(crate) fn revoke_folder_grant(&self, session: &str, id: &str) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .folder_store_mut()?
-            .revoke(session, id)?;
+        let mut inner = self.inner.lock().unwrap();
+        self.finish_folder_sweep_locked(&mut inner)?;
+        inner.folder_store_mut()?.revoke(session, id)?;
         let _ = self
             .tx
             .send(crate::snapshot(ServerEvent::FolderGrantsChanged {
@@ -303,6 +362,7 @@ impl Hub {
         session: &str,
         trash: bool,
     ) -> Result<()> {
+        self.finish_folder_sweep_locked(inner)?;
         inner.folder_store_mut()?.end_thread(session, trash)?;
         self.close_approvals(inner, "cancelled", |approval| {
             request(approval).is_some_and(|(owner, _)| owner == session)

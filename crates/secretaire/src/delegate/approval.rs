@@ -152,21 +152,12 @@ where
         let path = checked_read(tool, input, human_only, &scope.root, &protected_roots(&app.state_dir))?;
         Some((scope, path))
     };
-    if let Some((scope, canonical)) = path() {
-        let approval_owner = fuzukue_proto::ApprovalOwner {
-            thread: owner.session.clone(), job: owner.job.clone(), requester: "claude".into(),
-        };
-        if crate::full_approval::authorize(
-            &app.hub, approval_owner, "Read", fuzukue_proto::ApprovalRisk::Low,
-            json!({"fingerprint": crate::full_approval::fingerprint(input), "request": owner.backend_id}),
-            json!({"worktree": scope.root, "path": canonical.strip_prefix(&scope.root)?}),
-        )? {
-            return Ok("accept".into());
-        }
-    }
+    let full = crate::full_approval::worker_registration(
+        &owner.session, &owner.job, "claude", tool, &owner.backend_id, input,
+    );
     // Register the human waiter before invoking the legacy advisor.
-    let (wait, mut reply) = super::open_approval(app, &owner.session, &owner.job, Actor::Claude,
-        format!("{tool} {input}").into(), Some(owner.clone()));
+    let (wait, mut reply) = super::open_approval_with(app, &owner.session, &owner.job, Actor::Claude,
+        format!("{tool} {input}").into(), Some(owner.clone()), None, None, Some(full))?;
     let policy = *app.worker_approval_policy.lock().unwrap();
     if policy != WorkerApprovalPolicy::Ask {
         if let Some((scope, reviewed_path)) = path() {
@@ -284,6 +275,49 @@ mod tests {
         assert!(requests.next().is_none());
         assert!(app.hub.live_approval_threads().contains(SESSION));
         id
+    }
+
+    #[tokio::test]
+    async fn full_sweep_and_human_resolution_share_the_claude_worker_waiter() -> Result<()> {
+        let (_temp, app) = fixture(WorkerApprovalPolicy::Ask)?;
+        let owner = Owner::new(SESSION, JOB, "native-rpc");
+        let input = json!({"command": "printf fixture"});
+        let waiting = request(&app, owner, "Bash", &input, true);
+        tokio::pin!(waiting);
+        assert!(poll!(waiting.as_mut()).is_pending());
+        let id = pending(&app);
+        let mut events = app.hub.subscribe(u64::MAX).1;
+        let barrier = std::sync::Barrier::new(2);
+
+        let denied = std::thread::scope(|threads| -> Result<bool> {
+            let human = threads.spawn(|| {
+                barrier.wait();
+                app.delegates.resolve_approval(&id, "decline", false)
+            });
+            barrier.wait();
+            app.hub.set_full_approval(
+                fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour },
+                &crate::remote::SettingsPrincipal::fixture(),
+            )?;
+            human.join().unwrap()
+        })?;
+        let expected = if denied { "decline" } else { "accept" };
+        assert_eq!(waiting.await?, expected);
+        assert!(!app.delegates.resolve_approval(&id, "accept", false)?);
+        let resolutions = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|env| match env.event {
+                ServerEvent::ApprovalResolved { request_id, decision, automatic } if request_id == id =>
+                    Some((decision, automatic)),
+                _ => None,
+            }).collect::<Vec<_>>();
+        assert_eq!(resolutions, [(expected.into(), !denied)]);
+        let audit = app.hub.full_approval_settings(None)?.audit;
+        assert_eq!(audit.len(), usize::from(!denied));
+        if let Some(entry) = audit.first() {
+            assert_eq!(entry.approval_id, id);
+            assert_eq!(entry.granted_by, "full_mode");
+        }
+        Ok(())
     }
 
     #[cfg(unix)]

@@ -266,6 +266,19 @@ impl Store {
         Ok(grant)
     }
 
+    pub fn apply_full_sweep(&mut self, pending: &[&FolderGrant]) -> Result<()> {
+        let mut grants = self.grants.clone();
+        for &grant in pending {
+            if grants.iter().all(|saved| saved.id != grant.id) {
+                grants.push(grant.clone());
+            }
+        }
+        if grants.len() != self.grants.len() {
+            self.save(grants)?;
+        }
+        Ok(())
+    }
+
     pub fn revoke(&mut self, session: &str, id: &str) -> Result<()> {
         ensure!(
             self.grants

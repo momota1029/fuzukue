@@ -199,6 +199,9 @@ impl Workspace {
         hub.init_approval_queue(id.clone(), &state_dir);
         let research_issues = workshop::Queue::new(&project_dir, &state_dir, &id);
         let saved = hub.load_threads(&project_dir, &state_dir);
+        if let Err(error) = hub.restore_full_approval() {
+            tracing::warn!(%error, workspace = %id, "Could not restore full approvals");
+        }
         let mut workspace = Self {
             usage: Arc::new(Usage::new(hub.clone())),
             session_stats: Arc::default(),

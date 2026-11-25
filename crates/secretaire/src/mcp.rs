@@ -1646,17 +1646,17 @@ async fn call_read_tool(
             let Some(outside) = error.downcast_ref::<crate::folder_grants::OutsideScope>() else {
                 return Err(error);
             };
-            if let Some(id) = app.hub.auto_folder_access(session, job, &outside.0)? {
-                if let Some(job) = job {
+            if let Some(job) = job {
+                if let Some(id) = app.hub.auto_folder_access(session, Some(job), &outside.0)? {
                     app.delegates.workspace_read_scope(job)?;
+                    return tool.call(scope.with_additional_grant(id), args).await;
                 }
-                return tool.call(scope.with_additional_grant(id), args).await;
-            }
-            if job.is_some() {
                 return Err(error);
             }
+            use crate::hub::folder_grants::AccessRequest;
             match app.hub.request_folder_access(session, &outside.0) {
-                Ok(id) => anyhow::bail!(
+                Ok(AccessRequest::Granted(id)) => tool.call(scope.with_additional_grant(id), args).await,
+                Ok(AccessRequest::Pending(id)) => anyhow::bail!(
                     "{error}. Folder access request {id} is pending in the thread's approvals. Ask the user to approve it there, then retry. Delegated workers need the grant ID explicitly listed in their assignment."
                 ),
                 Err(request_error) => anyhow::bail!("{error}. Could not request folder access: {request_error}"),
@@ -1843,10 +1843,13 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         Tool::FolderGrants => {
             // The front desk branch has already authenticated the session in dispatch.
             match parse_args(args)? {
-                FolderGrantAction::Request { path } => match app.hub.auto_folder_access(session, None, &path)? {
-                    Some(id) => json!({"grant_id": id, "status": "granted"}),
-                    None => json!({"request_id": app.hub.request_folder_access(session, &path)?, "status": "pending"}),
-                },
+                FolderGrantAction::Request { path } => {
+                    use crate::hub::folder_grants::AccessRequest;
+                    match app.hub.request_folder_access(session, &path)? {
+                        AccessRequest::Granted(id) => json!({"grant_id": id, "status": "granted"}),
+                        AccessRequest::Pending(id) => json!({"request_id": id, "status": "pending"}),
+                    }
+                }
                 FolderGrantAction::List { audit_before } => {
                     let (grants, audit, audit_before) = app.hub.list_folder_grants(session, audit_before)?;
                     json!({"grants": grants, "audit": audit, "audit_before": audit_before})

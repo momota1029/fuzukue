@@ -347,22 +347,27 @@ async fn approve(
         "github-approve-close" => Some("github_issue_close"),
         _ => None,
     };
-    if let Some(tool) = tool {
+    let full = tool.map(|tool| {
         let args = serde_json::json!(summary.args);
-        if crate::full_approval::authorize(
-            &app.hub,
+        crate::full_approval::registration(
             crate::full_approval::desk_owner(session),
             tool,
             fuzukue_proto::ApprovalRisk::Mid,
             serde_json::json!({"fingerprint": crate::full_approval::fingerprint(&args)}),
             serde_json::json!({"target": args.get("item").or_else(|| args.get("repo"))}),
-        )? {
-            return Ok(());
+        )
+    });
+    if !confirm {
+        // Full mode authorizes this call without an explicit confirmation.
+        if let Some(full) = full {
+            if crate::full_approval::authorize(&app.hub, full)? {
+                return Ok(());
+            }
         }
+        anyhow::bail!("Ask the user first, then set confirm=true");
     }
-    ensure!(confirm, "Ask the user first, then set confirm=true");
     let decision =
-        crate::delegate::request_approval(app, session, APPROVAL, actor, summary).await?;
+        crate::delegate::request_approval_with_full(app, session, APPROVAL, actor, summary, full).await?;
     ensure!(decision == "accept", "The user declined the GitHub change");
     Ok(())
 }

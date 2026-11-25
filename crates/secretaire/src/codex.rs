@@ -150,6 +150,7 @@ struct PendingApproval {
     thread_id: String,
     human_only: bool,
     permissions: Option<Value>,
+    sweepable: bool,
     _alive: Arc<()>,
 }
 
@@ -1085,7 +1086,10 @@ impl Codex {
         }
         let pending = {
             let mut approvals = self.approvals.lock().unwrap();
-            if automatic && approvals.get(request_id).is_some_and(|approval| approval.human_only) {
+            if approvals.get(request_id).is_some_and(|approval| {
+                automatic && approval.human_only
+                    || approval.sweepable && !self.hub.claim_legacy_approval(request_id)
+            }) {
                 return Ok(false);
             }
             approvals.remove(request_id)
@@ -1109,20 +1113,24 @@ impl Codex {
         self.approvals.lock().unwrap().retain(|request, approval| {
             let matches = thread.is_none_or(|thread| approval.thread_id == thread)
                 && rpc_id.is_none_or(|id| &approval.rpc_id == id);
-            if matches {
+            if matches && (!approval.sweepable || self.hub.claim_legacy_approval(request)) {
                 self.approval_cancelled(request.clone());
             }
             !matches
         });
     }
 
-    fn register_approval(&self, thread_id: &str, rpc_id: Value, summary: fuzukue_proto::LocalizedMessage, permissions: Option<Value>) {
+    fn register_approval(
+        self: &Arc<Self>, thread_id: &str, rpc_id: Value, summary: fuzukue_proto::LocalizedMessage,
+        permissions: Option<Value>, full: Option<crate::hub::approval_store::Registration>,
+    ) -> Result<crate::hub::approval_store::FullAuthorization> {
+        use crate::hub::approval_store::FullAuthorization::*;
         let threads = self.threads.lock().unwrap();
-        let Some(thread) = threads.get(thread_id) else { return };
+        let Some(thread) = threads.get(thread_id) else { return Ok(AlreadyConsumed) };
         let mut approvals = self.approvals.lock().unwrap();
         if approvals.values().any(|pending| pending.rpc_id == rpc_id) {
             tracing::warn!(%rpc_id, "Codex reused a pending approval RPC ID");
-            return;
+            return Ok(AlreadyConsumed);
         }
         let actor = Actor::Codex { thread_id: thread_id.into(), parent_tool_use: thread.parent_tool_use.clone() };
         // The authenticated app-server binding identifies the worker. Even a literal
@@ -1131,14 +1139,43 @@ impl Codex {
         let prefix = if worker { WORKER_APPROVAL_PREFIX } else { "codex-" };
         let request_id = format!("{prefix}{}", crate::mail::session_key());
         let alive = Arc::new(());
-        approvals.insert(request_id.clone(), PendingApproval {
-            rpc_id, thread_id: thread_id.into(), human_only: worker || thread.partner.is_some(),
-            permissions, _alive: alive.clone(),
-        });
-        self.hub.publish_local_approval(ServerEvent::ApprovalRequested {
-            session: thread.session.clone(), request_id, actor,
+        let event = ServerEvent::ApprovalRequested {
+            session: thread.session.clone(), request_id: request_id.clone(), actor,
             summary: crate::l10n::render(fuzukue_i18n::Locale::JAPANESE, &summary), localized: Some(summary), shell_directory: None, shell_prefix: None,
-        }, &alive);
+        };
+        let sweepable = full.is_some();
+        if let Some(registration) = full {
+            let backend = Arc::downgrade(self);
+            let resume_id = request_id.clone();
+            let reply_id = rpc_id.clone();
+            let reply_permissions = permissions.clone();
+            let runtime = tokio::runtime::Handle::current();
+            let authorization = self.hub.publish_sweepable_approval(event, Arc::downgrade(&alive), registration, move |granted| {
+                runtime.spawn(async move {
+                    if let Some(backend) = backend.upgrade() {
+                        backend.finish_full_approval(&resume_id, reply_id, reply_permissions, granted).await;
+                    }
+                });
+            })?;
+            if authorization != Human {
+                return Ok(authorization);
+            }
+        } else {
+            self.hub.publish_local_approval(event, &alive);
+        }
+        approvals.insert(request_id, PendingApproval {
+            rpc_id, thread_id: thread_id.into(), human_only: worker || thread.partner.is_some(),
+            permissions, sweepable, _alive: alive,
+        });
+        Ok(Human)
+    }
+
+    async fn finish_full_approval(&self, request: &str, rpc_id: Value, permissions: Option<Value>, granted: bool) {
+        self.approvals.lock().unwrap().remove(request);
+        let result = approval_result(permissions, if granted { "accept" } else { "decline" });
+        if let Err(error) = self.write(json!({ "jsonrpc": "2.0", "id": rpc_id, "result": result })).await {
+            tracing::warn!(%error, request, "Could not deliver a full approval to Codex");
+        }
     }
 
     fn thread_context(&self, thread_id: &str) -> Option<(String, Actor, bool)> {
@@ -1200,10 +1237,13 @@ impl Codex {
             )),
             _ => None,
         };
+        let mut full = None;
         if let (Some(_), Some((session, Actor::Codex { parent_tool_use: Some(job), .. }, false))) = (&summary, &thread) {
             let execution = self.threads.lock().unwrap().get(thread_id).and_then(|thread| thread.worker_execution);
             let request = format!("{thread_id}:{id}");
-            let decision = crate::full_approval::authorize_worker(&self.hub, session, job, "codex", method, &request, p);
+            let registration = crate::full_approval::worker_registration(session, job, "codex", method, &request, p);
+            let decision = self.hub.authorize_full_approval(registration.clone());
+            full = Some(registration);
             use crate::hub::approval_store::FullAuthorization::*;
             let accept = match decision {
                 Ok(Granted) => Some(true),
@@ -1225,7 +1265,19 @@ impl Codex {
             (Some(_), Some((_, _, true))) => {
                 let _ = self.write(json!({ "jsonrpc": "2.0", "id": id, "result": { "decision": "decline" } })).await;
             }
-            (Some(summary), Some((_, _, false))) => self.register_approval(thread_id, id, summary, permissions),
+            (Some(summary), Some((_, _, false))) => {
+                use crate::hub::approval_store::FullAuthorization::*;
+                let accept = match self.register_approval(thread_id, id.clone(), summary, permissions.clone(), full) {
+                    Ok(Human | AlreadyConsumed) => return,
+                    Ok(Granted) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, thread_id, "Codex approval could not be registered");
+                        false
+                    }
+                };
+                let result = approval_result(permissions, if accept { "accept" } else { "decline" });
+                let _ = self.write(json!({ "jsonrpc": "2.0", "id": id, "result": result })).await;
+            }
             _ => {
                 // 扱えない要求は断る（放っておくと Codex が止まったままになる）。
                 let _ = self
@@ -1743,19 +1795,33 @@ mod tests {
         assert!(codex.resolve(&request_id, "decline", false).await?);
         codex.close_worker(&legacy).await;
 
-        // The same native request when full approval is active sends one reply.
+        // Resolve a live RPC under full mode, then replay it after changing leases.
         hub.init_approval_queue("fixture".into(), project.path());
-        hub.set_full_approval(
-            fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour },
-            &crate::remote::SettingsPrincipal::fixture(),
-        )?;
+        let change = fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour };
+        let principal = crate::remote::SettingsPrincipal::fixture();
         let full = codex.start_thread("owner", Some("delegate:full".into()), None).await?;
         let push = json!({"threadId": full, "command": "git push", "cwd": project.path()});
         codex.on_server_request(method, json!(94), &push).await;
+        let ServerEvent::ApprovalRequested { request_id: swept, .. } = requests.recv().await?.event else {
+            bail!("expected a pending Codex approval before enable");
+        };
+        hub.set_full_approval(change.clone(), &principal)?;
+        assert!(matches!(requests.recv().await?.event, ServerEvent::ApprovalResolved {
+            request_id, decision, automatic: true,
+        } if request_id == swept && decision == "accept"));
+        assert!(!codex.resolve(&swept, "decline", false).await?);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while codex.approvals.lock().unwrap().contains_key(&swept) {
+                tokio::task::yield_now().await;
+            }
+        }).await?;
+        hub.set_full_approval(fuzukue_proto::FullApprovalChange::Off, &principal)?;
+        hub.set_full_approval(change, &principal)?;
         codex.on_server_request(method, json!(94), &push).await;
         assert!(hub.live_approval_threads().is_empty());
         let audit = hub.full_approval_settings(None)?.audit;
         assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].approval_id, swept);
         assert_eq!(audit[0].granted_by, "full_mode");
         assert_eq!(audit[0].action.args, "[redacted]");
         codex.close_worker(&full).await;

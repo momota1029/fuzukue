@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::questions::{self, QuestionReply};
 
 mod notifications;
-mod folder_grants;
+pub(crate) mod folder_grants;
 mod approval_queue;
 pub(crate) mod approval_store;
 
@@ -82,6 +82,7 @@ struct PendingApproval {
     envelope: Envelope,
     observed: Observed,
     waiter: ApprovalWaiter,
+    full: Option<approval_queue::LegacyFullApproval>,
 }
 
 struct Observed {
@@ -1038,7 +1039,7 @@ fn observe_approval(inner: &mut Inner, envelope: &Envelope, waiter: ApprovalWait
     match &envelope.event {
         ServerEvent::ApprovalRequested { request_id, .. } => {
             inner.approvals.insert(request_id.clone(), PendingApproval {
-                envelope: envelope.clone(), observed: Observed::now(), waiter,
+                envelope: envelope.clone(), observed: Observed::now(), waiter, full: None,
             });
         }
         ServerEvent::ApprovalResolved { request_id, .. } => {

@@ -1,16 +1,17 @@
 //! The workspace approval queue and its durable decision history.
 
 use std::{
+    collections::HashSet,
     fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, RwLock},
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result, ensure};
 use fuzukue_proto::{
     ApprovalDecision, ApprovalDisplayAction, ApprovalGrantScope, ApprovalOwner, ApprovalRisk,
-    ApprovalState, ApprovalSummary, ApprovalUnattended, FullApprovalAudit, FullApprovalChange,
+    ApprovalState, ApprovalSummary, ApprovalUnattended, FolderGrant, FullApprovalAudit, FullApprovalChange,
     FullApprovalDuration, FullApprovalMode, FullApprovalSettings,
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,7 @@ pub(crate) struct Action {
     pub scope: Value,
 }
 
+#[derive(Clone)]
 pub(crate) struct Registration {
     pub owner: ApprovalOwner,
     pub risk: ApprovalRisk,
@@ -100,11 +102,16 @@ impl Record {
         });
     }
 
-    fn full_mode_id(&self) -> Option<&str> {
-        self.history.iter().find_map(|entry| match &entry.event {
-            AuditEvent::Granted { full_mode_id, .. } => full_mode_id.as_deref(),
-            _ => None,
-        })
+    fn was_granted(&self) -> bool {
+        self.history.iter().any(|entry| matches!(entry.event, AuditEvent::Granted { .. }))
+    }
+
+    fn was_granted_by_full_mode(&self) -> bool {
+        self.history.iter().any(|entry| matches!(entry.event, AuditEvent::Granted { full_mode_id: Some(_), .. }))
+    }
+
+    fn same_operation(&self, owner: &ApprovalOwner, action: &Action) -> bool {
+        self.summary.owner == *owner && self.action == *action
     }
 
     fn grant_full(&mut self, now: i64, mode: &ActiveMode) {
@@ -142,9 +149,52 @@ impl Record {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct ModeState {
+    active: Option<ActiveMode>,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Store {
     records: Vec<Record>,
+    // Absent in queue files written before the mode and grants shared a transaction.
+    #[serde(default)]
+    full_mode: Option<ModeState>,
+    #[serde(default)]
+    folder_sweep: Vec<FolderGrant>,
+}
+
+impl Store {
+    fn active_mode(&self, now: i64) -> Option<&ActiveMode> {
+        self.full_mode.as_ref()?.active.as_ref()
+            .filter(|mode| mode.settings.expires_at.is_none_or(|deadline| now < deadline))
+    }
+
+    fn grant_pending(&mut self, now: i64, mode: &ActiveMode) -> Vec<ApprovalSummary> {
+        let mut changed = Vec::new();
+        for index in 0..self.records.len() {
+            let record = &self.records[index];
+            let summary = &record.summary;
+            if summary.state != ApprovalState::Pending || summary.expires_at <= now
+                || !eligible_for_full(&summary.owner, summary.unattended, &record.action.tool)
+            {
+                continue;
+            }
+            let duplicate = self.records.iter().any(|previous| {
+                previous.same_operation(&summary.owner, &record.action) && previous.was_granted()
+            });
+            let record = &mut self.records[index];
+            if duplicate {
+                record.summary.state = ApprovalState::Withdrawn;
+                record.summary.updated_at = now;
+                record.audit(now, FULL_MODE_PRINCIPAL, Some("Operation already granted".into()), AuditEvent::Withdrawn);
+            } else {
+                record.grant_full(now, mode);
+            }
+            changed.push(record.summary.clone());
+        }
+        changed
+    }
 }
 
 pub(crate) struct Queue {
@@ -152,7 +202,6 @@ pub(crate) struct Queue {
     dir: PathBuf,
     // The same lock covers deadline checks, durable changes and update publication.
     store: Mutex<Option<Store>>,
-    full: RwLock<Option<Option<ActiveMode>>>,
     mode_changes: tokio::sync::watch::Sender<()>,
     updates: broadcast::Sender<ApprovalSummary>,
 }
@@ -163,7 +212,6 @@ impl Queue {
             workspace,
             dir: dir.into(),
             store: Mutex::new(None),
-            full: RwLock::new(None),
             mode_changes: tokio::sync::watch::channel(()).0,
             updates: broadcast::channel(128).0,
         }
@@ -201,26 +249,10 @@ impl Queue {
         Ok(())
     }
 
-    fn full_mode(&self, now: i64) -> Result<Option<ActiveMode>> {
-        if let Some(mode) = &*self.full.read().unwrap() {
-            return Ok(mode.clone().filter(|mode| mode.settings.expires_at.is_none_or(|deadline| now < deadline)));
-        }
-        let mut cached = self.full.write().unwrap();
-        let mode = match &*cached {
-            Some(mode) => mode.clone(),
-            None => {
-                let mode = self.load_full_mode()?;
-                *cached = Some(mode.clone());
-                mode
-            }
-        };
-        Ok(mode.filter(|mode| mode.settings.expires_at.is_none_or(|deadline| now < deadline)))
-    }
-
     pub(crate) fn full_mode_lease(&self) -> Result<Option<(FullApprovalMode, tokio::sync::watch::Receiver<()>)>> {
-        let _serial = self.store.lock().unwrap();
-        let updates = self.mode_changes.subscribe();
-        Ok(self.full_mode(now())?.map(|mode| (mode.settings, updates)))
+        self.with_store(now, |store, now| {
+            Ok(store.active_mode(now).map(|mode| (mode.settings.clone(), self.mode_changes.subscribe())))
+        })
     }
 
     fn load_full_mode(&self) -> Result<Option<ActiveMode>> {
@@ -236,8 +268,10 @@ impl Queue {
         &self,
         change: FullApprovalChange,
         principal: &str,
-    ) -> Result<Option<FullApprovalMode>> {
-        self.set_full_mode_at(change, principal, now)
+        legacy: Vec<(String, Registration)>,
+        folders: Vec<FolderGrant>,
+    ) -> Result<(Option<FullApprovalMode>, HashSet<String>)> {
+        self.set_full_mode_at(change, principal, now, legacy, folders)
     }
 
     fn set_full_mode_at(
@@ -245,38 +279,75 @@ impl Queue {
         change: FullApprovalChange,
         principal: &str,
         clock: impl FnOnce() -> i64,
-    ) -> Result<Option<FullApprovalMode>> {
-        let _serial = self.store.lock().unwrap();
-        let at = clock();
-        let active = match change {
-            FullApprovalChange::Off => None,
-            FullApprovalChange::Full { duration } => {
-                let hours = match duration {
-                    FullApprovalDuration::OneHour => Some(1),
-                    FullApprovalDuration::EightHours => Some(8),
-                    FullApprovalDuration::TwentyFourHours => Some(24),
-                    FullApprovalDuration::UntilDisabled => None,
-                };
-                Some(ActiveMode {
-                    id: crate::mail::session_key(),
-                    settings: FullApprovalMode {
-                        duration,
-                        enabled_at: at,
-                        expires_at: hours.map(|hours| at + hours * HOUR_MS),
-                        enabled_by: principal.into(),
-                    },
-                })
+        legacy: Vec<(String, Registration)>,
+        folders: Vec<FolderGrant>,
+    ) -> Result<(Option<FullApprovalMode>, HashSet<String>)> {
+        self.with_store(clock, |store, at| {
+            let active = match change {
+                FullApprovalChange::Off => None,
+                FullApprovalChange::Full { duration } => {
+                    let hours = match duration {
+                        FullApprovalDuration::OneHour => Some(1),
+                        FullApprovalDuration::EightHours => Some(8),
+                        FullApprovalDuration::TwentyFourHours => Some(24),
+                        FullApprovalDuration::UntilDisabled => None,
+                    };
+                    Some(ActiveMode {
+                        id: crate::mail::session_key(),
+                        settings: FullApprovalMode {
+                            duration,
+                            enabled_at: at,
+                            expires_at: hours.map(|hours| at + hours * HOUR_MS),
+                            enabled_by: principal.into(),
+                        },
+                    })
+                }
+            };
+            let mut next = store.clone();
+            let mut changed = Vec::new();
+            let mut granted = HashSet::new();
+            if let Some(mode) = &active {
+                changed = next.grant_pending(at, mode);
+                for (id, mut registration) in legacy {
+                    if next.records.iter().any(|previous| {
+                        previous.same_operation(&registration.owner, &registration.action) && previous.was_granted()
+                    }) {
+                        continue;
+                    }
+                    registration.expires_at = at + HOUR_MS;
+                    let mut record = self.new_record(id.clone(), registration, at);
+                    record.grant_full(at, mode);
+                    record.consume(at);
+                    next.records.push(record);
+                    granted.insert(id);
+                }
+                next.folder_sweep.extend(folders.into_iter().filter(|grant| granted.contains(&grant.id)));
             }
-        };
-        self.write_json(FULL_MODE_FILE, &active)?;
-        *self.full.write().unwrap() = Some(active.clone());
-        self.mode_changes.send_replace(());
-        Ok(active.map(|mode| mode.settings))
+            next.full_mode = Some(ModeState { active: active.clone() });
+            self.commit(store, next, changed)?;
+            self.mode_changes.send_replace(());
+            Ok((active.map(|mode| mode.settings), granted))
+        })
+    }
+
+    pub(crate) fn folder_sweep(&self) -> Result<Vec<FolderGrant>> {
+        self.with_store(now, |store, _| Ok(store.folder_sweep.clone()))
+    }
+
+    pub(crate) fn finish_folder_sweep(&self) -> Result<()> {
+        self.with_store(now, |store, _| {
+            if store.folder_sweep.is_empty() {
+                return Ok(());
+            }
+            let mut next = store.clone();
+            next.folder_sweep.clear();
+            self.commit(store, next, [])
+        })
     }
 
     pub(crate) fn full_settings(&self, before: Option<usize>) -> Result<FullApprovalSettings> {
         self.with_store(now, |store, now| {
-            let active = self.full_mode(now)?.map(|mode| mode.settings);
+            let active = store.active_mode(now).map(|mode| mode.settings.clone());
             let mut counts = std::collections::BTreeMap::new();
             let mut audit = Vec::new();
             for record in &store.records {
@@ -337,11 +408,22 @@ impl Queue {
         run: impl FnOnce(&mut Store, i64) -> Result<T>,
     ) -> Result<T> {
         let mut store = self.store.lock().unwrap();
+        let now = clock();
         if store.is_none() {
-            *store = Some(self.load()?);
+            let mut loaded = self.load()?;
+            if loaded.full_mode.is_none() {
+                loaded.full_mode = self.load_full_mode()?.map(|mode| ModeState { active: Some(mode) });
+            }
+            if let Some(mode) = loaded.active_mode(now).cloned() {
+                let mut next = loaded.clone();
+                let changed = next.grant_pending(now, &mode);
+                if !changed.is_empty() {
+                    self.commit(&mut loaded, next, changed)?;
+                }
+            }
+            *store = Some(loaded);
         }
         let store = store.as_mut().unwrap();
-        let now = clock();
         self.close_matching(store, now, |record| record.deadline() <= now, None)?;
         run(store, now)
     }
@@ -402,43 +484,56 @@ impl Queue {
                     && !request.action.tool.is_empty(),
                 "approval request requires a thread, job, requester and tool"
             );
-            let mode = if eligible_for_full(&request) { self.full_mode(now)? } else { None };
+            let eligible = eligible_for_full(&request.owner, request.unattended, &request.action.tool);
+            let mode = store.active_mode(now).filter(|_| eligible).cloned();
+
+            // A grant's operation identity outlives its lease and process. A
+            // finalized grant stops replay even if its original deadline passed.
+            if let Some(index) = store.records.iter().position(|record| {
+                record.same_operation(&request.owner, &request.action)
+                    && (record.was_granted_by_full_mode() || mode.is_some() && record.was_granted())
+            }) {
+                let record = &store.records[index];
+                let id = record.summary.approval_id.clone();
+                if !live {
+                    return Ok((id, FullAuthorization::Human));
+                }
+                if !eligible || record.summary.state != ApprovalState::Granted
+                    || record.summary.grant_scope != Some(ApprovalGrantScope::Once)
+                    || store.records.iter().any(|other| {
+                        other.same_operation(&request.owner, &request.action) && other.summary.consumed_at.is_some()
+                    })
+                {
+                    return Ok((id, FullAuthorization::AlreadyConsumed));
+                }
+                let mut next = store.clone();
+                next.records[index].consume(now);
+                let summary = next.records[index].summary.clone();
+                self.commit(store, next, [summary])?;
+                return Ok((id, FullAuthorization::Granted));
+            }
             if live && mode.is_none() {
                 return Ok((String::new(), FullAuthorization::Human));
             }
             let mut next = store.clone();
             if let Some(record) = next.records.iter_mut().rev().find(|record| {
                 let summary = &record.summary;
-                let same_grant = mode.as_ref().is_some_and(|mode| {
-                    summary.state == ApprovalState::Granted
-                        && record.full_mode_id() == Some(&mode.id)
-                        && (summary.consumed_at.is_none() || live)
-                        && record.deadline() > now
-                });
-                (summary.state == ApprovalState::Pending || same_grant)
-                    && summary.owner == request.owner
+                summary.state == ApprovalState::Pending
+                    && record.same_operation(&request.owner, &request.action)
                     && summary.risk == request.risk
                     && summary.unattended == request.unattended
-                    && record.action == request.action
             }) {
                 let id = record.summary.approval_id.clone();
                 record.audit(now, &request.owner.requester, None, AuditEvent::Deduplicated);
                 let mut changed = None;
                 let mut authorization = FullAuthorization::Human;
                 if let Some(mode) = &mode {
-                    if record.summary.consumed_at.is_some() {
-                        authorization = FullAuthorization::AlreadyConsumed;
-                    } else {
-                        if record.summary.state == ApprovalState::Pending {
-                            record.grant_full(now, mode);
-                            changed = Some(record.summary.clone());
-                        }
-                        if live {
-                            record.consume(now);
-                            authorization = FullAuthorization::Granted;
-                            changed = Some(record.summary.clone());
-                        }
+                    record.grant_full(now, mode);
+                    if live {
+                        record.consume(now);
+                        authorization = FullAuthorization::Granted;
                     }
+                    changed = Some(record.summary.clone());
                 }
                 self.commit(store, next, changed)?;
                 return Ok((id, authorization));
@@ -453,8 +548,27 @@ impl Queue {
                     break id;
                 }
             };
-            let summary = ApprovalSummary {
-                approval_id: approval_id.clone(),
+            let mut record = self.new_record(approval_id.clone(), request, now);
+            let mut authorization = FullAuthorization::Human;
+            if let Some(mode) = &mode {
+                record.grant_full(now, mode);
+                if live {
+                    record.consume(now);
+                    authorization = FullAuthorization::Granted;
+                }
+            }
+            let summary = record.summary.clone();
+            next.records.push(record);
+            self.commit(store, next, [summary])?;
+            Ok((approval_id, authorization))
+        })
+    }
+
+    fn new_record(&self, approval_id: String, request: Registration, now: i64) -> Record {
+        let requester = request.owner.requester.clone();
+        let mut record = Record {
+            summary: ApprovalSummary {
+                approval_id,
                 workspace: self.workspace.clone(),
                 owner: request.owner,
                 risk: request.risk,
@@ -471,26 +585,12 @@ impl Queue {
                     args: request.display_args,
                     scope: request.display_scope,
                 },
-            };
-            let mut record = Record {
-                summary: summary.clone(),
-                action: request.action,
-                history: Vec::new(),
-            };
-            record.audit(now, &summary.owner.requester, None, AuditEvent::Registered);
-            let mut authorization = FullAuthorization::Human;
-            if let Some(mode) = &mode {
-                record.grant_full(now, mode);
-                if live {
-                    record.consume(now);
-                    authorization = FullAuthorization::Granted;
-                }
-            }
-            let summary = record.summary.clone();
-            next.records.push(record);
-            self.commit(store, next, [summary])?;
-            Ok((approval_id, authorization))
-        })
+            },
+            action: request.action,
+            history: Vec::new(),
+        };
+        record.audit(now, &requester, None, AuditEvent::Registered);
+        record
     }
 
     /// Take the snapshot and subscribe at the same point in the mutation order.
@@ -570,7 +670,7 @@ impl Queue {
                 ApprovalDecision::Deny if previous.summary.state == ApprovalState::Pending => {
                     (ApprovalState::Denied, None, AuditEvent::Denied)
                 }
-                ApprovalDecision::Withdraw if previous.unstarted() => (
+                ApprovalDecision::Withdraw if previous.unstarted() && !previous.was_granted_by_full_mode() => (
                     ApprovalState::Withdrawn,
                     previous.summary.grant_scope,
                     AuditEvent::Withdrawn,
@@ -603,10 +703,7 @@ impl Queue {
         })
     }
 
-    pub(crate) fn expire(&self) -> Result<()> {
-        self.expire_at(now)
-    }
-
+    #[cfg(test)]
     fn expire_at(&self, clock: impl FnOnce() -> i64) -> Result<()> {
         self.with_store(clock, |_, _| Ok(()))
     }
@@ -639,10 +736,15 @@ impl Queue {
             }) else {
                 return Ok(false);
             };
-            if let Some(mode_id) = store.records[index].full_mode_id() {
-                if self.full_mode(now)?.is_none_or(|mode| mode.id != mode_id) {
-                    return Ok(false);
-                }
+            // Old servers could persist multiple full-mode grants across leases.
+            let mut full_grant = false;
+            let mut consumed = false;
+            for record in store.records.iter().filter(|record| record.same_operation(owner, action)) {
+                full_grant |= record.was_granted_by_full_mode();
+                consumed |= record.summary.consumed_at.is_some();
+            }
+            if full_grant && consumed {
+                return Ok(false);
             }
             let mut next = store.clone();
             let record = &mut next.records[index];
@@ -655,10 +757,10 @@ impl Queue {
 }
 
 // Producers attach the server's own worker or front-desk identity.
-fn eligible_for_full(request: &Registration) -> bool {
-    request.owner.requester != "front_desk"
-        || (request.unattended != ApprovalUnattended::NeverUnattended
-            && matches!(request.action.tool.as_str(),
+pub(super) fn eligible_for_full(owner: &ApprovalOwner, unattended: ApprovalUnattended, tool: &str) -> bool {
+    owner.requester != "front_desk"
+        || (unattended != ApprovalUnattended::NeverUnattended
+            && matches!(tool,
                 "folder_read" | "git_integrate_patch" | "github_comment" | "github_label"
                 | "github_issue_create" | "github_issue_close"
             ))

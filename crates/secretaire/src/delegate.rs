@@ -464,9 +464,13 @@ impl Workers {
                 return Ok(false);
             }
         }
-        let Some(approval) = approvals.remove(id) else {
+        let Some(pending) = approvals.get(id) else {
             return Ok(false);
         };
+        if pending.sweepable && !pending.hub.claim_legacy_approval(id) {
+            return Ok(false);
+        }
+        let approval = approvals.remove(id).unwrap();
         Self::finish_approval(id, approval, decision, review, None)?;
         Ok(true)
     }
@@ -475,10 +479,15 @@ impl Workers {
         let mut approvals = self.approvals.lock().unwrap();
         let Some(pending) = approvals.get(id) else { return Ok(false) };
         let shell = pending.shell.as_ref().context("This request is ineligible for a saved shell approval")?;
-        ensure!(!pending.reply.is_closed() && pending.worker.as_ref().is_some_and(|owner| {
+        ensure!(pending.reply.lock().unwrap().as_ref().is_some_and(|reply| !reply.is_closed())
+            && pending.worker.as_ref().is_some_and(|owner| {
             self.approval_scope(owner.session(), owner.job()).is_some()
         }), "The worker approval has ended");
-        let approved = app.shell_approval_rules.remember(&app.state_dir, &shell.scope, &shell.input, prefix)?;
+        let Some(approved) = pending.hub.claim_legacy_approval_with(id, || {
+            app.shell_approval_rules.remember(&app.state_dir, &shell.scope, &shell.input, prefix)
+        })? else {
+            return Ok(false);
+        };
         let pending = approvals.remove(id).expect("approval is locked");
         let delivered = Self::finish_approval(id, pending, "accept", None, Some(approved.input));
         drop(approvals);
@@ -492,10 +501,10 @@ impl Workers {
         shell_input: Option<serde_json::Value>,
     ) -> Result<()> {
         let refused = decision == "accept" && approval.authorize.is_some_and(|authorize| !authorize());
-        let delivered = approval.reply.send(ApprovalReply {
+        let delivered = approval.reply.lock().unwrap().take().is_some_and(|reply| reply.send(ApprovalReply {
             decision: if refused { MUTATION_APPROVAL_EXPIRED } else { decision }.into(),
             shell_input,
-        }).is_ok();
+        }).is_ok());
         if delivered {
             if let Some(review) = &review {
                 review.audit(&approval.hub);
@@ -2221,8 +2230,9 @@ impl Drop for WorkerApprovals<'_> {
 }
 
 struct LocalApproval {
-    reply: oneshot::Sender<ApprovalReply>,
+    reply: Arc<Mutex<Option<oneshot::Sender<ApprovalReply>>>>,
     hub: Arc<crate::Hub>,
+    sweepable: bool,
     worker: Option<approval::Owner>,
     authorize: Option<Box<dyn FnOnce() -> bool + Send>>,
     shell: Option<ShellApproval>,
@@ -2247,7 +2257,13 @@ struct ApprovalWait<'a> {
 
 impl Drop for ApprovalWait<'_> {
     fn drop(&mut self) {
-        if self.app.delegates.approvals.lock().unwrap().remove(&self.id).is_some() {
+        let mut approvals = self.app.delegates.approvals.lock().unwrap();
+        if let Some(approval) = approvals.get(&self.id) {
+            let cancelled = !approval.sweepable || approval.hub.claim_legacy_approval(&self.id);
+            approvals.remove(&self.id);
+            if !cancelled {
+                return;
+            }
             self.app.hub.publish(ServerEvent::ApprovalResolved {
                 request_id: self.id.clone(), decision: "cancelled".into(), automatic: false,
             });
@@ -2275,7 +2291,14 @@ pub async fn request_approval(
     actor: Actor,
     summary: impl Into<ApprovalSummary>,
 ) -> Result<String> {
-    let (_wait, reply) = open_approval(app, session, prefix, actor, summary.into(), None);
+    request_approval_with_full(app, session, prefix, actor, summary, None).await
+}
+
+pub(crate) async fn request_approval_with_full(
+    app: &App, session: &str, prefix: &str, actor: Actor, summary: impl Into<ApprovalSummary>,
+    full: Option<crate::hub::approval_store::Registration>,
+) -> Result<String> {
+    let (_wait, reply) = open_approval_with(app, session, prefix, actor, summary.into(), None, None, None, full)?;
     Ok(reply.await?.decision)
 }
 
@@ -2285,22 +2308,15 @@ pub(crate) async fn request_mutation_approval(
     app: &App, session: &str, prefix: &str, actor: Actor, summary: fuzukue_proto::LocalizedMessage,
     authorize: impl FnOnce() -> bool + Send + 'static,
 ) -> Result<String> {
-    let (_wait, reply) = open_approval_with(app, session, prefix, actor, summary.into(), None, Some(Box::new(authorize)), None);
+    let (_wait, reply) = open_approval_with(app, session, prefix, actor, summary.into(), None, Some(Box::new(authorize)), None, None)?;
     Ok(reply.await?.decision)
-}
-
-fn open_approval<'a>(
-    app: &'a App, session: &str, prefix: &str, actor: Actor, summary: ApprovalSummary,
-    worker: Option<approval::Owner>,
-) -> (ApprovalWait<'a>, oneshot::Receiver<ApprovalReply>) {
-    open_approval_with(app, session, prefix, actor, summary, worker, None, None)
 }
 
 fn open_approval_with<'a>(
     app: &'a App, session: &str, prefix: &str, actor: Actor, summary: ApprovalSummary,
     worker: Option<approval::Owner>, authorize: Option<Box<dyn FnOnce() -> bool + Send>>,
-    shell: Option<ShellApproval>,
-) -> (ApprovalWait<'a>, oneshot::Receiver<ApprovalReply>) {
+    shell: Option<ShellApproval>, full: Option<crate::hub::approval_store::Registration>,
+) -> Result<(ApprovalWait<'a>, oneshot::Receiver<ApprovalReply>)> {
     let request_id = format!("{prefix}:{}", mail::session_key());
     let (tx, rx) = oneshot::channel();
     let alive = Arc::new(());
@@ -2313,20 +2329,42 @@ fn open_approval_with<'a>(
     let shell_directory = shell.as_ref()
         .and_then(|shell| shell.scope.cwd.to_str().map(str::to_owned));
     let shell_prefix = shell.as_ref().and_then(|shell| shell.prefix).map(str::to_owned);
-    {
-        let mut approvals = app.delegates.approvals.lock().unwrap();
-        approvals.insert(request_id.clone(), LocalApproval { reply: tx, hub: app.hub.clone(), worker, authorize, shell });
-        app.hub.publish_local_approval(ServerEvent::ApprovalRequested {
-            session: session.into(),
-            actor,
-            request_id: request_id.clone(),
-            summary,
-            localized,
-            shell_directory,
-            shell_prefix,
-        }, &alive);
+    let event = ServerEvent::ApprovalRequested {
+        session: session.into(), actor, request_id: request_id.clone(), summary,
+        localized, shell_directory, shell_prefix,
+    };
+    let reply = Arc::new(Mutex::new(Some(tx)));
+    let mut approvals = app.delegates.approvals.lock().unwrap();
+    let sweepable = full.is_some();
+    let pending = if let Some(registration) = full {
+        use crate::hub::approval_store::FullAuthorization::*;
+        let resume = |reply: &Mutex<Option<oneshot::Sender<ApprovalReply>>>, granted| {
+            if let Some(reply) = reply.lock().unwrap().take() {
+                let decision = if granted { "accept" } else { "decline" };
+                let _ = reply.send(ApprovalReply { decision: decision.into(), shell_input: None });
+            }
+        };
+        let waiter = reply.clone();
+        match app.hub.publish_sweepable_approval(event, Arc::downgrade(&alive), registration,
+            move |granted| resume(&waiter, granted))?
+        {
+            Human => true,
+            Granted => {
+                resume(&reply, true);
+                false
+            }
+            AlreadyConsumed => anyhow::bail!("This full approval was already consumed. Check the original operation before retrying."),
+        }
+    } else {
+        app.hub.publish_local_approval(event, &alive);
+        true
+    };
+    if pending {
+        approvals.insert(request_id.clone(), LocalApproval {
+            reply, hub: app.hub.clone(), sweepable, worker, authorize, shell,
+        });
     }
-    (ApprovalWait { app, id: request_id, _alive: alive }, rx)
+    Ok((ApprovalWait { app, id: request_id, _alive: alive }, rx))
 }
 
 pub(crate) async fn request_worker_approval(
@@ -2337,9 +2375,10 @@ pub(crate) async fn request_worker_approval(
 
 pub(crate) async fn request_workspace_write_approval(
     app: &App, session: &str, job: &str, summary: fuzukue_proto::LocalizedMessage,
+    full: crate::hub::approval_store::Registration,
 ) -> Result<String> {
     let owner = approval::Owner::new(session, job, &mail::session_key());
-    let (_wait, reply) = open_approval(app, session, job, Actor::System, summary.into(), Some(owner));
+    let (_wait, reply) = open_approval_with(app, session, job, Actor::System, summary.into(), Some(owner), None, None, Some(full))?;
     Ok(reply.await?.decision)
 }
 
@@ -2350,23 +2389,14 @@ pub(crate) async fn request_shell_approval(
     let protected = crate::worker_scope::protected_roots(&app.state_dir);
     let shell = crate::worker_scope::shell::check(scope, &input, &protected);
     let (summary, candidate) = if let Some(approved) = shell {
-        if crate::full_approval::authorize(
-            &app.hub,
-            fuzukue_proto::ApprovalOwner { thread: session.into(), job: job.into(), requester: "claude".into() },
-            "Bash (validated)",
-            fuzukue_proto::ApprovalRisk::Low,
-            serde_json::json!({"fingerprint": crate::full_approval::fingerprint(&approved.input), "request": backend_id}),
-            serde_json::json!({"worktree": scope.cwd}),
-        )? {
-            return Ok(Some(approved.input));
-        }
         let candidate = ShellApproval { scope: scope.clone(), input: input.clone(), prefix: approved.prefix };
         (format!("Bash: {}", approved.command), Some(candidate))
     } else {
         (format!("Bash {input}"), None)
     };
+    let full = crate::full_approval::worker_registration(session, job, "claude", "Bash", backend_id, &input);
     let (_wait, reply) = open_approval_with(app, session, job, Actor::Claude, summary.into(),
-        Some(approval::Owner::new(session, job, backend_id)), None, candidate);
+        Some(approval::Owner::new(session, job, backend_id)), None, candidate, Some(full))?;
     let reply = reply.await?;
     Ok((reply.decision == "accept").then(|| reply.shell_input.unwrap_or(input)))
 }

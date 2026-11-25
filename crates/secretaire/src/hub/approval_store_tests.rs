@@ -47,7 +47,7 @@ fn full_approval_grants_one_claim_and_masks_its_history() -> Result<()> {
     let change = FullApprovalChange::Full {
         duration: FullApprovalDuration::OneHour,
     };
-    let enabled = queue.set_full_mode(change, "test-user")?.unwrap();
+    let enabled = queue.set_full_mode(change, "test-user", vec![], vec![])?.0.unwrap();
     assert_eq!(enabled.expires_at, Some(enabled.enabled_at + HOUR_MS));
     assert_eq!(queue.authorize_full(request())?, FullAuthorization::Granted);
     assert_eq!(queue.authorize_full(request())?, FullAuthorization::AlreadyConsumed);
@@ -72,7 +72,8 @@ fn full_approval_grants_one_claim_and_masks_its_history() -> Result<()> {
     let owner = unclaimed.owner.clone();
     let action = unclaimed.action.clone();
     let id = queue.register(unclaimed)?;
-    queue.set_full_mode(FullApprovalChange::Off, "test-user")?;
+    queue.set_full_mode(FullApprovalChange::Off, "test-user", vec![], vec![])?;
+    assert!(queue.consume_once(&id, &owner, &action)?);
     assert!(!queue.consume_once(&id, &owner, &action)?);
     assert!(queue.full_settings(None)?.active.is_none());
     Ok(())
@@ -85,13 +86,16 @@ fn full_approval_expiry_and_until_disabled() -> Result<()> {
     let change = FullApprovalChange::Full {
         duration: FullApprovalDuration::EightHours,
     };
-    queue.set_full_mode_at(change, "test-user", || 0)?;
-    assert!(queue.full_mode(8 * HOUR_MS - 1)?.is_some());
-    assert!(queue.full_mode(8 * HOUR_MS)?.is_none());
+    queue.set_full_mode_at(change, "test-user", || 0, vec![], vec![])?;
+    queue.with_store(|| 8 * HOUR_MS - 1, |store, now| {
+        assert!(store.active_mode(now).is_some());
+        assert!(store.active_mode(now + 1).is_none());
+        Ok(())
+    })?;
 
     let until_disabled = queue.set_full_mode(FullApprovalChange::Full {
         duration: FullApprovalDuration::UntilDisabled,
-    }, "test-user")?.unwrap();
+    }, "test-user", vec![], vec![])?.0.unwrap();
     assert_eq!(until_disabled.expires_at, None);
     assert!(crate::full_approval::command(&hub(dir.path()), "8h", None).is_err());
     assert!(queue.full_settings(None)?.active.is_some());
@@ -101,6 +105,143 @@ fn full_approval_expiry_and_until_disabled() -> Result<()> {
 const GRANT_ONCE: ApprovalDecision = ApprovalDecision::Grant {
     scope: ApprovalGrantScope::Once,
 };
+const ENABLE_FULL: FullApprovalChange = FullApprovalChange::Full {
+    duration: FullApprovalDuration::UntilDisabled,
+};
+
+#[test]
+fn full_sweep_and_human_decision_record_one_winner() -> Result<()> {
+    for _ in 0..8 {
+        let dir = TestDir::new();
+        let queue = Queue::new("workspace".into(), dir.path());
+        let registration = request();
+        let (owner, action) = (registration.owner.clone(), registration.action.clone());
+        let id = queue.register(registration)?;
+        let (_, mut updates) = queue.pending()?;
+        let barrier = Barrier::new(2);
+
+        let denied = thread::scope(|scope| -> Result<_> {
+            let human = scope.spawn(|| {
+                barrier.wait();
+                queue.decide(&id, ApprovalDecision::Deny, "desktop", None)
+            });
+            barrier.wait();
+            queue.set_full_mode(ENABLE_FULL, "desktop", vec![], vec![])?;
+            Ok(human.join().unwrap().is_ok())
+        })?;
+        let decision = updates.try_recv()?;
+        assert_eq!(decision.approval_id, id);
+        assert!(updates.try_recv().is_err());
+        assert!(queue.pending()?.0.is_empty());
+        if denied {
+            assert_eq!(decision.state, ApprovalState::Denied);
+            assert!(queue.full_settings(None)?.audit.is_empty());
+            assert!(!queue.consume_once(&id, &owner, &action)?);
+        } else {
+            assert_eq!(decision.state, ApprovalState::Granted);
+            assert_eq!(queue.full_settings(None)?.audit[0].approval_id, id);
+            assert!(queue.consume_once(&id, &owner, &action)?);
+            assert!(!queue.consume_once(&id, &owner, &action)?);
+        }
+        let saved = queue.load()?;
+        assert_eq!(saved.records[0].history.iter().filter(|entry| {
+            matches!(entry.event, AuditEvent::Granted { .. } | AuditEvent::Denied)
+        }).count(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn full_approval_restores_and_sweeps_queue_from_previous_server() -> Result<()> {
+    let dir = TestDir::new();
+    let queue = Queue::new("workspace".into(), dir.path());
+    let eligible = queue.register(request())?;
+    let mut control_plane = request();
+    control_plane.owner = crate::full_approval::desk_owner("thread-1");
+    control_plane.action.tool = "self_update".into();
+    let human = queue.register(control_plane)?;
+    queue.write_json(FULL_MODE_FILE, &Some(ActiveMode {
+        id: "saved-mode".into(),
+        settings: FullApprovalMode {
+            duration: FullApprovalDuration::UntilDisabled,
+            enabled_at: now(),
+            expires_at: None,
+            enabled_by: "desktop".into(),
+        },
+    }))?;
+    drop(queue);
+
+    let restarted = hub(dir.path());
+    restarted.restore_full_approval()?;
+    let settings = restarted.full_approval_settings(None)?;
+    assert_eq!(settings.active.unwrap().enabled_by, "desktop");
+    assert_eq!(settings.audit.len(), 1);
+    assert_eq!(settings.audit[0].approval_id, eligible);
+    let pending = restarted.pending_approvals()?.0;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].approval_id, human);
+    restarted.set_full_approval(FullApprovalChange::Off, &crate::remote::SettingsPrincipal::fixture())?;
+    let request = request();
+    assert!(restarted.consume_once_approval(&eligible, &request.owner, &request.action)?);
+    assert!(!restarted.consume_once_approval(&eligible, &request.owner, &request.action)?);
+    drop(restarted);
+
+    let restarted = hub(dir.path());
+    assert!(restarted.full_approval_settings(None)?.active.is_none());
+    assert_eq!(restarted.full_approval_settings(None)?.audit.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn consumed_full_approval_is_idempotent_across_toggles_and_restart() -> Result<()> {
+    let dir = TestDir::new();
+    let queue = Queue::new("workspace".into(), dir.path());
+    queue.set_full_mode(ENABLE_FULL, "desktop", vec![], vec![])?;
+    let id = queue.register(request())?;
+    assert_eq!(queue.authorize_full(request())?, FullAuthorization::Granted);
+    queue.set_full_mode(FullApprovalChange::Off, "desktop", vec![], vec![])?;
+    assert_eq!(queue.authorize_full(request())?, FullAuthorization::AlreadyConsumed);
+    queue.set_full_mode(ENABLE_FULL, "desktop", vec![], vec![])?;
+    assert_eq!(queue.authorize_full(request())?, FullAuthorization::AlreadyConsumed);
+    drop(queue);
+
+    let queue = Queue::new("workspace".into(), dir.path());
+    assert!(queue.full_settings(None)?.active.is_some());
+    assert_eq!(queue.register(request())?, id);
+    assert_eq!(queue.authorize_full(request())?, FullAuthorization::AlreadyConsumed);
+    let store = queue.load()?;
+    assert_eq!(store.records.len(), 1);
+    let events = &store.records[0].history;
+    assert_eq!(events.iter().filter(|entry| matches!(entry.event, AuditEvent::Granted { .. })).count(), 1);
+    assert_eq!(events.iter().filter(|entry| matches!(entry.event, AuditEvent::Consumed)).count(), 1);
+    assert_eq!(queue.full_settings(None)?.audit[0].approval_id, id);
+    Ok(())
+}
+
+#[test]
+fn earlier_leases_with_duplicate_full_grants_cannot_run_twice() -> Result<()> {
+    let dir = TestDir::new();
+    let queue = Queue::new("workspace".into(), dir.path());
+    queue.set_full_mode(ENABLE_FULL, "desktop", vec![], vec![])?;
+    let first = queue.register(request())?;
+    let replay = "legacy-duplicate";
+    queue.with_store(now, |store, at| {
+        let mut next = store.clone();
+        let mut duplicate = queue.new_record(replay.into(), request(), at);
+        duplicate.grant_full(at, store.active_mode(at).unwrap());
+        duplicate.consume(at);
+        next.records.push(duplicate);
+        queue.commit(store, next, [])
+    })?;
+    drop(queue);
+
+    let queue = Queue::new("workspace".into(), dir.path());
+    let request = request();
+    assert!(!queue.consume_once(&first, &request.owner, &request.action)?);
+    assert!(!queue.consume_once(replay, &request.owner, &request.action)?);
+    assert_eq!(queue.authorize_full(request)?, FullAuthorization::AlreadyConsumed);
+    Ok(())
+}
 
 #[test]
 fn concurrent_registration_deduplicates_and_notifies_once() -> Result<()> {

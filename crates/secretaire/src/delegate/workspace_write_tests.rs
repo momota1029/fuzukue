@@ -219,7 +219,7 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
     assert_eq!(body["active"]["duration"], "24h");
     let enabled = body["active"]["enabled_at"].as_i64().unwrap();
     assert_eq!(body["active"]["expires_at"], enabled + 24 * 60 * 60 * 1000);
-    let settings_file = state.join("full-approval-mode.json");
+    let settings_file = state.join("async-approvals.json");
     assert_eq!(fs::metadata(&settings_file)?.permissions().mode() & 0o777, 0o600);
     fs::write(&settings_file, "null")?;
     assert_eq!(route(path, &token, None).await?.1["active"]["duration"], "24h");
@@ -251,6 +251,26 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
     let lease = app.hub.full_approval_lease()?;
     assert!(route(path, &token, Some(json!({"mode": "off"}))).await?.1["active"].is_null());
     tokio::time::timeout(Duration::from_secs(1), crate::full_approval::wait_for_end(lease)).await?;
+
+    let pending = tokio::spawn(request(true, "tools/call", write("swept.txt", "written once\n")));
+    let (pending_id, _) = next_approval(&mut events).await?;
+    assert!(!root.join("swept.txt").exists());
+    let (status, body) = route(path, &token, enable()).await?;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body["audit"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|entry| entry["approval_id"] == pending_id && entry["granted_by"] == "full_mode"));
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), pending).await???["isError"], false);
+    assert_eq!(fs::read_to_string(root.join("swept.txt"))?, "written once\n");
+    crate::resolve_approval(&app, pending_id.clone(), "decline".into(), false).await?;
+    let resolutions = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|env| match env.event {
+            ServerEvent::ApprovalResolved { request_id, decision, automatic } if request_id == pending_id =>
+                Some((decision, automatic)),
+            _ => None,
+        }).collect::<Vec<_>>();
+    assert_eq!(resolutions, [("accept".into(), true)]);
+    assert!(route(path, &token, Some(json!({"mode": "off"}))).await?.1["active"].is_null());
 
     let pending = tokio::spawn(request(
         true,
