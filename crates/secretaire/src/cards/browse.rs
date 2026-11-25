@@ -108,6 +108,48 @@ pub(crate) async fn content(State(app): State<Arc<App>>, Query(query): Query<Dec
     }).await
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct ProseQuery {
+    workspace: Option<String>,
+    deck: String,
+    path: String,
+    start: u64,
+    len: usize,
+    sha256: String,
+}
+
+pub(crate) async fn prose(State(app): State<Arc<App>>, Query(query): Query<ProseQuery>) -> Result<Response, ReadError> {
+    let app = app.route(query.workspace).await.map_err(read_error)?;
+    let text = tokio::task::spawn_blocking(move || {
+        let deck = crate::safe_join(&app.project_dir, &query.deck)?;
+        let span = fuzukue_proto::DocProseSpan {
+            path: query.path,
+            start: query.start,
+            len: query.len,
+            sha256: query.sha256,
+            newline_before: false,
+        };
+        read_prose(&deck, &span)
+    }).await.map_err(|err| read_error(err.into()))?.map_err(read_error)?;
+    Ok(text.into_response())
+}
+
+pub(super) fn read_prose(deck: &Path, span: &fuzukue_proto::DocProseSpan) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use sha2::{Digest, Sha256};
+
+    anyhow::ensure!(span.len <= fuzukue_proto::DOC_PROSE_SPAN_BYTES, "prose range exceeds the size limit");
+    let path = crate::safe_join(deck, &span.path)?;
+    anyhow::ensure!(!fuzukue_proto::is_thread_save_artifact(&path), "private thread save path");
+    anyhow::ensure!(path.is_file() && path.extension().is_some_and(|ext| ext == "tex"), "prose source must be a TeX file");
+    let mut file = crate::mcp::workspace_read::open_regular_source(&path)?;
+    file.seek(SeekFrom::Start(span.start))?;
+    let mut bytes = vec![0; span.len];
+    file.read_exact(&mut bytes)?;
+    anyhow::ensure!(format!("{:x}", Sha256::digest(&bytes)) == span.sha256, "manuscript changed");
+    Ok(String::from_utf8(bytes)?)
+}
+
 pub(crate) async fn diagnostics(State(app): State<Arc<App>>, Query(query): Query<DeckQuery>) -> Result<Response, ReadError> {
     read(app, query, |project, prefix, deck, query| {
         let path = query.card.as_ref().map(|id| {

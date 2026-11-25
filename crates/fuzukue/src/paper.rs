@@ -331,13 +331,23 @@ impl Workbench {
     fn rebuild_read_views(&mut self, presentation_changed: bool, only: Option<&str>, cx: &mut Context<Self>) {
         let mut rows = vec![ReadRow::Title(self.doc_title.clone())];
         for sec in &self.doc_sections {
-            rows.push(ReadRow::Section(sec.title.clone()));
-            for item in &sec.items {
+            if !sec.title.is_empty() {
+                rows.push(ReadRow::Section(sec.title.clone()));
+            }
+            let mut prose = sec.prose.iter().peekable();
+            for (index, item) in sec.items.iter().enumerate() {
+                while prose.peek().is_some_and(|prose| prose.before_item <= index) {
+                    rows.push(ReadRow::Prose(prose.next().unwrap().text.clone()));
+                }
                 rows.push(match item {
                     DocItem::Card { id } => ReadRow::Card(id.clone()),
                     DocItem::Subsection { title } => ReadRow::Subsection(title.clone()),
                 });
             }
+            rows.extend(prose.map(|prose| ReadRow::Prose(prose.text.clone())));
+        }
+        if presentation_changed || self.read_rows != rows {
+            self.reconcile_prose(&rows, presentation_changed);
         }
         let ids: HashSet<_> = rows
             .iter()
@@ -524,6 +534,9 @@ impl Workbench {
     }
 
     pub(super) fn read_row_measurement_ready(&self, index: usize, cx: &App) -> bool {
+        if let Some(ReadRow::Prose(text)) = self.read_rows.get(index) {
+            return self.prose_ready(text, cx);
+        }
         let Some(ReadRow::Card(card)) = self.read_rows.get(index) else { return true };
         self.card_body_measured(card) && [false, true].into_iter()
             .filter(|&proof| !proof || self.proof_is_open(card))
@@ -640,6 +653,9 @@ impl Workbench {
     }
 
     pub(super) fn paper_row_ready(&self, index: usize, cx: &App) -> bool {
+        if let Some(ReadRow::Prose(text)) = self.read_rows.get(index) {
+            return self.prose_ready(text, cx);
+        }
         let Some(ReadRow::Card(card)) = self.read_rows.get(index) else {
             return true;
         };
@@ -703,6 +719,7 @@ impl Workbench {
                     .text_base()
                     .child(t.clone())
                     .into_any_element(),
+                ReadRow::Prose(text) => this.render_prose(text, &entity, cx).into_any_element(),
                 ReadRow::Card(id) => {
                     let card = this.cards.iter().find(|c| &c.id == id);
                     let theorem = card.and_then(|card| {
@@ -1114,6 +1131,7 @@ impl Workbench {
                         window.defer(cx, move |_, cx| {
                             let _ = workbench.update(cx, |this, cx| {
                                 this.load_visible_card_bodies(cx);
+                                this.load_visible_prose(cx);
                                 if let Some((card, index, tail)) = settled_jump {
                                     this.settle_paper_jump(&card, index, tail, cx);
                                 }

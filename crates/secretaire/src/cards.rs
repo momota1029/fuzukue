@@ -17,6 +17,8 @@ use crate::{build_jobs, Workspace};
 pub(crate) mod browse;
 mod translation;
 #[cfg(test)]
+mod manuscript_tests;
+#[cfg(test)]
 mod r81_tests;
 #[cfg(test)]
 mod translation_tests;
@@ -212,7 +214,7 @@ fn is_source_change(project: &Path, path: &Path) -> bool {
 /// デッキの並び（structure.yaml）と、プリアンブルおよび設定のマクロ。
 pub(crate) fn document_for_deck(deck: &Path, built_pdf: Option<&Path>) -> ServerEvent {
     let cfg = DeckConfig::read(deck).ok();
-    let (title, sections) = cfg.as_ref().and_then(|cfg| read_document_structure(deck, cfg).ok()).unwrap_or_default();
+    let (title, sections) = cfg.as_ref().map(|cfg| document_outline(deck, cfg)).unwrap_or_default();
     let references = cfg.as_ref().and_then(|cfg| crate::paper_refs::read(deck, cfg, built_pdf));
     let title = deck_display_title(deck, cfg.as_ref(), title.as_deref());
     let math_macros: Vec<_> = cfg
@@ -317,8 +319,40 @@ pub fn read_structure(deck: &Path) -> anyhow::Result<(Option<String>, Vec<DocSec
     read_document_structure(deck, &DeckConfig::read(deck)?)
 }
 
+fn document_outline(deck: &Path, cfg: &DeckConfig) -> (Option<String>, Vec<DocSection>) {
+    let structure = crate::build::read_structure(deck, cfg).ok();
+    let (title, mut sections) = structure.as_ref().map(|v| structure_outline(v, cfg)).unwrap_or_default();
+    if !cfg.meta.imported_latex && matches!(cfg.meta.kind.as_str(), "paper" | "book") {
+        if let Some(root) = cfg.meta.build.as_ref().and_then(|build| build.tex_root.as_deref()) {
+            if let Ok(source) = fuzukue_cards::latex_book::manuscript_sections(deck, root, &sections) {
+                return (title, source);
+            }
+        }
+    }
+    if cfg.meta.imported_latex {
+        use fuzukue_proto::{DocProse, DocProseText};
+        if let Some(tex) = structure.as_ref().and_then(|v| v["before_sections"].as_str())
+            .filter(|tex| tex.lines().any(|line| {
+                let line = line.trim_start();
+                !line.is_empty() && !line.starts_with('%')
+            }))
+        {
+            sections.insert(0, DocSection {
+                title: String::new(),
+                items: Vec::new(),
+                prose: vec![DocProse { before_item: 0, text: DocProseText::Tex(tex.to_owned()) }],
+            });
+        }
+    }
+    (title, sections)
+}
+
 fn read_document_structure(deck: &Path, cfg: &DeckConfig) -> anyhow::Result<(Option<String>, Vec<DocSection>)> {
     let v = crate::build::read_structure(deck, cfg)?;
+    Ok(structure_outline(&v, cfg))
+}
+
+fn structure_outline(v: &serde_yaml::Value, cfg: &DeckConfig) -> (Option<String>, Vec<DocSection>) {
     let title = v["title"].as_str().map(str::to_owned);
     let mut sections: Vec<_> = v["sections"]
         .as_sequence()
@@ -327,15 +361,16 @@ fn read_document_structure(deck: &Path, cfg: &DeckConfig) -> anyhow::Result<(Opt
         .map(|sec| DocSection {
             title: sec["title"].as_str().unwrap_or("").to_string(),
             items: document_items(&sec["items"], cfg.harness),
+            prose: Vec::new(),
         })
         .collect();
     if cfg.harness {
         let items = document_items(&v["appendix"], true);
         if !items.is_empty() {
-            sections.push(DocSection { title: cfg.meta.appendix_title.clone().unwrap_or_else(|| "Deferred proofs".into()), items });
+            sections.push(DocSection { title: cfg.meta.appendix_title.clone().unwrap_or_else(|| "Deferred proofs".into()), items, prose: Vec::new() });
         }
     }
-    Ok((title, sections))
+    (title, sections)
 }
 
 fn document_items(items: &serde_yaml::Value, harness: bool) -> Vec<DocItem> {

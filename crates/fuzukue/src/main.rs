@@ -38,6 +38,7 @@ mod extensions;
 mod exploration;
 mod math;
 mod paper;
+mod paper_prose;
 mod paper_edit;
 mod paper_pdf;
 mod pane_resize;
@@ -205,6 +206,7 @@ struct Workbench {
     /// 通して読む画面の行と、カードごとの選択可能な Markdown
     read_rows: Vec<ReadRow>,
     read_md: HashMap<ReadPart, ReadText>,
+    read_prose: HashMap<fuzukue_proto::DocProseText, paper_prose::ProseBody>,
     open_proofs: HashMap<String, HashSet<String>>,
     proof_comments: HashSet<String>,
     paper_jump: Option<PaperJump>,
@@ -355,6 +357,7 @@ enum ReadRow {
     Title(String),
     Section(String),
     Subsection(String),
+    Prose(fuzukue_proto::DocProseText),
     Card(String),
 }
 
@@ -739,6 +742,7 @@ impl Workbench {
             doc_references: None,
             read_rows: Vec::new(),
             read_md: HashMap::new(),
+            read_prose: HashMap::new(),
             read_list,
             open_proofs: HashMap::new(),
             proof_comments: HashSet::new(),
@@ -1719,6 +1723,7 @@ impl Workbench {
         self.findings = Default::default();
         self.doc_title.clear();
         self.doc_sections.clear();
+        self.read_prose.clear();
         self.doc_macros.clear();
         self.doc_math_macros.clear();
         self.doc_references = None;

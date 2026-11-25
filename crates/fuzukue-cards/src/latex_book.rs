@@ -1,6 +1,9 @@
 //! Import literal, multi-file LaTeX into an editable book deck.
+mod reading;
 mod scan;
 mod verify;
+
+pub use reading::manuscript_sections;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -77,6 +80,7 @@ struct Span {
     range: Range<usize>,
     file: PathBuf,
     line: usize,
+    source_start: Option<usize>,
 }
 
 #[derive(Default)]
@@ -87,6 +91,7 @@ struct Expanded {
     assets: BTreeMap<PathBuf, PathBuf>,
     graphics_dirs: Vec<PathBuf>,
     warnings: BTreeSet<String>,
+    reading: Option<reading::Reading>,
 }
 
 impl Expanded {
@@ -103,6 +108,7 @@ impl Expanded {
                 .bytes()
                 .filter(|&b| b == b'\n')
                 .count(),
+            source_start: Some(range.start),
         });
     }
 
@@ -114,6 +120,7 @@ impl Expanded {
             range: start..self.tex.len(),
             file: file.to_owned(),
             line,
+            source_start: None,
         });
     }
 
@@ -136,6 +143,9 @@ impl Expanded {
             file.display()
         );
         stack.push(file.to_owned());
+        if let Some(reading) = &mut self.reading {
+            reading.count_source(file)?;
+        }
         let file_contents = if let Some(contents) = self.sources.get(file) {
             Rc::clone(contents)
         } else {
@@ -184,8 +194,12 @@ impl Expanded {
                     } else {
                         (root, local)
                     };
-                    let target = find_file(first, name, &["tex"])
-                        .or_else(|| find_file(second, name, &["tex"]))
+                    let target = if self.reading.is_some() {
+                        reading::find_input(first, second, name, limit)
+                    } else {
+                        find_file(first, name, &["tex"])
+                            .or_else(|| find_file(second, name, &["tex"]))
+                    }
                         .with_context(|| {
                             format!(
                                 "{} の {command}{{{name}}} が見つからない",
@@ -193,6 +207,20 @@ impl Expanded {
                             )
                         })?;
                     self.push(source, relative, cursor..token.start);
+                    if let Some(reading) = &mut self.reading {
+                        if let Some((id, part)) = reading.card_input(&target) {
+                            // Keep an outline anchor without reading the card's TeX body.
+                            let start = self.tex.len();
+                            let env = match part {
+                                reading::Part::Statement => "theorem",
+                                reading::Part::Proof => "proof",
+                            };
+                            self.tex.push_str(&format!("\\begin{{{env}}}\\end{{{env}}}"));
+                            reading.anchors.insert(start, (id, part));
+                            cursor = end;
+                            continue;
+                        }
+                    }
                     let include = matches!(command, "\\include" | "\\subfileinclude");
                     let child_subfile = matches!(command, "\\subfile" | "\\subfileinclude");
                     if include {
@@ -215,6 +243,7 @@ impl Expanded {
                     cursor = end;
                 }
                 "\\includeonly" if braces == 0 => bail!("\\includeonly を外して本全体を取り込む"),
+                _ if self.reading.is_some() => {}
                 "\\graphicspath" if braces == 0 => {
                     if let Some((paths, _)) = argument(source, token.end, '{', '}') {
                         let mut offset = 0;

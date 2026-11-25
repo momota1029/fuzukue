@@ -51,6 +51,7 @@ enum Flow {
         text: String,
     },
     Quote(Vec<Block>),
+    Abstract(Vec<Block>),
     Center(Vec<Block>),
     Theorem {
         heading: Vec<Run>,
@@ -367,7 +368,10 @@ impl<'a> Reader<'a> {
                 " " => Inline::Text("\u{a0}".into()),
                 "," => Inline::Text("\u{2009}".into()),
                 ";" => Inline::Text("\u{2005}".into()),
-                "!" | "leavevmode" | "noindent" | "ignorespaces" => return,
+                "!" | "leavevmode" | "noindent" | "ignorespaces" | "maketitle"
+                | "tableofcontents" | "listoffigures" | "listoftables" | "frontmatter"
+                | "mainmatter" | "backmatter" | "appendix" | "newpage" | "clearpage"
+                | "cleardoublepage" | "begingroup" | "endgroup" => return,
                 "\\" | "newline" | "linebreak" => Inline::Break,
                 "label" => {
                     input.arg('{');
@@ -669,6 +673,11 @@ impl<'a> Reader<'a> {
             }
             "enumerate" | "itemize" | "description" => self.list(input, name, base == "enumerate"),
             _ if is_literal_environment(name) => Self::code(input, name, base, begin),
+            "abstract" => {
+                let body = self.blocks(input, Some(name), false);
+                input.environment_end(name);
+                Flow::Abstract(body)
+            }
             "quote" | "quotation" | "center" => {
                 let body = self.blocks(input, Some(name), false);
                 input.environment_end(name);

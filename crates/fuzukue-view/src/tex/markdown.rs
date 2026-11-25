@@ -232,6 +232,13 @@ impl Markdown<'_> {
             }
             Flow::Center(body) => self.blocks(body),
             Flow::Quote(body) => self.blockquote(Some("fuzukue-quote"), |out| out.blocks(body)),
+            Flow::Abstract(body) => {
+                self.write("**Abstract**");
+                if !body.is_empty() {
+                    self.write("\n\n");
+                    self.blocks(body);
+                }
+            }
             Flow::Theorem { heading, body } => {
                 self.blockquote(Some("fuzukue-theorem"), |out| {
                     out.write("<strong>");

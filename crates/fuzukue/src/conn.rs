@@ -319,6 +319,22 @@ impl HttpTarget {
         self.get(&format!("{}/{route}/{path}", self.base), &[])
     }
 
+    pub(super) fn read_prose(&self, deck: &str, span: &fuzukue_proto::DocProseSpan) -> Result<String, String> {
+        use std::io::Read as _;
+
+        let response = self.get_request(&format!("{}/deck/prose", self.base), &[
+            ("deck", deck), ("path", &span.path), ("start", &span.start.to_string()),
+            ("len", &span.len.to_string()), ("sha256", &span.sha256),
+        ]).timeout(Duration::from_secs(60)).call().map_err(|error| error.to_string())?;
+        let mut tex = String::new();
+        response.into_reader().take(span.len as u64 + 1).read_to_string(&mut tex)
+            .map_err(|error| error.to_string())?;
+        if tex.len() != span.len {
+            return Err("Incomplete manuscript excerpt.".into());
+        }
+        Ok(tex)
+    }
+
     pub(super) fn read_deck<T: serde::de::DeserializeOwned>(
         &self,
         route: &str,

@@ -30,6 +30,26 @@ fn plain(node: &Node) -> String {
 }
 
 #[test]
+fn renders_amsart_opening_in_source_order_without_page_commands() {
+    let tex = r"
+\begin{abstract}
+A short abstract with $x^2$.
+\end{abstract}
+\maketitle
+Before the first section.
+\clearpage
+More running prose.
+";
+    let md = read_card_tex(tex, None, &[]).markdown;
+    let rendered = rendered(&md);
+    let positions = ["Abstract", "A short abstract", "Before the first section", "More running prose"]
+        .map(|text| md.find(text).unwrap());
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(walk(&rendered).any(|node| matches!(node, Node::InlineMath(math) if math.value == "x^2")));
+    assert!(!md.contains("maketitle") && !md.contains("clearpage"));
+}
+
+#[test]
 fn labelled_enumerate_keeps_math_in_its_items() {
     // The layout of (c), (d), and (e) in a nested list,
     // with the supported display delimiters represented in the same list.

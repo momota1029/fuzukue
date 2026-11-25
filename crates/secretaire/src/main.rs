@@ -762,6 +762,7 @@ fn router(app: Arc<App>, access: Arc<remote::Access>) -> Router {
         .route("/exploration", get(exploration::tree))
         .route("/deck/cards", get(cards::browse::summaries))
         .route("/deck/card", get(cards::browse::content))
+        .route("/deck/prose", get(cards::browse::prose))
         .route("/deck/diagnostics", get(cards::browse::diagnostics))
         .route("/cards-for-file/{*path}", get(source::cards_for_file_handler))
         .route("/source/{*path}", get(source::source_handler))

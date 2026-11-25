@@ -1870,7 +1870,37 @@ pub struct BranchView {
 pub struct DocSection {
     pub title: String,
     pub items: Vec<DocItem>,
+    /// Read-only manuscript text inserted before the indicated outline item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prose: Vec<DocProse>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocProse {
+    pub before_item: usize,
+    #[serde(flatten)]
+    pub text: DocProseText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocProseText {
+    Tex(String),
+    Source(Vec<DocProseSpan>),
+}
+
+/// Byte range in a deck-relative TeX file. The digest identifies the exact excerpt.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DocProseSpan {
+    pub path: String,
+    pub start: u64,
+    pub len: usize,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub newline_before: bool,
+}
+
+pub const DOC_PROSE_SPAN_BYTES: usize = 256 * 1024;
 
 /// PDF を作ったときに確定した相互参照と文献の表示番号。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
