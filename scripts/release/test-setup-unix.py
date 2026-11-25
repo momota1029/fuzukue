@@ -83,6 +83,24 @@ class SourceSetup(unittest.TestCase):
         confirm.assert_not_called()
         self.assertTrue(all(call.args[1]["RUSTUP_AUTO_INSTALL"] == "0" for call in probe.call_args_list))
 
+    def test_rust_setup_uses_the_checkout_pin(self):
+        host = "aarch64-apple-darwin"
+        (self.project / "rust-toolchain.toml").write_text(
+            '[toolchain]\nchannel = "1.98.1"\n', encoding="utf-8",
+        )
+        pinned = "+1.98.1-" + host
+
+        def probe(command, env, *, cwd):
+            self.assertEqual(cwd, self.project)
+            if command[0] == "rustc":
+                version = "1.98.1" if pinned in command else "1.95.0"
+                return f"release: {version}\nhost: {host}"
+            self.assertEqual(command, ["cargo", pinned, "--version"])
+            return "cargo 1.98.1"
+
+        with patch.object(SETUP, "ROOT", self.project), patch.object(SETUP, "probe", side_effect=probe):
+            self.assertEqual(SETUP.rust_toolchain(host, True, {}), ["cargo", pinned])
+
     def test_linux_preview_suggests_packages_without_running_sudo(self):
         with patch.object(SETUP.shutil, "which", return_value=None), patch.object(
             SETUP, "probe", return_value=None

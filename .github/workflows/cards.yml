@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install Rust 1.95.0
-        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Install Rust
+        run: rustup toolchain install --profile minimal
       - name: Check cards
-        run: cargo +1.95.0 run --locked -q -p fuzukue-cards -- check
+        run: cargo run --locked -q -p fuzukue-cards -- check

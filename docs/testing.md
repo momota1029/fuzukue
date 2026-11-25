@@ -2,7 +2,7 @@
 
 ## Rust のテスト
 
-Rust と Cargo、Git、Python 3、POSIX シェル、C/C++ のビルド環境が必要です。Git と Python 3 はテストのフィクスチャでも使います。Linux のデスクトップ版をリンクするには、環境に応じて XCB、xkbcommon、xkbcommon-x11 の開発用ライブラリも用意してください。
+[ルートの `rust-toolchain.toml`](../rust-toolchain.toml) がソースセットアップ、CI、リリースビルドで使う Rust を指定します。rustup を使う場合は、チェックアウト内で `rustup toolchain install --profile minimal` を実行すると、その版の Rust と Cargo が入ります。テストには Git、Python 3、POSIX シェル、C/C++ のビルド環境も必要です。Linux のデスクトップ版をリンクするには、環境に応じて XCB、xkbcommon、xkbcommon-x11 の開発用ライブラリも用意してください。
 
 リポジトリのルートから、サーバーと共有クレートのワークスペース、別ワークスペースのデスクトップ版を順に実行します。
 

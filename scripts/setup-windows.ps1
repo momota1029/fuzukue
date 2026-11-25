@@ -91,9 +91,9 @@ $registered = (Invoke-Wsl -Arguments @('--list', '--quiet') -Capture) -split '\r
 if (-not $registered) { throw 'WSL ディストリビューションがありません。例: wsl --install -d Ubuntu' }
 if ($Distro -match '^[\-]|[\s"]') { throw '-Distro に空白や引用符を含まない名前を指定してください。' }
 if ($Distro -and $Distro -notin $registered) { throw "WSL ディストリビューションが見つかりません: $Distro" }
-$prefix = @()
-if ($Distro) { $prefix += @('-d', $Distro) }
-$prefix += @('--cd', '/', '--exec')
+$distroArguments = @()
+if ($Distro) { $distroArguments += @('-d', $Distro) }
+$prefix = $distroArguments + @('--cd', '/', '--exec')
 $actualDistro = Invoke-Wsl -Arguments ($prefix + @('/usr/bin/printenv', 'WSL_DISTRO_NAME')) -Capture
 $linuxHome = Invoke-Wsl -Arguments ($prefix + @('/usr/bin/printenv', 'HOME')) -Capture
 if (-not $actualDistro -or -not $linuxHome.StartsWith('/')) {
@@ -141,10 +141,15 @@ if (-not (Invoke-Wsl -Arguments ($prefix + @('/usr/bin/test', '-x', $linuxCargo)
 }
 
 # 各 OS でネイティブのファイルシステムにビルド成果物を置く。
-Invoke-Wsl -Arguments ($prefix + @('/usr/bin/env', $linuxCargo, 'build', '--release',
+Invoke-Wsl -Arguments ($distroArguments + @('--cd', $repo, '--exec', '/usr/bin/env', $linuxCargo, 'build', '--release',
     '--manifest-path', "$repo/Cargo.toml", '--target-dir', "$repo/target", '-p', 'secretaire'))
-& $windowsCargo.Source build --release --manifest-path $manifest --target-dir $target
-if ($LASTEXITCODE -ne 0) { throw "Windows クライアントのビルドに失敗しました ($LASTEXITCODE)。" }
+Push-Location -LiteralPath $source
+try {
+    & $windowsCargo.Source build --release --manifest-path $manifest --target-dir $target
+    if ($LASTEXITCODE -ne 0) { throw "Windows クライアントのビルドに失敗しました ($LASTEXITCODE)。" }
+} finally {
+    Pop-Location
+}
 
 if ((Test-Path -LiteralPath $oldPortableSettings -PathType Leaf) -and -not (Test-Path -LiteralPath $portableSettings)) {
     [IO.File]::Copy($oldPortableSettings, $portableSettings, $false)

@@ -16,7 +16,7 @@ sh scripts/setup-unix.sh
 ```
 
 - プレビューは macOS のバージョンと CPU を表示し、必要なツールを確認します。Apple Silicon では Rosetta を使わないターミナルで実行します。
-- このクローンのデスクトップビルドには、macOS SDK と C/C++ コンパイラを含む **Command Line Tools**、Python 3.8 以降、Rust 1.95 以降が必要です。GPUI Kit は `runtime_shaders` を有効にしており、アプリの起動時に macOS の Metal API でシェーダーをコンパイルします。フル版 Xcode と追加の Metal Toolchain のダウンロードは不要です。[Apple の Command Line Tools ガイド](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)
+- このクローンのデスクトップビルドには、macOS SDK と C/C++ コンパイラを含む **Command Line Tools**、Python 3.8 以降、[リポジトリが指定する Rust ツールチェーン](../rust-toolchain.toml)が必要です。GPUI Kit の macOS バックエンドは、Rust 1.98.0 で安定化された `Option::map_or_default` を使います。GPUI Kit は `runtime_shaders` を有効にしており、アプリの起動時に macOS の Metal API でシェーダーをコンパイルします。フル版 Xcode と追加の Metal Toolchain のダウンロードは不要です。[Apple の Command Line Tools ガイド](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)
 - セットアップは不足しているツールの導入コマンドを表示します。公式インストーラーを開く、または実行する場合は対話端末で確認します。Rust と Cargo の依存関係の取得にはインターネット接続が必要です。初回のビルドには時間がかかります。
 - 既定ではサンプル `examples/lab` を開きます。手元のプロジェクトを使う場合は `sh scripts/setup-unix.sh --project "$HOME/my-project"` のようにホームディレクトリ内の既存フォルダーを渡します。
 - サーバーはログインユーザーの LaunchAgent から `127.0.0.1:7878` で起動します。セットアップはクライアントの接続モードを「外部」に設定します。クライアントから同じ Mac のサーバーに接続する際にトークンは不要です。クライアントを開いたまま更新する場合は、次回起動時に新しい実行ファイルが使われます。

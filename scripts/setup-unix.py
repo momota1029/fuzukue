@@ -13,7 +13,6 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MIN_RUST = (1, 95, 0)  # Wasmtime in the server lockfile.
 HOSTS = {
     ("Darwin", "arm64"): "aarch64-apple-darwin",
     ("Darwin", "x86_64"): "x86_64-apple-darwin",
@@ -43,10 +42,10 @@ def config_home(name, fallback):
     return path if path.is_absolute() else Path.home() / fallback
 
 
-def probe(command, env=None):
+def probe(command, env=None, *, cwd=None):
     try:
         result = subprocess.run(
-            command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            command, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, timeout=10,
         )
         return result.stdout.strip() if result.returncode == 0 else None
@@ -115,34 +114,38 @@ def mac_tools():
 
 
 def rust_toolchain(host, preview, env):
+    # Keep Python 3.8 support and read the single pinned channel used by rustup.
+    config = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+    channel = re.search(r'^channel\s*=\s*"(\d+\.\d+\.\d+)"', config, re.MULTILINE)
+    if not channel:
+        raise ValueError("Expected a Rust version in rust-toolchain.toml.")
+    version = channel.group(1)
     cargo_home = config_home("CARGO_HOME", ".cargo")
     env["PATH"] = str(cargo_home / "bin") + os.pathsep + os.environ.get("PATH", os.defpath)
     # A rustup proxy can otherwise install a missing toolchain even for -vV.
     env["RUSTUP_AUTO_INSTALL"] = "0"
-    toolchain = f"stable-{host}"
+    toolchain = f"{version}-{host}"
 
     def available(prefix):
-        version = probe(["rustc", *prefix, "-vV"], env)
-        release = re.search(r"(?m)^release: (\d+)\.(\d+)\.(\d+)", version or "")
-        return (release and tuple(map(int, release.groups())) >= MIN_RUST
-                and f"host: {host}" in version.splitlines()
-                and probe(["cargo", *prefix, "--version"], env))
+        info = (probe(["rustc", *prefix, "-vV"], env, cwd=ROOT) or "").splitlines()
+        return (f"release: {version}" in info and f"host: {host}" in info
+                and probe(["cargo", *prefix, "--version"], env, cwd=ROOT))
 
     for prefix in ([], ["+" + toolchain]):
         if available(prefix):
             return ["cargo", *prefix]
-    print(f"Install Rust 1.95 or newer for {host}.")
+    print(f"Install Rust {version} for {host} (pinned in rust-toolchain.toml).")
     if shutil.which("rustup", path=env["PATH"]):
         install = ["rustup", "toolchain", "install", toolchain, "--profile", "minimal"]
         print("  " + shlex.join(install))
-        if not preview and confirm("Update Rust using rustup?"):
+        if not preview and confirm("Install the pinned Rust toolchain using rustup?"):
             subprocess.run(install, env=env, check=True)
             if available(["+" + toolchain]):
                 return ["cargo", "+" + toolchain]
     else:
         url = "https://sh.rustup.rs"
         fetch = ["curl", "--disable", "--proto", "=https", "--tlsv1.2", "-sSf", url]
-        options = ["--profile", "minimal", "--default-host", host]
+        options = ["--profile", "minimal", "--default-host", host, "--default-toolchain", version]
         print(f"  {shlex.join(fetch)} | sh -s -- {shlex.join(options)}")
         if not preview and shutil.which("curl") and confirm("Download and run the official rustup installer?"):
             with tempfile.TemporaryDirectory(prefix="fuzukue-rustup-") as tmp:

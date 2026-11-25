@@ -79,8 +79,7 @@ jobs:
         env:
           TAG: ${{ needs.source.outputs.tag }}
         run: |
-          rustup update stable
-          rustup default stable
+          rustup toolchain install --profile minimal
           scripts/release/package-linux.sh "$TAG" dist
       - uses: actions/upload-artifact@v4
         with:
@@ -103,11 +102,7 @@ jobs:
         env:
           TAG: ${{ needs.source.outputs.tag }}
         run: |
-          rustup update stable
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default stable
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup target add x86_64-pc-windows-msvc
+          rustup toolchain install --profile minimal --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./scripts/release/Package-Release.ps1 -Tag $env:TAG -OutputDirectory dist
       - uses: actions/upload-artifact@v4
