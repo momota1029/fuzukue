@@ -6,6 +6,16 @@ fuzukue is a workbench for writing mathematics and doing research with AI agents
 
 The project is early. The maintainer uses it for daily work, and setup and workflows may change.
 
+## Install on Mac
+
+Paste this into Terminal on macOS 15 or later once a release with the Mac packages is published.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/momota1029/fuzukue/main/install.sh | sh
+```
+
+The installer selects Apple Silicon or Intel, adds fuzukue to Applications in your home folder, starts the local server, and enables updates for both. [Mac installation guide (Japanese)](docs/install-mac.md)
+
 ## Features
 
 - Organize definitions, theorems, proofs, and notes into cards and decks. Follow references between cards and browse the sample workspace for examples. [Card graph](docs/graph.md) · [Sample workspace](examples/lab/README.md)
@@ -43,7 +53,7 @@ For Android source builds and signed APKs, follow the [Android guide](android/RE
 
 ## Install from a release
 
-When matching packages are published, use [install-server.sh](scripts/install-server.sh) for the server, [install-client.sh](scripts/install-client.sh) for macOS or Linux desktop, or [install-client.ps1](scripts/install-client.ps1) for Windows desktop. macOS beta installations with launchd can update both components from GitHub Releases. [Installation guide](docs/install.md#english) · [Mac release setup (Japanese)](docs/install-mac.md#配布版へ切り替える)
+When matching packages are published, use the Mac command above or follow the packaged installation instructions for Linux and Windows. [Installation guide](docs/install.md#english)
 
 ## Add a custom skill
 

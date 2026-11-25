@@ -7,8 +7,8 @@ name: Desktop release
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing v-prefixed SemVer tag to build
-        required: true
+        description: Existing v-prefixed SemVer tag. Leave empty for an untagged dry run.
+        required: false
         type: string
       dry-run:
         description: Build and retain workflow artifacts without creating a release
@@ -35,9 +35,15 @@ jobs:
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || (github.event_name == 'push' && github.ref_name) || '' }}
+          DRY_RUN: ${{ inputs['dry-run'] }}
         run: |
           set -euo pipefail
+          if [[ -z $TAG ]]; then
+            [[ $DRY_RUN == true ]] || { echo 'Creating a draft requires an existing tag.' >&2; exit 2; }
+            printf 'tag=v0.0.0-dryrun.%s\ncommit=%s\n' "$GITHUB_RUN_ID" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           number='(0|[1-9][0-9]*)'
           identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
           [[ $TAG =~ ^v$number\.$number\.$number(-$identifier(\.$identifier)*)?$ ]]
@@ -112,10 +118,18 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  # macOS dogfood assets use the manually dispatched macos-dogfood.yml workflow.
+  macos:
+    needs: source
+    permissions:
+      contents: read
+    uses: ./.github/workflows/macos-dogfood.yml
+    with:
+      tag: ${{ needs.source.outputs.tag }}
+      build-commit: ${{ needs.source.outputs.commit }}
+      include-intel: true
 
   manifest:
-    needs: [source, linux, windows]
+    needs: [source, linux, windows, macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -129,6 +143,10 @@ jobs:
           pattern: '*-release'
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dogfood-assets
+          path: dist
       - name: Assemble release manifest and SHA256SUMS
         env:
           TAG: ${{ needs.source.outputs.tag }}
@@ -138,6 +156,8 @@ jobs:
           python3 scripts/release/make-manifest.py "$TAG" "$GITHUB_REPOSITORY" dist "$RUNNER_TEMP/secretaire"
           jq -e --arg commit "$EXPECTED_COMMIT" '.commit == $commit' dist/release-manifest.json
           (cd dist && sha256sum --strict --check SHA256SUMS)
+          jq -e --arg commit "$EXPECTED_COMMIT" '.commit == $commit' dist/macos-release-manifest.json
+          (cd dist && sha256sum --strict --check SHA256SUMS-macos)
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-release-assets
@@ -147,7 +167,7 @@ jobs:
 
   draft:
     needs: [source, manifest]
-    if: ${{ github.event_name == 'push' || inputs['dry-run'] == false }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs['dry-run'] == false }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -165,6 +185,7 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum --strict --check SHA256SUMS
+          sha256sum --strict --check SHA256SUMS-macos
           ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '[.object.type, .object.sha] | @tsv')
           for ((depth=0; depth<10; depth++)); do
             read -r type sha <<< "$ref"
@@ -183,4 +204,5 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag "${flags[@]}" \
             --title "$TAG" --notes 'Draft desktop release. The release manifest is unsigned.' \
             "secretaire-$TAG-linux-x86_64.tar.gz" "fuzukue-$TAG-linux-x86_64.tar.gz" \
-            "fuzukue-$TAG-windows-x86_64.zip" SHA256SUMS release-manifest.json
+             "fuzukue-$TAG-windows-x86_64.zip" SHA256SUMS release-manifest.json \
+             ./*-macos-*.tar.gz SHA256SUMS-macos macos-release-manifest.json

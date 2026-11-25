@@ -1,6 +1,32 @@
 # Mac で fuzukue を使う
 
-同じ Mac でサーバー `secretaire` とデスクトップクライアント `fuzukue` を動かします。クローンから始める場合、公開リリースを待つ必要はありません。
+Apple Silicon と Intel の Mac に対応します。macOS 15（Sequoia）以降で「ターミナル」を開き、次の一行を貼り付けて Return を押します。
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/momota1029/fuzukue/main/install.sh | sh
+```
+
+このコマンドは、Apple Silicon・Intel 用のアプリとサーバーがそろったリリースが公開されてから使えます。公開前に試す場合は、下の[クローンからセットアップする](#クローンからセットアップする)手順を使います。
+
+ホームの「アプリケーション」（`~/Applications`）にアイコン付きの fuzukue が入ります。次回からは Finder で fuzukue をダブルクリックします。Mac にログインするとバックグラウンドでサーバーが起動します。アプリはそのサーバーにつながり、最初の作業フォルダーとして `~/fuzukue-project` が開きます。管理者権限、Git、Rust、Python、Xcode、Command Line Tools はアプリの導入や起動に不要です。
+
+- **会話を始める**。Claude Code と Codex の両方がなければ、インストール中にどちらかの公式インストーラーを選べます。アプリの案内に従い、ターミナルから自分のアカウントでログインします。ログイン後に fuzukue を開き直します。
+- **変更履歴と取り消しを使う**。Git がない場合、アプリは開けますが、変更履歴、取り消し、Git による差分の確認は使えません。その間の変更は fuzukue の履歴に残りません。使うには、ターミナルに `xcode-select --install` と入力し、Apple の案内に従います。Git がすでに使える Mac では、その Git を利用します。
+- **更新する**。Mac にログインしている間、fuzukue は約6時間ごとに新しい版を確認し、作業が止まっているときにサーバーとアプリを更新します。開いているアプリは次に開き直すと新しい版になります。今すぐ修復や更新をするには、上の一行をもう一度実行します。
+
+自動更新を止めるには次を実行します。再開するには `--no-auto-update` を `--resume-auto-update` に置き換えます。
+
+```sh
+sh "$HOME/Applications/fuzukue.app/Contents/Resources/install.sh" --no-auto-update
+```
+
+削除するときは fuzukue を閉じて、ターミナルで次を実行します。アプリ、サーバー、起動と更新の登録を削除し、作業フォルダー、履歴、設定、会話用ツールは保持します。
+
+```sh
+sh "$HOME/Applications/fuzukue.app/Contents/Resources/install.sh" --uninstall
+```
+
+配布版の照合には、macOS 標準の `curl`（HTTPS）、`osascript` の JavaScript for Automation（JSON）、`shasum -a 256`（SHA-256）、`stat`（サイズ）、`tar`（展開）、`codesign`（アドホック署名）を使います。`plutil` でアプリと自動起動の設定を確認し、`launchctl` と `open` で起動します。GitHub 上のタグが指すコミット、配布マニフェスト、サイズと SHA-256 を照合します。ベータのマニフェストは未署名で、アプリは Apple の公証を受けていません。[macOS が起動を止めた場合の Apple の案内](https://support.apple.com/ja-jp/102445)
 
 ## クローンからセットアップする
 
@@ -30,7 +56,7 @@ Mac には Linux の Bubblewrap による作業役・レシピのホスト隔離
 
 ## 配布版へ切り替える
 
-案内されたプリリリースにサーバーとクライアント両方のパッケージがそろったら、同じクローンで以下の配布版インストーラーを実行できます。サーバーの LaunchAgent を登録するコマンドには、使い続けたいプロジェクトフォルダーを渡します。配布版のインストール後は LaunchAgent が GitHub Releases のベータ版を確認します。
+クローンから導入済みで作業フォルダーとコマンドラインランチャーを使い続ける場合は、以下の手順で案内されたベータ版へ切り替えられます。新しい一行インストーラーに移る場合は、先に既存のサーバーを停止します。
 
 ### 1. 準備する
 

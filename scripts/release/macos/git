@@ -1,0 +1,24 @@
+#!/bin/sh
+# Apple's Git shim prompts to install developer tools. Let Git operations fail
+# quietly on a clean Mac, and use a real Git installation when one is available.
+path=$PATH
+while [ -n "$path" ]; do
+    dir=${path%%:*}
+    case $path in *:*) path=${path#*:} ;; *) path= ;; esac
+    case $dir in
+        /usr/bin)
+            developer=$(/usr/bin/xcode-select -p 2>/dev/null) || continue
+            real_git="$developer/usr/bin/git"
+            if [ -x "$real_git" ] && ! [ "$real_git" -ef /usr/bin/git ]; then
+                exec "$real_git" "$@"
+            fi
+            ;;
+        /*)
+            if [ -x "$dir/git" ] && ! [ "$dir/git" -ef "$0" ] && ! [ "$dir/git" -ef /usr/bin/git ]; then
+                exec "$dir/git" "$@"
+            fi
+            ;;
+    esac
+done
+printf '%s\n' 'Git is unavailable on this Mac.' >&2
+exit 127

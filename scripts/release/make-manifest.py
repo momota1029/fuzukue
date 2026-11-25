@@ -25,13 +25,14 @@ def main():
     parser.add_argument("repository", help="GitHub OWNER/REPO")
     parser.add_argument("assets", type=Path)
     parser.add_argument("secretaire", type=Path, nargs="?", help="packaged Linux server binary")
-    parser.add_argument("--macos", action="store_true", help="generate supplemental macOS prerelease metadata")
+    parser.add_argument("--macos", action="store_true", help="generate supplemental macOS metadata")
     parser.add_argument("--include-intel", action="store_true", help="require macOS Intel packages as well")
+    parser.add_argument("--with-app", action="store_true", help="require macOS app bundle packages")
     args = parser.parse_args()
-    if args.macos == (args.secretaire is not None) or (args.include_intel and not args.macos):
-        parser.error("provide either the Linux server binary or --macos (optionally with --include-intel)")
-    if args.macos and "-" not in args.tag:
-        parser.error("macOS metadata requires a prerelease tag")
+    if args.macos == (args.secretaire is not None) or ((args.include_intel or args.with_app) and not args.macos):
+        parser.error("provide either the Linux server binary or --macos")
+    if args.macos and not args.with_app and "-" not in args.tag:
+        parser.error("legacy macOS metadata requires a prerelease tag")
     root = Path(__file__).resolve().parents[2]
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", args.tag):
         parser.error("expected a v-prefixed SemVer tag")
@@ -75,6 +76,8 @@ def main():
             for platform in platforms
             for kind, binary in (("server", "secretaire"), ("macos-client", "fuzukue"))
         ]
+        if args.with_app:
+            packages.extend(("macos-app", "fuzukue-app", platform, "tar.gz") for platform in platforms)
     for kind, binary, platform, extension in packages:
         name = f"{binary}-{args.tag}-{platform}.{extension}"
         spec["artifacts"].append({

@@ -1,6 +1,26 @@
 name: macOS dogfood prerelease
 
 'on':
+  pull_request:
+    paths:
+      - install.sh
+      - scripts/install-server.sh
+      - scripts/release/**
+      - .github/workflows/macos-dogfood.yml
+      - .github/workflows/release.yml
+      - crates/fuzukue/src/main.rs
+      - crates/secretaire/src/mcp/workspace_write.rs
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      build-commit:
+        required: true
+        type: string
+      include-intel:
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       tag:
@@ -9,7 +29,7 @@ name: macOS dogfood prerelease
       include-intel:
         description: Also build and smoke-test Intel macOS
         type: boolean
-        default: false
+        default: true
       attach:
         description: Attach verified assets to an existing prerelease or prerelease draft
         type: boolean
@@ -18,7 +38,7 @@ name: macOS dogfood prerelease
 permissions: {}
 
 concurrency:
-  group: macos-dogfood-${{ inputs.tag || github.ref }}
+  group: macos-dogfood-${{ github.workflow }}-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -36,15 +56,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           ATTACH: ${{ inputs.attach }}
+          BUILD_COMMIT: ${{ inputs['build-commit'] }}
         run: |
           set -euo pipefail
-          if [[ -z $TAG ]]; then
-            [[ $ATTACH == false ]] || { echo 'Attachment requires an existing prerelease tag.' >&2; exit 2; }
+          number='(0|[1-9][0-9]*)'
+          identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          if [[ -n $BUILD_COMMIT ]]; then
+            [[ $TAG =~ ^v$number\.$number\.$number(-$identifier(\.$identifier)*)?$ && $BUILD_COMMIT =~ ^[0-9a-f]{40}$ ]]
+            tag=$TAG
+            commit=$BUILD_COMMIT
+          elif [[ -z $TAG ]]; then
+            [[ $ATTACH != true ]] || { echo 'Attachment requires an existing prerelease tag.' >&2; exit 2; }
             tag="v0.0.0-dogfood.$GITHUB_RUN_ID"
             commit=$GITHUB_SHA
           else
-            number='(0|[1-9][0-9]*)'
-            identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
             [[ $TAG =~ ^v$number\.$number\.$number-$identifier(\.$identifier)*$ ]] || {
               echo 'Expected a v-prefixed SemVer prerelease tag.' >&2
               exit 2
@@ -83,7 +108,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs['include-intel'] && '["macos-latest","macos-15-intel"]' || '["macos-latest"]') }}
+        runner: ${{ fromJSON((github.event_name == 'pull_request' || inputs['include-intel']) && '["macos-15","macos-15-intel"]' || '["macos-15"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
@@ -99,7 +124,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$RUNNER_LABEL:$(uname -m)" in
-            macos-latest:arm64|macos-15-intel:x86_64) ;;
+            macos-15:arm64|macos-15-intel:x86_64) ;;
             *) echo 'Unexpected runner architecture.' >&2; exit 2 ;;
           esac
           xcodebuild -version
@@ -146,10 +171,10 @@ jobs:
         env:
           TAG: ${{ needs.source.outputs.tag }}
           EXPECTED_COMMIT: ${{ needs.source.outputs.commit }}
-          INCLUDE_INTEL: ${{ inputs['include-intel'] }}
+          INCLUDE_INTEL: ${{ github.event_name == 'pull_request' || inputs['include-intel'] }}
         run: |
           set -euo pipefail
-          flags=(--macos)
+          flags=(--macos --with-app)
           if [[ $INCLUDE_INTEL == true ]]; then flags+=(--include-intel); fi
           python3 scripts/release/make-manifest.py "$TAG" "$GITHUB_REPOSITORY" dist "${flags[@]}"
           jq -e --arg commit "$EXPECTED_COMMIT" '.commit == $commit' dist/macos-release-manifest.json
@@ -166,9 +191,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs['include-intel'] && '["macos-latest","macos-15-intel"]' || '["macos-latest"]') }}
+        runner: ${{ fromJSON((github.event_name == 'pull_request' || inputs['include-intel']) && '["macos-15","macos-15-intel"]' || '["macos-15"]') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -180,12 +205,19 @@ jobs:
         with:
           name: macos-dogfood-assets
           path: dist
-      - name: Install into an isolated home and smoke-test launchd and loopback health
+      - name: Exercise the one-line installer, app bundle and automatic update
         env:
           TAG: ${{ needs.source.outputs.tag }}
         run: |
           export TMPDIR="$RUNNER_TEMP"
-          bash scripts/release/smoke-macos.sh "$PWD/dist" "$TAG"
+          bash scripts/release/smoke-one-line-macos.sh "$PWD/dist" "$TAG"
+      - name: Exercise the existing prerelease installer
+        env:
+          TAG: ${{ needs.source.outputs.tag }}
+        run: |
+          if [[ $TAG == *-* ]] && launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+            bash scripts/release/smoke-macos.sh "$PWD/dist" "$TAG"
+          fi
 
   attach:
     if: ${{ inputs.attach }}

@@ -3208,5 +3208,20 @@ fn main() {
         })
         .expect("failed to open window");
         cx.activate(true);
+        #[cfg(target_os = "macos")]
+        show_packaged_setup_guide(cx);
     });
+}
+
+#[cfg(target_os = "macos")]
+fn show_packaged_setup_guide(cx: &mut gpui_kit::App) {
+    let Some(script) = std::env::current_exe().ok().and_then(|exe| {
+        Some(exe.parent()?.parent()?.join("Resources/install.sh"))
+    }).filter(|script| script.is_file()) else { return };
+    cx.background_spawn(async move {
+        let _ = std::process::Command::new("/bin/sh")
+            .arg(script)
+            .arg("--guide")
+            .status();
+    }).detach();
 }

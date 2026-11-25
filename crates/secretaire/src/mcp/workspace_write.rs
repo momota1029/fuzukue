@@ -518,10 +518,17 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn git(directory: &Path, args: &[&str]) -> Result<Output> {
+    // The packaged Mac server puts its real-Git resolver first. Apple's stub
+    // would open a developer-tools prompt even for this internal text diff.
+    let path = if cfg!(target_os = "macos") && std::env::var_os("FUZUKUE_MACOS_PACKAGE").is_some() {
+        std::env::var_os("PATH").unwrap_or_default()
+    } else {
+        "/usr/bin:/bin".into()
+    };
     Command::new("git")
         .current_dir(directory)
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", path)
         .env("LC_ALL", "C")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
