@@ -14,6 +14,7 @@ use notify::{RecursiveMode, Watcher};
 
 use crate::{build_jobs, Workspace};
 
+pub(crate) mod browse;
 mod translation;
 #[cfg(test)]
 mod r81_tests;
@@ -29,66 +30,32 @@ pub fn workspace(project: &Path, deck: &str) -> ServerEvent {
 
 pub fn deck_snapshot(project: &Path, deck: &str) -> (ServerEvent, ServerEvent, ServerEvent) {
     let root = project.join(deck);
-    (snapshot_for_deck(project, &root), document_for_deck(&root, None), workspace(project, deck))
+    (ServerEvent::DeckCardsChanged { deck: deck.into() }, document_for_deck(&root, None), workspace(project, deck))
 }
 
 pub(crate) fn snapshot_for_deck(project: &Path, deck: &Path) -> ServerEvent {
-    // カードのパスはプロジェクトからの相対にそろえる（編集や HTTP の取得に使う）。
-    let prefix = deck.strip_prefix(project).map(Path::to_path_buf).unwrap_or_default();
+    snapshot_for_deck_with(project, deck, legacy_diagnostics)
+}
+
+pub(super) fn snapshot_for_deck_with(
+    project: &Path,
+    deck: &Path,
+    project_diagnostics: impl FnOnce(&Path, &[fuzukue_cards::Diagnostic]) -> Vec<CardDiagnostic>,
+) -> ServerEvent {
+    let prefix = deck.strip_prefix(project).unwrap_or(Path::new(""));
     match crate::rules::open_graph(project, deck) {
         Ok(g) => {
             let tex = tex_access(project, deck, &g);
             let mut sources = translation::Sources::new(project, &g);
-            let cards = g
-                .cards
-                .values()
-                .map(|c| CardView {
-                    id: c.id.clone(),
-                    kind: c.kind.clone(),
-                    title: c.title.clone(),
-                    status: c.status.clone(),
-                    path: prefix.join(&c.path).to_string_lossy().into(),
-                    links: c.links.iter().map(|l| (l.rel.clone(), l.to.clone())).collect(),
-                    backlinks: g
-                        .backlinks
-                        .get(&c.id)
-                        .into_iter()
-                        .flatten()
-                        .map(|(from, rel)| (rel.clone(), from.clone()))
-                        .collect(),
-                    issues: c.issues.clone(),
-                    files: c.files.clone(),
-                    body: c.body.clone(),
-                    edit_body: edit_source(deck, c, CardEditPart::Body, tex).ok(),
-                    edit_proof: edit_source(deck, c, CardEditPart::Proof, tex).ok(),
-                    external: c.external,
-                    source: c.source.clone(),
-                    translation: sources.check(c),
-                    research_origin: g.research_origins.get(&c.id).and_then(|(deck, card)| {
-                        Some(fuzukue_proto::ResearchOrigin {
-                            deck: deck.strip_prefix(project).ok()?.to_string_lossy().replace('\\', "/"),
-                            card: card.clone(),
-                        })
-                    }),
-                    tex: c.tex.iter().map(|t| prefix.join(t).to_string_lossy().replace('\\', "/")).collect(),
-                    lean: c.lean.clone(),
-                })
-                .collect();
-            let diagnostics = g
-                .diagnostics
-                .iter()
-                .map(|d| CardDiagnostic {
-                    error: d.severity == Severity::Error,
-                    path: prefix.join(&d.path).to_string_lossy().into(),
-                    message: d.display_message(),
-                    style: d.code.filter(|code| code.starts_with("style/")).map(|code| fuzukue_proto::CardStyleDiagnostic {
-                        code: code.into(),
-                        textlint_rule: d.textlint_rule.clone(),
-                        detail: d.message.clone(),
-                        note: d.style_note.clone(),
-                    }),
-                })
-                .collect();
+            let cards = g.cards.values().map(|c| {
+                let mut card = card_summary(project, prefix, &g, c, &mut sources);
+                let content = card_content(deck, c, tex);
+                card.body = content.body;
+                card.edit_body = content.edit_body;
+                card.edit_proof = content.edit_proof;
+                card
+            }).collect();
+            let diagnostics = project_diagnostics(prefix, &g.diagnostics);
             ServerEvent::Cards { deck: prefix.to_string_lossy().into_owned(), cards, diagnostics }
         }
         Err(e) => ServerEvent::Cards {
@@ -96,6 +63,88 @@ pub(crate) fn snapshot_for_deck(project: &Path, deck: &Path) -> ServerEvent {
             cards: Vec::new(),
             diagnostics: vec![CardDiagnostic { error: true, path: ".".into(), message: format!("{e:#}"), style: None }],
         },
+    }
+}
+
+
+fn legacy_diagnostics(prefix: &Path, diagnostics: &[fuzukue_cards::Diagnostic]) -> Vec<CardDiagnostic> {
+    let mut per_path = BTreeMap::new();
+    let total = diagnostics.len();
+    let mut diagnostics: Vec<_> = diagnostics.iter().filter(|d| {
+        let count = per_path.entry(&d.path).or_insert(0);
+        *count += 1;
+        *count <= 16
+    }).take(256).map(|d| diagnostic_view(prefix, d)).collect();
+    if diagnostics.len() < total {
+        diagnostics.push(CardDiagnostic {
+            error: false,
+            path: ".".into(),
+            message: format!("Showing {} of {total} deck diagnostics. Update the client and server to view more.", diagnostics.len()),
+            style: None,
+        });
+    }
+    diagnostics
+}
+
+fn card_summary(
+    project: &Path,
+    prefix: &Path,
+    g: &fuzukue_cards::Graph,
+    c: &Card,
+    sources: &mut translation::Sources<'_>,
+) -> CardView {
+    CardView {
+        id: c.id.clone(),
+        kind: c.kind.clone(),
+        title: c.title.clone(),
+        status: c.status.clone(),
+        path: prefix.join(&c.path).to_string_lossy().into(),
+        links: c.links.iter().map(|l| (l.rel.clone(), l.to.clone())).collect(),
+        backlinks: g
+            .backlinks
+            .get(&c.id)
+            .into_iter()
+            .flatten()
+            .map(|(from, rel)| (rel.clone(), from.clone()))
+            .collect(),
+        issues: c.issues.clone(),
+        files: c.files.clone(),
+        body: String::new(),
+        edit_body: None,
+        edit_proof: None,
+        external: c.external,
+        source: c.source.clone(),
+        translation: sources.check(c),
+        research_origin: g.research_origins.get(&c.id).and_then(|(deck, card)| {
+            Some(fuzukue_proto::ResearchOrigin {
+                deck: deck.strip_prefix(project).ok()?.to_string_lossy().replace('\\', "/"),
+                card: card.clone(),
+            })
+        }),
+        tex: c.tex.iter().map(|t| prefix.join(t).to_string_lossy().replace('\\', "/")).collect(),
+        lean: c.lean.clone(),
+    }
+}
+
+fn card_content(deck: &Path, card: &Card, tex: Access) -> fuzukue_proto::CardContent {
+    fuzukue_proto::CardContent {
+        body: card.body.clone(),
+        edit_body: edit_source(deck, card, CardEditPart::Body, tex).ok(),
+        edit_proof: edit_source(deck, card, CardEditPart::Proof, tex).ok(),
+    }
+}
+
+pub(super) fn diagnostic_view(prefix: &Path, d: &fuzukue_cards::Diagnostic) -> CardDiagnostic {
+    CardDiagnostic {
+        error: d.severity == Severity::Error,
+        path: prefix.join(&d.path).to_string_lossy().into(),
+        message: d.display_message(),
+        style: d.code.filter(|code| code.starts_with("style/")).map(|code| fuzukue_proto::CardStyleDiagnostic {
+            code: code.into(),
+            textlint_rule: d.textlint_rule.clone(),
+            detail: d.message.clone(),
+            note: d.style_note.clone(),
+        }),
     }
 }
 
@@ -836,12 +885,13 @@ pub fn watch(
             }
             let hub = &app.hub;
             if pending.cards {
+                app.deck_view.clear();
                 let p = project.clone();
                 let deck = app.current_deck();
                 if let Ok((c, d, w)) = tokio::task::spawn_blocking(move || deck_snapshot(&p, &deck)).await {
+                    hub.publish_snapshot(w);
                     hub.publish_snapshot(c);
                     hub.publish_snapshot(d);
-                    hub.publish_snapshot(w);
                 }
             }
             if pending.macros {

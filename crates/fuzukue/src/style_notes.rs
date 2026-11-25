@@ -73,6 +73,7 @@ impl Workbench {
     ) -> impl Iterator<Item = &'a CardStyleDiagnostic> {
         self.card_diags
             .iter()
+            .chain(self.loaded_card_diagnostics(path))
             .filter(move |d| d.path == path)
             .filter_map(|d| d.style.as_ref())
     }

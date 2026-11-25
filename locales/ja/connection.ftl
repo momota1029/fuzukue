@@ -14,3 +14,5 @@ connection-starting-server-in-wsl = WSL でサーバーを起動中…
 connection-timed-out-stopping-the-wsl-server = WSL のサーバー停止がタイムアウトした
 connection-wsl-stop-command-failed = WSL の停止コマンドが失敗した ({ $status })
 connection-server-closed = サーバーが接続を閉じた
+
+connection-workspace-fallback = { $reason } 保存されたワークスペースを指定せずに再接続します。

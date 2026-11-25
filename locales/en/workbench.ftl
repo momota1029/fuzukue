@@ -217,3 +217,13 @@ findings-sources = Sources
 findings-source-human = Human
 findings-source-agent = Agent
 findings-change-unavailable = This card edit is unavailable in the local change history.
+
+workbench-loading-deck = Loading card summaries…
+workbench-deck-changed = The deck changed while it was loading.
+workbench-retry-deck = Reload deck
+workbench-loading-card = Loading card…
+workbench-retry-card = Reload card
+workbench-show-diagnostics = Show diagnostics
+workbench-more-diagnostics = Show more diagnostics
+workbench-loading-diagnostics = Checking diagnostics…
+workbench-diagnostic-total = Showing { $shown } of { $total } diagnostics ({ $errors } errors)

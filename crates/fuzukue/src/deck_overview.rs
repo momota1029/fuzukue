@@ -211,7 +211,7 @@ impl Workbench {
                                         card_diagnostic_text,
                                     ),
                             )
-                    }))),
+                    })).children(self.deck_diagnostics_panel(None, cx))),
             )
     }
 

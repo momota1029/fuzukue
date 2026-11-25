@@ -901,6 +901,23 @@ impl Graph {
         Ok(g)
     }
 
+    /// Load a deck and build its cross-reference index without running body lint.
+    pub fn open_for_browsing(root: &Path, rules: &[PathBuf], project: &Path) -> Result<Self> {
+        let cfg = DeckConfig::read_config(root, rules, Some(project))?;
+        let mut graph = Self::load_deck(root, &cfg, project)?;
+        graph.index_links(project)?;
+        Ok(graph)
+    }
+
+    /// Complete diagnostics for a graph from `open_for_browsing`.
+    pub fn browsing_diagnostics(&self, rules: &[PathBuf], project: &Path) -> Result<Vec<Diagnostic>> {
+        let cfg = DeckConfig::read_config(&self.root, rules, Some(project))?;
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.extend(self.lint(&cfg.lint, cfg.style, Some(project), |_| true)?);
+        diagnostics.sort_by(|a, b| (&a.severity, &a.path).cmp(&(&b.severity, &b.path)));
+        Ok(diagnostics)
+    }
+
     /// Load local and namespaced cards without running the browsing lint rules.
     pub fn load_deck(root: &Path, cfg: &DeckConfig, workspace: &Path) -> Result<Self> {
         let mut g = Self::load_cards_scoped(root, &cfg.dirs, Some(workspace))?;
@@ -989,6 +1006,7 @@ impl Graph {
     fn load_cards_scoped(root: &Path, card_dirs: &[PathBuf], workspace: Option<&Path>) -> Result<Self> {
         let root = root.canonicalize().with_context(|| format!("{} がない", root.display()))?;
         let mut g = Graph { root: root.clone(), ..Default::default() };
+        let mut seen = BTreeSet::new();
         for dir in card_dirs {
             if let Some(workspace) = workspace {
                 workspace_paths::resolve(workspace, &root, dir)?;
@@ -1001,6 +1019,10 @@ impl Graph {
                 let entry = entry?;
                 let p = entry.path();
                 if !entry.file_type().is_file() || p.extension().is_none_or(|e| e != "md") {
+                    continue;
+                }
+                // Configured roots can overlap or name the same directory through a symlink.
+                if !seen.insert(p.canonicalize()?) {
                     continue;
                 }
                 if let Some(workspace) = workspace.filter(|_| p.ends_with("card.md")) {
@@ -1035,13 +1057,22 @@ impl Graph {
     }
 
     fn index(&mut self, lint: &LintConfig, style: StyleConfig, project: Option<&Path>) -> Result<()> {
-        let mut problems = Vec::new();
         let project = project.map(Path::to_path_buf).unwrap_or_else(|| {
             self.root.ancestors().find(|p| fuzukue_proto::compat::workspace_config(p).is_file())
                 .or_else(|| self.root.ancestors().find(|p| p.join("research").is_dir()))
                 .unwrap_or(&self.root).to_path_buf()
         });
         let project = project.canonicalize()?;
+        self.index_links(&project)?;
+        let diagnostics = self.lint(lint, style, Some(&project), |_| true)?;
+        self.diagnostics.extend(diagnostics);
+        self.diagnostics.sort_by(|a, b| (&a.severity, &a.path).cmp(&(&b.severity, &b.path)));
+        Ok(())
+    }
+
+    fn index_links(&mut self, project: &Path) -> Result<()> {
+        let project = project.canonicalize()?;
+        let mut problems = Vec::new();
         let mut research = HashMap::new();
         for card in self.cards.values() {
             if card.external {
@@ -1072,9 +1103,6 @@ impl Graph {
         for (s, p, m) in problems {
             self.diag(s, &p, m);
         }
-        let diagnostics = self.lint(lint, style, Some(&project), |_| true)?;
-        self.diagnostics.extend(diagnostics);
-        self.diagnostics.sort_by(|a, b| (&a.severity, &a.path).cmp(&(&b.severity, &b.path)));
         Ok(())
     }
 

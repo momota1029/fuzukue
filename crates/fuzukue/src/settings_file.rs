@@ -80,6 +80,10 @@ pub(super) fn save_workspace(path: &Path, id: &str) -> anyhow::Result<()> {
     update(path, |settings| Ok(remember_workspace(settings, id)))
 }
 
+pub(super) fn clear_workspace(path: &Path) -> anyhow::Result<()> {
+    update(path, |settings| Ok(settings.remove(LAST_WORKSPACE).is_some()))
+}
+
 pub(super) fn save_server_on_close(path: &Path, enabled: bool) -> anyhow::Result<()> {
     update(path, |settings| {
         settings.insert(SAVE_SERVER_ON_CLOSE.into(), Value::Boolean(enabled));

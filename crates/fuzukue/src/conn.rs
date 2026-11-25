@@ -138,6 +138,10 @@ impl Target {
     }
 
     fn connect(&self) -> anyhow::Result<Socket> {
+        // Older servers send a complete deck in a single frame.
+        let config = Some(tungstenite::protocol::WebSocketConfig::default()
+            .max_frame_size(Some(64 * 1024 * 1024))
+            .max_message_size(Some(64 * 1024 * 1024)));
         let Some(launch) = &self.launch else {
             if let Some(authorization) = &self.http.authorization {
                 use tungstenite::http::{header::AUTHORIZATION, HeaderValue};
@@ -145,15 +149,15 @@ impl Target {
                 let mut value = HeaderValue::from_str(authorization)?;
                 value.set_sensitive(true);
                 request.headers_mut().insert(AUTHORIZATION, value);
-                return Ok(tungstenite::client::connect_with_config(request, None, 0)?.0);
+                return Ok(tungstenite::client::connect_with_config(request, config, 0)?.0);
             }
-            return Ok(tungstenite::connect(self.url.as_str())?.0);
+            return Ok(tungstenite::client::connect_with_config(self.url.as_str(), config, 3)?.0);
         };
         let request = self.url.as_str().into_client_request()?;
         let stream = TcpStream::connect_timeout(&launch.addr(), Duration::from_secs(1))?;
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-        let (ws, _) = tungstenite::client(request, MaybeTlsStream::Plain(stream))
+        let (ws, _) = tungstenite::client::client_with_config(request, MaybeTlsStream::Plain(stream), config)
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         Ok(ws)
     }
@@ -315,7 +319,47 @@ impl HttpTarget {
         self.get(&format!("{}/{route}/{path}", self.base), &[])
     }
 
+    pub(super) fn read_deck<T: serde::de::DeserializeOwned>(
+        &self,
+        route: &str,
+        deck: &str,
+        card: Option<&str>,
+        revision: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<T, String> {
+        use std::io::Read as _;
+
+        let mut request = self.get_request(&format!("{}/deck/{route}", self.base), &[("deck", deck)])
+            .timeout(Duration::from_secs(60))
+            .query("offset", &offset.to_string());
+        if let Some(revision) = revision {
+            request = request.query("revision", &revision.to_string());
+        }
+        if let Some(card) = card {
+            request = request.query("card", card);
+        }
+        let response = request.call().map_err(|error| match error {
+            ureq::Error::Status(status, response) => {
+                let mut text = String::new();
+                let _ = response.into_reader().take(4096).read_to_string(&mut text);
+                if text.is_empty() { format!("HTTP {status}") } else { text }
+            }
+            error => error.to_string(),
+        })?;
+        let mut bytes = Vec::new();
+        response.into_reader().take(limit as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() > limit {
+            return Err("Deck response exceeds the size limit.".into());
+        }
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    }
+
     fn get(&self, url: &str, query: &[(&str, &str)]) -> Result<ureq::Response, ureq::Error> {
+        self.get_request(url, query).call()
+    }
+
+    fn get_request(&self, url: &str, query: &[(&str, &str)]) -> ureq::Request {
         let mut request = match &self.authorization {
             Some(value) => ureq::AgentBuilder::new()
                 .redirects(0)
@@ -330,7 +374,7 @@ impl HttpTarget {
         for (key, value) in query {
             request = request.query(key, value);
         }
-        request.call()
+        request
     }
 
     fn read_file_response(response: Result<ureq::Response, ureq::Error>) -> Result<Vec<u8>, String> {
@@ -346,6 +390,7 @@ impl HttpTarget {
 }
 
 enum Control {
+    Workspace(String),
     Restart(Target),
     Stop,
 }
@@ -385,6 +430,10 @@ impl Connection {
             return;
         }
         let _ = self.control.send(Control::Restart(target));
+    }
+
+    pub(super) fn reconnect_to_workspace(&self, id: String) -> bool {
+        self.control.send(Control::Workspace(id)).is_ok()
     }
 
     pub fn shutdown(&self) {
@@ -722,9 +771,20 @@ impl Worker {
         let mut deadline: Option<Instant> = None;
         let mut delay = Duration::from_millis(200);
         let mut last_error = String::new();
+        let mut reconnect_delay = Duration::from_secs(1);
+        let mut rapid_failures = 0;
+        let mut tried_default = false;
         loop {
             if let Some(command) = self.wait(Duration::ZERO) {
-                return Ok(Some(command));
+                match command {
+                    Control::Workspace(id) => {
+                        *cursor = Cursor { workspace: Some(id), pending_workspace_save: true, ..Default::default() };
+                        rapid_failures = 0;
+                        tried_default = false;
+                        reconnect_delay = Duration::from_secs(1);
+                    }
+                    command => return Ok(Some(command)),
+                }
             }
             let exit = self.owner.lock().unwrap().exit();
             match exit {
@@ -751,11 +811,37 @@ impl Worker {
                 Ok(mut ws) => {
                     may_start = false;
                     deadline = None;
+                    let started = Instant::now();
                     match self.transfer(&mut ws, cursor, target) {
+                        Ok(Transfer::Control(Control::Workspace(id))) => {
+                            *cursor = Cursor { workspace: Some(id), pending_workspace_save: true, ..Default::default() };
+                            rapid_failures = 0;
+                            tried_default = false;
+                            reconnect_delay = Duration::from_secs(1);
+                            continue;
+                        }
                         Ok(Transfer::Control(control)) => return Ok(Some(control)),
                         Ok(Transfer::RetryLegacy) => continue,
                         Err(err) => {
-                            if !self.emit(ConnEvent::Disconnected(err.to_string())) {
+                            if started.elapsed() >= Duration::from_secs(15) {
+                                reconnect_delay = Duration::from_secs(1);
+                                rapid_failures = 0;
+                            }
+                            rapid_failures += 1;
+                            let oversized = matches!(err.downcast_ref(), Some(tungstenite::Error::Capacity(_)));
+                            let mut message = err.to_string();
+                            if (oversized || rapid_failures >= 3) && !tried_default && cursor.workspace.is_some() {
+                                tried_default = true;
+                                *cursor = Cursor::default();
+                                self.transcript_resume.lock().unwrap().take();
+                                if let Some(path) = self.settings_path.as_deref() {
+                                    if let Err(error) = crate::settings_file::clear_workspace(path) {
+                                        eprintln!("{}", tr!("settings-cannot-save-workspace", err = format!("{error:#}")));
+                                    }
+                                }
+                                message = tr!("connection-workspace-fallback", reason = message);
+                            }
+                            if !self.emit(ConnEvent::Disconnected(message)) {
                                 return Ok(None);
                             }
                         }
@@ -806,10 +892,20 @@ impl Worker {
                 delay = (delay * 2).min(Duration::from_secs(3));
                 wait
             } else {
-                Duration::from_secs(1)
+                let wait = reconnect_delay;
+                reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
+                wait
             };
             if let Some(command) = self.wait(wait) {
-                return Ok(Some(command));
+                match command {
+                    Control::Workspace(id) => {
+                        *cursor = Cursor { workspace: Some(id), pending_workspace_save: true, ..Default::default() };
+                        rapid_failures = 0;
+                        tried_default = false;
+                        reconnect_delay = Duration::from_secs(1);
+                    }
+                    command => return Ok(Some(command)),
+                }
             }
         }
     }
@@ -993,17 +1089,20 @@ impl Worker {
                             synced = false;
                         }
                         cursor.pending_workspace_save |= cursor.workspace_selected(id, *replay);
-                        if cursor.pending_workspace_save {
-                            cursor.pending_workspace_save = self.settings_path.as_deref().is_some_and(|path| {
+                    } else if !scoped && env.seq > 0 {
+                        cursor.seq = Some(env.seq);
+                    }
+                    if cursor.pending_workspace_save
+                        && matches!(&env.event, ServerEvent::ThreadSync { .. } | ServerEvent::Threads { .. } if !scoped || synced)
+                    {
+                        cursor.pending_workspace_save = self.settings_path.as_deref().zip(cursor.workspace.as_deref())
+                            .is_some_and(|(path, id)| {
                                 if let Err(err) = crate::settings_file::save_workspace(path, id) {
                                     eprintln!("{}", tr!("settings-cannot-save-workspace", err = format!("{err:#}")));
                                     return true;
                                 }
                                 false
                             });
-                        }
-                    } else if !scoped && env.seq > 0 {
-                        cursor.seq = Some(env.seq);
                     }
                     if !self.emit(ConnEvent::Event(env)) {
                         return Ok(Transfer::Control(Control::Stop));

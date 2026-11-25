@@ -38,6 +38,9 @@ mod reading_pages;
 #[path = "integration_tests/windowed_history.rs"]
 mod windowed_history;
 
+#[path = "integration_tests/large_deck.rs"]
+mod large_deck;
+
 fn sample_lab() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lab")
 }
@@ -2711,7 +2714,7 @@ print(json.dumps({"type": "result", "is_error": False, "result": json.dumps({"fi
 async fn scoped_paper_refreshes_after_save_without_switching_other_clients() -> Result<()> {
     use axum::{extract::ConnectInfo, Extension};
     use futures_util::{SinkExt, StreamExt};
-    use fuzukue_proto::{CardEditPart, CardSaveOutcome, ReviewFindingsOutcome, PROTOCOL_VERSION, TRANSLATION_DRIFT_PROTOCOL};
+    use fuzukue_proto::{CardEditPart, CardSaveOutcome, ReviewFindingsOutcome, LARGE_LEGACY_FRAME_PROTOCOL, REVIEW_FINDINGS_PROTOCOL, TRANSLATION_DRIFT_PROTOCOL};
     use tokio::io::duplex;
     use tokio::sync::mpsc;
     use tokio_tungstenite::{client_async, tungstenite::Message, WebSocketStream};
@@ -2756,7 +2759,7 @@ async fn scoped_paper_refreshes_after_save_without_switching_other_clients() -> 
                 loop {
                     match receive(&mut socket).await? {
                         ServerEvent::Workspace { deck, .. } => break Ok::<_, anyhow::Error>((socket, deck)),
-                        ServerEvent::ReviewFindings { .. } if protocol < PROTOCOL_VERSION => {
+                        ServerEvent::ReviewFindings { .. } if protocol < REVIEW_FINDINGS_PROTOCOL => {
                             anyhow::bail!("protocol {protocol} received review findings at startup");
                         }
                         _ => {}
@@ -2764,7 +2767,7 @@ async fn scoped_paper_refreshes_after_save_without_switching_other_clients() -> 
                 }
             }
         };
-        let (mut active, shared) = connect(PROTOCOL_VERSION).await?;
+        let (mut active, shared) = connect(LARGE_LEGACY_FRAME_PROTOCOL).await?;
         let (mut other, _) = connect(8).await?;
         let (mut v62, _) = connect(TRANSLATION_DRIFT_PROTOCOL).await?;
         send(&mut v62, ClientMsg::SelectPaper { deck: deck.into() }).await?;

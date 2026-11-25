@@ -251,6 +251,14 @@ impl Workbench {
 
     /// 通して読む画面の行とカード本文を更新する。
     pub(super) fn rebuild_read(&mut self, cards_changed: bool, cx: &mut Context<Self>) {
+        self.rebuild_read_views(cards_changed, None, cx);
+    }
+
+    pub(super) fn rebuild_read_card(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.rebuild_read_views(false, Some(id), cx);
+    }
+
+    fn rebuild_read_views(&mut self, cards_changed: bool, only: Option<&str>, cx: &mut Context<Self>) {
         let mut rows = vec![ReadRow::Title(self.doc_title.clone())];
         for sec in &self.doc_sections {
             rows.push(ReadRow::Section(sec.title.clone()));
@@ -273,7 +281,7 @@ impl Workbench {
         for card in self
             .cards
             .iter()
-            .filter(|card| ids.contains(card.id.as_str()))
+            .filter(|card| ids.contains(card.id.as_str()) && only.is_none_or(|id| id == card.id))
         {
             let uses_tex = super::card_reading::uses_tex(card);
             let parts = if uses_tex {
@@ -349,7 +357,10 @@ impl Workbench {
             }
         }
 
-        changed.extend(self.read_md.keys().map(|part| part.card.clone()));
+        changed.extend(self.read_md.keys().filter(|part| only.is_none_or(|id| id == part.card)).map(|part| part.card.clone()));
+        if let Some(id) = only {
+            views.extend(self.read_md.drain().filter(|(part, _)| part.card != id));
+        }
         if rows == self.read_rows {
             if cards_changed {
                 self.read_list.remeasure_items(0..rows.len());
@@ -582,6 +593,7 @@ impl Workbench {
         });
         let reader = gpui_kit::list(self.read_list.clone(), move |ix, _window, cx| {
             let theme = cx.theme().clone();
+            Self::queue_visible_card(ix, cx, entity.clone());
             let this = entity.read(cx);
             let Some(row) = this.read_rows.get(ix) else {
                 return div().h(tail).into_any_element();
@@ -732,6 +744,7 @@ impl Workbench {
                     let mut col = v_flex().w_full().min_w_0().px(PANE_INSET).py_4().gap_2()
                         .when(highlighted, |row| row.rounded_lg().bg(theme.link.alpha(0.15)))
                         .child(statement)
+                        .children(card.and_then(|_| this.card_body_status(id, &entity, cx)))
                         .children(this.review_markers(id, &entity, cx))
                         .children(card.and_then(|card| {
                             this.card_findings_button(card, format!("paper-review-findings-{id}"), entity.downgrade(), cx)
@@ -1386,7 +1399,7 @@ impl Workbench {
     }
 
     pub(super) fn finish_paper_open(&mut self, cx: &mut Context<Self>) {
-        if self.right != RightPane::Read || !self.pending_paper_open.as_ref()
+        if self.right != RightPane::Read || self.deck_summaries_pending(&self.deck) || !self.pending_paper_open.as_ref()
             .is_some_and(|(deck, _, _)| deck == &self.deck)
         {
             return;

@@ -132,6 +132,7 @@ pub struct Workspace {
     id: String,
     registry: std::sync::Weak<App>,
     deck: std::sync::RwLock<String>,
+    deck_view: cards::browse::Cache,
     hub: Arc<Hub>,
     usage: Arc<Usage>,
     session_stats: Arc<SessionStatsStore>,
@@ -218,6 +219,7 @@ impl Workspace {
             handoff: Default::default(),
             registry: Default::default(),
             deck: Default::default(),
+            deck_view: Default::default(),
             lsp: lsp::Manager::new(&project_dir),
             project_dir,
             addr,
@@ -728,6 +730,9 @@ fn router(app: Arc<App>, access: Arc<remote::Access>) -> Router {
         .route("/file/{*path}", get(file_handler))
         .route("/file", get(file_browser::download))
         .route("/exploration", get(exploration::tree))
+        .route("/deck/cards", get(cards::browse::summaries))
+        .route("/deck/card", get(cards::browse::content))
+        .route("/deck/diagnostics", get(cards::browse::diagnostics))
         .route("/cards-for-file/{*path}", get(source::cards_for_file_handler))
         .route("/source/{*path}", get(source::source_handler))
         .route("/editor/{*path}", get(source_editor::read_handler))
@@ -1006,8 +1011,11 @@ fn wire_welcome(event: &ServerEvent, capabilities: fuzukue_proto::WelcomeCapabil
         capabilities: fuzukue_proto::WelcomeCapabilities,
     }
 
-    let wire = serde_json::json!({ "seq": 0, "event": Welcome { event, capabilities } });
-    Message::Text(wire.to_string().into())
+    #[derive(serde::Serialize)]
+    struct Wire<'a> { seq: u64, event: Welcome<'a> }
+    let fallback = ServerEvent::Error { message: "Server welcome exceeds the WebSocket size limit.".into() };
+    bounded_wire(&Wire { seq: 0, event: Welcome { event, capabilities } }, 12 * 1024 * 1024)
+        .unwrap_or_else(|| wire_event(&snapshot(fallback), 0, None, fuzukue_i18n::Locale::JAPANESE))
 }
 
 fn wire_event(env: &Envelope, protocol: u32, workspace: Option<&str>, locale: fuzukue_i18n::Locale) -> Message {
@@ -1120,7 +1128,94 @@ fn wire_event(env: &Envelope, protocol: u32, workspace: Option<&str>, locale: fu
         event => event,
     };
     let workspace = workspace.filter(|_| protocol >= 11);
-    Message::Text(serde_json::to_string(&Wire { seq: env.seq, workspace, event }).unwrap().into())
+    let budget = if protocol == fuzukue_proto::LARGE_LEGACY_FRAME_PROTOCOL && matches!(event, ServerEvent::Cards { .. }) { 48 } else { 12 } * 1024 * 1024;
+    if let Some(frame) = bounded_wire(&Wire { seq: env.seq, workspace, event }, budget) {
+        return frame;
+    }
+    let fallback = match event {
+        ServerEvent::Cards { deck, .. } if deck.len() <= 4096 => ServerEvent::Cards {
+            deck: deck.clone(),
+            cards: Vec::new(),
+            diagnostics: vec![fuzukue_proto::CardDiagnostic {
+                error: true, path: ".".into(), style: None,
+                message: "This deck exceeds the WebSocket size limit. Update the client and server to open it.".into(),
+            }],
+        },
+        ServerEvent::HistoryResult { id, .. } => ServerEvent::HistoryResult {
+            id: *id,
+            outcome: fuzukue_proto::HistoryOutcome::Error { message: "History response exceeds the WebSocket size limit.".into() },
+        },
+        ServerEvent::GitResult { id, .. } => ServerEvent::GitResult {
+            id: *id,
+            outcome: fuzukue_proto::GitOutcome::Error { message: "Git response exceeds the WebSocket size limit.".into() },
+        },
+        ServerEvent::CardSaveResult { request, .. } => ServerEvent::CardSaveResult {
+            request: *request,
+            outcome: CardSaveOutcome::Error { message: "Card save response exceeds the WebSocket size limit. Reload the card for the latest content.".into() },
+        },
+        ServerEvent::ReviewFindings { deck, .. } if deck.len() <= 4096 => ServerEvent::ReviewFindings {
+            deck: deck.clone(),
+            outcome: fuzukue_proto::ReviewFindingsOutcome::Error { message: "Review findings exceed the WebSocket size limit.".into() },
+        },
+        _ => {
+            let response = match event {
+                ServerEvent::Document { .. } => "Deck structure",
+                ServerEvent::SymbolResults { .. } => "Graph lookup",
+                ServerEvent::LibraryResults { .. } | ServerEvent::DeckSearchResults { .. } => "Search response",
+                ServerEvent::ThreadTail { .. } | ServerEvent::ThreadHistoryPage { .. } | ServerEvent::ThreadRestored { .. } => "Thread history",
+                ServerEvent::LeanStatus { .. } | ServerEvent::LspDocument { .. } => "Diagnostics",
+                _ => "Server response",
+            };
+            let message = format!("{response} exceeded the WebSocket size limit.");
+            if protocol >= fuzukue_proto::LAZY_DECK_PROTOCOL {
+                ServerEvent::ResponseTooLarge { message }
+            } else {
+                ServerEvent::Error { message }
+            }
+        },
+    };
+    bounded_wire(&Wire { seq: env.seq, workspace, event: &fallback }, budget)
+        .or_else(|| bounded_wire(&Wire { seq: env.seq, workspace: None, event: &fallback }, budget))
+        .expect("size fallback is bounded")
+}
+
+fn bounded_wire(value: &impl serde::Serialize, budget: usize) -> Option<Message> {
+    Some(Message::Text(String::from_utf8(bounded_json(value, budget)?).ok()?.into()))
+}
+
+fn bounded_json(value: &impl serde::Serialize, budget: usize) -> Option<Vec<u8>> {
+    let mut json = Vec::new();
+    serde_json::to_writer(&mut BoundedJson { bytes: &mut json, budget }, value).ok()?;
+    Some(json)
+}
+
+struct BoundedJson<'a> {
+    bytes: &'a mut Vec<u8>,
+    budget: usize,
+}
+
+impl std::io::Write for BoundedJson<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.budget - self.bytes.len() {
+            return Err(std::io::Error::other("JSON size limit exceeded"));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+async fn deck_event(project: &Path, protocol: u32, event: ServerEvent) -> ServerEvent {
+    if let ServerEvent::DeckCardsChanged { deck } = &event {
+        if protocol < fuzukue_proto::LAZY_DECK_PROTOCOL {
+            let project = project.to_path_buf();
+            let root = project.join(deck);
+            return tokio::task::spawn_blocking(move || cards::snapshot_for_deck(&project, &root))
+                .await.unwrap_or_else(|_| ServerEvent::Error { message: "Cannot read deck cards.".into() });
+        }
+    }
+    event
 }
 
 async fn serve_workspace(
@@ -1140,7 +1235,8 @@ async fn serve_workspace(
     notices: &mut Option<tokio::sync::broadcast::Receiver<Envelope>>,
 ) -> Option<Arc<Workspace>> {
     let locale_for_wire = || *locale.read().unwrap();
-    let question_protocol = if client_version.0 == Some("android") { 0 } else { protocol };
+    let desktop_cards = client_version.0 != Some("android");
+    let question_protocol = if desktop_cards { protocol } else { 0 };
     let _question_client = (question_protocol >= fuzukue_proto::QUESTION_PROTOCOL)
         .then(|| app.hub.register_question_client());
     let scoped = transcripts.is_some();
@@ -1226,6 +1322,7 @@ async fn serve_workspace(
             return false;
         }
         match env.event {
+            ServerEvent::DeckCardsChanged { .. } | ServerEvent::Cards { .. } | ServerEvent::Document { .. } => desktop_cards,
             ServerEvent::WorkspaceRequests { view: Some(_) } => request_operator,
             ServerEvent::WorkspaceRequests { view: None } | ServerEvent::WorkspaceRequestError { .. } => workspace_request_client,
             ServerEvent::FolderGrants { .. } | ServerEvent::FolderGrantsChanged { .. } =>
@@ -1306,11 +1403,12 @@ async fn serve_workspace(
         let issues = app.last_issues.lock().unwrap().clone();
         let lean = ServerEvent::LeanStatus { decls: app.lean_status.lock().unwrap().clone(), running: false, doc_findings: app.lean_doc_findings.lock().unwrap().clone() };
         let comments = ServerEvent::Comments { items: comments::load(&app.project_dir.join(&deck)), deck };
-        for ev in [Some(w), Some(c), Some(d), Some(a), Some(app.usage.snapshot()), issues, Some(lean), Some(comments)]
+        for ev in [Some(w), desktop_cards.then_some(c), desktop_cards.then_some(d), Some(a), Some(app.usage.snapshot()), issues, Some(lean), Some(comments)]
             .into_iter()
             .flatten()
         {
-            if tx.send(send(&Envelope { workspace: None, seq: 0, event: ev })).await.is_err() {
+            let event = deck_event(&app.project_dir, protocol, ev).await;
+            if tx.send(send(&snapshot(event))).await.is_err() {
                 return None;
             }
         }
@@ -1574,13 +1672,14 @@ async fn serve_workspace(
                         let ServerEvent::Workspace { tabs, .. } = cards::workspace(&dir, &deck) else { unreachable!() };
                         [
                             ServerEvent::Workspace { tabs, deck: deck.clone() },
-                            cards::snapshot_for_deck(&dir, &root),
+                            ServerEvent::DeckCardsChanged { deck: deck.clone() },
                             cards::document_for_deck(&root, None),
                             ServerEvent::Comments { items: comments::load(&root), deck },
                         ]
                     }).await else { break };
                     for event in events {
-                        if tx.send(send(&Envelope { workspace: None, seq: 0, event })).await.is_err() {
+                        let event = deck_event(&project, protocol, event).await;
+                        if tx.send(send(&snapshot(event))).await.is_err() {
                             break 'write;
                         }
                     }
@@ -1609,16 +1708,15 @@ async fn serve_workspace(
                     }
                     if let Some(paper) = &paper {
                         match &mut env.event {
-                            ServerEvent::Cards { .. } | ServerEvent::Document { .. } => continue,
+                            ServerEvent::DeckCardsChanged { .. } | ServerEvent::Cards { .. } | ServerEvent::Document { .. } => continue,
                             // The card watcher ends each workspace refresh with this snapshot.
                             ServerEvent::Workspace { deck, .. } => {
                                 deck.clone_from(paper);
-                                let (dir, root) = (project.clone(), project.join(paper));
-                                if let Ok([cards, document]) = tokio::task::spawn_blocking(move || [
-                                    cards::snapshot_for_deck(&dir, &root),
-                                    cards::document_for_deck(&root, None),
-                                ]).await {
-                                    updates.extend([cards, document]);
+                                let root = project.join(paper);
+                                if let Ok(document) = tokio::task::spawn_blocking(move || {
+                                    cards::document_for_deck(&root, None)
+                                }).await {
+                                    updates.extend([ServerEvent::DeckCardsChanged { deck: paper.clone() }, document]);
                                 }
                             }
                             ServerEvent::BuildStatus { deck, state, pdf: Some(pdf), .. }
@@ -1639,8 +1737,13 @@ async fn serve_workspace(
                             env.event = ServerEvent::ThreadHistoryInvalidated { session };
                         }
                     }
-                    if supports(&env) && tx.send(send(&env)).await.is_err() {
-                        break;
+                    if supports(&env) {
+                        if matches!(env.event, ServerEvent::DeckCardsChanged { .. }) {
+                            env.event = deck_event(&project, protocol, env.event).await;
+                        }
+                        if tx.send(send(&env)).await.is_err() {
+                            break;
+                        }
                     }
                     let refresh_findings = supports_findings && match &env.event {
                         ServerEvent::Workspace { deck, .. } => {
@@ -1654,7 +1757,8 @@ async fn serve_workspace(
                         updates.push(review_findings::snapshot(&project, &findings_deck).await);
                     }
                     for event in updates {
-                        if tx.send(send(&Envelope { workspace: None, seq: 0, event })).await.is_err() {
+                        let event = deck_event(&project, protocol, event).await;
+                        if tx.send(send(&snapshot(event))).await.is_err() {
                             break 'write;
                         }
                     }
@@ -2156,7 +2260,7 @@ async fn serve_workspace(
                         let _ = reply.send(ServerEvent::SymbolResults { request, results });
                     });
                 }
-                Ok(ClientMsg::SelectPaper { deck }) if protocol >= 9 => {
+                Ok(ClientMsg::SelectPaper { deck }) if desktop_cards && protocol >= 9 => {
                     let path = if deck.is_empty() { "." } else { &deck };
                     let target = if path == "." && app.project_dir.join("cards").is_dir() {
                         Ok(".".to_owned())

@@ -10,11 +10,11 @@ const FIXTURE: &str = include_str!(
 );
 
 #[test]
-fn design_card_renders_markdown_in_the_reader_and_detail() {
+fn lazy_card_body_renders_markdown_in_the_reader_and_detail() {
     let (_, body) = fuzukue_cards::split_frontmatter(FIXTURE).unwrap();
-    let card = serde_json::from_value(serde_json::json!({
+    let summary = serde_json::from_value(serde_json::json!({
         "id": CARD, "kind": "design", "title": "Markdown card", "status": "",
-        "path": PATH, "body": body, "links": [], "backlinks": [], "files": [], "external": false
+        "path": PATH, "body": "", "links": [], "backlinks": [], "files": [], "external": false
     }))
     .unwrap();
     let (result, completed) = std::sync::mpsc::channel();
@@ -33,14 +33,7 @@ fn design_card_renders_markdown_in_the_reader_and_detail() {
                     },
                     cx,
                 );
-                view.on_event(
-                    ServerEvent::Cards {
-                        deck: DECK.into(),
-                        cards: vec![card],
-                        diagnostics: vec![],
-                    },
-                    cx,
-                );
+                view.apply_deck_cards(DECK, vec![summary], vec![], cx);
                 view.on_event(
                     ServerEvent::Document {
                         title: "Card Markdown fixture".into(),
@@ -54,6 +47,10 @@ fn design_card_renders_markdown_in_the_reader_and_detail() {
                     cx,
                 );
                 view.open_paper_deck(DECK.into(), cx);
+                assert!(view.read_md.is_empty());
+                view.receive_card_content(CARD.into(), fuzukue_proto::CardContent {
+                    body: body.into(), edit_body: None, edit_proof: None,
+                }, cx);
             });
             cx.spawn(async move |cx| {
                 let mut runner = Runner {

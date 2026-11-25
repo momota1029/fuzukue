@@ -1005,7 +1005,8 @@ html_out = "website/private/cards/sample-paper"
         assert!(matches!(events.try_recv()?.event, ServerEvent::Workspace { tabs, deck }
             if deck == DECK && [DECK, EXTERNAL].iter().all(|path|
                 tabs.iter().any(|tab| tab.deck.as_deref() == Some(path) && tab.kind == "paper"))));
-        assert!(matches!(events.try_recv()?.event, ServerEvent::Cards { deck, cards, .. }
+        assert!(matches!(events.try_recv()?.event, ServerEvent::DeckCardsChanged { deck } if deck == DECK));
+        assert!(matches!(crate::cards::snapshot_for_deck(&workspace, &workspace.join(DECK)), ServerEvent::Cards { deck, cards, .. }
             if deck == DECK && cards.iter().any(|card| card.id == "ctg:source"
                 && card.external && card.body.contains("External definition."))));
 

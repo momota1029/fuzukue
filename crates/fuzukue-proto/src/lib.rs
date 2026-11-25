@@ -68,7 +68,11 @@ pub const LIVE_MODELS_PROTOCOL: u32 = 66;
 pub const JOB_LABEL_PROTOCOL: u32 = 67;
 pub const JOB_DISMISS_PROTOCOL: u32 = 68;
 pub const WORKSPACE_REQUESTS_PROTOCOL: u32 = 69;
-pub const PROTOCOL_VERSION: u32 = WORKSPACE_REQUESTS_PROTOCOL;
+pub const LARGE_LEGACY_FRAME_PROTOCOL: u32 = 70;
+pub const LAZY_DECK_PROTOCOL: u32 = 71;
+pub const PROTOCOL_VERSION: u32 = LAZY_DECK_PROTOCOL;
+pub const DECK_PAGE_BYTES: usize = 1024 * 1024;
+pub const CARD_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
 mod approvals;
 pub use approvals::*;
@@ -1298,6 +1302,31 @@ pub struct CardView {
     /// 形式化した Lean の宣言
     #[serde(default)]
     pub lean: Vec<String>,
+}
+
+/// Bounded HTTP page of card summaries for a single deck revision.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeckCardPage {
+    pub revision: u64,
+    pub next: Option<usize>,
+    pub cards: Vec<CardView>,
+}
+
+/// The renderable text and editing sources for one selected card.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CardContent {
+    pub body: String,
+    pub edit_body: Option<CardEditSource>,
+    pub edit_proof: Option<CardEditSource>,
+}
+
+/// A byte- and count-bounded HTTP page of deck or card diagnostics.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeckDiagnosticPage {
+    pub next: Option<usize>,
+    pub total: usize,
+    pub errors: usize,
+    pub diagnostics: Vec<CardDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2604,6 +2633,10 @@ pub enum ServerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         references: Option<DocReferences>,
     },
+    /// Invalidate the HTTP card summaries and any loaded bodies for this deck.
+    DeckCardsChanged { deck: String },
+    /// The server omitted a response that exceeded the WebSocket byte budget.
+    ResponseTooLarge { message: String },
     /// カード全体のスナップショット（接続時と、カードが変わったとき）。
     Cards {
         #[serde(default)]

@@ -14,3 +14,5 @@ connection-starting-server-in-wsl = Starting server in WSL…
 connection-timed-out-stopping-the-wsl-server = Timed out stopping the WSL server
 connection-wsl-stop-command-failed = WSL stop command failed ({ $status })
 connection-server-closed = Server closed the connection
+
+connection-workspace-fallback = { $reason } Reconnecting without the saved workspace.

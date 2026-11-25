@@ -201,3 +201,13 @@ findings-sources = 出どころ
 findings-source-human = 人
 findings-source-agent = エージェント
 findings-change-unavailable = このカード編集は、この端末の変更履歴から取得できません。
+
+workbench-loading-deck = カード一覧を読み込み中…
+workbench-deck-changed = 読み込み中にデッキが変更されました。
+workbench-retry-deck = デッキを読み直す
+workbench-loading-card = カードを読み込み中…
+workbench-retry-card = カードを読み直す
+workbench-show-diagnostics = 診断を表示
+workbench-more-diagnostics = 診断をさらに表示
+workbench-loading-diagnostics = 診断を確認中…
+workbench-diagnostic-total = 診断 { $total } 件中 { $shown } 件を表示（エラー { $errors } 件）

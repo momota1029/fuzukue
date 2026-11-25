@@ -147,7 +147,12 @@ impl Workbench {
             cx.notify();
             return;
         }
-        self.workspaces.pending = self.out.send(message).is_ok();
+        self.workspaces.pending = match message {
+            ClientMsg::SwitchWorkspace { id } if matches!(self.status, crate::ConnectionStatus::Reconnecting(_)) => {
+                self.connection.reconnect_to_workspace(id)
+            }
+            message => self.out.send(message).is_ok(),
+        };
         self.workspaces.error =
             (!self.workspaces.pending).then(|| tr!("workspace-cannot-send-request-to-server").into());
         cx.notify();

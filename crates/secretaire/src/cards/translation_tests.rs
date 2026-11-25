@@ -208,26 +208,29 @@ async fn translation_watcher_refreshes_the_open_deck_after_a_source_edit() -> Re
     *app.deck.write().unwrap() = "translated".into();
     let (_, mut snapshots) = app.hub.subscribe(0);
     watch(app.clone(), Default::default())?;
-    assert_eq!(
-        cards(root, "translated")[0]
-            .translation
-            .as_ref()
-            .unwrap()
-            .status,
-        TranslationStatus::Current
-    );
+    use axum::{body::{to_bytes, Body}, extract::ConnectInfo, http::Request, Extension};
+    use tower::ServiceExt;
+
+    let access = crate::remote::Access::new(root, Default::default())?;
+    let peer: std::net::SocketAddr = "127.0.0.1:1234".parse()?;
+    let router = crate::router(crate::App::fixture(app.clone()), Arc::new(access))
+        .layer(Extension(ConnectInfo(peer)));
+    let translation_status = async || -> Result<_> {
+        let request = Request::builder().uri("/deck/cards?deck=translated").body(Body::empty())?;
+        let response = router.clone().oneshot(request).await?;
+        assert!(response.status().is_success());
+        let bytes = to_bytes(response.into_body(), fuzukue_proto::DECK_PAGE_BYTES).await?;
+        let page: fuzukue_proto::DeckCardPage = serde_json::from_slice(&bytes)?;
+        Ok(page.cards[0].translation.as_ref().unwrap().status)
+    };
+    assert_eq!(translation_status().await?, TranslationStatus::Current);
     fs::write(source, format!("{original}New paragraph\n"))?;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let ServerEvent::Cards { deck, cards, .. } = snapshots.recv().await?.event {
-                if deck == "translated"
-                    && cards[0]
-                        .translation
-                        .as_ref()
-                        .is_some_and(|check| check.status == TranslationStatus::Stale)
-                {
-                    return anyhow::Ok(());
-                }
+            if matches!(snapshots.recv().await?.event, ServerEvent::DeckCardsChanged { deck } if deck == "translated")
+                && translation_status().await? == TranslationStatus::Stale
+            {
+                return anyhow::Ok(());
             }
         }
     })

@@ -24,6 +24,7 @@ mod unified_diff;
 mod conn;
 mod composer_markdown;
 mod deck_overview;
+mod lazy_deck;
 mod github_report;
 #[cfg(test)]
 mod cjk_emphasis_tests;
@@ -173,6 +174,7 @@ struct Workbench {
     status: ConnectionStatus,
     cards: Vec<CardView>,
     card_diags: Vec<CardDiagnostic>,
+    lazy_deck: lazy_deck::LazyDeck,
     style_note_disclosure: fuzukue_view::style_notes::StyleNoteDisclosure,
     selected: Option<String>,
     pdfs: Vec<String>,
@@ -196,6 +198,7 @@ struct Workbench {
     /// 論文の並び（structure.yaml）とマクロ
     doc_title: String,
     doc_sections: Vec<DocSection>,
+    document_deck: Option<String>,
     doc_macros: Vec<(String, String)>,
     doc_references: Option<DocReferences>,
     /// 通して読む画面の行と、カードごとの選択可能な Markdown
@@ -669,6 +672,7 @@ impl Workbench {
             status: ConnectionStatus::Connecting,
             cards: Vec::new(),
             card_diags: Vec::new(),
+            lazy_deck: Default::default(),
             style_note_disclosure: Default::default(),
             // 動作確認用: 起動時に選んでおくカード。
             selected: fuzukue_proto::compat::env("FUZUKUE_SELECT").ok(),
@@ -717,6 +721,7 @@ impl Workbench {
             stats: std::collections::BTreeMap::new(),
             doc_title: String::new(),
             doc_sections: Vec::new(),
+            document_deck: None,
             doc_macros: Vec::new(),
             doc_references: None,
             read_rows: Vec::new(),
@@ -1647,6 +1652,8 @@ impl Workbench {
         self.pending_research_origin = None;
         self.cards.clear();
         self.card_diags.clear();
+        self.lazy_deck = Default::default();
+        self.document_deck = None;
         self.pdfs.clear();
         self.issues.clear();
         self.repo.clear();
@@ -2065,26 +2072,11 @@ impl Workbench {
             ServerEvent::ToolResult { session, item, ok, output } if render => {
                 self.chat(&session, cx).tool_result(&item, ok, output, cx);
             }
-            ServerEvent::Cards { deck, mut cards, diagnostics } => {
-                self.findings.cards_deck = Some(wire_deck(&deck.replace('\\', "/")).to_owned());
-                cards.sort_by(|a, b| (a.external, kind_rank(&a.kind), &a.id).cmp(&(b.external, kind_rank(&b.kind), &b.id)));
-                if self.selected.as_ref().is_some_and(|id| !cards.iter().any(|c| &c.id == id)) {
-                    self.selected = None;
-                }
-                self.cards = cards;
-                self.card_diags = diagnostics;
-                self.sync_card_file_style_notes(cx);
-                self.rebuild_read(true, cx);
-                self.finish_overview_deck_request(&deck);
-                if self.pending_research_origin.as_ref().is_some_and(|origin| origin.deck == deck) {
-                    let origin = self.pending_research_origin.take().unwrap();
-                    if self.cards.iter().any(|card| card.id == origin.card) {
-                        self.select(origin.card, cx);
-                    } else {
-                        self.notice = Some(tr!("workbench-research-card-not-found").into());
-                    }
-                }
+            ServerEvent::Cards { deck, cards, diagnostics } => {
+                self.lazy_deck = Default::default();
+                self.apply_deck_cards(&deck, cards, diagnostics, cx);
             }
+            ServerEvent::DeckCardsChanged { deck } => self.load_deck_summaries(deck, cx),
             ServerEvent::Workspace { tabs, deck } => {
                 self.tabs = tabs;
                 if self.deck != deck {
@@ -2103,6 +2095,7 @@ impl Workbench {
                     self.paper_jump = None;
                     self.paper_highlight = None;
                     self.doc_references = None;
+                    self.document_deck = None;
                     self.from_pdf = false;
                     self.read_list.remeasure_items(0..self.read_list.item_count());
                     self.read_list.scroll_to(gpui_kit::ListOffset::default());
@@ -2117,6 +2110,7 @@ impl Workbench {
                 }
             }
             ServerEvent::Document { title, sections, macros, references } => {
+                self.document_deck = Some(self.deck.clone());
                 self.doc_title = title;
                 // Keep the last PDF's numbering while a body-only change is rebuilt.
                 if references.is_some() || self.doc_sections != sections {
@@ -2225,6 +2219,7 @@ impl Workbench {
                 let text = i18n::Message { fallback: message.key.clone(), localized: Some(message) };
                 self.chat(&session, cx).push_error(text.text().into_owned(), cx);
             }
+            ServerEvent::ResponseTooLarge { message } => self.notice = Some(message.into()),
             ServerEvent::Error { message } => {
                 self.agent_models.save_failed();
                 let session = self.active.clone();
@@ -2242,6 +2237,11 @@ impl Render for Workbench {
         self.sync_chat_activity_clock(cx);
         self.sync_blocker_expiry(cx);
         self.ensure_paper_pdf(window, cx);
+        if self.right == RightPane::Card {
+            if let Some(card) = self.selected.clone() {
+                self.load_card_content(card, cx);
+            }
+        }
         let theme = cx.theme().clone();
         let source_centered = self.right == RightPane::Source && self.source.centered;
         let paper_info = self.thread_info_visible()
@@ -2479,7 +2479,29 @@ impl Workbench {
         }
     }
 
+    fn apply_deck_cards(&mut self, deck: &str, mut cards: Vec<CardView>, diagnostics: Vec<CardDiagnostic>, cx: &mut Context<Self>) {
+        self.findings.cards_deck = Some(wire_deck(&deck.replace('\\', "/")).to_owned());
+        cards.sort_by(|a, b| (a.external, kind_rank(&a.kind), &a.id).cmp(&(b.external, kind_rank(&b.kind), &b.id)));
+        if self.selected.as_ref().is_some_and(|id| !cards.iter().any(|c| &c.id == id)) {
+            self.selected = None;
+        }
+        self.cards = cards;
+        self.card_diags = diagnostics;
+        self.sync_card_file_style_notes(cx);
+        self.rebuild_read(true, cx);
+        self.finish_overview_deck_request(deck);
+        if self.pending_research_origin.as_ref().is_some_and(|origin| origin.deck == deck) {
+            let origin = self.pending_research_origin.take().unwrap();
+            if self.cards.iter().any(|card| card.id == origin.card) {
+                self.select(origin.card, cx);
+            } else {
+                self.notice = Some(tr!("workbench-research-card-not-found").into());
+            }
+        }
+    }
+
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
+        self.load_card_content(id.clone(), cx);
         self.settings_open = false;
         self.selected = Some(id);
         self.right = RightPane::Card;
@@ -2824,7 +2846,8 @@ impl Workbench {
                         .map(|d| div().text_xs().text_color(theme.warning).child(card_diagnostic_text(d))))
                     .children(self.usage_lines(cx)),
             )
-            .child(div().id("card-list").flex_1().min_h_0().px_2().pb_3().overflow_y_scrollbar().child(list))
+            .child(div().id("card-list").flex_1().min_h_0().px_2().pb_3().overflow_y_scrollbar().child(list)
+                .children(self.deck_diagnostics_panel(None, cx)))
     }
 
     /// 「Claude 5時間 12%（あと2時間3分）」を agent ごとに 1 行。閾値に近い枠は色を変える。
@@ -3131,9 +3154,11 @@ impl Workbench {
                         self.research_origin_link(origin, format!("card-origin-{}", card.id), cx.entity(), cx)
                     }))
                     .child(diag_box)
+                    .children(self.deck_diagnostics_panel(Some(&card.id), cx))
                     .child(lean_box)
                     .child(links)
                     .child(files)
+                    .children(self.card_body_status(&card.id, &cx.entity(), cx))
                     .child(self.symbol_menu(
                         div().id(id).child(self.appearance.style_reading(div().w_full()).child(text)),
                         &cx.entity(), symbols::text_lookup(self.deck.clone(), card.id.clone(), card.body.as_str().into(), display, view),
