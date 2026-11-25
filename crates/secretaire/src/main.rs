@@ -25,6 +25,7 @@ mod claude;
 mod codex;
 mod agents;
 mod agent_usage;
+mod isolated_model;
 mod delegate;
 mod extensions;
 mod confined_fs;

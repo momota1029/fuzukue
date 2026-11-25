@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::delegate::blind::Fixture;
+use crate::isolated_model::{self, Fixture};
 
 const DECK: &str = "books/concentration-notes";
 const PROP: &str = "ch1-prop-median-vs-mean";
@@ -278,10 +278,30 @@ fn assert_recorded_packet(
     acquired_excerpt: Option<&str>,
 ) -> Result<()> {
     let session = reviewed["session"].as_str().context("Missing session")?;
-    let saved = fs::read_to_string(state.join("section-reviews").join(format!("{session}.json")))?;
+    let saved = fs::read_to_string(
+        state
+            .join("section-reviews")
+            .join(format!("{session}.json")),
+    )?;
     assert!(!saved.contains("fixture-provider-key"));
     let receipt: Value = serde_json::from_str(&saved)?;
     let packet = &receipt["blind"]["packet"];
+    let model_run = receipt["blind"]["model_run_id"]
+        .as_str()
+        .context("Missing model run")?;
+    assert_eq!(model_run, session);
+    let snapshot = model_run_receipt(state, model_run)?;
+    assert_eq!(
+        snapshot["snapshot"]["input"]["legacy_message"],
+        expected_message
+    );
+    assert_eq!(snapshot["snapshot"]["input"]["instructions"][0], PROMPT);
+    assert_eq!(snapshot["snapshot"]["input"]["instructions"][1], CRITERIA);
+    assert_eq!(snapshot["snapshot"]["policy"]["billing"], "metered_api");
+    assert_eq!(
+        snapshot["attempted_at"],
+        receipt["blind"]["sent"]["attempted_at"]
+    );
     assert_eq!(packet, &reviewed["receipt"]["blind"]["packet"]);
     // The provider mock checks the serialized request against the same independently built text.
     assert_eq!(packet["message"], expected_message);
@@ -296,10 +316,21 @@ fn assert_recorded_packet(
     expected.extend(acquired_excerpt.map(str::to_owned));
     let excerpts = packet["excerpts"].as_array().context("Missing excerpts")?;
     assert_eq!(excerpts.len(), expected.len());
-    for (excerpt, text) in excerpts.iter().zip(expected) {
+    for (index, (excerpt, text)) in excerpts.iter().zip(expected).enumerate() {
         assert_eq!(excerpt["text"], text);
+        assert_eq!(
+            snapshot["snapshot"]["input"]["materials"][index],
+            json!({"label":excerpt["label"], "text":text})
+        );
     }
     Ok(())
+}
+
+fn model_run_receipt(state: &Path, id: &str) -> Result<Value> {
+    let path = state.join("isolated-model-runs").join(format!("{id}.json"));
+    let saved = fs::read_to_string(path)?;
+    assert!(!saved.contains("fixture-provider-key"));
+    Ok(serde_json::from_str(&saved)?)
 }
 
 fn install_mock(
@@ -325,7 +356,11 @@ fn install_mock_response(
                 .as_str()
                 .context("Missing requested model")?
                 .to_owned();
-            let reply_model = format!("{model}-resolved");
+            let reply_model = if model == "wrong-model" {
+                "different-model"
+            } else {
+                &model
+            };
             let message_field = match backend {
                 AgentBackend::Codex => {
                     assert_eq!(request.url(), "https://api.openai.com/v1/responses");
@@ -387,7 +422,10 @@ fn install_mock_response(
                 if clean { "pass" } else { "findings" },
                 json!([location("excerpt-5", 2)]),
             )];
-            if !matches!(model.as_str(), "partial" | "truncated") {
+            if !matches!(
+                model.as_str(),
+                "partial" | "truncated" | "truncated-invalid"
+            ) {
                 let mut cor = target(COR, 3, "pass", json!([location("excerpt-1", 1)]));
                 if model == "partial-observation" {
                     cor["checked"].as_array_mut().unwrap().remove(0);
@@ -428,18 +466,43 @@ fn install_mock_response(
                 _ => {}
             }
             let mut response = if backend == AgentBackend::Codex {
-                let content = if model == "refused" {
-                    json!({"type": "refusal", "refusal": "Fixture refusal"})
+                let content = match model.as_str() {
+                    "refused" => json!({"type": "refusal", "refusal": "Fixture refusal"}),
+                    "tool-call" => json!({"type": "function_call", "name": "read_file"}),
+                    "invalid-report" | "truncated-invalid" => {
+                        json!({"type": "output_text", "text": "not JSON"})
+                    }
+                    _ => json!({"type": "output_text", "text": answer}),
+                };
+                let item = if model == "tool-call" {
+                    content
                 } else {
-                    json!({"type": "output_text", "text": if model == "invalid-report" { "not JSON" } else { &answer }})
+                    json!({"type":"message", "role":"assistant", "content": [content]})
                 };
                 json!({"model": reply_model, "status": "completed", "output": [
-                    {"type":"message", "role":"assistant", "content": [content]},
-                ]})
+                    item,
+                ], "usage": {"input_tokens": 20, "output_tokens": 12, "total_tokens": 32,
+                    "output_tokens_details": {"reasoning_tokens": 0}}})
             } else {
-                json!({"model": reply_model, "stop_reason": "end_turn", "content": [{"type":"text","text":answer}]})
+                let stop_reason = match model.as_str() {
+                    "refused" => "refusal",
+                    "tool-call" => "tool_use",
+                    "truncated" | "truncated-invalid" => "max_tokens",
+                    _ => "end_turn",
+                };
+                let content = match model.as_str() {
+                    "tool-call" => json!({"type":"tool_use","name":"read_file"}),
+                    "invalid-report" | "truncated-invalid" => {
+                        json!({"type":"text","text":"not JSON"})
+                    }
+                    _ => json!({"type":"text","text":answer}),
+                };
+                json!({"model": reply_model, "stop_reason": stop_reason, "content": [content],
+                    "usage": {"input_tokens": 20, "output_tokens": 12, "cache_read_input_tokens": 0}})
             };
-            if model == "truncated" {
+            if backend == AgentBackend::Codex
+                && matches!(model.as_str(), "truncated" | "truncated-invalid")
+            {
                 response["status"] = json!("incomplete");
                 response["incomplete_details"] = json!({"reason": "max_output_tokens"});
             }
@@ -597,10 +660,7 @@ async fn section_math_blind_review_workflow() -> Result<()> {
                     "excerpt-5",
                 ])
             );
-            assert_eq!(
-                record["blind"]["resolved_model"],
-                format!("{model}-resolved")
-            );
+            assert_eq!(record["blind"]["resolved_model"], model);
             assert_eq!(record["blind"]["front_desk"], json!(backend));
             assert_eq!(record["blind"]["request"]["backend"], json!(provider));
             assert_eq!(
@@ -693,10 +753,7 @@ async fn section_math_blind_review_workflow() -> Result<()> {
                 recheck["receipt"]["review"]["input_hash"],
                 hash(new_message.as_bytes())
             );
-            assert_eq!(
-                recheck["receipt"]["blind"]["resolved_model"],
-                format!("{model}-resolved")
-            );
+            assert_eq!(recheck["receipt"]["blind"]["resolved_model"], model);
             assert_eq!(recheck["receipt"]["scope"]["reviewed_version"], new_version);
             assert_eq!(
                 recheck["receipt"]["blind"]["coverage"]["targets"][1]["verdict"],
@@ -1383,7 +1440,7 @@ async fn section_math_blind_review_workflow_acquired_material() -> Result<()> {
     ));
     let calls = install_mock(&app, expected.clone(), version);
     let id = app.hub.edit_threads(|threads| threads.create(None))?;
-    let desk = Desk::open(app, id, AgentBackend::Claude, false).await?;
+    let desk = Desk::open(app.clone(), id, AgentBackend::Claude, false).await?;
     let mut args = arguments("private", AgentBackend::Claude, "fixture-material");
     args["allow"].as_array_mut().unwrap().push(json!({
         "source": {"type": "material", "key": "fixture"}, "lines": [2,2],
@@ -1426,5 +1483,281 @@ async fn section_math_blind_review_workflow_acquired_material() -> Result<()> {
         json!({PROP: false, COR: false})
     );
     assert_eq!(calls.lock().unwrap().len(), 1);
+    fs::write(project.path().join("CLAUDE.md"), "PRIVATE_CHANGED_RULES")?;
+    let original_id = session.as_str().unwrap();
+    let replayed = isolated_model::replay(&app, original_id, &Arc::default()).await?;
+    let original = model_run_receipt(state.path(), original_id)?;
+    let replay = model_run_receipt(state.path(), &replayed.id)?;
+    assert_eq!(replay["replay_of"], original_id);
+    assert_eq!(replay["snapshot"], original["snapshot"]);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], calls[1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn section_math_blind_review_storage_failure_does_not_send() -> Result<()> {
+    let (project, state) = setup()?;
+    let app = open(&project, state.path());
+    let (message, version) = golden(PREMISE)?;
+    let calls = install_mock(&app, message, version);
+    let id = app.hub.edit_threads(|threads| threads.create(None))?;
+    let desk = Desk::open(app, id, AgentBackend::Claude, false).await?;
+    fs::write(
+        state.path().join("isolated-model-runs"),
+        "storage is blocked",
+    )?;
+    let review = desk
+        .review(arguments("storage-failure", AgentBackend::Codex, "fixture"))
+        .await?;
+    let run = &review["receipt"]["blind"];
+    assert_eq!(run["failure"]["stage"], "storage");
+    assert!(run["sent"].is_null());
+    assert!(calls.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn section_math_blind_review_validates_both_provider_envelopes() -> Result<()> {
+    let (project, state) = setup()?;
+    let app = open(&project, state.path());
+    let (message, version) = golden(PREMISE)?;
+    let calls = install_mock(&app, message, version);
+    let id = app.hub.edit_threads(|threads| threads.create(None))?;
+    let desk = Desk::open(app.clone(), id, AgentBackend::Claude, false).await?;
+    for backend in [AgentBackend::Codex, AgentBackend::Claude] {
+        let mock = app
+            .reviews
+            .blind_provider
+            .lock()
+            .unwrap()
+            .replace(Fixture::MissingCredential);
+        let failed = desk
+            .review(arguments(
+                &format!("{backend:?}-missing-key"),
+                backend,
+                "fixture",
+            ))
+            .await?;
+        *app.reviews.blind_provider.lock().unwrap() = mock;
+        assert_eq!(failed["receipt"]["blind"]["failure"]["stage"], "credential");
+        assert!(failed["receipt"]["blind"]["sent"].is_null());
+        for (model, reason) in [
+            ("refused", "refused"),
+            (
+                "tool-call",
+                if backend == AgentBackend::Claude {
+                    "non-text"
+                } else {
+                    "unexpected output"
+                },
+            ),
+            ("wrong-model", "does not match requested model"),
+            ("truncated", "output limit"),
+            ("truncated-invalid", "Invalid section review JSON"),
+        ] {
+            let review = desk
+                .review(arguments(&format!("{backend:?}-{model}"), backend, model))
+                .await?;
+            let run = &review["receipt"]["blind"];
+            assert_eq!(review["stage"], "failed");
+            assert_eq!(run["failure"]["stage"], "response");
+            let failure = run["failure"]["reason"].as_str().unwrap();
+            assert!(failure.contains(reason), "{failure}");
+            assert_eq!(
+                run["resolved_model"],
+                if model == "wrong-model" {
+                    "different-model"
+                } else {
+                    model
+                }
+            );
+            let saved = model_run_receipt(state.path(), run["model_run_id"].as_str().unwrap())?;
+            assert_eq!(saved["outcome"]["usage"], run["provider_usage"]);
+            assert_eq!(saved["outcome"]["total_tokens"], 32);
+            match model {
+                "truncated" => {
+                    assert_eq!(run["coverage"]["verdict"], "partial");
+                    assert!(run["response"].is_string());
+                }
+                "truncated-invalid" => {
+                    assert!(failure.contains("output limit"));
+                    assert!(run["coverage"].is_null());
+                    assert_eq!(run["response"], "not JSON");
+                }
+                _ => assert!(run["coverage"].is_null()),
+            }
+            assert_eq!(review["complete"], false);
+        }
+    }
+    let actual: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(backend, model, _)| (*backend, model.as_str().to_owned()))
+        .collect();
+    let expected: Vec<_> = [AgentBackend::Codex, AgentBackend::Claude]
+        .into_iter()
+        .flat_map(|backend| {
+            [
+                "refused",
+                "tool-call",
+                "wrong-model",
+                "truncated",
+                "truncated-invalid",
+            ]
+            .map(|model| (backend, model.to_owned()))
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn generic_blind_delegate_uses_saved_inline_request() -> Result<()> {
+    let (project, state) = setup()?;
+    let app = open(&project, state.path());
+    let id = app.hub.edit_threads(|threads| threads.create(None))?;
+    let desk = Desk::open(app.clone(), id, AgentBackend::Claude, false).await?;
+    let called = Arc::new(Mutex::new(Vec::new()));
+    let capture = called.clone();
+    let prompt = "  Compare the supplied excerpts.\r\n";
+    let report = "  第一の案。\n";
+    *app.reviews.blind_provider.lock().unwrap() = Some(Fixture::Available(Arc::new(
+        move |backend, request, bytes| {
+            let text =
+                "  Compare the supplied excerpts.\r\n\n\n[A]\n Aの本文\r\n\n\n[B]\n Bの本文\n";
+            let model = "fixture";
+            let (endpoint, body, response) = match backend {
+                AgentBackend::Codex => (
+                    "https://api.openai.com/v1/responses",
+                    json!({"model":model, "input":[{"role":"user","content":text}], "tools":[],
+                        "store":false, "max_output_tokens":4096}),
+                    json!({"model":model, "status":"completed", "usage":{"total_tokens":0},
+                        "output":[{"type":"message","role":"assistant","content":[
+                            {"type":"output_text","text":report}]}]}),
+                ),
+                AgentBackend::Claude => (
+                    "https://api.anthropic.com/v1/messages",
+                    json!({"model":model, "messages":[{"role":"user","content":text}],
+                        "tools":[], "max_tokens":4096}),
+                    json!({"model":model, "stop_reason":"end_turn",
+                        "content":[{"type":"text","text":report}]}),
+                ),
+            };
+            assert_eq!(request.url(), endpoint);
+            assert_eq!(bytes, serde_json::to_vec(&body)?);
+            capture.lock().unwrap().push(backend);
+            Ok(serde_json::to_vec(&response)?)
+        },
+    )));
+    let artifacts = json!([{"label":"A","text":" Aの本文\r\n"}, {"label":"B","text":" Bの本文\n"}]);
+    for backend in [AgentBackend::Codex, AgentBackend::Claude] {
+        let job = desk
+            .call(
+                "delegate",
+                json!({
+                    "isolation":"blind", "backend":backend, "model":"fixture",
+                    "prompt":prompt, "artifacts":artifacts, "title":"Compare excerpts",
+                }),
+            )
+            .await?;
+        let id = job["job"].as_str().context("Missing job ID")?;
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = desk.call("job_status", json!({"job":id})).await?;
+                if matches!(
+                    status["state"].as_str(),
+                    Some("finished" | "failed" | "cancelled")
+                ) {
+                    return Ok::<_, anyhow::Error>(status);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        assert_eq!(status["state"], "finished", "{status}");
+        let saved = model_run_receipt(state.path(), id)?;
+        assert_eq!(saved["snapshot"]["input"]["instructions"], json!([prompt]));
+        assert_eq!(saved["snapshot"]["input"]["materials"], artifacts);
+        assert_eq!(saved["outcome"]["text"], report);
+        assert_eq!(
+            saved["outcome"]["total_tokens"],
+            if backend == AgentBackend::Codex {
+                json!(0)
+            } else {
+                Value::Null
+            }
+        );
+    }
+    assert_eq!(
+        *called.lock().unwrap(),
+        [AgentBackend::Codex, AgentBackend::Claude]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn isolated_model_run_saves_separate_instructions_and_cancelled_result() -> Result<()> {
+    use crate::cancellation::Cancellation;
+    use crate::isolated_model::{Connection, Input, Material};
+
+    let (project, state) = setup()?;
+    let app = open(&project, state.path());
+    let instructions = "  Summarize only these materials.\r\n";
+    let materials = vec![Material {
+        label: "Excerpt".into(),
+        text: "  日本語\r\n".into(),
+    }];
+    let cancel = Arc::new(Cancellation::default());
+    let interrupt = cancel.clone();
+    let called = Arc::new(Mutex::new(0));
+    let capture = called.clone();
+    let state_path = state.path().to_owned();
+    *app.reviews.blind_provider.lock().unwrap() = Some(Fixture::Available(Arc::new(
+        move |backend, request, bytes| {
+            assert_eq!(backend, AgentBackend::Claude);
+            assert_eq!(request.url(), "https://api.anthropic.com/v1/messages");
+            let expected = json!({"model":"fixture", "system":instructions, "tools":[],
+                "messages":[{"role":"user","content":"[Excerpt]\n  日本語\r\n"}], "max_tokens":4096});
+            assert_eq!(serde_json::from_slice::<Value>(bytes)?, expected);
+            let before = model_run_receipt(&state_path, "in-flight")?;
+            assert_eq!(
+                before["snapshot"]["body"].as_str().unwrap().as_bytes(),
+                bytes
+            );
+            assert!(before["attempted_at"].is_number() && before["outcome"].is_null());
+            *capture.lock().unwrap() += 1;
+            interrupt.cancel();
+            Ok(serde_json::to_vec(
+                &json!({"model":"fixture", "stop_reason":"end_turn",
+                "content":[{"type":"thinking","thinking":"skip"},{"type":"text","text":" answer\n"}],
+                "usage":{"input_tokens":7,"output_tokens":0,"cache_read_input_tokens":3}}),
+            )?)
+        },
+    )));
+    let input = Input::new(instructions.into(), materials);
+    for (id, was_sent) in [("in-flight", true), ("already-cancelled", false)] {
+        let client = Connection::open(&app, AgentBackend::Claude)?;
+        isolated_model::run(
+            &app,
+            id.into(),
+            client,
+            "fixture",
+            input.clone(),
+            &cancel,
+            || Ok(()),
+        )
+        .await?;
+        let receipt = model_run_receipt(state.path(), id)?;
+        assert_eq!(receipt["outcome"]["failure"]["stage"], "interrupted");
+        assert_eq!(receipt["attempted_at"].is_number(), was_sent);
+        if was_sent {
+            assert_eq!(receipt["outcome"]["text"], " answer\n");
+            assert_eq!(receipt["outcome"]["total_tokens"], 10);
+        }
+    }
+    assert_eq!(*called.lock().unwrap(), 1);
     Ok(())
 }

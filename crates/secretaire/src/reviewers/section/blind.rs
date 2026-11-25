@@ -11,7 +11,8 @@ use anyhow::Error;
 use fuzukue_proto::AgentCaller;
 use serde_json::{json, Value};
 
-use crate::delegate::blind::{self as provider, Connection, Isolation};
+use crate::delegate::blind::Isolation;
+use crate::isolated_model::{self, Connection};
 
 use super::*;
 use report::{Coverage, Verdict};
@@ -111,7 +112,11 @@ pub(crate) struct Run {
     stage: Stage,
     packet: Option<Packet>,
     sent: Option<Sent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_run_id: Option<String>,
     resolved_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_usage: Option<Value>,
     provider_response: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     malformed_response_bytes: Option<Vec<u8>>,
@@ -191,15 +196,6 @@ impl Request {
     }
 }
 
-fn connection(app: &Workspace, backend: AgentBackend) -> Result<Connection> {
-    #[cfg(test)]
-    if let Some(fixture) = app.reviews.blind_provider.lock().unwrap().clone() {
-        return Connection::mocked(backend, fixture);
-    }
-    let _ = app;
-    Connection::open(backend)
-}
-
 pub(crate) async fn request(
     app: &Arc<Workspace>,
     origin: &str,
@@ -271,7 +267,9 @@ pub(crate) async fn request(
             stage: Stage::Pending,
             packet: None,
             sent: None,
+            model_run_id: None,
             resolved_model: None,
+            provider_usage: None,
             provider_response: None,
             malformed_response_bytes: None,
             response: None,
@@ -285,7 +283,7 @@ pub(crate) async fn request(
         Err(error) => Err(("selection", error)),
         Ok(selection) => prepare(app, &mut receipt.deck, &mut receipt.scope, selection).await,
     };
-    let (client, backend, model, packet) = match launch {
+    let (client, model, packet) = match launch {
         Ok(launch) => launch,
         Err((stage, error)) => {
             run.fail(stage, error);
@@ -335,7 +333,7 @@ pub(crate) async fn request(
     let app = app.clone();
     tokio::spawn(async move {
         let _work = work;
-        let result = complete(&app, &mut receipt, client, backend, &model, &cancel).await;
+        let result = complete(&app, &mut receipt, client, &model, &cancel).await;
         if let Err((stage, error)) = result {
             receipt
                 .blind
@@ -352,7 +350,7 @@ pub(crate) async fn request(
     Ok(accepted)
 }
 
-type Launch = (Connection, AgentBackend, String, Packet);
+type Launch = (Connection, String, Packet);
 type RunError = (&'static str, Error);
 
 async fn prepare(
@@ -364,7 +362,7 @@ async fn prepare(
     app.check_review_policy(Kind::Math, Some(AgentCaller::FrontDesk))
         .await
         .map_err(|e| ("permission", e))?;
-    let client = connection(app, selection.backend).map_err(|e| ("credential", e))?;
+    let client = Connection::open(app, selection.backend).map_err(|e| ("credential", e))?;
     let project = app
         .project_dir
         .canonicalize()
@@ -385,26 +383,25 @@ async fn prepare(
     .map_err(|e| ("scope", e))?;
     *deck = resolved;
     *scope = captured;
-    Ok((
-        client,
-        selection.backend,
-        selection.model.to_owned(),
-        packet,
-    ))
+    Ok((client, selection.model.to_owned(), packet))
 }
 
 async fn complete(
     app: &Workspace,
     receipt: &mut Receipt,
     client: Connection,
-    backend: AgentBackend,
     model: &str,
     cancel: &Arc<Cancellation>,
 ) -> Result<(), RunError> {
     cancel.check().map_err(|e| ("interrupted", e))?;
-    let run = receipt.blind.as_mut().expect("blind receipt");
-    let packet = run.packet.as_ref().expect("prepared blind packet");
-    run.sent = Some(Sent {
+    let id = receipt.review.session.clone();
+    let packet = receipt
+        .blind
+        .as_ref()
+        .and_then(|run| run.packet.as_ref())
+        .expect("prepared blind packet");
+    let input = packet.model_input(&receipt.scope);
+    let sent = Sent {
         attempted_at: usage::now(),
         message_bytes: packet.message.len(),
         input_hash: receipt.review.input_hash.clone(),
@@ -413,49 +410,46 @@ async fn complete(
             .iter()
             .map(|excerpt| excerpt.label.clone())
             .collect(),
-    });
-    persist_receipt(&app.state_dir, receipt, true).map_err(|e| ("storage", e))?;
-    let run = receipt.blind.as_mut().expect("blind receipt");
-    let packet = run.packet.as_ref().expect("prepared blind packet");
-    let response = client
-        .complete(model, &packet.message, cancel)
-        .await
-        .map_err(|e| {
-            (
-                if e.is::<Cancelled>() {
-                    "interrupted"
-                } else {
-                    "provider"
-                },
-                e,
-            )
-        })?;
-    let response = match provider::decode(&response) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            run.malformed_response_bytes = Some(response);
-            return Err(("response", error));
-        }
     };
-    run.resolved_model = response["model"]
-        .as_str()
-        .filter(|model| !model.trim().is_empty())
-        .map(str::to_owned);
-    run.provider_response = Some(response);
+    let result = isolated_model::run(app, id.clone(), client, model, input, cancel, || {
+        let run = receipt.blind.as_mut().expect("blind receipt");
+        run.model_run_id = Some(id);
+        run.sent = Some(sent);
+        persist_receipt(&app.state_dir, receipt, true)
+    })
+    .await
+    .map_err(|error| ("storage", error))?;
+    let run = receipt.blind.as_mut().expect("blind receipt");
+    run.model_run_id = Some(result.id);
+    if let Some(attempted_at) = result.attempted_at {
+        run.sent.as_mut().expect("sent marker").attempted_at = attempted_at;
+    } else {
+        run.sent = None;
+    }
+    let outcome = result.outcome.expect("finished blind run");
+    run.resolved_model = outcome.resolved_model;
+    run.provider_response = outcome.provider_response;
+    run.provider_usage = outcome.usage;
+    run.malformed_response_bytes = outcome.malformed_response_bytes;
+    run.response = outcome.text;
     cancel.check().map_err(|e| ("interrupted", e))?;
-    let (answer, truncated) =
-        provider::section_response(backend, run.provider_response.as_ref().unwrap())
-            .map_err(|e| ("response", e))?;
-    run.response = Some(answer);
-    let limit = || anyhow::anyhow!("Blind review provider reached its output limit");
+    let truncated = outcome.output_limited;
+    let failure = outcome
+        .failure
+        .map(|failure| (failure.stage.label(), anyhow::anyhow!("{}", failure.reason)));
+    if !truncated {
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+    }
+    let packet = run.packet.as_ref().expect("prepared blind packet");
     let mut coverage = report::validate(&receipt.scope, packet, run.response.as_deref().unwrap())
         .map_err(|error| {
         (
             "response",
-            if truncated {
-                error.context(limit())
-            } else {
-                error
+            match &failure {
+                Some((_, limit)) => error.context(limit.to_string()),
+                None => error,
             },
         )
     })?;
@@ -463,8 +457,8 @@ async fn complete(
         coverage.verdict = Verdict::Partial;
     }
     run.coverage = Some(coverage);
-    if truncated {
-        return Err(("response", limit()));
+    if let Some(failure) = failure {
+        return Err(failure);
     }
     run.stage = Stage::Reviewed;
     Ok(())

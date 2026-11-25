@@ -94,6 +94,26 @@ pub(super) struct Packet {
 }
 
 impl Packet {
+    pub(super) fn model_input(&self, scope: &Scope) -> crate::isolated_model::Input {
+        use crate::isolated_model::{Input, Material};
+
+        Input::legacy(
+            vec![
+                INSTRUCTIONS.into(),
+                self.skill.text.clone(),
+                scope_header(scope),
+            ],
+            self.excerpts
+                .iter()
+                .map(|excerpt| Material {
+                    label: excerpt.label.clone(),
+                    text: excerpt.text.clone(),
+                })
+                .collect(),
+            self.message.clone(),
+        )
+    }
+
     pub(super) fn is_relevant(&self, target: &str, excerpt: &Excerpt) -> bool {
         excerpt.role == Role::Material
             || excerpt
@@ -495,16 +515,18 @@ fn add_tex_dependencies(
     Ok(())
 }
 
-fn message(scope: &Scope, skill: &Skill, excerpts: &[Excerpt]) -> Result<String> {
-    use std::fmt::Write as _;
-    let mut message = format!("{INSTRUCTIONS}\n{}\n", skill.text);
-    writeln!(
-        message,
+fn scope_header(scope: &Scope) -> String {
+    format!(
         "Scope: {}",
         serde_json::json!({
             "cards": scope.cards, "reviewed_version": scope.reviewed_version,
         })
-    )?;
+    )
+}
+
+fn message(scope: &Scope, skill: &Skill, excerpts: &[Excerpt]) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut message = format!("{INSTRUCTIONS}\n{}\n{}\n", skill.text, scope_header(scope));
     // Field order is fixed independently of serde_json's map features.
     #[derive(Serialize)]
     struct Header<'a> {

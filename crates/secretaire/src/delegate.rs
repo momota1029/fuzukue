@@ -602,7 +602,7 @@ pub(crate) async fn start_with_grants(
 ) -> Result<String> {
     let request = Assignment {
         prompt, title, label, worktree: None, agent: agent.map(str::to_owned),
-        selection, caller: Some(caller), adopted: None, routing, touches, issue: None, isolation: None, folder_grants, exec_trusted,
+        selection, caller: Some(caller), adopted: None, routing, touches, issue: None, isolation: None, blind_input: None, folder_grants, exec_trusted,
     };
     start_assignment(app, session, request).await
 }
@@ -631,7 +631,7 @@ pub async fn start_for_issue(
         "Link the issue before delegating in its worktree");
     let request = Assignment {
         prompt, title, label, worktree: Some(crate::github::worktree_path(&app.project_dir, number)?), agent: agent.map(str::to_owned),
-        selection, caller: Some(caller), adopted: None, routing, touches, issue: Some(number), isolation: None, folder_grants, exec_trusted: false,
+        selection, caller: Some(caller), adopted: None, routing, touches, issue: Some(number), isolation: None, blind_input: None, folder_grants, exec_trusted: false,
     };
     start_assignment(app, session, request).await
 }
@@ -652,7 +652,7 @@ pub(crate) async fn queue_issue_assignment(
     let job = format!("{DELEGATE_JOB}{}", mail::session_key());
     let assignment = Assignment {
         prompt, title: None, label: None, worktree: Some(directory), agent: None, selection: Some(selection),
-        caller: None, adopted: None, routing: Default::default(), touches: None, issue: None, isolation: None, folder_grants: Vec::new(), exec_trusted: false,
+        caller: None, adopted: None, routing: Default::default(), touches: None, issue: None, isolation: None, blind_input: None, folder_grants: Vec::new(), exec_trusted: false,
     };
     let (_, run) = launch_assignment(app, session, job, assignment, false).await?;
     Ok(run)
@@ -683,7 +683,7 @@ async fn launch(
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
     let _accept = app.admit_work()?;
     let job = format!("{DELEGATE_JOB}{}", mail::session_key());
-    let request = Assignment { prompt, title, label: None, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None, folder_grants: Vec::new(), exec_trusted: false };
+    let request = Assignment { prompt, title, label: None, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None, blind_input: None, folder_grants: Vec::new(), exec_trusted: false };
     launch_assignment(app, session, job, request, false).await
 }
 
@@ -705,6 +705,8 @@ pub(crate) struct Assignment {
     issue: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     isolation: Option<blind::Isolation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blind_input: Option<crate::isolated_model::Input>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     folder_grants: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -737,7 +739,7 @@ pub(crate) async fn restore_assignment(app: &Arc<App>, session: String, id: Stri
 async fn launch_assignment(
     app: &Arc<App>, session: &str, job: String, request: Assignment, restore: bool,
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
-    let Assignment { prompt, title, label, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, folder_grants, exec_trusted } = request.clone();
+    let Assignment { prompt, title, label, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, blind_input, folder_grants, exec_trusted } = request.clone();
     let blind = isolation.is_some();
     app.hub.validate_worker_grants(session, &folder_grants)?;
     let is_planner = request.is_planner();
@@ -1007,7 +1009,7 @@ async fn launch_assignment(
             publish(&app, &session, &job, &model.selection, &decision, Some(started_at), None);
             if blind {
                 let mut metadata = RunMetadata::default();
-                let result = blind::run(&model.selection, prompt, &cancel, &mut metadata).await;
+                let result = blind::run(&app, &job, &model.selection, prompt, blind_input, &cancel, &mut metadata).await;
                 let attempt = crate::tiers::attempt(decision.tier, model, &result, metadata, timer.elapsed(), None);
                 record.lock().unwrap().selection = attempt.selection.clone();
                 publish(&app, &session, &job, &attempt.selection, &decision, Some(started_at), None);

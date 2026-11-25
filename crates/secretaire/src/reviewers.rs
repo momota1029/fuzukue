@@ -615,7 +615,7 @@ fn escape_stray_backslashes(json: &str) -> String {
 pub(crate) struct RunningReviews {
     blind: std::sync::Mutex<BTreeMap<String, Arc<Cancellation>>>,
     #[cfg(test)]
-    pub(crate) blind_provider: std::sync::Mutex<Option<crate::delegate::blind::Fixture>>,
+    pub(crate) blind_provider: std::sync::Mutex<Option<crate::isolated_model::Fixture>>,
     pruned_decks: Vec<String>,
     failures: std::sync::Mutex<std::collections::BTreeSet<(String, Kind)>>,
     jobs: std::sync::Mutex<BTreeMap<(String, Kind), Arc<Job>>>,
