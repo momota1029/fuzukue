@@ -830,28 +830,18 @@ pub(crate) async fn run_latex(
     command: &mut Command,
     cancel: &Cancellation,
 ) -> Result<std::process::Output> {
-    use rustix::process::{kill_process_group, Pid, Signal};
     use std::process::Stdio;
 
     cancel.check()?;
-    let child = command
-        .process_group(0)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let (child, job) = crate::job_process::Job::spawn(command, "latex", None)
         .context("latexmk を起動できない")?;
-    let group = Pid::from_raw(child.id().context("latexmk の PID がない")? as i32)
-        .context("latexmk の PID が不正")?;
     let output = child.wait_with_output();
     tokio::pin!(output);
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            match kill_process_group(group, Signal::KILL) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-                Err(error) => return Err(error).context("latexmk を停止できない"),
-            }
+            job.stop().context("latexmk を停止できない")?;
             output.await.context("latexmk の終了を待てない")?;
             Err(crate::cancellation::Cancelled.into())
         }

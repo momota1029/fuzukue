@@ -262,6 +262,7 @@ fn render_unit(opts: &UnitOptions<'_>) -> String {
     let mut unit = format!(
         "[Unit]\nDescription=fuzukue server\n\n[Service]\nType=exec\n{exec}\n\
          Restart=on-failure\nRestartSec=3\nStandardOutput=journal\nStandardError=journal\n\
+         MemoryAccounting=yes\nDelegate=memory\nDelegateSubgroup=server\n\
          KillMode=mixed\nTimeoutStopSec={}\nEnvironment={SERVICE_ENV}=1\n",
         opts.stop_seconds
     );

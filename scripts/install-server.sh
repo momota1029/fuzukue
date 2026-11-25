@@ -508,6 +508,9 @@ WorkingDirectory={quote(project)}
 Environment={" ".join(paths)}
 Restart=on-failure
 RestartSec=3
+MemoryAccounting=yes
+Delegate=memory
+DelegateSubgroup=server
 KillMode=mixed
 TimeoutStopSec=75
 

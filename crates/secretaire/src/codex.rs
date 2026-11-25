@@ -257,6 +257,7 @@ pub struct Codex {
     session_stats: Arc<SessionStatsStore>,
     project_dir: PathBuf,
     skill_roots: tokio::sync::Mutex<SkillRoots>,
+    job: crate::job_process::Job,
     _child: tokio::sync::Mutex<Child>,
 }
 
@@ -279,13 +280,8 @@ impl Codex {
         usage: Arc<Usage>,
         session_stats: Arc<SessionStatsStore>,
     ) -> Result<Arc<Self>> {
-        let mut child = command
-            .current_dir(project_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
+        command.current_dir(project_dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let (mut child, job) = crate::job_process::Job::spawn(&mut command, "codex", None)
             .context("failed to spawn codex app-server")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -302,6 +298,7 @@ impl Codex {
             session_stats,
             project_dir: project_dir.to_path_buf(),
             skill_roots: tokio::sync::Mutex::default(),
+            job,
             _child: tokio::sync::Mutex::new(child),
         });
 
@@ -316,6 +313,7 @@ impl Codex {
                 }
             }
             let Some(reader) = reader.upgrade() else { return };
+            let _ = reader.job.stop();
             reader.hub.publish(ServerEvent::Error { message: "codex app-server exited".into() });
             for (_, tx) in reader.pending.lock().unwrap().drain() {
                 let _ = tx.send(Err("codex app-server exited".into()));

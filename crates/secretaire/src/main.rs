@@ -47,6 +47,7 @@ mod full_approval;
 mod worker_execution;
 mod mail;
 mod inbox;
+mod job_process;
 mod folder_attachment;
 #[cfg(test)]
 mod folder_drop_regression;
@@ -74,6 +75,8 @@ mod file_browser;
 mod source_editor;
 mod self_update;
 mod service;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod server_memory;
 mod state;
 mod send_latency;
 mod synctex;
@@ -529,6 +532,8 @@ fn main() -> anyhow::Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("release")) {
         return secretaire::release::cli(std::env::args_os().skip(2));
     }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    server_memory::configure_allocator();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(run_server());
     runtime.shutdown_timeout(Duration::from_secs(2));
@@ -626,6 +631,8 @@ async fn run_server() -> anyhow::Result<()> {
         Arc::new(self_update::Update::shutdown_only(&project_dir, &state_dir))
     });
     let app = App::with_delegate_config(home, project_dir, state_dir, local_addr.to_string(), mail, config.delegate)?;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    server_memory::start_trimming();
     let _ = app.shutdown_drain_seconds.set(config.shutdown_drain_seconds);
     let _ = app.self_update.set(shutdown_control.clone());
     if let Some(update) = &update {
@@ -1150,19 +1157,12 @@ fn wire_event(env: &Envelope, protocol: u32, workspace: Option<&str>, locale: fu
         event => event,
     };
     let workspace = workspace.filter(|_| protocol >= 11);
-    let budget = if protocol == fuzukue_proto::LARGE_LEGACY_FRAME_PROTOCOL && matches!(event, ServerEvent::Cards { .. }) { 48 } else { 12 } * 1024 * 1024;
+    let budget = if matches!(event, ServerEvent::Cards { .. }) { cards::legacy_budget(protocol) } else { 12 * 1024 * 1024 };
     if let Some(frame) = bounded_wire(&Wire { seq: env.seq, workspace, event }, budget) {
         return frame;
     }
     let fallback = match event {
-        ServerEvent::Cards { deck, .. } if deck.len() <= 4096 => ServerEvent::Cards {
-            deck: deck.clone(),
-            cards: Vec::new(),
-            diagnostics: vec![fuzukue_proto::CardDiagnostic {
-                error: true, path: ".".into(), style: None,
-                message: "This deck exceeds the WebSocket size limit. Update the client and server to open it.".into(),
-            }],
-        },
+        ServerEvent::Cards { deck, .. } if deck.len() <= 4096 => cards::oversized_deck(deck.clone()),
         ServerEvent::HistoryResult { id, .. } => ServerEvent::HistoryResult {
             id: *id,
             outcome: fuzukue_proto::HistoryOutcome::Error { message: "History response exceeds the WebSocket size limit.".into() },
@@ -1211,6 +1211,21 @@ fn bounded_json(value: &impl serde::Serialize, budget: usize) -> Option<Vec<u8>>
     Some(json)
 }
 
+fn bounded_json_len(value: &impl serde::Serialize, budget: usize) -> Option<usize> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_sub(data.len())
+                .ok_or_else(|| std::io::Error::other("JSON size limit exceeded"))?;
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut count = Count(budget);
+    serde_json::to_writer(&mut count, value).ok()?;
+    Some(budget - count.0)
+}
+
 struct BoundedJson<'a> {
     bytes: &'a mut Vec<u8>,
     budget: usize,
@@ -1231,9 +1246,14 @@ impl std::io::Write for BoundedJson<'_> {
 async fn deck_event(project: &Path, protocol: u32, event: ServerEvent) -> ServerEvent {
     if let ServerEvent::DeckCardsChanged { deck } = &event {
         if protocol < fuzukue_proto::LAZY_DECK_PROTOCOL {
+            static LEGACY_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+            let permit = LEGACY_READS.acquire().await.expect("legacy readers are never closed");
             let project = project.to_path_buf();
             let root = project.join(deck);
-            return tokio::task::spawn_blocking(move || cards::snapshot_for_deck(&project, &root))
+            return tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                cards::legacy_snapshot(&project, &root, protocol)
+            })
                 .await.unwrap_or_else(|_| ServerEvent::Error { message: "Cannot read deck cards.".into() });
         }
     }

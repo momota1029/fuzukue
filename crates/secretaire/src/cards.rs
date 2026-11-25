@@ -33,18 +33,53 @@ pub fn deck_snapshot(project: &Path, deck: &str) -> (ServerEvent, ServerEvent, S
     (ServerEvent::DeckCardsChanged { deck: deck.into() }, document_for_deck(&root, None), workspace(project, deck))
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_for_deck(project: &Path, deck: &Path) -> ServerEvent {
     snapshot_for_deck_with(project, deck, legacy_diagnostics)
 }
 
+#[cfg(test)]
 pub(super) fn snapshot_for_deck_with(
     project: &Path,
     deck: &Path,
     project_diagnostics: impl FnOnce(&Path, &[fuzukue_cards::Diagnostic]) -> Vec<CardDiagnostic>,
 ) -> ServerEvent {
+    legacy_snapshot_with(project, deck, None, project_diagnostics)
+}
+
+pub(super) fn legacy_budget(protocol: u32) -> usize {
+    if protocol == fuzukue_proto::LARGE_LEGACY_FRAME_PROTOCOL { 48 * 1024 * 1024 } else { 12 * 1024 * 1024 }
+}
+
+pub(super) fn oversized_deck(deck: String) -> ServerEvent {
+    ServerEvent::Cards {
+        deck,
+        cards: Vec::new(),
+        diagnostics: vec![CardDiagnostic {
+            error: true, path: ".".into(), style: None,
+            message: "This deck exceeds the WebSocket size limit. Update the client and server to open it.".into(),
+        }],
+    }
+}
+
+pub(super) fn legacy_snapshot(project: &Path, deck: &Path, protocol: u32) -> ServerEvent {
+    legacy_snapshot_with(project, deck, Some(legacy_budget(protocol)), legacy_diagnostics)
+}
+
+fn legacy_snapshot_with(
+    project: &Path, deck: &Path, budget: Option<usize>,
+    project_diagnostics: impl FnOnce(&Path, &[fuzukue_cards::Diagnostic]) -> Vec<CardDiagnostic>,
+) -> ServerEvent {
     let prefix = deck.strip_prefix(project).unwrap_or(Path::new(""));
-    match crate::rules::open_graph(project, deck) {
-        Ok(g) => {
+    let graph = if let Some(budget) = budget {
+        crate::rules::resolve(project).and_then(|rules|
+            fuzukue_cards::Graph::open_bounded(deck, &rules.layers(project), project, budget))
+    } else {
+        crate::rules::open_graph(project, deck).map(Some)
+    };
+    match graph {
+        Ok(None) => oversized_deck(prefix.to_string_lossy().into_owned()),
+        Ok(Some(g)) => {
             let tex = tex_access(project, deck, &g);
             let mut sources = translation::Sources::new(project, &g);
             let cards = g.cards.values().map(|c| {

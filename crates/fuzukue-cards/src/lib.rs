@@ -773,6 +773,18 @@ pub fn read_card(root: &Path, path: &Path) -> Result<Option<Card>> {
     parse_card_document(root, path, &text)
 }
 
+fn validate_card_tex(project: &Path, root: &Path, path: &Path) -> Result<()> {
+    if path.ends_with("card.md") {
+        for entry in std::fs::read_dir(path.parent().expect("card.md has a parent"))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "tex") {
+                workspace_paths::resolve(project, root, &path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_card_document(root: &Path, path: &Path, text: &str) -> Result<Option<Card>> {
     if split_frontmatter(text).is_none() {
         return Ok(None);
@@ -905,26 +917,49 @@ impl Graph {
         Ok(g)
     }
 
-    /// Load a deck and build its cross-reference index without running body lint.
+    /// Index card metadata and cross-references without retaining local card bodies.
     pub fn open_for_browsing(root: &Path, rules: &[PathBuf], project: &Path) -> Result<Self> {
         let cfg = DeckConfig::read_config(root, rules, Some(project))?;
-        let mut graph = Self::load_deck(root, &cfg, project)?;
+        let mut graph = Self::load_deck_with_bodies(root, &cfg, project, false)?;
         graph.index_links(project)?;
         Ok(graph)
     }
 
-    /// Complete diagnostics for a graph from `open_for_browsing`.
+    /// Skip lint and serialization work if the raw card bodies alone exceed a wire budget.
+    pub fn open_bounded(root: &Path, rules: &[PathBuf], project: &Path, max_body_bytes: usize) -> Result<Option<Self>> {
+        let cfg = DeckConfig::read_config(root, rules, Some(project))?;
+        let mut graph = Self::load_deck(root, &cfg, project)?;
+        let mut remaining = max_body_bytes;
+        for card in graph.cards.values() {
+            let Some(next) = remaining.checked_sub(card.body.len()) else { return Ok(None); };
+            remaining = next;
+        }
+        graph.index(&cfg.lint, cfg.style, Some(project))?;
+        Ok(Some(graph))
+    }
+
+    /// Read one local card from a browsing graph, with workspace path checks.
+    pub fn read_browsing_card(&self, card: &Card, project: &Path) -> Result<Card> {
+        anyhow::ensure!(!card.external, "cannot reload a namespaced card as a local card");
+        let path = workspace_paths::resolve(project, &self.root, &card.path)?;
+        validate_card_tex(project, &self.root, &path)?;
+        let loaded = read_card(&self.root, &path)?.context("Card is no longer in this deck")?;
+        anyhow::ensure!(loaded.id == card.id, "Card changed while it was being read");
+        Ok(loaded)
+    }
+
+    /// Complete diagnostics, including the body lint omitted from the browsing index.
     pub fn browsing_diagnostics(&self, rules: &[PathBuf], project: &Path) -> Result<Vec<Diagnostic>> {
-        let cfg = DeckConfig::read_config(&self.root, rules, Some(project))?;
-        let mut diagnostics = self.diagnostics.clone();
-        diagnostics.extend(self.lint(&cfg.lint, cfg.style, Some(project), |_| true)?);
-        diagnostics.sort_by(|a, b| (&a.severity, &a.path).cmp(&(&b.severity, &b.path)));
-        Ok(diagnostics)
+        Ok(Self::open_in_project(&self.root, rules, Some(project))?.diagnostics)
     }
 
     /// Load local and namespaced cards without running the browsing lint rules.
     pub fn load_deck(root: &Path, cfg: &DeckConfig, workspace: &Path) -> Result<Self> {
-        let mut g = Self::load_cards_scoped(root, &cfg.dirs, Some(workspace))?;
+        Self::load_deck_with_bodies(root, cfg, workspace, true)
+    }
+
+    fn load_deck_with_bodies(root: &Path, cfg: &DeckConfig, workspace: &Path, local: bool) -> Result<Self> {
+        let mut g = Self::load_cards_with_bodies(root, &cfg.dirs, Some(workspace), local)?;
         let workspace_root = workspace.canonicalize()?;
         for (ns, resolved) in cfg.external_roots(workspace, root) {
             let ext_root = resolved?;
@@ -1008,6 +1043,10 @@ impl Graph {
     }
 
     fn load_cards_scoped(root: &Path, card_dirs: &[PathBuf], workspace: Option<&Path>) -> Result<Self> {
+        Self::load_cards_with_bodies(root, card_dirs, workspace, true)
+    }
+
+    fn load_cards_with_bodies(root: &Path, card_dirs: &[PathBuf], workspace: Option<&Path>, retain_bodies: bool) -> Result<Self> {
         let root = root.canonicalize().with_context(|| format!("{} がない", root.display()))?;
         let mut g = Graph { root: root.clone(), ..Default::default() };
         let mut seen = BTreeSet::new();
@@ -1029,20 +1068,20 @@ impl Graph {
                 if !seen.insert(p.canonicalize()?) {
                     continue;
                 }
-                if let Some(workspace) = workspace.filter(|_| p.ends_with("card.md")) {
-                    let parent = p.parent().expect("card.md has a parent");
-                    for entry in std::fs::read_dir(parent)? {
-                        let entry = entry?;
-                        if entry.path().extension().is_some_and(|e| e == "tex") {
-                            workspace_paths::resolve(workspace, &root, &entry.path())?;
-                        }
-                    }
+                if let Some(workspace) = workspace {
+                    validate_card_tex(workspace, &root, p)?;
                 }
                 let rel = p.strip_prefix(&root).unwrap_or(p).to_path_buf();
                 let parsed = parse_card_document(&root, p, &std::fs::read_to_string(p)?);
                 match parsed {
                     Ok(None) => continue, // README などカードでない Markdown
-                    Ok(Some(card)) => {
+                    Ok(Some(mut card)) => {
+                        if !retain_bodies {
+                            card.body = String::new();
+                            card.statement = None;
+                            card.proof = None;
+                            card.prose = None;
+                        }
                         if let Some(prev) = g.cards.get(&card.id) {
                             g.diag(Severity::Error, &rel, format!("id `{}` が {} と重複", card.id, prev.path.display()));
                         } else {

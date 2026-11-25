@@ -1176,14 +1176,19 @@ impl Update {
         }
         let separate_group = step == Step::Publish
             || self.status.borrow().canary_status.is_some();
-        if separate_group {
-            cmd.process_group(0);
-        }
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("launch {step:?} command"))?;
+        let scoped = matches!(step, Step::Build | Step::Test);
+        let (mut child, _job) = if scoped {
+            let (child, job) = crate::job_process::Job::spawn(cmd, "update-build", None)
+                .with_context(|| format!("launch {step:?} command"))?;
+            (child, Some(job))
+        } else {
+            if separate_group {
+                cmd.process_group(0);
+            }
+            (cmd.spawn().with_context(|| format!("launch {step:?} command"))?, None)
+        };
         let mut group = ProcessGroup(
-            child.id().filter(|_| separate_group)
+            child.id().filter(|_| separate_group && !scoped)
                 .and_then(|pid| rustix::process::Pid::from_raw(pid as i32)),
         );
         let stdout = child.stdout.take().context("missing stdout")?;

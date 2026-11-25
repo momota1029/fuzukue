@@ -35,6 +35,10 @@ drain_seconds = 60
 
 `service install` が書くユニットの `TimeoutStopSec` は `drain_seconds + 15` 秒（既定 75 秒）。上限を変更したら `service install` でユニットも更新する。`KillMode=mixed` は、最初の SIGTERM をサーバー本体に送り、子プロセスが退勤中に結果を保存できるようにする。
 
+systemd 254 以降と cgroup v2 では、導入スクリプトがサーバーをユニット配下の `server` に置く。エージェント、テスト、ビルド、レシピは個別の `job-*` cgroup で動き、終了時には残った子プロセスも停止する。ジョブごとの既定上限は 8 GiB で、`FUZUKUE_JOB_MEMORY_MIB` で変更できる。レシピにはレシピ自身のメモリ上限を適用する。
+
+ユニット全体のメモリにはジョブとページキャッシュが含まれる。サーバー単体の使用量は `server/memory.current`、匿名メモリとファイルキャッシュの内訳は `server/memory.stat` の `anon` と `file` で確認できる。cgroup の委譲が使えない環境ではプロセスグループで停止する。
+
 自己更新は作業が空くまで待ち、起動先を切り替えて systemd で再起動する。
 新しいビルドの応答を確認できなければ旧版に戻し、自己更新の状態に結果を残す。
 既存の `server-builds/current` がサービス対応前の版を指す場合は、サービス化の前に通常の自己更新で対応版まで進める。

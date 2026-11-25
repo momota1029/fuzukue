@@ -3,10 +3,10 @@ use crate::{Workspace, cancellation::Cancellation};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use fuzukue_proto::{ApprovalOwner, ApprovalRisk, FullApprovalMode};
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::Pid;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::File;
 use std::future::{Future, pending, ready};
 use std::io::ErrorKind;
@@ -106,7 +106,7 @@ pub(crate) struct Worker {
 #[derive(Default)]
 struct Processes {
     stopping: bool,
-    groups: HashSet<Pid>,
+    jobs: HashMap<Pid, crate::job_process::Job>,
 }
 
 static PROCESSES: std::sync::LazyLock<Mutex<Processes>> = std::sync::LazyLock::new(Mutex::default);
@@ -114,8 +114,8 @@ static PROCESSES: std::sync::LazyLock<Mutex<Processes>> = std::sync::LazyLock::n
 pub(crate) fn shutdown() {
     let mut processes = PROCESSES.lock().unwrap();
     processes.stopping = true;
-    for &pid in &processes.groups {
-        let _ = kill_process_group(pid, Signal::KILL);
+    for job in processes.jobs.values() {
+        let _ = job.stop();
     }
 }
 
@@ -125,29 +125,27 @@ impl Group {
     fn spawn(mut command: Command) -> Result<(tokio::process::Child, Self)> {
         let mut processes = PROCESSES.lock().unwrap();
         ensure!(!processes.stopping, "The server is stopping");
-        let child = command
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
+        let (child, job) = crate::job_process::Job::spawn(&mut command, "exec", None)
             .context("Could not start Bash")?;
         let pid = child
             .id()
             .and_then(|pid| Pid::from_raw(pid as i32))
             .context("Bash has no process ID")?;
-        processes.groups.insert(pid);
+        processes.jobs.insert(pid, job);
         Ok((child, Self(pid)))
     }
 
     fn kill(&self) {
-        let _ = kill_process_group(self.0, Signal::KILL);
+        if let Some(job) = PROCESSES.lock().unwrap().jobs.get(&self.0) {
+            let _ = job.stop();
+        }
     }
 }
 
 impl Drop for Group {
     fn drop(&mut self) {
-        let mut processes = PROCESSES.lock().unwrap();
-        self.kill();
-        processes.groups.remove(&self.0);
+        let job = PROCESSES.lock().unwrap().jobs.remove(&self.0);
+        drop(job);
     }
 }
 

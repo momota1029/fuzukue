@@ -558,36 +558,57 @@ impl Transcript {
             .strip_suffix("\n\n")
             .context("missing transcript separator")?;
         for part in body.split("\n\n<!-- labo-thread ") {
-            let (header, content) = part
-                .split_once(" -->\n")
-                .context("broken transcript header")?;
-            let meta: EntryMeta = serde_json::from_str(header)?;
-            let text = if meta.tool.is_some() {
-                String::new()
-            } else {
-                let (_, content) = content
-                    .split_once("\n\n")
-                    .context("missing transcript heading")?;
-                let content = content
-                    .strip_suffix(&attachment_list(&meta.attachments))
-                    .context("missing transcript attachment list")?;
-                content
-                    .split('\n')
-                    .map(|line| {
-                        if line.starts_with('\\')
-                            && line.trim_start_matches('\\').starts_with(ENTRY)
-                        {
-                            &line[1..]
-                        } else {
-                            line
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            transcript.push(Entry { meta, text });
+            transcript.push(Self::decode_entry(part)?);
         }
         Ok(transcript)
+    }
+
+    fn read_buffered(input: &mut impl BufRead) -> Result<Self> {
+        let mut transcript = Self::default();
+        let mut line = String::new();
+        let mut entry = String::new();
+        while input.read_line(&mut line)? != 0 {
+            ensure!(!line.as_bytes().contains(&0), "NUL bytes in transcript");
+            if let Some(header) = line.strip_prefix(ENTRY) {
+                if entry.is_empty() || entry.ends_with("\n\n") {
+                    if !entry.is_empty() {
+                        transcript.push(Self::decode_entry(&entry[..entry.len() - 2])?);
+                    }
+                    entry.clear();
+                    entry.push_str(header);
+                    line.clear();
+                    continue;
+                }
+            }
+            ensure!(!entry.is_empty(), "missing transcript entry");
+            entry.push_str(&line);
+            line.clear();
+        }
+        if !entry.is_empty() {
+            let part = entry.strip_suffix("\n\n").context("missing transcript separator")?;
+            transcript.push(Self::decode_entry(part)?);
+        }
+        Ok(transcript)
+    }
+
+    fn decode_entry(part: &str) -> Result<Entry> {
+        let (header, content) = part.split_once(" -->\n").context("broken transcript header")?;
+        let meta: EntryMeta = serde_json::from_str(header)?;
+        let mut text = String::new();
+        if meta.tool.is_none() {
+            let (_, content) = content.split_once("\n\n").context("missing transcript heading")?;
+            let content = content.strip_suffix(&attachment_list(&meta.attachments))
+                .context("missing transcript attachment list")?;
+            text.reserve_exact(content.len());
+            for line in content.split_inclusive('\n') {
+                if line.starts_with('\\') && line.trim_start_matches('\\').starts_with(ENTRY) {
+                    text.push_str(&line[1..]);
+                } else {
+                    text.push_str(line);
+                }
+            }
+        }
+        Ok(Entry { meta, text })
     }
 
     fn replay_tail(
@@ -944,7 +965,13 @@ impl TranscriptSlot {
     fn cache_weight(&self) -> Option<usize> {
         let data = self.loaded.get()?;
         (self.source.is_some() && !self.dirty.get()).then(|| {
-            data.weight.max(data.value.items.len() * (std::mem::size_of::<Entry>() + 256))
+            let weight = data.value.items.iter().fold(0usize, |total, entry| {
+                total.saturating_add(std::mem::size_of::<Entry>() + 256)
+                    .saturating_add(entry.text.capacity())
+                    .saturating_add(entry.meta.tool.as_ref()
+                        .and_then(|tool| tool.output.as_ref()).map_or(0, String::capacity))
+            });
+            data.weight.max(weight)
         })
     }
 }
@@ -967,11 +994,20 @@ impl DerefMut for TranscriptSlot {
 
 impl TranscriptSource {
     fn read(&self) -> Result<(Transcript, usize)> {
-        let text = std::fs::read_to_string(&self.path)?;
-        let (_, body) = fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
-        let mut transcript = Transcript::read(body)?;
+        let mut input = BufReader::new(std::fs::File::open(&self.path)?);
+        let mut weight = input.get_ref().metadata()?.len() as usize;
+        let mut line = String::new();
+        input.read_line(&mut line)?;
+        ensure!(matches!(line.as_str(), "---\n" | "---\r\n"), "missing thread front matter");
+        loop {
+            line.clear();
+            ensure!(input.read_line(&mut line)? != 0, "unterminated thread front matter");
+            if matches!(line.as_str(), "---" | "---\n" | "---\r\n") {
+                break;
+            }
+        }
+        let mut transcript = Transcript::read_buffered(&mut input)?;
         let mut recovered = Transcript::default();
-        let mut weight = text.len();
         self.timeline.visit_session(&self.session, |env, bytes| {
             if env.seq > self.after {
                 weight = weight.saturating_add(bytes as usize);

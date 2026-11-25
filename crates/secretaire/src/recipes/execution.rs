@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
 use rustix::fs::{self as fd, Mode, OFlags, ResolveFlags};
-use rustix::process::{kill_process_group, Pid, Signal};
 use tokio::process::Command;
 
 use super::{config, Broker, Cancellation, Pending, Record, State};
@@ -206,20 +205,10 @@ async fn launch(
         libc::rlim_t::try_from(u64::from(pending.recipe.max_memory_mib) * 1024 * 1024)
             .context("recipe memory limit exceeds the platform limit")?;
     limits(&mut command, memory_bytes, passed_fds);
-    let mut child = command
-        .process_group(0)
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log.try_clone()?)
-        .spawn()
-        .context("could not launch recipe command")?;
-    let group = ProcessGroup(
-        child
-            .id()
-            .and_then(|pid| Pid::from_raw(pid as i32))
-            .context("missing recipe PID")?,
-    );
+    command.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
+    let (mut child, group) = crate::job_process::Job::spawn(
+        &mut command, "recipe", Some(u64::from(pending.recipe.max_memory_mib) * 1024 * 1024),
+    ).context("could not launch recipe command")?;
     let timeout = Duration::from_secs(u64::from(pending.recipe.timeout_secs));
     let result = tokio::select! {
         biased;
@@ -248,14 +237,6 @@ async fn launch(
             }
             Ok(Exit::Completed(status))
         }
-    }
-}
-
-struct ProcessGroup(Pid);
-
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        let _ = kill_process_group(self.0, Signal::KILL);
     }
 }
 

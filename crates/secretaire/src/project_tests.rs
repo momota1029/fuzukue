@@ -472,24 +472,15 @@ async fn stream(
     parsed: &mut Parsed,
     run: &mut TestRun,
 ) -> Result<Execution> {
-    use rustix::process::{kill_process_group, Pid, Signal};
-
     if cancel.check().is_err() {
         return Ok(Execution::Cancelled);
     }
     if Instant::now() >= deadline {
         return Ok(Execution::TimedOut);
     }
-    let mut child = command
-        .process_group(0)
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let (mut child, job) = crate::job_process::Job::spawn(command, "test", None)
         .with_context(|| format!("テストを起動できない: {}", suite.info.command))?;
-    let group =
-        Pid::from_raw(child.id().context("テストの PID がない")? as i32).context("PID が不正")?;
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut out_line = Line::default();
@@ -506,7 +497,12 @@ async fn stream(
             _ = tokio::time::sleep_until(deadline), if forced.is_none() => { forced = Some(Execution::TimedOut); None },
             waited = child.wait(), if status.is_none() => {
                 match waited {
-                    Ok(exit) => status = Some(exit),
+                    Ok(exit) => {
+                        status = Some(exit);
+                        if let Err(error) = job.stop() {
+                            break Err(error).context("テストの子プロセスを停止できない");
+                        }
+                    }
                     Err(error) => break Err(error.into()),
                 }
                 None
@@ -547,10 +543,7 @@ async fn stream(
             return Ok(Execution::Exited(status));
         }
     };
-    match kill_process_group(group, Signal::KILL) {
-        Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-        Err(error) => return Err(error).context("テストを停止できない"),
-    }
+    job.stop().context("テストを停止できない")?;
     child.wait().await?;
     result
 }

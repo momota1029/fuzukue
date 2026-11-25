@@ -124,6 +124,7 @@ pub struct ClaudeSession {
 }
 
 struct ClaudeProcess {
+    job: crate::job_process::Job,
     child: Child,
     stdin: Option<ChildStdin>,
     settings: ChatSettings,
@@ -132,18 +133,20 @@ struct ClaudeProcess {
 
 impl ClaudeProcess {
     fn start(mut cmd: Command, project: &Path, settings: ChatSettings) -> Result<(Self, ChildStdout)> {
-        let mut child = cmd.current_dir(project)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
-            .kill_on_drop(true).spawn().context("failed to spawn claude")?;
+        cmd.current_dir(project).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        let (mut child, job) = crate::job_process::Job::spawn(&mut cmd, "claude", None)
+            .context("failed to spawn claude")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        Ok((Self { child, stdin: Some(stdin), settings, stop_reading: Arc::default() }, stdout))
+        Ok((Self { job, child, stdin: Some(stdin), settings, stop_reading: Arc::default() }, stdout))
     }
 
     async fn stop(&mut self) {
         // Closing stdin lets stream-json flush its transcript before a resumed process opens it.
         drop(self.stdin.take());
-        if tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await.is_err() {
+        let timed_out = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await.is_err();
+        let _ = self.job.stop();
+        if timed_out {
             let _ = self.child.kill().await;
         }
     }
@@ -996,12 +999,7 @@ impl ClaudeSession {
         if reap {
             // EOF cleanup records the interrupted input and leaves unclaimed prompts in the journal.
             let mut process = self.process.lock().await;
-            if let Some(group) = process.child.id().and_then(|id| rustix::process::Pid::from_raw(id as i32)) {
-                match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
-                    Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-                    Err(error) => return Err(error).context("stop unresponsive Claude process group"),
-                }
-            }
+            process.job.stop().context("stop unresponsive Claude job")?;
             process.child.wait().await.context("reap unresponsive Claude process")?;
             process.stop_reading.cancel();
         } else if !already_interrupted {

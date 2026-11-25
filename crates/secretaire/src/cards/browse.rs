@@ -9,9 +9,9 @@ use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fuzukue_cards::{Diagnostic, Graph, Severity};
-use fuzukue_proto::{DeckCardPage, DeckDiagnosticPage, CARD_CONTENT_BYTES, DECK_PAGE_BYTES};
+use fuzukue_proto::{CardContent, CardEditPart, DeckCardPage, DeckDiagnosticPage, CARD_CONTENT_BYTES, DECK_PAGE_BYTES};
 
-use super::{card_content, card_summary, diagnostic_view, tex_access, translation};
+use super::{card_content, card_summary, diagnostic_view, edit_source, tex_access, translation};
 use crate::App;
 
 #[derive(Default)]
@@ -26,6 +26,7 @@ struct CacheState {
 struct Deck {
     revision: u64,
     graph: Graph,
+    body_bytes: usize,
     rules: Vec<PathBuf>,
     diagnostics: Mutex<Option<Vec<Diagnostic>>>,
 }
@@ -46,12 +47,21 @@ impl Cache {
         }
         let rules = crate::rules::resolve(project)?.layers(project);
         let graph = Graph::open_for_browsing(root, &rules, project)?;
-        let deck = Arc::new(Deck { revision: state.revision, graph, rules, diagnostics: Mutex::default() });
-        // Keep the active deck and recent paper views available to other connections.
-        if state.decks.len() == 4 {
-            state.decks.pop_front();
+        // Local bodies are absent. Namespaced cards can still carry large content.
+        const BODY_BUDGET: usize = 32 * 1024 * 1024;
+        let body_bytes = graph.cards.values().map(|card| {
+            card.body.capacity() + [&card.statement, &card.proof, &card.prose].into_iter()
+                .flatten().map(|part| part.text.capacity()).sum::<usize>()
+        }).sum();
+        let deck = Arc::new(Deck { revision: state.revision, graph, body_bytes, rules, diagnostics: Mutex::default() });
+        if body_bytes <= BODY_BUDGET {
+            while state.decks.len() >= 4
+                || state.decks.iter().map(|deck| deck.body_bytes).sum::<usize>() > BODY_BUDGET - body_bytes
+            {
+                state.decks.pop_front();
+            }
+            state.decks.push_back(deck.clone());
         }
-        state.decks.push_back(deck.clone());
         Ok(deck)
     }
 }
@@ -83,7 +93,17 @@ pub(crate) async fn content(State(app): State<Arc<App>>, Query(query): Query<Dec
         let card = deck.graph.cards.get(query.card.as_deref().unwrap_or_default())
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Card is no longer in this deck.".into()))?;
         let root = &deck.graph.root;
-        let content = card_content(root, card, tex_access(project, root, &deck.graph));
+        let tex = tex_access(project, root, &deck.graph);
+        let content = if card.external {
+            card_content(root, card, tex)
+        } else {
+            let card = deck.graph.read_browsing_card(card, project).map_err(read_error)?;
+            CardContent {
+                edit_body: edit_source(root, &card, CardEditPart::Body, tex).ok(),
+                edit_proof: edit_source(root, &card, CardEditPart::Proof, tex).ok(),
+                body: card.body,
+            }
+        };
         json(&content, CARD_CONTENT_BYTES)
     }).await
 }
@@ -104,7 +124,7 @@ pub(crate) async fn diagnostics(State(app): State<Arc<App>>, Query(query): Query
         let errors = matches().filter(|diag| diag.severity == Severity::Error).count();
         let rows = matches().skip(query.offset).map(|diag| {
             let view = diagnostic_view(prefix, diag);
-            if crate::bounded_json(&view, DECK_PAGE_BYTES - 1025).is_some() {
+            if crate::bounded_json_len(&view, DECK_PAGE_BYTES - 1025).is_some() {
                 view
             } else {
                 fuzukue_proto::CardDiagnostic {
@@ -149,7 +169,7 @@ fn page<T: serde::Serialize>(rows: impl Iterator<Item = T>, offset: usize, count
             return Ok((page, Some(offset + count)));
         }
         let oversized = || (StatusCode::PAYLOAD_TOO_LARGE, "A deck entry exceeds the page size limit.".into());
-        let size = crate::bounded_json(&row, DECK_PAGE_BYTES - 1025).ok_or_else(oversized)?.len() + 1;
+        let size = crate::bounded_json_len(&row, DECK_PAGE_BYTES - 1025).ok_or_else(oversized)? + 1;
         if size > remaining && !page.is_empty() {
             let next = offset + page.len();
             return Ok((page, Some(next)));
