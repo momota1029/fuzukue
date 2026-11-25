@@ -173,7 +173,7 @@ impl<'a> Query<'a> {
         (first < text.len()).then_some((freq, first))
     }
 
-    fn scan(&self, text: &str) -> Option<(Vec<usize>, usize)> {
+    pub(crate) fn scan(&self, text: &str) -> Option<(Vec<usize>, usize)> {
         let mut words = Words::new();
         if !self.words.is_empty() {
             for word in WORDS.find_iter(text) {

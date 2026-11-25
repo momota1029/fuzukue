@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use fuzukue_proto::{Actor, ChatSettings, CodexModel, PermissionMode, ServerEvent};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{oneshot, OnceCell};
 
 use crate::agent_usage::RunMetadata;
@@ -258,7 +258,6 @@ pub struct Codex {
     project_dir: PathBuf,
     skill_roots: tokio::sync::Mutex<SkillRoots>,
     job: crate::job_process::Job,
-    _child: tokio::sync::Mutex<Child>,
 }
 
 impl Codex {
@@ -299,7 +298,14 @@ impl Codex {
             project_dir: project_dir.to_path_buf(),
             skill_roots: tokio::sync::Mutex::default(),
             job,
-            _child: tokio::sync::Mutex::new(child),
+        });
+
+        let waiter = Arc::downgrade(&codex);
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            if let Some(codex) = waiter.upgrade() {
+                let _ = codex.job.stop();
+            }
         });
 
         let reader = Arc::downgrade(&codex);

@@ -1,6 +1,12 @@
 //! Own long-running subprocesses and their descendants.
 
 use std::io;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::check_service_isolation;
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn check_service_isolation() {}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use rustix::process::{kill_process_group, Pid, Signal};
 use tokio::process::{Child, Command};
@@ -15,7 +21,7 @@ pub(crate) struct Job {
 impl Job {
     pub(crate) fn spawn(command: &mut Command, kind: &str, memory_bytes: Option<u64>) -> io::Result<(Child, Self)> {
         #[cfg(target_os = "linux")]
-        let cgroup = linux::Cgroup::prepare(command, kind, memory_bytes);
+        let cgroup = linux::Cgroup::prepare(command, kind, memory_bytes)?;
         #[cfg(not(target_os = "linux"))]
         let _ = (kind, memory_bytes);
         let child = command.process_group(0).kill_on_drop(true).spawn()?;
@@ -94,8 +100,9 @@ mod linux {
     use std::io;
     use std::os::fd::AsRawFd;
     use std::path::{Component, Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     use tokio::process::Command;
 
@@ -103,23 +110,46 @@ mod linux {
     const DEFAULT_MIB: u64 = 8192;
     static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    static EMPTYING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-    pub(super) struct Cgroup(PathBuf);
+    pub(super) struct Cgroup {
+        dir: PathBuf,
+        cleaning: AtomicBool,
+    }
 
-    fn delegated_root(membership: &str) -> Option<PathBuf> {
+    fn membership_path(membership: &str) -> Option<&Path> {
         let path = membership.lines().find_map(|line| line.strip_prefix("0::/"))?;
         let path = Path::new(path);
-        if !path.components().all(|component| matches!(component, Component::Normal(_))) {
+        path.components().all(|component| matches!(component, Component::Normal(_))).then_some(path)
+    }
+
+    fn delegated_root(membership: &str) -> Option<PathBuf> {
+        let path = membership_path(membership)?;
+        if path.file_name()? != "server" {
             return None;
         }
         let unit = path.parent()?;
-        if path.file_name()? != "server"
-            || !matches!(unit.file_name()?.to_str()?, "fuzukue.service" | "fuzukue-release.service")
-        {
+        if service_unit(unit).is_none() {
             return None;
         }
         Some(Path::new("/sys/fs/cgroup").join(unit))
+    }
+
+    fn service_unit(path: &Path) -> Option<&str> {
+        let name = path.file_name()?.to_str()?;
+        matches!(name, "fuzukue.service" | "fuzukue-release.service").then_some(name)
+    }
+
+    pub(crate) fn check_service_isolation() {
+        let Ok(membership) = fs::read_to_string("/proc/self/cgroup") else { return };
+        let Some(path) = membership_path(&membership) else { return };
+        let unit = if path.file_name().is_some_and(|name| name == "server") {
+            path.parent().and_then(service_unit)
+        } else {
+            service_unit(path)
+        };
+        if let Some(unit) = unit.filter(|_| root().is_none()) {
+            tracing::warn!("Job memory isolation is unavailable. To enable it and restart the user service, run: secretaire service enable-job-isolation {unit}");
+        }
     }
 
     fn root() -> Option<&'static Path> {
@@ -134,15 +164,13 @@ mod linux {
     }
 
     impl Cgroup {
-        pub(super) fn prepare(command: &mut Command, kind: &str, limit: Option<u64>) -> Option<Self> {
-            let root = root()?;
-            EMPTYING.lock().unwrap().retain(|path| matches!(fs::remove_dir(path),
-                Err(error) if error.kind() != io::ErrorKind::NotFound));
+        pub(super) fn prepare(command: &mut Command, kind: &str, limit: Option<u64>) -> io::Result<Option<Self>> {
+            let Some(root) = root() else { return Ok(None) };
             let generation = NEXT.fetch_add(1, Ordering::Relaxed);
             let dir = root.join(format!("job-{kind}-{}-{generation}", std::process::id()));
             let result = (|| -> io::Result<Self> {
                 fs::create_dir(&dir)?;
-                let cgroup = Self(dir.clone());
+                let cgroup = Self { dir: dir.clone(), cleaning: AtomicBool::new(false) };
                 let bytes = limit.unwrap_or_else(|| {
                     std::env::var("FUZUKUE_JOB_MEMORY_MIB").ok()
                         .and_then(|value| value.parse::<u64>().ok())
@@ -150,9 +178,10 @@ mod linux {
                         .and_then(|value| value.checked_mul(MIB))
                         .unwrap_or(DEFAULT_MIB * MIB)
                 });
+                fs::write(dir.join("memory.high"), (bytes / 2).to_string())?;
                 fs::write(dir.join("memory.max"), bytes.to_string())?;
                 fs::write(dir.join("memory.oom.group"), "1")?;
-                // Fail over to a process group if the kernel cannot kill descendants atomically.
+                // Require atomic descendant cleanup, including daemons that called setsid.
                 OpenOptions::new().write(true).open(dir.join("cgroup.kill"))?;
                 let procs = OpenOptions::new().write(true).open(dir.join("cgroup.procs"))?;
                 // Writing zero puts the newly forked process in this group before exec.
@@ -168,26 +197,61 @@ mod linux {
                 }
                 Ok(cgroup)
             })();
-            match result {
-                Ok(cgroup) => Some(cgroup),
-                Err(error) => {
-                    tracing::warn!(%error, path=?dir, "could not create job memory cgroup");
-                    None
-                }
-            }
+            result.map(Some).map_err(|error| {
+                tracing::warn!(%error, path=?dir, "could not create job memory cgroup");
+                error
+            })
         }
 
         pub(super) fn kill(&self) -> io::Result<()> {
-            fs::write(self.0.join("cgroup.kill"), "1")
+            fs::write(self.dir.join("cgroup.kill"), "1")?;
+            self.start_cleanup();
+            Ok(())
+        }
+
+        fn start_cleanup(&self) {
+            if self.cleaning.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let dir = self.dir.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || cleanup(&dir));
+            } else {
+                cleanup(&dir);
+            }
         }
     }
 
     impl Drop for Cgroup {
         fn drop(&mut self) {
-            if let Err(error) = fs::remove_dir(&self.0) {
-                if error.kind() != io::ErrorKind::NotFound {
-                    EMPTYING.lock().unwrap().push(self.0.clone());
+            self.start_cleanup();
+        }
+    }
+
+    fn cleanup(dir: &Path) {
+        // cgroup.kill sends SIGKILL but task exit and writeback may still be in flight.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::read_to_string(dir.join("cgroup.events")) {
+                Ok(events) if events.lines().any(|line| line == "populated 0") => break,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                _ => break,
+            }
+        }
+        // Reclaim while the charge still belongs to this job. Old kernels lack this file.
+        if let Ok(stat) = fs::read_to_string(dir.join("memory.stat")) {
+            let file_bytes = stat.lines().find_map(|line| line.strip_prefix("file "))
+                .and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+            if file_bytes > 0 {
+                if let Err(error) = fs::write(dir.join("memory.reclaim"), file_bytes.to_string()) {
+                    tracing::debug!(%error, path=?dir, "job cache reclaim was unavailable or partial");
                 }
+            }
+        }
+        if let Err(error) = fs::remove_dir(dir) {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(%error, path=?dir, "could not remove job cgroup");
             }
         }
     }

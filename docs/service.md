@@ -35,12 +35,18 @@ drain_seconds = 60
 
 `service install` が書くユニットの `TimeoutStopSec` は `drain_seconds + 15` 秒（既定 75 秒）。上限を変更したら `service install` でユニットも更新する。`KillMode=mixed` は、最初の SIGTERM をサーバー本体に送り、子プロセスが退勤中に結果を保存できるようにする。
 
-systemd 254 以降と cgroup v2 では、導入スクリプトがサーバーをユニット配下の `server` に置く。エージェント、テスト、ビルド、レシピは個別の `job-*` cgroup で動き、終了時には残った子プロセスも停止する。ジョブごとの既定上限は 8 GiB で、`FUZUKUE_JOB_MEMORY_MIB` で変更できる。レシピにはレシピ自身のメモリ上限を適用する。
+systemd 254 以降と cgroup v2 では、サービスの `Delegate=yes` と `DelegateSubgroup=server` が、サーバーをユニット配下の `server` に置く。エージェント、テスト、ビルド、レシピは個別の `job-*` cgroup で動く。ジョブの終了時には残った子プロセスも停止し、カーネルが対応していれば `memory.reclaim` で残りのファイルキャッシュの回収を試みる。
+
+ジョブごとの `memory.max` は既定で 8 GiB、`memory.high` は上限の半分。上限は `FUZUKUE_JOB_MEMORY_MIB` で変更できる。レシピにはレシピ自身のメモリ上限を適用する。
+
+古いユニットで分離が使えない場合、起動ログに移行コマンドが出る。`secretaire service enable-job-isolation fuzukue.service`（リリース版は `fuzukue-release.service`）を実行すると、設定を drop-in に加え、稼働中のサービスを再起動して反映する。
 
 ユニット全体のメモリにはジョブとページキャッシュが含まれる。サーバー単体の使用量は `server/memory.current`、匿名メモリとファイルキャッシュの内訳は `server/memory.stat` の `anon` と `file` で確認できる。cgroup の委譲が使えない環境ではプロセスグループで停止する。
 
 自己更新は作業が空くまで待ち、起動先を切り替えて systemd で再起動する。
 新しいビルドの応答を確認できなければ旧版に戻し、自己更新の状態に結果を残す。
+自己更新と試運転の Cargo ビルドは `server-builds/target` を共有する。デバッグ情報とインクリメンタルコンパイルを無効にし、前後に保存先の使用量を確認する。16 GiB を超えるか、ボリュームの空きが 8 GiB を下回るとビルドキャッシュを消去する。新規ビルドには 8 GiB の空きが必要になる。
+開発用 worktree のビルドは `bash scripts/worker-cargo.sh <cargo arguments>` で主チェックアウトの `target/worker-shared` を共有できる。このキャッシュの上限は 20 GiB で、必要な空きは 8 GiB。
 既存の `server-builds/current` がサービス対応前の版を指す場合は、サービス化の前に通常の自己更新で対応版まで進める。
 更新元を自動で見つけられない場合は、`server.toml` の `[self_update]` に `source` を指定する。
 

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{ensure, Result};
 use fuzukue_cards::DeckConfig;
@@ -16,7 +16,7 @@ use crate::references::{
     self,
     search::{index_words, score, snippet, Query, Words},
 };
-use crate::{comments, hub::Hub, memos, threads::LibraryStamp, workspace, Workspace};
+use crate::{comments, hub::Hub, memos, workspace, Workspace};
 
 const TITLE_WEIGHT: f64 = 3.0;
 
@@ -24,7 +24,21 @@ const TITLE_WEIGHT: f64 = 3.0;
 pub(crate) struct Index {
     files: Files,
     decks: BTreeMap<String, DeckEntry>,
-    threads: BTreeMap<String, (LibraryStamp, Vec<Document>)>,
+    last_used: Option<Instant>,
+}
+
+type QueryMatch = (Vec<usize>, usize);
+
+enum MatchSource<'a> {
+    File(&'a Document),
+    Thread(usize, Option<usize>),
+}
+
+struct Candidate<'a> {
+    source: MatchSource<'a>,
+    updated: i64,
+    body: Option<QueryMatch>,
+    heading: Option<QueryMatch>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -129,8 +143,11 @@ pub(crate) async fn search(app: Arc<Workspace>, search: Search) -> Result<Result
     tokio::task::spawn_blocking(move || {
         let _reference_guard = reference_guard;
         let mut index = app.library.lock().unwrap();
-        index.refresh(&app.project_dir.canonicalize()?, &app.hub);
-        index.search(&search)
+        index.refresh(&app.project_dir.canonicalize()?);
+        let result = index.search(&search, &app.hub);
+        index.last_used = Some(Instant::now());
+        index.trim_size();
+        result
     })
     .await?
 }
@@ -187,7 +204,27 @@ fn refresh_file(
 }
 
 impl Index {
-    fn refresh(&mut self, project: &Path, hub: &Hub) {
+    pub(crate) fn trim_idle(&mut self, idle: Duration) {
+        if self.last_used.is_some_and(|used| used.elapsed() >= idle) {
+            *self = Self::default();
+        }
+    }
+
+    fn trim_size(&mut self) {
+        // A large query can use the full corpus without leaving it resident.
+        const BUDGET: usize = 24 * 1024 * 1024;
+        let bytes = self.files.values().flat_map(|entry| &entry.documents)
+            .flat_map(|doc| [&doc.heading, &doc.body])
+            .map(|text| text.source.capacity()
+                + text.words.capacity() * std::mem::size_of::<(String, (usize, usize))>()
+                + text.words.keys().map(String::capacity).sum::<usize>())
+            .sum::<usize>();
+        if bytes > BUDGET {
+            *self = Self::default();
+        }
+    }
+
+    fn refresh(&mut self, project: &Path) {
         let mut next = BTreeMap::new();
         self.refresh_decks(project, &mut next);
         match references::root(project) {
@@ -227,59 +264,6 @@ impl Index {
             Err(err) => tracing::warn!("library reference root: {err:#}"),
         }
         self.files = next;
-        let changes = hub.library_threads(|id, stamp| {
-            self.threads
-                .get(id)
-                .is_some_and(|(previous, _)| previous == stamp)
-        });
-        self.threads = changes
-            .into_iter()
-            .map(|snapshot| {
-                let crate::threads::LibraryThread {
-                    id,
-                    stamp,
-                    messages,
-                } = snapshot;
-                let entry = match messages {
-                    Some(messages) => {
-                        let deck = stamp.decks.first().cloned();
-                        let title = &stamp.title;
-                        let date = stamp.updated;
-                        let title_location = LibraryLocation::Thread {
-                            thread: id.clone(),
-                            message_index: None,
-                            item: None,
-                        };
-                        let mut docs = vec![Document::new(
-                            title.clone(),
-                            deck.clone(),
-                            title_location,
-                            title.clone(),
-                            String::new(),
-                            date,
-                        )];
-                        docs.extend(messages.into_iter().map(|message| {
-                            let location = LibraryLocation::Thread {
-                                thread: id.clone(),
-                                message_index: Some(message.index),
-                                item: Some(message.item),
-                            };
-                            Document::new(
-                                title.clone(),
-                                deck.clone(),
-                                location,
-                                String::new(),
-                                message.text,
-                                date,
-                            )
-                        }));
-                        (stamp, docs)
-                    }
-                    None => self.threads.remove(&id).unwrap(),
-                };
-                (id, entry)
-            })
-            .collect();
     }
 
     fn refresh_decks(&mut self, project: &Path, next: &mut Files) {
@@ -535,7 +519,7 @@ impl Index {
         }
     }
 
-    fn search(&self, search: &Search) -> Result<Results> {
+    fn search(&self, search: &Search, hub: &Hub) -> Result<Results> {
         let mut results = Results {
             hits: Vec::new(),
             more: false,
@@ -550,41 +534,13 @@ impl Index {
             return Ok(results);
         }
         let query = Query::new(&search.query)?;
-        let files = self
-            .files
-            .values()
-            .flat_map(|entry| &entry.documents)
-            .map(|doc| (doc, None));
-        let threads = self
-            .threads
-            .values()
-            .flat_map(|(stamp, docs)| docs.iter().map(|doc| (doc, Some(stamp.decks.as_slice()))));
         let mut documents = 0;
         let mut df = vec![0; query.len()];
-        let mut matches = Vec::new();
-        for (doc, attached) in files.chain(threads) {
-            let kind = doc.location.kind();
-            if (kind == LibraryKind::ReviewReport && search.protocol < fuzukue_proto::REVIEW_REPORTS_PROTOCOL)
-                || (kind == LibraryKind::Deck && search.protocol < fuzukue_proto::LIBRARY_DECKS_PROTOCOL)
-                || (!search.kinds.is_empty() && !search.kinds.contains(&kind))
-            {
-                continue;
-            }
-            let deck = if let Some(filter) = &search.deck {
-                if doc.deck.as_ref() != Some(filter)
-                    && !attached.is_some_and(|decks| decks.contains(filter))
-                {
-                    continue;
-                }
-                Some(filter)
-            } else {
-                doc.deck.as_ref()
-            };
+        let mut candidates = Vec::new();
+        let mut record = |source, updated, body: Option<QueryMatch>, heading: Option<QueryMatch>| {
             documents += 1;
-            let body = query.matches(&doc.body.source, &doc.body.words);
-            let heading = query.matches(&doc.heading.source, &doc.heading.words);
             if body.is_none() && heading.is_none() {
-                continue;
+                return;
             }
             for (i, n) in df.iter_mut().enumerate() {
                 *n += usize::from(
@@ -592,51 +548,110 @@ impl Index {
                         || heading.as_ref().is_some_and(|(freq, _)| freq[i] > 0),
                 );
             }
-            matches.push((doc, deck, body, heading));
+            candidates.push(Candidate { source, updated, body, heading });
+        };
+
+        for doc in self.files.values().flat_map(|entry| &entry.documents) {
+            let kind = doc.location.kind();
+            if (kind == LibraryKind::ReviewReport && search.protocol < fuzukue_proto::REVIEW_REPORTS_PROTOCOL)
+                || (kind == LibraryKind::Deck && search.protocol < fuzukue_proto::LIBRARY_DECKS_PROTOCOL)
+                || (!search.kinds.is_empty() && !search.kinds.contains(&kind))
+            {
+                continue;
+            }
+            if search.deck.as_ref().is_some_and(|deck| doc.deck.as_ref() != Some(deck)) {
+                continue;
+            }
+            record(
+                MatchSource::File(doc),
+                doc.updated,
+                query.matches(&doc.body.source, &doc.body.words),
+                query.matches(&doc.heading.source, &doc.heading.words),
+            );
         }
-        let mut ranked: Vec<_> = matches
-            .into_iter()
-            .map(|(doc, deck, body, heading)| {
-                let field_score = |matched: &Option<(Vec<usize>, usize)>| {
-                    matched
-                        .as_ref()
-                        .map_or(0.0, |(freq, _)| score(freq, &df, documents))
+
+        // Keep the ranking inputs and reload text only for hits on the requested page.
+        let mut threads = Vec::new();
+        if search.kinds.is_empty() || search.kinds.contains(&LibraryKind::Thread) {
+            for id in hub.library_thread_ids() {
+                let Some(thread) = hub.library_thread(&id, |stamp| {
+                    search.deck.as_ref().is_none_or(|deck| stamp.decks.contains(deck))
+                }) else {
+                    continue;
                 };
-                let rank = field_score(&body) + TITLE_WEIGHT * field_score(&heading);
-                let (text, first) = if let Some((_, first)) = body {
-                    (&doc.body.source, first)
-                } else {
-                    (&doc.heading.source, heading.unwrap().1)
-                };
-                (doc, deck, rank, text, first)
-            })
-            .collect();
+                let Some(messages) = thread.messages else { continue };
+                let index = threads.len();
+                record(
+                    MatchSource::Thread(index, None),
+                    thread.stamp.updated,
+                    None,
+                    query.scan(&thread.stamp.title),
+                );
+                for message in messages {
+                    record(
+                        MatchSource::Thread(index, Some(message.index)),
+                        thread.stamp.updated,
+                        query.scan(&message.text),
+                        None,
+                    );
+                }
+                threads.push((id, thread.stamp));
+            }
+        }
+
+        let mut ranked: Vec<_> = candidates.into_iter().map(|candidate| {
+            let field_score = |field: &Option<QueryMatch>| {
+                field.as_ref().map_or(0.0, |(freq, _)| score(freq, &df, documents))
+            };
+            let rank = field_score(&candidate.body) + TITLE_WEIGHT * field_score(&candidate.heading);
+            let from_body = candidate.body.is_some();
+            let first = candidate.body.or(candidate.heading).unwrap().1;
+            (candidate.source, candidate.updated, rank, first, from_body)
+        }).collect();
         ranked.sort_by(|a, b| {
             let relevance = || b.2.total_cmp(&a.2);
-            let newest = || b.0.updated.cmp(&a.0.updated);
+            let newest = || b.1.cmp(&a.1);
             match search.sort {
                 LibrarySort::Relevance => relevance().then_with(newest),
                 LibrarySort::Newest => newest().then_with(relevance),
             }
         });
         results.more = ranked.len().saturating_sub(search.offset) > search.limit;
-        results.hits = ranked
-            .into_iter()
-            .skip(search.offset)
-            .take(search.limit)
-            .map(|(doc, deck, score, text, first)| {
-                let (snippet, highlights) = query.highlighted_snippet(text, first);
-                LibraryHit {
-                    title: doc.title.clone(),
-                    deck: deck.cloned(),
-                    location: doc.location.clone(),
-                    snippet,
-                    highlights,
-                    score,
-                    updated: doc.updated,
+        let mut loaded = None;
+        for (source, updated, score, first, from_body) in ranked.into_iter().skip(search.offset).take(search.limit) {
+            let (title, deck, location, text) = match source {
+                MatchSource::File(doc) => (
+                    doc.title.clone(),
+                    doc.deck.clone(),
+                    doc.location.clone(),
+                    if from_body { doc.body.source.as_str() } else { doc.heading.source.as_str() },
+                ),
+                MatchSource::Thread(index, message_index) => {
+                    let (id, stamp) = &threads[index];
+                    let (item, text) = if let Some(message_index) = message_index {
+                        if loaded.as_ref().is_none_or(|(previous, _)| *previous != index) {
+                            loaded = hub.library_thread(id, |current| current == stamp)
+                                .and_then(|thread| thread.messages)
+                                .map(|messages| (index, messages));
+                        }
+                        let Some((_, messages)) = &loaded else { continue };
+                        let Ok(position) = messages.binary_search_by_key(&message_index, |message| message.index)
+                            else { continue };
+                        (Some(messages[position].item.clone()), messages[position].text.as_str())
+                    } else {
+                        (None, stamp.title.as_str())
+                    };
+                    (
+                        stamp.title.clone(),
+                        search.deck.clone().or_else(|| stamp.decks.first().cloned()),
+                        LibraryLocation::Thread { thread: id.clone(), message_index, item },
+                        text,
+                    )
                 }
-            })
-            .collect();
+            };
+            let (snippet, highlights) = query.highlighted_snippet(text, first);
+            results.hits.push(LibraryHit { title, deck, location, snippet, highlights, score, updated });
+        }
         Ok(results)
     }
 }
@@ -647,7 +662,7 @@ mod tests {
     use crate::test_support::TestDir;
     use fuzukue_proto::{Actor, CommentView, LibraryReferencePart, ServerEvent};
 
-    fn search(index: &Index, query: &str, kinds: Vec<LibraryKind>, deck: Option<&str>) -> Results {
+    fn search(index: &Index, hub: &Hub, query: &str, kinds: Vec<LibraryKind>, deck: Option<&str>) -> Results {
         index
             .search(&Search {
                 query: query.into(),
@@ -657,7 +672,7 @@ mod tests {
                 offset: 0,
                 limit: LIBRARY_PAGE_SIZE,
                 protocol: fuzukue_proto::PROTOCOL_VERSION,
-            })
+            }, hub)
             .unwrap()
     }
 
@@ -669,10 +684,10 @@ mod tests {
         project.write("papers/draft/deck.toml", "kind = 'paper'\ntitle = 'Alternate caption'\nsummary = 'Geodesic bounds'\nstructure = 'order.yaml'");
         project.write("papers/draft/order.yaml", "title: Sphere concentration estimates\nsections: []");
         let mut index = Index::default();
-        index.refresh(&root, &hub);
+        index.refresh(&root);
 
         for query in ["Sphere concentration estimates", "Alternate caption", "Geodesic bounds"] {
-            let result = search(&index, query, vec![], None);
+            let result = search(&index, &hub, query, vec![], None);
             assert_eq!(result.hits.len(), 1, "{query}");
             let hit = &result.hits[0];
             assert_eq!(hit.title, "Sphere concentration estimates");
@@ -681,10 +696,10 @@ mod tests {
         }
 
         project.write("papers/draft/order.yaml", "title: Revised manuscript\nsections: []");
-        index.refresh(&root, &hub);
-        assert!(search(&index, "Sphere concentration estimates", vec![], None).hits.is_empty());
-        assert_eq!(search(&index, "Revised manuscript", vec![LibraryKind::Deck], None).hits.len(), 1);
-        assert!(search(&index, "Revised manuscript", vec![LibraryKind::Card], None).hits.is_empty());
+        index.refresh(&root);
+        assert!(search(&index, &hub, "Sphere concentration estimates", vec![], None).hits.is_empty());
+        assert_eq!(search(&index, &hub, "Revised manuscript", vec![LibraryKind::Deck], None).hits.len(), 1);
+        assert!(search(&index, &hub, "Revised manuscript", vec![LibraryKind::Card], None).hits.is_empty());
         Ok(())
     }
 
@@ -697,16 +712,16 @@ mod tests {
         project.write("paper/deck.toml", "kind = 'paper'");
         project.write("paper/cards/filed/card.md", "---\nid: filed\nkind: memo\n---\nHemlock");
         let mut index = Index::default();
-        index.refresh(&project.path().canonicalize().unwrap(), &hub);
+        index.refresh(&project.path().canonicalize().unwrap());
 
-        let recent = search(&index, "", vec![], None);
+        let recent = search(&index, &hub, "", vec![], None);
         assert_eq!(recent.hits.len(), 1);
         assert!(matches!(&recent.hits[0].location, LibraryLocation::Memo { card, path }
             if card == "todo" && path == "memos/todo/card.md"));
-        assert_eq!(search(&index, "", vec![LibraryKind::Memo, LibraryKind::Card], None).hits.len(), 1);
-        assert!(search(&index, "", vec![LibraryKind::Card], None).hits.is_empty());
-        assert!(search(&index, "", vec![LibraryKind::Memo], Some("paper")).hits.is_empty());
-        let cards = search(&index, "hemlock", vec![LibraryKind::Card], None);
+        assert_eq!(search(&index, &hub, "", vec![LibraryKind::Memo, LibraryKind::Card], None).hits.len(), 1);
+        assert!(search(&index, &hub, "", vec![LibraryKind::Card], None).hits.is_empty());
+        assert!(search(&index, &hub, "", vec![LibraryKind::Memo], Some("paper")).hits.is_empty());
+        let cards = search(&index, &hub, "hemlock", vec![LibraryKind::Card], None);
         assert_eq!(cards.hits.len(), 1);
         assert!(matches!(&cards.hits[0].location, LibraryLocation::Card { card } if card == "filed"));
     }
@@ -774,34 +789,34 @@ mod tests {
         });
 
         let mut index = Index::default();
-        index.refresh(project.path(), &hub);
-        let japanese = search(&index, "写像", vec![], None);
+        index.refresh(project.path());
+        let japanese = search(&index, &hub, "写像", vec![], None);
         assert_eq!(japanese.hits.len(), 4);
         for hit in japanese.hits {
             let [start, end] = hit.highlights[0];
             assert_eq!(&hit.snippet[start..end], "写像");
         }
-        let references = search(&index, "KERNEL", vec![LibraryKind::Reference], None);
+        let references = search(&index, &hub, "KERNEL", vec![LibraryKind::Reference], None);
         assert!(
             matches!(&references.hits[0].location, LibraryLocation::Reference {
             key, file, part: LibraryReferencePart::Lines { lines: [61, 61] }, ..
         } if key == "source" && file == "notes.txt")
         );
         assert_eq!(references.hits[0].title, "Source title");
-        assert!(search(&index, "kernel", vec![LibraryKind::Card], None)
+        assert!(search(&index, &hub, "kernel", vec![LibraryKind::Card], None)
             .hits
             .is_empty());
         assert_eq!(
-            search(&index, "INJECTION", vec![], Some("paper"))
+            search(&index, &hub, "INJECTION", vec![], Some("paper"))
                 .hits
                 .len(),
             1
         );
         assert_eq!(
-            search(&index, "kernel", vec![], Some("paper")).hits.len(),
+            search(&index, &hub, "kernel", vec![], Some("paper")).hits.len(),
             2
         );
-        assert!(search(&index, "confidentialpayload", vec![], None)
+        assert!(search(&index, &hub, "confidentialpayload", vec![], None)
             .hits
             .is_empty());
 
@@ -810,26 +825,26 @@ mod tests {
         project.write(tex, "Revised image lemma.");
         project.write(reference, "New reference word.");
         comments::save(&deck, &[])?;
-        index.refresh(project.path(), &hub);
-        let hits = search(&index, "kernel", vec![], None).hits;
+        index.refresh(project.path());
+        let hits = search(&index, &hub, "kernel", vec![], None).hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "A renamed thread");
         assert!(matches!(&hits[0].location, LibraryLocation::Thread {
             thread: id, message_index: Some(1), item: Some(item),
         } if id == &thread && item == "answer"));
-        assert_eq!(search(&index, "image", vec![], None).hits.len(), 1);
+        assert_eq!(search(&index, &hub, "image", vec![], None).hits.len(), 1);
 
         references::refresh(project.path())?;
-        index.refresh(project.path(), &hub);
+        index.refresh(project.path());
         assert_eq!(
-            search(&index, "reference", vec![LibraryKind::Reference], None)
+            search(&index, &hub, "reference", vec![LibraryKind::Reference], None)
                 .hits
                 .len(),
             1
         );
         fs::remove_file(project.path().join(tex))?;
-        index.refresh(project.path(), &hub);
-        assert!(search(&index, "image", vec![], None).hits.is_empty());
+        index.refresh(project.path());
+        assert!(search(&index, &hub, "image", vec![], None).hits.is_empty());
         Ok(())
     }
 
@@ -847,7 +862,7 @@ mod tests {
         });
         comments::save(&project.path().join("paper"), &items)?;
         let mut index = Index::default();
-        index.refresh(project.path(), &Hub::new());
+        index.refresh(project.path());
         let results = index.search(&Search {
             query: "topology".into(),
             kinds: vec![LibraryKind::Comment],
@@ -856,7 +871,7 @@ mod tests {
             offset: 0,
             limit: LIBRARY_PAGE_SIZE,
             protocol: fuzukue_proto::PROTOCOL_VERSION,
-        })?;
+        }, &Hub::new())?;
         assert!(matches!(
             results.hits[0].location,
             LibraryLocation::Comment { index: 1, .. }

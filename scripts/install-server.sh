@@ -509,7 +509,7 @@ Environment={" ".join(paths)}
 Restart=on-failure
 RestartSec=3
 MemoryAccounting=yes
-Delegate=memory
+Delegate=yes
 DelegateSubgroup=server
 KillMode=mixed
 TimeoutStopSec=75
@@ -879,6 +879,7 @@ def uninstall(root, launcher, unit, binary, macos):
             systemctl("disable", "--now", UNIT)
         unit.unlink()
         if not macos:
+            (unit.with_name(unit.name + ".d") / "60-fuzukue-job-isolation.conf").unlink(missing_ok=True)
             systemctl("daemon-reload")
     launcher.unlink(missing_ok=True)
     set_link(root, "current", None)

@@ -40,11 +40,19 @@ const CACHE_VERSION: u32 = 2;
 #[derive(Default)]
 pub(crate) struct WorkspaceGraph {
     dirty: AtomicBool,
-    data: Mutex<Option<Graph>>,
+    data: Mutex<Option<(Graph, std::time::Instant)>>,
     pending: Mutex<Option<FileSet>>,
 }
 
 impl WorkspaceGraph {
+    pub(crate) fn trim_idle(&self, idle: std::time::Duration) {
+        if let Ok(mut data) = self.data.try_lock() {
+            if data.as_ref().is_some_and(|(_, used)| used.elapsed() >= idle) {
+                *data = None;
+            }
+        }
+    }
+
     pub(crate) fn invalidate(&self) {
         let mut pending = self.pending.lock().unwrap();
         *pending = None;
@@ -78,13 +86,16 @@ impl WorkspaceGraph {
             (dirty, std::mem::replace(&mut *pending, Some(FileSet::new())))
         };
         match data.as_mut() {
-            Some(graph) if dirty || refresh_external && graph.has_unwatched_inputs => {
+            Some((graph, _)) if dirty || refresh_external && graph.has_unwatched_inputs => {
                 graph.refresh(project, state, dirty, paths.as_ref())
             }
             Some(_) => {}
-            None => *data = Some(Graph::open(project, state)),
+            None => *data = Some((Graph::open(project, state), std::time::Instant::now())),
         }
-        run(data.as_ref().unwrap())
+        let (graph, used) = data.as_mut().unwrap();
+        let result = run(graph);
+        *used = std::time::Instant::now();
+        result
     }
 
     pub(crate) fn route_scores(

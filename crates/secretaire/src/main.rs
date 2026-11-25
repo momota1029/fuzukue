@@ -462,6 +462,14 @@ impl Workspace {
         }
     }
 
+    fn trim_idle_caches(&self, idle: Duration) {
+        if let Ok(mut library) = self.library.try_lock() {
+            library.trim_idle(idle);
+        }
+        self.graph.trim_idle(idle);
+        self.hub.trim_idle_transcripts(idle);
+    }
+
     fn watch_idle_agents(self: &Arc<Self>) {
         const IDLE: Duration = Duration::from_secs(5 * 60);
         let workspace = Arc::downgrade(self);
@@ -471,6 +479,7 @@ impl Workspace {
             loop {
                 tick.tick().await;
                 let Some(workspace) = workspace.upgrade() else { break };
+                workspace.trim_idle_caches(Duration::from_secs(2 * 60));
                 {
                     let mut slot = workspace.codex.lock().await;
                     if slot.as_ref().is_some_and(|codex| Arc::strong_count(codex) == 1 && codex.idle_for(IDLE))
@@ -621,6 +630,7 @@ async fn run_server() -> anyhow::Result<()> {
         bind_listeners(&listen).await?
     };
     if !canary() {
+        job_process::check_service_isolation();
         recipes::configure(&config.server_config, &state_dir, config.server_config_path)?;
     }
     let mail = if canary() { None } else { mail::Store::load(&state_dir)? };

@@ -8,8 +8,7 @@
 - クライアントを直接ビルドするときは、書き込める `TMPDIR` と `RUST_FONTCONFIG_DLOPEN=1` を使う。必要ならリポジトリ内に一時ディレクトリを作って `TMPDIR` に指定する。
 - `xcb`、`xkbcommon`、`xkbcommon-x11` のリンク名がなければ、`scripts/shot.sh` と同様に一時ディレクトリ内で `libxcb.so.1` → `libxcb.so`、`libxkbcommon.so.0` → `libxkbcommon.so`、`libxkbcommon-x11.so.0` → `libxkbcommon-x11.so` の別名を作る。そのディレクトリを `LIBRARY_PATH="$link_dir${LIBRARY_PATH:+:$LIBRARY_PATH}"` で渡す。
 - サーバーからサービスモードや自己更新用の環境変数が引き継がれることがある。secretaire のテストは `env -u FUZUKUE_SERVICE -u FUZUKUE_SELF_UPDATE_READY -u FUZUKUE_SELF_UPDATE_SOURCE cargo test -q -p secretaire` で実行する。
-- 同じ Cargo の出力先を共有すると `Blocking waiting for file lock` が出る。先行ジョブを待つか、並行ビルドには `CARGO_TARGET_DIR="$TMPDIR/target"` を使う。
-- できる限り `cargo test` はクレート一つかテスト名に絞り、別々の `CARGO_TARGET_DIR` への全体ビルドを並行させない（各出力先で数 GB を使う）。`TMPDIR` 内に専用の `CARGO_TARGET_DIR` を作った場合は、作業が終わったら削除する。
+- fuzukue のビルドとテストは `bash scripts/worker-cargo.sh test -q -p secretaire` のように実行する。リンクした worktree 間で主チェックアウトの `target/worker-shared` を共有する。先行ビルドがあれば待ち、テストはクレートやテスト名で絞る。
 - 並行ビルド中の一時的なリンクエラーは、先行ジョブの終了後に同じコマンドで再確認する。
 - 実時間を比較するテストは高負荷時に不安定になることがある。該当テストを単独で再実行し、最初の結果と再実行の結果を残す。
 
@@ -25,7 +24,6 @@
 - For direct client builds, use a writable `TMPDIR` and `RUST_FONTCONFIG_DLOPEN=1`. If needed, create a temporary directory inside the repository and set `TMPDIR` to it.
 - If linker names for `xcb`, `xkbcommon`, and `xkbcommon-x11` are missing, follow `scripts/shot.sh`: create temporary aliases from `libxcb.so.1` to `libxcb.so`, `libxkbcommon.so.0` to `libxkbcommon.so`, and `libxkbcommon-x11.so.0` to `libxkbcommon-x11.so`. Pass the directory via `LIBRARY_PATH="$link_dir${LIBRARY_PATH:+:$LIBRARY_PATH}"`.
 - The worker can inherit service mode and self-update variables from the server. Run secretaire tests with `env -u FUZUKUE_SERVICE -u FUZUKUE_SELF_UPDATE_READY -u FUZUKUE_SELF_UPDATE_SOURCE cargo test -q -p secretaire`.
-- Sharing a Cargo target directory can cause `Blocking waiting for file lock`. Wait for the other build or use `CARGO_TARGET_DIR="$TMPDIR/target"` for concurrent builds.
-- Run `cargo test` for a single crate or test name when possible and avoid parallel full builds into separate `CARGO_TARGET_DIR`s (each costs gigabytes). Delete a private `CARGO_TARGET_DIR` under your `TMPDIR` when you finish.
+- Build and test fuzukue with `bash scripts/worker-cargo.sh test -q -p secretaire`. Linked worktrees share `target/worker-shared` in the primary checkout. Wait for earlier builds and narrow tests by crate or test name where possible.
 - For transient linker errors during concurrent builds, retry the same command once the other build finishes.
 - Tests that compare wall-clock times can flake under load. Rerun the affected test in isolation and record both results.

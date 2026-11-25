@@ -1,5 +1,6 @@
 //! Build a pinned server release and hand the restart to a detached supervisor.
 
+mod build_cache;
 mod canary;
 pub(crate) mod drain;
 mod prune;
@@ -919,6 +920,10 @@ impl Update {
     }
 
     async fn pipeline(&self, source: &Path, build: Command) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+        self.with_build_cache(self.prepare_pipeline(source, build)).await
+    }
+
+    async fn prepare_pipeline(&self, source: &Path, build: Command) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
         let (checkout, commit) = self.prepare_checkout(source).await?;
         let build_state = checkout.path().join(".windows-build");
         let prebuild = self.config.prebuild();
@@ -1159,6 +1164,10 @@ impl Update {
         self.log(step, &format!("{}$ {:?}\n", mode.prefix(), cmd.as_std()));
         cmd.current_dir(cwd)
             .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
+            .env("CARGO_PROFILE_TEST_DEBUG", "0")
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "0")
             .env("FUZUKUE_PROJECT_DIR", &self.project)
             .env("LABO_PROJECT_DIR", &self.project)
             .env_remove(supervisor::READY_ENV)
@@ -1176,8 +1185,8 @@ impl Update {
         }
         let separate_group = step == Step::Publish
             || self.status.borrow().canary_status.is_some();
-        let scoped = matches!(step, Step::Build | Step::Test);
-        let (mut child, _job) = if scoped {
+        let scoped = matches!(step, Step::Build | Step::Test | Step::Shot | Step::Publish);
+        let (mut child, job) = if scoped {
             let (child, job) = crate::job_process::Job::spawn(cmd, "update-build", None)
                 .with_context(|| format!("launch {step:?} command"))?;
             (child, Some(job))
@@ -1193,8 +1202,15 @@ impl Update {
         );
         let stdout = child.stdout.take().context("missing stdout")?;
         let stderr = child.stderr.take().context("missing stderr")?;
+        let wait = async {
+            let status = child.wait().await?;
+            if let Some(job) = &job {
+                job.stop()?;
+            }
+            Ok(status)
+        };
         let result = tokio::try_join!(
-            child.wait(),
+            wait,
             self.read_log(step, stdout, mode),
             self.read_log(step, stderr, mode)
         )?;
@@ -1202,6 +1218,25 @@ impl Update {
             group.0 = None;
         }
         Ok(result)
+    }
+
+    async fn with_build_cache<T>(
+        &self,
+        build: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        // The update/canary caller holds lock_builds across this operation.
+        let root = self.root.clone();
+        self.log(Step::Build, "Checking the shared self-update Cargo target\n");
+        tokio::task::spawn_blocking(move || build_cache::maintain(&root, true)).await??;
+        let result = build.await;
+        let root = self.root.clone();
+        match tokio::task::spawn_blocking(move || build_cache::maintain(&root, false)).await {
+            Ok(Ok(true)) => self.log(Step::Build, "Cleared the self-update Cargo target at its storage limit\n"),
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "could not maintain the self-update Cargo target"),
+            Err(error) => tracing::warn!(%error, "self-update Cargo target maintenance failed"),
+        }
+        result
     }
 
     async fn read_log(

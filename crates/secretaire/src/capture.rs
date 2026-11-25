@@ -564,13 +564,6 @@ async fn run_script(run: Run<'_>) -> Result<Exit> {
     use rustix::process::{kill_process_group, Pid, Signal};
     use std::process::Stdio;
 
-    struct ProcessGroup(Pid);
-    impl Drop for ProcessGroup {
-        fn drop(&mut self) {
-            let _ = kill_process_group(self.0, Signal::KILL);
-        }
-    }
-
     let private = tempfile::tempdir_in(run.output)?;
     let home = private.path().join("home");
     let temp = private.path().join("tmp");
@@ -645,28 +638,24 @@ async fn run_script(run: Run<'_>) -> Result<Exit> {
         command.arg(fixture_path(run.root, run.fixture.project)?);
     }
     let log = File::create(run.output.join("shot.log"))?;
-    let mut child = command
-        .arg(scenario_file)
+    command.arg(scenario_file)
         .arg(run.output)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
+        .stderr(log);
+    let (mut child, job) = crate::job_process::Job::spawn(&mut command, "capture", None)
         .context("could not start scripts/shot.sh")?;
     let pid = child
         .id()
         .and_then(|pid| Pid::from_raw(pid as i32))
         .context("missing capture PID")?;
-    let group = ProcessGroup(pid);
     match tokio::time::timeout(run.timeout, child.wait()).await {
         Ok(status) => Ok(Exit::Status(status?)),
         Err(_) => {
             // Give Xvfb a chance to remove its display lock before killing the group.
-            let _ = kill_process_group(group.0, Signal::TERM);
+            let _ = kill_process_group(pid, Signal::TERM);
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-            drop(group);
+            job.stop()?;
             child.wait().await?;
             Ok(Exit::Timeout(run.timeout))
         }

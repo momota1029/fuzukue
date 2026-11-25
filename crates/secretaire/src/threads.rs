@@ -1008,7 +1008,6 @@ pub(crate) struct LibraryStamp {
 }
 
 pub(crate) struct LibraryThread {
-    pub id: String,
     pub stamp: LibraryStamp,
     pub messages: Option<Vec<LibraryMessage>>,
 }
@@ -1803,6 +1802,17 @@ impl Store {
         }
     }
 
+    pub(crate) fn trim_idle_transcripts(&mut self, idle: std::time::Duration) {
+        for thread in self.threads.values_mut().filter(|thread| !thread.active) {
+            let transcript = &mut thread.transcript;
+            if transcript.accessed.get().elapsed() >= idle
+                && transcript.source.is_some() && !transcript.dirty.get()
+            {
+                transcript.loaded.take();
+            }
+        }
+    }
+
     fn migrated_thread(&self, session: &str) -> Option<&str> {
         if let Some(id) = self.migrations.get(session) {
             return Some(id);
@@ -1899,35 +1909,39 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn library_threads(
+    pub(crate) fn library_thread_ids(&self) -> Vec<String> {
+        self.threads.keys().cloned().collect()
+    }
+
+    pub(crate) fn library_thread(
         &mut self,
-        known: impl Fn(&str, &LibraryStamp) -> bool,
-    ) -> Vec<LibraryThread> {
-        let ids: Vec<_> = self.threads.keys().cloned().collect();
-        ids.into_iter().map(|id| {
-            let thread = &self.threads[&id];
-            let stamp = LibraryStamp {
-                title: thread.front.title.clone(),
-                decks: thread.front.attached.clone(),
-                updated: thread.front.updated.max(thread.library_updated),
-                revision: thread.library_revision,
-            };
-            let messages = (!known(&id, &stamp)).then(|| {
-                thread.transcript.items.iter().enumerate()
-                    .filter(|(_, entry)| {
-                        !entry.meta.superseded && entry.meta.tool.is_none() && !entry.meta.is_delegated()
-                            && (matches!(entry.meta.actor, Actor::User) || crate::routing::is_partner(&entry.meta.actor))
-                    })
-                    .map(|(index, entry)| LibraryMessage {
-                        index,
-                        item: entry.meta.item.clone(),
-                        text: entry.text.clone(),
-                    })
-                    .collect()
-            });
+        id: &str,
+        read_messages: impl FnOnce(&LibraryStamp) -> bool,
+    ) -> Option<LibraryThread> {
+        let thread = self.threads.get(id)?;
+        let stamp = LibraryStamp {
+            title: thread.front.title.clone(),
+            decks: thread.front.attached.clone(),
+            updated: thread.front.updated.max(thread.library_updated),
+            revision: thread.library_revision,
+        };
+        let messages = read_messages(&stamp).then(|| {
+            thread.transcript.items.iter().enumerate()
+                .filter(|(_, entry)| {
+                    !entry.meta.superseded && entry.meta.tool.is_none() && !entry.meta.is_delegated()
+                        && (matches!(entry.meta.actor, Actor::User) || crate::routing::is_partner(&entry.meta.actor))
+                })
+                .map(|(index, entry)| LibraryMessage {
+                    index,
+                    item: entry.meta.item.clone(),
+                    text: entry.text.clone(),
+                })
+                .collect()
+        });
+        if messages.is_some() {
             self.trim_transcripts();
-            LibraryThread { id, stamp, messages }
-        }).collect()
+        }
+        Some(LibraryThread { stamp, messages })
     }
 
     pub(crate) fn title(&self, id: &str) -> Option<String> {

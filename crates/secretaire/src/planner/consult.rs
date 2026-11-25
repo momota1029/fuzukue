@@ -249,9 +249,8 @@ pub(crate) async fn consult(
         .map(|plan| trimmed(&plan, 12000));
     let mut recent = app
         .hub
-        .library_threads(|id, _| id != session)
-        .into_iter()
-        .find_map(|thread| thread.messages)
+        .library_thread(session, |_| true)
+        .and_then(|thread| thread.messages)
         .unwrap_or_default()
         .into_iter()
         .rev()

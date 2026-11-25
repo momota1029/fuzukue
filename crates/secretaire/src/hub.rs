@@ -801,12 +801,25 @@ impl Hub {
         records
     }
 
-    pub(crate) fn library_threads(
+    pub(crate) fn library_thread_ids(&self) -> Vec<String> {
+        self.inner.lock().unwrap().threads.as_ref()
+            .map(|store| store.library_thread_ids()).unwrap_or_default()
+    }
+
+    pub(crate) fn trim_idle_transcripts(&self, idle: std::time::Duration) {
+        if let Ok(mut inner) = self.inner.try_lock() {
+            if let Some(threads) = &mut inner.threads {
+                threads.trim_idle_transcripts(idle);
+            }
+        }
+    }
+
+    pub(crate) fn library_thread(
         &self,
-        known: impl Fn(&str, &crate::threads::LibraryStamp) -> bool,
-    ) -> Vec<crate::threads::LibraryThread> {
-        self.inner.lock().unwrap().threads.as_mut()
-            .map(|store| store.library_threads(known)).unwrap_or_default()
+        id: &str,
+        read_messages: impl FnOnce(&crate::threads::LibraryStamp) -> bool,
+    ) -> Option<crate::threads::LibraryThread> {
+        self.inner.lock().unwrap().threads.as_mut()?.library_thread(id, read_messages)
     }
 
     pub(crate) fn history_cursor(&self, session: &str) -> usize {

@@ -17,7 +17,7 @@ const SERVICE_ENV: &str = "FUZUKUE_SERVICE";
 const READY_ENV: &str = "FUZUKUE_SELF_UPDATE_READY";
 const SOURCE_ENV: &str = "FUZUKUE_SELF_UPDATE_SOURCE";
 pub(crate) const INSTALL_SOURCE_ENV: &str = "FUZUKUE_SERVICE_SOURCE";
-const USAGE: &str = "使い方: secretaire service install [--project <dir>] [--now] [--force] | uninstall | status | restart | stop";
+const USAGE: &str = "使い方: secretaire service install [--project <dir>] [--now] [--force] | enable-job-isolation <unit> | uninstall | status | restart | stop";
 
 pub(crate) fn managed() -> bool {
     managed_env(
@@ -60,6 +60,12 @@ pub(crate) fn cli(mut args: impl Iterator<Item = OsString>) -> Result<()> {
         cfg!(target_os = "linux"),
         "サービス管理には Linux の systemd が必要"
     );
+    if action == "enable-job-isolation" {
+        let unit = args.next().context("Pass fuzukue.service or fuzukue-release.service")?;
+        let unit = unit.to_str().context("Invalid service name")?;
+        ensure!(args.next().is_none(), "Pass exactly one service name");
+        return enable_job_isolation(&ProcessRunner, &unit_path()?, unit);
+    }
     if action == "install" {
         let options = InstallOptions::parse(args)?;
         let home = home()?;
@@ -263,7 +269,7 @@ fn render_unit(opts: &UnitOptions<'_>) -> String {
     let mut unit = format!(
         "[Unit]\nDescription=fuzukue server\n\n[Service]\nType=exec\n{exec}\n\
          Restart=on-failure\nRestartSec=3\nStandardOutput=journal\nStandardError=journal\n\
-         MemoryAccounting=yes\nDelegate=memory\nDelegateSubgroup=server\n\
+         MemoryAccounting=yes\nDelegate=yes\nDelegateSubgroup=server\n\
          KillMode=mixed\nTimeoutStopSec={}\nEnvironment={SERVICE_ENV}=1\n",
         opts.stop_seconds
     );
@@ -322,6 +328,28 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+const JOB_ISOLATION_DROP_IN: &str = "60-fuzukue-job-isolation.conf";
+
+fn enable_job_isolation(runner: &impl SystemctlRunner, unit_path: &Path, unit: &str) -> Result<()> {
+    ensure!(matches!(unit, UNIT | "fuzukue-release.service"), "Invalid fuzukue service name");
+    ensure!(
+        systemctl(runner, &["show", "-p", "LoadState", "--value", unit])? == "loaded",
+        "The user service {unit} is not installed"
+    );
+    let override_file = unit_path.with_file_name(format!("{unit}.d")).join(JOB_ISOLATION_DROP_IN);
+    write_private(
+        &override_file,
+        "[Service]\nMemoryAccounting=yes\nDelegate=yes\nDelegateSubgroup=server\n",
+    )?;
+    systemctl(runner, &["daemon-reload"])?;
+    ensure!(
+        systemctl(runner, &["show", "-p", "Delegate", "--value", unit])? == "yes",
+        "Another systemd override disables delegation for {unit}. Check systemctl --user cat {unit}."
+    );
+    systemctl(runner, &["try-restart", unit])?;
+    Ok(())
+}
+
 fn drop_in(unit: &Path) -> PathBuf {
     unit.with_file_name("fuzukue.service.d")
         .join("50-fuzukue-self-update.conf")
@@ -376,6 +404,7 @@ fn uninstall(runner: &impl SystemctlRunner, unit: &Path) -> Result<()> {
     }
     remove_if_present(unit)?;
     remove_if_present(&drop_in(unit))?;
+    remove_if_present(&unit.with_file_name("fuzukue.service.d").join(JOB_ISOLATION_DROP_IN))?;
     systemctl(runner, &["daemon-reload"])?;
     Ok(())
 }
@@ -538,6 +567,8 @@ mod tests {
                     "SubState=running\nExecMainStatus=0\nMainPID=246\nActiveState=active\n"
                 }
                 ["--user", "is-enabled", UNIT] => "enabled\n",
+                ["--user", "show", "-p", "LoadState", "--value", _] => "loaded\n",
+                ["--user", "show", "-p", "Delegate", "--value", _] => "yes\n",
                 _ => "",
             };
             Ok(Output {
@@ -669,6 +700,27 @@ mod tests {
         );
         assert!(!unit.exists());
         assert!(!drop_in(&unit).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn migration_adds_a_drop_in_and_restarts_only_the_requested_service() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = unit_path_in(dir.path(), None);
+        let unit = "fuzukue-release.service";
+        let installed = path.with_file_name(unit);
+        let original = "[Service]\nDelegate=no\nEnvironment=CUSTOM=1\n";
+        write_private(&installed, original)?;
+        let runner = FakeRunner::default();
+        enable_job_isolation(&runner, &path, unit)?;
+        assert_eq!(fs::read_to_string(&installed)?, original);
+        let override_file = installed.with_file_name(format!("{unit}.d")).join(JOB_ISOLATION_DROP_IN);
+        assert_eq!(
+            fs::read_to_string(override_file)?,
+            "[Service]\nMemoryAccounting=yes\nDelegate=yes\nDelegateSubgroup=server\n"
+        );
+        assert_eq!(runner.calls.borrow()[1], ["systemctl", "--user", "daemon-reload"]);
+        assert_eq!(runner.calls.borrow()[3], ["systemctl", "--user", "try-restart", unit]);
         Ok(())
     }
 

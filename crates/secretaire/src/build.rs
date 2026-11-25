@@ -834,9 +834,25 @@ pub(crate) async fn run_latex(
 
     cancel.check()?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let (child, job) = crate::job_process::Job::spawn(command, "latex", None)
+    let (mut child, job) = crate::job_process::Job::spawn(command, "latex", None)
         .context("latexmk を起動できない")?;
-    let output = child.wait_with_output();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let output = async {
+        use tokio::io::AsyncReadExt;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let wait = async {
+            let status = child.wait().await?;
+            job.stop()?;
+            Ok(status)
+        };
+        let (status, _, _) = tokio::try_join!(
+            wait, stdout.read_to_end(&mut out), stderr.read_to_end(&mut err)
+        )?;
+        Ok::<_, std::io::Error>(std::process::Output { status, stdout: out, stderr: err })
+    };
     tokio::pin!(output);
     tokio::select! {
         biased;

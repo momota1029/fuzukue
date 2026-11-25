@@ -359,7 +359,7 @@ impl Update {
         );
         self.step(Step::Publish, State::Skipped);
         let binary = self
-            .build_and_test(checkout.path(), &commit, build, dir)
+            .with_build_cache(self.build_and_test(checkout.path(), &commit, build, dir))
             .await?;
         let project = match &self.config.canary_project {
             Some(project) => {
