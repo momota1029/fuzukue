@@ -13,17 +13,18 @@ links:
 
 ## 現状
 
-「接続設定」の「更新を確認」から手動で確認し、利用者の操作で APK を取得する。アプリが SHA-256、パッケージ名、`versionCode` を照合した後に Android のインストーラーを開く。GitHub のローリングプレリリース `android-beta` に APK と `android-latest.json` を置く。アプリの更新 URL は初期状態では空欄で、自前の HTTPS 更新先も入力できる。tailnet 内では署名済み APK を個別に渡す運用もできる。 [Android の配布と更新](../../android/README.md#配布と更新) · [インストール・更新の設計](install-and-update.md#更新の操作とサーバーからの配布)
+公開ベータは `momota1029/fuzukue` のローリングプレリリース `android-beta` で配布し、署名済み APK と更新フィードを同じリリースに置く。「接続設定」の「更新を確認」から手動で確認できる。自動更新の初期設定はオフ。 [Android の配布と更新](../../android/README.md#配布と更新) · [ベータの更新フィード](https://github.com/momota1029/fuzukue/releases/download/android-beta/android-latest.json)
 
 ## 配布元とチャネル
 
 - デスクトップと同じように、配布チャネルで更新候補を選ぶ。`stable` は公開安定版、`beta` は既存の `android-beta` に対応するベータ版、`dev` は自前サーバーで明示的に公開した開発版を対象とする。チャネル間で同じ `applicationId` とリリース鍵を使う成果物には、全チャネルで単調増加する `versionCode` を割り当てる。チャネル変更後は、選択先が端末より新しい版を出した時点で更新できる。
-- GitHub に加えて、接続先の自前の secretaire から Tailscale 経由で取得できるようにする。チャネルごとに `android-latest.json` と、その `apk` 欄で指定する署名済み APK を同じ URL ディレクトリに置く。JSON は GitHub と同じ形式（`version`、`versionCode`、`package`、`sha256`、`apk`、`minimum_protocol`、`release_notes_first_line`、`built_at`）を使う。
+- GitHub に加えて、接続先の自前の secretaire から Tailscale 経由で取得できるようにする。チャネルごとに `android-latest.json` と、その `apk` 欄で指定する署名済み APK を同じ URL ディレクトリに置く。JSON は GitHub と同じ形式（`version`、`versionCode`、`package`、`sha256`、`apk`、`minimum_protocol`、`maximum_protocol`、`release_notes_first_line`、`built_at`）を使う。
 - 自前サーバーが提示する候補は、稼働中のサーバーと対応プロトコルの範囲が重なる APK に限る。`minimum_protocol` は現行 JSON の下限として維持し、公開時に APK の対応上限もサーバー側の登録情報で照合する。確認用 HTTP は WebSocket の接続・プロトコル交渉前にも利用できる。
-- `stable` と `beta` では設定したチャネルの自前サーバーを優先する。自前の配布元に到達できない場合に GitHub で取得できる候補は、同じチャネルで互換性を確認できる版に限る。互換候補なし、認証拒否、検証失敗は理由を表示し、その確認を終了する。稼働サーバーとの互換性を確かめられない場合は手動確認に回す。`dev` の取得先は自前サーバーとする。
-- リリース処理は検証済み APK を版ごとの URL に登録し、取得可能になってから JSON をアトミックに切り替える。同じ版の APK の内容は固定し、更新中の端末が旧 URL から再開できるよう直前の正常版を保持する。公開に失敗した場合は直前のフィードで配信を続ける。
+- 初期チャネルは `beta`、配布元は自動選択。接続先が HTTPS なら、そのサーバーの互換フィードを優先する。HTTP 接続や、フィードに到達できない、見つからない、無効、または互換候補がない場合は、GitHub の `android-beta` を確認する。認証拒否や TLS エラーは理由を表示する。GitHub の候補を適用するには、稼働サーバーとの互換性確認が必要になる。
+- `stable` と `beta` は接続先サーバーまたは指定の HTTPS URL を選べる。以前入力した URL は `beta` に引き継ぎ、URL が空の既存の `beta` 設定は自動選択に移行する。接続先サーバーを明示的に選んだ場合は、通信エラー時に、互換性を判断できる同一チャネルの指定 URL を確認できる。`dev` は接続先の HTTPS サーバーを使う。
+- 自前サーバーでは検証済み APK を版ごとの URL に登録し、JSON を原子的に切り替える。GitHub では新しい APK、SHA-256、`android-latest.json` の順でアップロードし、フィードの差し替えに失敗した場合は前のフィードの復元を試みる。どちらも版ごとの APK の内容を固定し、更新中の端末が旧 URL から再開できるように直前の APK を保持する。
 
-自前サーバーのフィードと APK は同じ認証で保護する。tailnet 内の取得は許可リストと Tailscale の接続元 ID を確認し、最初の実装では tailnet 側も HTTPS を使う。tailnet 外から自前サーバーに接続する場合は HTTPS と端末トークンを必須にする。トークンは既存の暗号化保存を使い、設定した自前サーバーのオリジンに限って Bearer ヘッダーで送る。リダイレクト先も HTTPS に限定し、別オリジンや GitHub にはトークンを送らない。URL、アプリとサーバーのログ、診断出力にトークンを残さない。 [リモート接続](../../docs/remote.md)
+自前サーバーのフィードと APK は同じ認証で保護する。tailnet 内の取得は許可リストと Tailscale の接続元 ID を確認し、最初の実装では tailnet 側も HTTPS を使う。tailnet 外から自前サーバーに接続する場合は HTTPS と端末トークンを必須にする。トークンは既存の暗号化保存を使い、設定した自前サーバーのオリジンに限って Bearer ヘッダーで送る。接続先サーバーの更新リクエストではリダイレクトを追わない。GitHub のフィードと APK は端末トークンなしで取得し、アセットのリダイレクトは HTTPS に限って追う。URL、アプリとサーバーのログ、診断出力にトークンを残さない。 [リモート接続](../../docs/remote.md)
 
 ## 取得とインストール
 
@@ -47,7 +48,7 @@ links:
 
 ## 決めること
 
-- 既存の手入力 URL とチャネル設定の移行、初期チャネル、GitHub への切り替えを利用者に知らせるタイミング。
+- GitHub への切り替えを利用者に知らせるタイミング。
 - `stable` の公開条件、`dev` の版番号割り当て、署名鍵の交代手順と許容する署名履歴。
 - アイドルとみなす時間、確認・再試行間隔、従量回線での取得、手元と配布元での APK の保持期間。
 - APK の互換性情報の登録方法と、WebSocket に接続できない端末が GitHub 候補の互換性を判断するための情報源。

@@ -21,11 +21,12 @@ class AndroidUpdaterTest {
 
     @Before fun resetSettings() {
         prefs.edit().clear().commit()
+        settings.save("", "")
     }
 
-    @Test fun defaultsToTheConnectedServerAndStoresChannelAndOptIn() {
+    @Test fun defaultsToAutomaticBetaAndStoresChannelAndOptIn() {
         val updater = AndroidUpdater(context)
-        assertEquals(UpdateOrigin.Server, updater.state.value.origin)
+        assertEquals(UpdateSourcePreference.Automatic, updater.state.value.preference)
         assertEquals(UpdateChannel.Beta, updater.state.value.channel)
         assertFalse(updater.state.value.auto)
         updater.setChannel(UpdateChannel.Stable)
@@ -40,13 +41,33 @@ class AndroidUpdaterTest {
         prefs.edit().putString("url", customFeed).apply()
         val updater = AndroidUpdater(context)
         assertEquals(customFeed, updater.state.value.url)
-        assertEquals(UpdateOrigin.Custom, updater.state.value.origin)
+        assertEquals(UpdateSourcePreference.Custom, updater.state.value.preference)
         updater.setChannel(UpdateChannel.Dev)
         assertEquals("", updater.state.value.url)
-        assertEquals(UpdateOrigin.Server, updater.state.value.origin)
+        assertEquals(UpdateSourcePreference.Server, updater.state.value.preference)
         updater.setChannel(UpdateChannel.Beta)
         assertEquals(customFeed, updater.state.value.url)
-        assertEquals(UpdateOrigin.Custom, updater.state.value.origin)
+        assertEquals(UpdateSourcePreference.Custom, updater.state.value.preference)
+    }
+
+    @Test fun migratesEmptyLegacyBetaUrlsAndPersistsAnExplicitServerChoice() {
+        for (legacyOrigin in listOf("Server", "Custom")) {
+            prefs.edit().putString("origin", legacyOrigin).putString("url_beta", "  ").commit()
+            assertEquals(UpdateSourcePreference.Automatic, AndroidUpdater(context).state.value.preference)
+        }
+        AndroidUpdater(context).setOrigin(UpdateSourcePreference.Server)
+        assertEquals(UpdateSourcePreference.Server, AndroidUpdater(context).state.value.preference)
+    }
+
+    @Test fun restoresGitHubCandidatesForHttpAndHttpsConnections() {
+        val github = githubBetaSource()
+        for (connection in listOf("ws://server.example/ws", "wss://server.example/ws")) {
+            val primary = serverUpdateSource(connection, UpdateChannel.Beta) ?: github
+            val release = cacheCandidate(connection, primary, github)
+            val updater = AndroidUpdater(context, settings)
+            assertEquals(release, (updater.state.value.status as UpdateStatus.Ready).release)
+            assertEquals(UpdateOrigin.GitHub, updater.state.value.feedOrigin)
+        }
     }
 
     @Test fun changingChannelDiscardsTheOldReadyCandidate() {
@@ -87,20 +108,22 @@ class AndroidUpdaterTest {
         assertFalse(sameApkSigners(emptyArray(), emptyArray()))
     }
 
-    private fun cacheCandidate(): UpdateRelease {
+    private fun cacheCandidate(
+        connection: String = "wss://example.org/ws",
+        source: UpdateSource = checkNotNull(serverUpdateSource(connection, UpdateChannel.Beta)),
+        feed: UpdateSource = source,
+    ): UpdateRelease {
         val release = UpdateRelease(
             "0.2.0", BuildConfig.VERSION_CODE + 1, context.packageName, "a".repeat(64),
             "app.apk", 18, "", "2026-11-22T08:00:00Z", PROTOCOL_VERSION,
         )
-        val connection = "wss://example.org/ws"
         settings.save(connection, "")
-        val source = checkNotNull(serverUpdateSource(connection, UpdateChannel.Beta))
         val file = UpdateDownload(context).verifiedFile(release)
         file.parentFile?.mkdirs()
         file.writeText("Already verified before process exit")
         prefs.edit().putString("candidate", Protocol.json.encodeToString(UpdateRelease.serializer(), release))
             .putString("candidate_source", "${socketUrl(connection)}\n${source.key}")
-            .putString("candidate_feed", source.key).commit()
+            .putString("candidate_feed", feed.key).commit()
         return release
     }
 }

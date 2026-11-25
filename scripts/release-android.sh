@@ -56,24 +56,80 @@ maximum_protocol=$(sed -nE 's/^const val PROTOCOL_VERSION = ([0-9]+)$/\1/p' \
 
 output="$android/build/releases/$version"
 apk="fuzukue-android-$version.apk"
+if [[ -z $channel ]]; then
+    apk="fuzukue-android-${version//+/-}-$version_code.apk"
+fi
 release_tag=android-beta
 release_title="fuzukue for Android v$version"
-release_command() {
-    printf 'First beta (the tag will be created on the releases repository default branch):\n'
-    printf 'gh release create'
-    printf ' %q' "$release_tag" "$output/$apk" "$output/$apk.sha256" "$output/android-latest.json" \
-        --repo "$release_repo" --prerelease --latest=false --title "$release_title" --notes-file "$notes"
-    printf '\n\nSubsequent betas (upload the APK and checksum before replacing the feed):\n'
-    printf 'gh release upload'
-    printf ' %q' "$release_tag" "$output/$apk" "$output/$apk.sha256" --clobber --repo "$release_repo"
-    printf ' &&\n'
-    printf 'gh release upload'
-    printf ' %q' "$release_tag" "$output/android-latest.json" --clobber --repo "$release_repo"
-    printf ' &&\n'
-    printf 'gh release edit'
-    printf ' %q' "$release_tag" --repo "$release_repo" --prerelease --latest=false \
+github_plan() {
+    printf 'GitHub repository: %s\n' "$release_repo"
+    printf 'Would look up %s and create a draft prerelease if missing (tag from the default branch).\n' "$release_tag"
+    printf 'Would upload %s, then %s, keeping previous versions and reusing identical assets.\n' "$apk" "$apk.sha256"
+    printf 'Would back up any current feed and write android-latest.json last if it changed (attempt restoration if replacement fails).\n'
+    printf 'Would publish or update %s as a prerelease with title "%s" and notes from "%s".\n' "$release_tag" "$release_title" "$notes"
+    printf 'Feed: https://github.com/%s/releases/download/%s/android-latest.json\n' "$release_repo" "$release_tag"
+}
+
+gh_release() {
+    gh release "$@" --repo "$release_repo"
+}
+
+github_has_asset() {
+    [[ $'\n'$asset_names$'\n' == *$'\n'"$1"$'\n'* ]]
+}
+
+github_upload_version_asset() {
+    local name=$1
+    if github_has_asset "$name"; then
+        gh_release download "$release_tag" --pattern "$name" --dir "$previous"
+        cmp -s -- "$previous/$name" "$output/$name" ||
+            fail "GitHub asset $name already has different contents. Use a new Android version."
+    else
+        gh_release upload "$release_tag" "$output/$name"
+    fi
+}
+
+github_publish() {
+    local asset_names replace_feed previous="$staging/previous" feed=android-latest.json
+    if ! asset_names=$(gh_release view "$release_tag" --json assets --jq '.assets[].name'); then
+        gh_release create "$release_tag" --draft --prerelease --latest=false \
+            --title "$release_title" --notes-file "$notes"
+        asset_names=
+    fi
+    mkdir -- "$previous"
+    github_upload_version_asset "$apk"
+    github_upload_version_asset "$apk.sha256"
+
+    if github_has_asset "$feed"; then
+        gh_release download "$release_tag" --pattern "$feed" --dir "$previous"
+        replace_feed=$(python3 -c '
+import json
+import sys
+from pathlib import Path
+
+old, new = (json.loads(Path(path).read_text(encoding="utf-8")) for path in sys.argv[1:])
+if old["versionCode"] > new["versionCode"] or (
+    old["versionCode"] == new["versionCode"] and
+    (old["apk"], old["sha256"].lower()) != (new["apk"], new["sha256"].lower())
+):
+    sys.exit("The GitHub feed already uses this versionCode or a newer one.")
+for manifest in (old, new):
+    manifest.pop("built_at", None)
+print("yes" if old != new else "no")
+' "$previous/$feed" "$output/$feed")
+
+        if [[ $replace_feed == yes ]] && ! gh_release upload "$release_tag" "$output/$feed" --clobber; then
+            if ! gh_release upload "$release_tag" "$previous/$feed" --clobber; then
+                cp -- "$previous/$feed" "$output/previous-$feed"
+                fail "Could not restore the GitHub feed. Its backup is at $output/previous-$feed."
+            fi
+            fail 'Could not update the GitHub feed. The previous feed was restored.'
+        fi
+    else
+        gh_release upload "$release_tag" "$output/$feed"
+    fi
+    gh_release edit "$release_tag" --draft=false --prerelease --latest=false \
         --title "$release_title" --notes-file "$notes"
-    printf '\n'
 }
 
 if $dry_run; then
@@ -83,11 +139,15 @@ if $dry_run; then
             "$version_code" "$minimum_protocol" "$maximum_protocol" "$channel" "$project"
         printf 'Feed: /android/%s/android-latest.json\nFirst install: /android/%s/download.apk\n' "$channel" "$channel"
     else
-        printf 'Would write %s, %s and android-latest.json to %s (versionCode %s, minimum protocol %s).\n' \
-            "$apk" "$apk.sha256" "$output" "$version_code" "$minimum_protocol"
-        release_command
+        printf 'Would write %s, %s and android-latest.json to %s (versionCode %s, protocol %s–%s).\n' \
+            "$apk" "$apk.sha256" "$output" "$version_code" "$minimum_protocol" "$maximum_protocol"
+        github_plan
     fi
     exit 0
+fi
+
+if [[ -z $channel ]]; then
+    command -v gh >/dev/null || fail 'Install and authenticate the GitHub CLI to publish an Android beta.'
 fi
 
 apksigner=$(command -v apksigner || true)
@@ -175,4 +235,4 @@ fi
 "$apksigner" verify "$staging/$apk" >&2
 mkdir -p -- "$output"
 mv -f -- "$staging/$apk" "$staging/$apk.sha256" "$staging/android-latest.json" "$output/"
-release_command
+github_publish

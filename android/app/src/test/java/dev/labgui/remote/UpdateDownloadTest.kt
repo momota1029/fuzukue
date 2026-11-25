@@ -32,6 +32,63 @@ class UpdateDownloadTest {
         "release.apk", 18, "", "2026-11-22T08:00:00Z", 73,
     )
 
+    @Test fun followsGitHubFeedAndApkRedirectsOverHttpsWithoutCredentials() {
+        val github = githubBetaSource()
+        val requests = mutableListOf<Request>()
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            requests += request
+            when (requests.size) {
+                1, 3 -> response(request, 302, "".toResponseBody())
+                    .header("Location", "https://release-assets.githubusercontent.com/asset-${requests.size}")
+                    .build()
+                2 -> response(request, 200, dev.labgui.remote.Protocol.json
+                    .encodeToString(UpdateRelease.serializer(), release).toResponseBody()).build()
+                else -> response(request, 200, bytes.toResponseBody()).build()
+            }
+        }.build()
+        val transfer = UpdateDownload(context, client)
+        assertEquals(release, transfer.check(github, "device", UpdateProtocol(18, 73)))
+        val invalid = assertThrows(UpdateProblem::class.java) {
+            transfer.download(github, release, "device") { _, _ -> }
+        }
+        assertEquals(R.string.update_apk_invalid, invalid.label)
+        assertEquals(listOf(
+            github.feed.toString(), "https://release-assets.githubusercontent.com/asset-1",
+            release.apkUrl(github.feed).toString(), "https://release-assets.githubusercontent.com/asset-3",
+        ), requests.map { it.url.toString() })
+        assertTrue(requests.all { it.header("Authorization") == null })
+    }
+
+    @Test fun refusesGitHubRedirectsToHttp() {
+        val requests = mutableListOf<Request>()
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            requests += request
+            response(request, 302, "".toResponseBody())
+                .header("Location", "http://release-assets.githubusercontent.com/asset")
+                .build()
+        }.build()
+        assertThrows(IOException::class.java) {
+            UpdateDownload(context, client).check(githubBetaSource(), "device", UpdateProtocol(18, 73))
+        }
+        assertEquals(1, requests.size)
+        assertNull(requests.single().header("Authorization"))
+    }
+
+    @Test fun withholdsTheDeviceTokenEvenIfGitHubIsConfiguredAsTheServer() {
+        val githubServer = checkNotNull(serverUpdateSource("wss://github.com/ws", UpdateChannel.Beta))
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            assertNull(request.header("Authorization"))
+            response(request, 404, "".toResponseBody()).build()
+        }.build()
+        val error = assertThrows(UpdateProblem::class.java) {
+            UpdateDownload(context, client).check(githubServer, "device", null)
+        }
+        assertEquals(R.string.update_feed_missing, error.label)
+    }
+
     @Test fun interruptedDownloadResumesWithItsValidatorAndRejectsANonApkAfterwards() {
         val requests = mutableListOf<Request>()
         val cut = 7

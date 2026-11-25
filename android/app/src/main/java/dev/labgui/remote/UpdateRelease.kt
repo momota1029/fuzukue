@@ -4,6 +4,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.URI
@@ -11,6 +12,31 @@ import java.net.URISyntaxException
 import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.time.Instant
+import javax.net.ssl.SSLException
+
+internal fun checkUpdateSources(
+    primary: UpdateSource,
+    fallback: UpdateSource?,
+    fetch: (UpdateSource) -> UpdateRelease,
+): UpdateRelease {
+    if (fallback == null) return fetch(primary)
+    try {
+        return fetch(primary)
+    } catch (error: Exception) {
+        val unavailable = when (error) {
+            is SSLException -> false
+            is UpdateProblem -> fallback.origin == UpdateOrigin.GitHub &&
+                error.label in listOf(
+                    R.string.update_check_failed, R.string.update_feed_missing, R.string.update_incompatible,
+                )
+            is IOException -> true
+            is IllegalArgumentException -> fallback.origin == UpdateOrigin.GitHub
+            else -> false
+        }
+        if (!unavailable) throw error
+    }
+    return fetch(fallback)
+}
 
 private val apkFileName = Regex("[A-Za-z0-9][A-Za-z0-9._+-]*\\.apk")
 private val sha256Hex = Regex("[0-9a-fA-F]{64}")
@@ -55,7 +81,15 @@ internal enum class UpdateChannel { Stable, Beta, Dev;
     val path get() = name.lowercase()
 }
 
-internal enum class UpdateOrigin { Server, Custom }
+internal enum class UpdateOrigin { Server, Custom, GitHub }
+
+internal enum class UpdateSourcePreference { Automatic, Server, Custom }
+
+internal fun githubBetaSource() = UpdateSource(
+    checkNotNull(httpsUpdateUrl("https://github.com/momota1029/fuzukue/releases/download/android-beta/android-latest.json")),
+    UpdateOrigin.GitHub,
+    UpdateChannel.Beta,
+)
 
 internal data class UpdateSource(val feed: HttpUrl, val origin: UpdateOrigin, val channel: UpdateChannel) {
     val key: String get() = "$origin:${channel.path}:$feed"

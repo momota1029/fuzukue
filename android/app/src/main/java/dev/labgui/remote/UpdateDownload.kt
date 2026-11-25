@@ -28,11 +28,10 @@ internal class UpdateDownload(
     private val directory = File(context.filesDir, "android-updates")
     private val partial = File(directory, "download.part")
     private val resume = File(directory, "download.resume")
-    private val customClient = client.newBuilder()
-        .followSslRedirects(false)
+    private val updateClient = client.newBuilder()
+        .followRedirects(false)
         .callTimeout(5, TimeUnit.MINUTES)
         .build()
-    private val serverClient = customClient.newBuilder().followRedirects(false).build()
 
     fun check(source: UpdateSource, token: String, protocol: UpdateProtocol?): UpdateRelease =
         get(source, source.feed, token).use { response ->
@@ -165,14 +164,25 @@ internal class UpdateDownload(
     ): Response {
         require(url.isHttps)
         val authenticated = source.origin == UpdateOrigin.Server
-        val request = Request.Builder().url(url).header("Accept-Encoding", "identity").apply {
+        var request = Request.Builder().url(url).header("Accept-Encoding", "identity").apply {
             if (offset > 0 && validator != null) {
                 header("Range", "bytes=$offset-")
                 header("If-Range", validator)
             }
-            if (authenticated && token.isNotEmpty() && url.sameOrigin(source.feed)) header("Authorization", "Bearer $token")
+            if (authenticated && token.isNotEmpty() && url.sameOrigin(source.feed) && !url.isGitHubHost()) {
+                header("Authorization", "Bearer $token")
+            }
         }.build()
-        return (if (authenticated) serverClient else customClient).newCall(request).execute()
+        repeat(20) {
+            val response = updateClient.newCall(request).execute()
+            if (authenticated || response.code !in listOf(300, 301, 302, 303, 307, 308)) return response
+            val location = response.header("Location") ?: return response
+            response.close()
+            val redirect = request.url.resolve(location)
+            if (redirect?.isHttps != true) throw IOException("Update redirect must use HTTPS")
+            request = request.newBuilder().url(redirect).build()
+        }
+        throw IOException("Too many update redirects")
     }
 
     private fun requireSuccess(response: Response, fallback: Int) {
@@ -188,6 +198,12 @@ internal class UpdateDownload(
 private fun File.outputStreamFor(append: Boolean) = java.io.FileOutputStream(this, append)
 
 private fun HttpUrl.sameOrigin(other: HttpUrl) = scheme == other.scheme && host == other.host && port == other.port
+
+private fun HttpUrl.isGitHubHost(): Boolean {
+    val domain = host.trimEnd('.')
+    return domain == "github.com" || domain.endsWith(".github.com") ||
+        domain == "githubusercontent.com" || domain.endsWith(".githubusercontent.com")
+}
 
 internal fun strongEtag(value: String?): String? =
     value?.takeIf { it.length in 2..256 && it.first() == '"' && it.last() == '"' }

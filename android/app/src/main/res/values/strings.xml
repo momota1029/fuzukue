@@ -79,6 +79,8 @@
     <string name="update_auto">アプリの自動更新</string>
     <string name="update_channel">配布チャネル</string>
     <string name="update_source">配布元 — %1$s</string>
+    <string name="update_source_automatic">自動選択（サーバー / GitHub）</string>
+    <string name="update_source_github">取得元 — GitHub のベータ版</string>
     <string name="update_source_server">接続先サーバー</string>
     <string name="update_source_custom">指定した HTTPS URL</string>
     <string name="update_source_fallback">サーバーに接続できなかったため、このチャネルの指定 URL を確認しました。</string>

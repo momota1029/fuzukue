@@ -90,7 +90,7 @@ internal fun RemoteApp(
     onCancelUpdate: () -> Unit = {},
     onAutoUpdate: (Boolean) -> Unit = {},
     onUpdateChannel: (UpdateChannel) -> Unit = {},
-    onUpdateOrigin: (UpdateOrigin) -> Unit = {},
+    onUpdateOrigin: (UpdateSourcePreference) -> Unit = {},
     onBackground: (Boolean) -> Unit = {},
     onWorkerNotices: (Boolean) -> Unit = {},
     onShowPlanAboveConversation: (Boolean) -> Unit = {},
@@ -402,7 +402,7 @@ private fun UpdatePanel(
     url: String, onUrl: (String) -> Unit, state: UpdateState, installError: String?,
     onCheck: () -> Unit, onDownload: () -> Unit, onInstall: () -> Unit,
     onAllow: () -> Unit, onCancel: () -> Unit, onAuto: (Boolean) -> Unit,
-    onChannel: (UpdateChannel) -> Unit, onOrigin: (UpdateOrigin) -> Unit,
+    onChannel: (UpdateChannel) -> Unit, onOrigin: (UpdateSourcePreference) -> Unit,
 ) {
     Panel {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -420,23 +420,22 @@ private fun UpdatePanel(
         }
         var choosingSource by remember { mutableStateOf(false) }
         Box {
-            val label = stringResource(if (state.origin == UpdateOrigin.Server) R.string.update_source_server
-                else R.string.update_source_custom)
+            val label = stringResource(state.preference.label())
             OutlinedButton(onClick = { choosingSource = true },
                 enabled = !state.installing && state.channel != UpdateChannel.Dev, modifier = Modifier.fillMaxWidth()) {
                 Text(stringResource(R.string.update_source, label))
             }
             DropdownMenu(choosingSource, { choosingSource = false }) {
-                for (origin in UpdateOrigin.entries) {
+                for (preference in UpdateSourcePreference.entries) {
+                    if (preference == UpdateSourcePreference.Automatic && state.channel != UpdateChannel.Beta) continue
                     DropdownMenuItem(
-                        text = { Text(stringResource(if (origin == UpdateOrigin.Server) R.string.update_source_server
-                            else R.string.update_source_custom)) },
-                        onClick = { choosingSource = false; onOrigin(origin) },
+                        text = { Text(stringResource(preference.label())) },
+                        onClick = { choosingSource = false; onOrigin(preference) },
                     )
                 }
             }
         }
-        if (state.origin == UpdateOrigin.Custom) {
+        if (state.preference == UpdateSourcePreference.Custom) {
             OutlinedTextField(
                 value = url, onValueChange = onUrl, enabled = !state.busy, singleLine = true,
                 label = { Text(stringResource(R.string.update_url)) },
@@ -444,14 +443,22 @@ private fun UpdatePanel(
                 modifier = Modifier.fillMaxWidth(),
             )
         }
-        if (state.feedOrigin == UpdateOrigin.Custom && state.origin == UpdateOrigin.Server) {
-            Text(stringResource(R.string.update_source_fallback), style = MaterialTheme.typography.bodySmall)
+        val checkedSource = when {
+            state.feedOrigin == UpdateOrigin.GitHub -> R.string.update_source_github
+            state.feedOrigin == UpdateOrigin.Server && state.preference == UpdateSourcePreference.Automatic ->
+                R.string.update_source_server
+            state.feedOrigin == UpdateOrigin.Custom && state.preference == UpdateSourcePreference.Server ->
+                R.string.update_source_fallback
+            else -> null
+        }
+        if (checkedSource != null) {
+            Text(stringResource(checkedSource), style = MaterialTheme.typography.bodySmall)
         }
         OutlinedButton(onClick = onCheck, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
             Text(stringResource(R.string.update_check))
         }
         when (val status = state.status.takeIf {
-            state.origin == UpdateOrigin.Server || url.trim() == state.url
+            state.preference != UpdateSourcePreference.Custom || url.trim() == state.url
         } ?: UpdateStatus.Idle) {
             UpdateStatus.Idle -> Unit
             UpdateStatus.Checking -> Text(stringResource(R.string.update_checking))
@@ -488,6 +495,12 @@ private fun UpdatePanel(
         }
         installError?.let { ErrorText(it) }
     }
+}
+
+private fun UpdateSourcePreference.label(): Int = when (this) {
+    UpdateSourcePreference.Automatic -> R.string.update_source_automatic
+    UpdateSourcePreference.Server -> R.string.update_source_server
+    UpdateSourcePreference.Custom -> R.string.update_source_custom
 }
 
 @Composable

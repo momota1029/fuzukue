@@ -26,7 +26,7 @@ Android 10 以降のスマホとタブレット向けの指示出しクライア
 
 ## 配布と更新
 
-自前サーバーから初回インストールするには、スマートフォンを許可リストに入っている Tailscale アカウントで tailnet に参加させ、ブラウザーで `https://<サーバーの MagicDNS 名>/android/beta/download.apk` を開く。Tailscale Serve が HTTPS を提供し、secretaire が接続元の Tailscale ログインを許可リストと照合する。URL にトークンは付けない。別のチャネルを配布した場合は `beta` を置き換える。ダウンロードした APK を開き、Android が求めたらブラウザーまたはファイル管理アプリからのインストールを許可する。既存の方法として GitHub Releases の署名済み APK も利用できる。
+初回インストールには [GitHub のベータリリース](https://github.com/momota1029/fuzukue/releases/tag/android-beta) の署名済み APK を使える。自前サーバーから入れる場合は、スマートフォンを許可リストに入っている Tailscale アカウントで tailnet に参加させ、ブラウザーで `https://<サーバーの MagicDNS 名>/android/beta/download.apk` を開く。Tailscale Serve が HTTPS を提供し、secretaire が接続元の Tailscale ログインを許可リストと照合する。URL にトークンは付けない。別のチャネルを配布した場合は `beta` を置き換える。ダウンロードした APK を開き、Android が求めたらブラウザーまたはファイル管理アプリからのインストールを許可する。
 
 tailnet 外の HTTPS プロキシではフィードと APK の両方に `Authorization: Bearer` の端末トークンが必要となる。通常のブラウザーのダウンロードリンクではこのヘッダーを付けられない。tailnet 経由で取得するか、端末トークンを扱える HTTP クライアントで取得した署名済み APK をスマートフォンに移す。
 
@@ -34,7 +34,9 @@ tailnet 外の HTTPS プロキシではフィードと APK の両方に `Authori
 
 アプリ ID は `dev.fuzukue.android`。旧 ID `dev.labgui.remote` のインストールは Android では別アプリとして扱われる。新しい APK を手動でインストールし、接続設定を入力し直す。旧アプリはアンインストールできる。
 
-「接続設定」で Tailscale Serve または HTTPS プロキシの `wss://<サーバー>/ws` を接続先に設定する。「更新を確認」はそのサーバーの選択チャネルを使う。新規設定の既定は `beta` で、自動更新はオフ。配布先は `stable`、`beta`、`dev` から選べる。以前入力した HTTPS URL は `beta` に引き継ぐ。`stable` と `beta` は同じチャネルの指定 URL へ切り替えられる。サーバーを選んでいて接続できない場合、サーバーの対応プロトコルが既知なら、設定済みの同じチャネルの URL を確認する。認証拒否や互換版なしの場合は理由を表示する。`dev` は接続先のサーバーを使う。
+「接続設定」の「更新を確認」は、初期設定では `beta` の配布元を自動で選ぶ。接続先が HTTPS で互換フィードを提供していれば、そのフィードを使う。HTTP の tailnet 接続や、互換フィードが取得できない場合は、[GitHub の `android-beta` フィード](https://github.com/momota1029/fuzukue/releases/download/android-beta/android-latest.json) を確認する。GitHub に端末トークンは送らず、アセットのリダイレクトは HTTPS に限って追う。自前サーバーの認証拒否や TLS エラーは理由を表示する。
+
+`stable` と `beta` は接続先の HTTPS サーバーまたは指定の HTTPS URL も選べる。以前入力した URL は `beta` に引き継ぎ、URL が空の既存の `beta` 設定は自動選択に移行する。接続先サーバーを明示的に選んだ場合は、通信エラー時に、サーバーの対応プロトコルが分かっていれば同じチャネルの設定済み URL を確認する。`dev` は接続先の HTTPS サーバーを使う。自動更新の初期設定はオフ。
 
 自動更新をオンにすると、起動時とアプリを開いている間に新版を確認する。通常は約 1 時間、通信エラー後は約 15 分の間隔を空ける。APK のハッシュ、署名証明書、アプリ ID、増加する `versionCode`、サーバーとの互換性を確かめてから、操作が落ち着いたタイミングで適用する。作業や承認が表示されている間、送信・添付・編集・再接続中は適用を待つ。切断したダウンロードは、強い ETag と取得対象が同じ場合に再開する。
 
@@ -99,18 +101,18 @@ keyPassword=<key password>
 ### リリースの作り方
 
 1. `android/version.properties` で `versionName` を決め、`versionCode` を前回の配布版より大きくする。Gradle と配布スクリプトは同じファイルから両方の値を読む。
-2. UTF-8 のリリースノートを用意し、先頭行にアプリ内で表示する短い要約を書く。`cd android` で `../scripts/check-android-notices.sh` と `./gradlew :app:testDebugUnitTest` を実行する。署名を設定し、配布するコミットの作業ツリーから次を実行する。
+2. UTF-8 のリリースノートを用意し、先頭行にアプリ内で表示する短い要約を書く。`cd android` で `../scripts/check-android-notices.sh` と `./gradlew :app:testDebugUnitTest` を実行する。署名を設定し、公開前に署名済み APK でライセンス表示を実機確認する。GitHub CLI を公開先への書き込み権限があるアカウントで認証し、配布するコミットの作業ツリーから次を実行する。
 
    ```sh
-   export FUZUKUE_ANDROID_RELEASE_REPO=OWNER/REPO
+   export FUZUKUE_ANDROID_RELEASE_REPO=momota1029/fuzukue
    ../scripts/release-android.sh --dry-run /path/to/release-notes.md
    ../scripts/release-android.sh /path/to/release-notes.md
    ```
 
-3. スクリプトは `:app:assembleRelease` を実行して `apksigner` で署名を検証し、`android/build/releases/<version>/` に APK、`.apk.sha256`、`android-latest.json` を出力する。JSON の `package` にはビルド結果の `applicationId` が入る。署名済み APK の `assets/licenses/` に表示ファイルがあり、実機で開けることを確認する。
-4. `FUZUKUE_ANDROID_RELEASE_REPO` に配布先の GitHub リポジトリを指定する。スクリプトはこの宛先で使う公開コマンドを表示する。初回は `gh release create` でプレリリース `android-beta` を作る。次回以降は新しい APK と SHA-256 を先にアップロードし、最後に `android-latest.json` とリリースノートを更新する。利用者に案内した更新 URL と新しい APK の取得を確認してから、旧 APK と SHA-256 を `gh release delete-asset` で個別に削除する。
+3. スクリプトは `:app:assembleRelease` を実行して `apksigner` で署名を検証し、`android/build/releases/<version>/` に APK、`.apk.sha256`、`android-latest.json` を出力する。JSON の `package` にはビルド結果の `applicationId` が入る。
+4. 通常の実行で `android-beta` に公開する。初回はプレリリースを下書きで作り、すべてのアセットが揃ってから公開する。更新時は同じタグに新しい APK、SHA-256、`android-latest.json` の順でアップロードする。フィードの差し替えに失敗すると以前のフィードの復元を試みる。以前の APK と SHA-256 は取得できる状態で保持する。GitHub の APK 名は `fuzukue-android-<versionName>-<versionCode>.apk`。同じ `versionName` で更新する場合も、`versionCode` ごとに別の URL で取得できる。
 
-配布スクリプトは `--dry-run` でも `scripts/check-android-protocol.sh` と `scripts/check-android-notices.sh` を実行する。ライセンスの確認には JDK 21 を使う。依存を変更したときは APK に入る推移依存も見直し、`app/src/main/assets/licenses/THIRD_PARTY_LICENSES.txt` のバージョンと表示を更新する。各チェッカーはリポジトリのルートから単独で実行できる。
+配布スクリプトは `--dry-run` でも `scripts/check-android-protocol.sh` と `scripts/check-android-notices.sh` を実行する。dry-run は GitHub への接続やアセットの公開を行わない。ライセンスの確認には JDK 21 を使う。依存を変更したときは APK に入る推移依存も見直し、`app/src/main/assets/licenses/THIRD_PARTY_LICENSES.txt` のバージョンと表示を更新する。各チェッカーはリポジトリのルートから単独で実行できる。
 
 リリースビルドの R8 とリソース縮小は `optimization { enable = false }` で無効にしている。縮小を有効にする際は署名済み APK を実機に入れて接続・更新と RaTeX の描画を確認する。
 
@@ -128,5 +130,5 @@ export JAVA_HOME=$HOME/opt/jdk-21.0.13.1+2
 - APK は `app/build/outputs/apk/debug/app-debug.apk` に出る。
 - JVM テストでは fuzukue-proto の JSON を読み、差分から会話と作業カードの状態を更新できることを確認する。
 - 再接続テストでは、作業の詳細ダイアログ内で作業名と「閉じる」を検索し、入力欄の送信と停止を個別のテストタグで指定する。
-- Roborazzi は設定、一覧、進捗付き会話、承認、タブレットの画面をライト・ダークで `app/build/shots/` に出す。更新のテストではプロトコル不一致からの確認、提供元の設定、適用の保留と Android の確認操作を検証する。画像は `app/build/shots/update-available.png` と `app/build/shots/update-permission.png` に出る。Robolectric では Android 用ネイティブライブラリをロードできないため、数式は TeX ソースで写る。
+- Roborazzi は設定、一覧、進捗付き会話、承認、タブレットの画面をライト・ダークで `app/build/shots/` に出す。更新のテストではプロトコル不一致からの確認、提供元の設定、適用の保留と Android の確認操作を検証する。画像は `app/build/shots/` の `update-github.png`、`update-available.png`、`update-permission.png` に出る。Robolectric では Android 用ネイティブライブラリをロードできないため、数式は TeX ソースで写る。
 - 実機では Tailscale / LAN での接続、日本語 IME、通知許可とバックグラウンドでの通知、RaTeX による数式描画を確認する。

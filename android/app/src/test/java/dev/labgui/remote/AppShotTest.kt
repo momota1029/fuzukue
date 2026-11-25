@@ -206,6 +206,20 @@ class AppShotTest {
         }
     }
 
+    @Test fun automaticBetaDisplaysTheGitHubFeedSource() {
+        compose.setContent {
+            RemoteTheme {
+                RemoteApp(
+                    RemoteState(error = "プロトコルのバージョンが一致しません", updateRequired = true),
+                    updates = UpdateState(feedOrigin = UpdateOrigin.GitHub),
+                )
+            }
+        }
+        compose.onNodeWithText("配布元 — 自動選択（サーバー / GitHub）").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("取得元 — GitHub のベータ版").performScrollTo().assertIsDisplayed()
+        compose.onRoot().captureRoboImage("build/shots/update-github.png")
+    }
+
     @Test fun protocolMismatchOffersTheSameUpdateCheckAndDownload() {
         val url = "https://example.org/android-latest.json"
         val updates = mutableStateOf(UpdateState(url))

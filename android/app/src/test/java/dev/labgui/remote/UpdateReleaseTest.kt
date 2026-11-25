@@ -16,6 +16,49 @@ class UpdateReleaseTest {
         }
     """.trimIndent()
 
+    @Test fun automaticBetaFallsBackWhenTheServerHasNoUsableFeed() {
+        val server = checkNotNull(serverUpdateSource("wss://server.example/ws", UpdateChannel.Beta))
+        val github = githubBetaSource()
+        val release = UpdateRelease.parse(manifest, applicationId)
+        assertEquals("https://github.com/momota1029/fuzukue/releases/download/android-beta/android-latest.json",
+            github.feed.toString())
+        val errors = listOf(
+            UpdateProblem(R.string.update_feed_missing),
+            UpdateProblem(R.string.update_incompatible),
+            UpdateProblem(R.string.update_check_failed),
+            IllegalArgumentException("Invalid manifest"),
+            java.io.IOException("Unreachable"),
+        )
+        for (error in errors) {
+            val sources = mutableListOf<UpdateSource>()
+            assertEquals(release, checkUpdateSources(server, github) { selected ->
+                sources += selected
+                if (selected == server) throw error
+                release
+            })
+            assertEquals(listOf(server, github), sources)
+        }
+        assertEquals(release, checkUpdateSources(server, github) { selected ->
+            assertEquals(server, selected)
+            release
+        })
+    }
+
+    @Test fun automaticBetaSurfacesServerAuthAndTlsErrors() {
+        val server = checkNotNull(serverUpdateSource("wss://server.example/ws", UpdateChannel.Beta))
+        val github = githubBetaSource()
+        val errors = listOf(UpdateProblem(R.string.update_auth_failed), javax.net.ssl.SSLException("TLS error"))
+        for (error in errors) {
+            val actual = assertThrows(java.io.IOException::class.java) {
+                checkUpdateSources(server, github) { selected ->
+                    assertEquals(server, selected)
+                    throw error
+                }
+            }
+            assertSame(error, actual)
+        }
+    }
+
     @Test fun comparesVersionCodesNumerically() {
         val release = UpdateRelease.parse(manifest, applicationId)
         assertTrue(release.isNewerThan(9))

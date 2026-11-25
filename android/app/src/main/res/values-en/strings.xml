@@ -79,6 +79,8 @@
     <string name="update_auto">Automatically update the app</string>
     <string name="update_channel">Release channel</string>
     <string name="update_source">Source — %1$s</string>
+    <string name="update_source_automatic">Automatic (server / GitHub)</string>
+    <string name="update_source_github">Feed — GitHub beta</string>
     <string name="update_source_server">Connected server</string>
     <string name="update_source_custom">Custom HTTPS URL</string>
     <string name="update_source_fallback">The server was unreachable, so this channel’s custom URL was checked.</string>

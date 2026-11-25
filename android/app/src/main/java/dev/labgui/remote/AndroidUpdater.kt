@@ -15,7 +15,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
-import javax.net.ssl.SSLException
 
 private const val CHECK_INTERVAL = 60 * 60 * 1000L
 private const val RETRY_INTERVAL = 15 * 60 * 1000L
@@ -29,7 +28,11 @@ internal data class UpdateState(
     val status: UpdateStatus = UpdateStatus.Idle,
     val auto: Boolean = false,
     val channel: UpdateChannel = UpdateChannel.Beta,
-    val origin: UpdateOrigin = if (url.isBlank()) UpdateOrigin.Server else UpdateOrigin.Custom,
+    val preference: UpdateSourcePreference = when {
+        url.isNotBlank() -> UpdateSourcePreference.Custom
+        channel == UpdateChannel.Beta -> UpdateSourcePreference.Automatic
+        else -> UpdateSourcePreference.Server
+    },
     val canInstallFromSource: Boolean = false,
     val applyBlocked: Boolean = false,
     val feedOrigin: UpdateOrigin? = null,
@@ -79,27 +82,40 @@ internal class AndroidUpdater(
         val channel = UpdateChannel.entries.firstOrNull { it.name == prefs.getString("channel", null) }
             ?: UpdateChannel.Beta
         val url = customUrl(channel)
-        val origin = UpdateOrigin.entries.firstOrNull { it.name == prefs.getString("origin", null) }
-            ?: if (url.isBlank()) UpdateOrigin.Server else UpdateOrigin.Custom
+        val savedPreference = prefs.getString("source_preference", null)
+        val legacyOrigin = prefs.getString("origin", null)
+        val preference = UpdateSourcePreference.entries.firstOrNull { it.name == savedPreference } ?: when {
+            channel == UpdateChannel.Beta && url.isBlank() -> UpdateSourcePreference.Automatic
+            legacyOrigin == "Server" -> UpdateSourcePreference.Server
+            url.isNotBlank() || legacyOrigin == "Custom" -> UpdateSourcePreference.Custom
+            else -> UpdateSourcePreference.Server
+        }
         return UpdateState(url, auto = prefs.getBoolean("auto", false), channel = channel,
-            origin = if (channel == UpdateChannel.Dev) UpdateOrigin.Server else origin,
+            preference = if (channel == UpdateChannel.Dev ||
+                (channel != UpdateChannel.Beta && preference == UpdateSourcePreference.Automatic)
+            ) UpdateSourcePreference.Server else preference,
             canInstallFromSource = installer.allowed)
     }
 
     private fun customUrl(channel: UpdateChannel): String = prefs.getString("url_${channel.path}", null)
         ?: prefs.getString("url", "").orEmpty().takeIf { channel == UpdateChannel.Beta }.orEmpty()
 
-    private fun source(current: UpdateState = state.value): UpdateSource? = when (current.origin) {
-        UpdateOrigin.Server -> serverUpdateSource(connection, current.channel)
-        UpdateOrigin.Custom -> httpsUpdateUrl(current.url)?.let { UpdateSource(it, current.origin, current.channel) }
+    private fun customSource(current: UpdateState) =
+        httpsUpdateUrl(current.url)?.let { UpdateSource(it, UpdateOrigin.Custom, current.channel) }
+
+    private fun source(current: UpdateState = state.value): UpdateSource? = when (current.preference) {
+        UpdateSourcePreference.Automatic -> serverUpdateSource(connection, current.channel) ?: githubBetaSource()
+        UpdateSourcePreference.Server -> serverUpdateSource(connection, current.channel)
+        UpdateSourcePreference.Custom -> customSource(current)
     }
 
     private fun candidateKey(source: UpdateSource) = "${socketUrl(connection).orEmpty()}\n${source.key}"
 
-    private fun fallbackSource(current: UpdateState = state.value): UpdateSource? =
-        if (current.origin == UpdateOrigin.Server && current.channel != UpdateChannel.Dev) {
-            httpsUpdateUrl(current.url)?.let { UpdateSource(it, UpdateOrigin.Custom, current.channel) }
-        } else null
+    private fun fallbackSource(current: UpdateState = state.value): UpdateSource? = when (current.preference) {
+        UpdateSourcePreference.Automatic -> githubBetaSource()
+        UpdateSourcePreference.Server -> customSource(current).takeUnless { current.channel == UpdateChannel.Dev }
+        UpdateSourcePreference.Custom -> null
+    }
 
     fun setAuto(value: Boolean) {
         prefs.edit().putBoolean("auto", value).apply()
@@ -113,9 +129,12 @@ internal class AndroidUpdater(
         resetSource(loadSettings())
     }
 
-    fun setOrigin(origin: UpdateOrigin) {
-        if (state.value.installing || state.value.channel == UpdateChannel.Dev || origin == state.value.origin) return
-        prefs.edit().putString("origin", origin.name).apply()
+    fun setOrigin(preference: UpdateSourcePreference) {
+        val current = state.value
+        if (current.installing || current.channel == UpdateChannel.Dev || preference == current.preference ||
+            (preference == UpdateSourcePreference.Automatic && current.channel != UpdateChannel.Beta)
+        ) return
+        prefs.edit().putString("source_preference", preference.name).apply()
         resetSource(loadSettings())
     }
 
@@ -137,7 +156,7 @@ internal class AndroidUpdater(
 
     fun check(input: String, protocol: UpdateProtocol? = null) {
         if (state.value.busy) return
-        if (state.value.origin == UpdateOrigin.Custom) {
+        if (state.value.preference == UpdateSourcePreference.Custom) {
             val url = input.trim()
             prefs.edit().putString("url_${state.value.channel.path}", url).apply()
             if (url != state.value.url) resetSource(state.value.copy(url = url))
@@ -149,7 +168,7 @@ internal class AndroidUpdater(
     private fun check(protocol: UpdateProtocol?) {
         val source = source() ?: run {
             val reason = when {
-                state.value.origin == UpdateOrigin.Server -> R.string.update_server_https
+                state.value.preference == UpdateSourcePreference.Server -> R.string.update_server_https
                 state.value.url.isBlank() -> R.string.update_url_missing
                 else -> R.string.update_url_invalid
             }
@@ -158,7 +177,7 @@ internal class AndroidUpdater(
             return
         }
         val key = generation
-        val fallback = fallbackSource().takeIf { protocol != null }
+        val fallback = fallbackSource()?.takeIf { it != source && (protocol != null || it.origin == UpdateOrigin.GitHub) }
         prefs.edit().clearCandidate().apply()
         availableSource = null
         mutableState.value = state.value.copy(feedOrigin = null)
@@ -166,15 +185,12 @@ internal class AndroidUpdater(
         scope.launch {
             var checkedSource = source
             val status = try {
-                val (actual, release) = withContext(Dispatchers.IO) {
-                    try {
-                        source to transfer.check(source, token(source), protocol)
-                    } catch (error: IOException) {
-                        if (error is UpdateProblem || error is SSLException || fallback == null) throw error
-                        fallback to transfer.check(fallback, "", protocol)
+                val release = withContext(Dispatchers.IO) {
+                    checkUpdateSources(source, fallback) { selected ->
+                        checkedSource = selected
+                        transfer.check(selected, token(selected), protocol)
                     }
                 }
-                checkedSource = actual
                 if (release.versionCode > installer.installedVersion()) UpdateStatus.Available(release)
                 else UpdateStatus.Current
             } catch (error: UpdateProblem) {
@@ -254,7 +270,9 @@ internal class AndroidUpdater(
             }
             is UpdateStatus.Available -> if (autoCompatible(status.release, protocol) &&
                 (status.error == null || now >= nextCheck)) download()
-            else -> if (now >= nextCheck && (current.origin == UpdateOrigin.Server || protocol != null)) check(protocol)
+            else -> if (now >= nextCheck && (current.preference == UpdateSourcePreference.Server ||
+                source()?.origin == UpdateOrigin.Server || protocol != null)
+            ) check(protocol)
         }
     }
 
