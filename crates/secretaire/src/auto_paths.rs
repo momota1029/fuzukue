@@ -13,7 +13,7 @@ pub(crate) fn excluded(project: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(project) else {
         return true;
     };
-    relative.components().any(|component| {
+    fuzukue_proto::is_inbox_upload_path(relative) || relative.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
         name.starts_with('.')
             || matches!(name.as_ref(), "target" | "node_modules" | "_build")

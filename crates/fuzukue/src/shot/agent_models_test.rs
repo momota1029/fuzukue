@@ -28,7 +28,7 @@ fn fresh_model_setup_can_be_dismissed_and_reopened_from_the_roles_list() {
                             view.protocol = fuzukue_proto::PROTOCOL_VERSION;
                             view.on_event(ServerEvent::ChatCapabilities {
                                 effort_levels: vec!["low".into(), "medium".into()],
-                                mail_restricted: false, mcp_tools: vec![],
+                                mail_restricted: false, mcp_tools: vec![], folder_attachments: false,
                             }, cx);
                             view.on_event(ServerEvent::PartnerDefaultChanged { settings: ChatSettings::default() }, cx);
                             view.on_event(ServerEvent::AgentModelCapabilities {

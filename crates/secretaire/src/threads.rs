@@ -1970,6 +1970,19 @@ impl Store {
         Ok(thread.front.attached.clone())
     }
 
+    pub(crate) fn inbox_paths(&self, id: &str) -> Vec<String> {
+        let Some(thread) = self.threads.get(id).filter(|thread| !thread.front.archived) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        thread.transcript.items.iter().rev()
+            .filter(|entry| matches!(entry.meta.actor, Actor::User))
+            .flat_map(|entry| &entry.meta.attachments)
+            .filter(|path| seen.insert(path.as_str()))
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn routing_context(&self, id: &str) -> Option<(Vec<String>, Vec<String>)> {
         let thread = self.threads.get(id).filter(|thread| !thread.front.archived)?;
         let mut texts = Vec::new();

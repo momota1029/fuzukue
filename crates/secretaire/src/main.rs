@@ -47,6 +47,9 @@ mod full_approval;
 mod worker_execution;
 mod mail;
 mod inbox;
+mod folder_attachment;
+#[cfg(test)]
+mod folder_drop_regression;
 mod routing;
 mod questions;
 mod mcp;
@@ -142,6 +145,7 @@ pub struct Workspace {
     #[cfg(test)]
     claude_program: Option<PathBuf>,
     prompt_start: Mutex<()>,
+    folder_copy_slots: Arc<tokio::sync::Semaphore>,
     front_desk_nudge: bool,
     hold_planner_during_update: bool,
     delegates: delegate::Workers,
@@ -227,6 +231,7 @@ impl Workspace {
             #[cfg(test)]
             claude_program: None,
             prompt_start: Mutex::new(()),
+            folder_copy_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             front_desk_nudge: !canary() && front_desk::nudge_enabled(),
             hold_planner_during_update: true,
             codex: Mutex::new(None),
@@ -853,7 +858,9 @@ async fn ws_handler(
     let github_report_client = !headers.contains_key(axum::http::header::ORIGIN);
     let grant_principal = device.as_ref().map(|device| format!("device:{}", device.0.id()))
         .unwrap_or_else(|| if ip.is_loopback() { "local_user" } else { "shared_token_user" }.into());
-    ws.on_upgrade(move |socket| async move {
+    // The largest ordinary client request is a 4 MiB screenshot encoded as Base64.
+    // Allow headroom for text requests while bounding incoming fragmented messages.
+    ws.max_message_size(16 * 1024 * 1024).on_upgrade(move |socket| async move {
         let settings = settings.filter(|_| github_report_client).map(|extension| extension.0);
         let serve = client_loop(socket, app, ip, github_report_client, grant_principal, settings);
         if let Some(axum::Extension(device)) = device {
@@ -873,11 +880,20 @@ async fn file_handler(
     axum::extract::Path(path): axum::extract::Path<String>,
     State(app): State<Arc<App>>,
     Query(query): Query<WorkspaceQuery>,
-) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
     let not_found = |e: anyhow::Error| (axum::http::StatusCode::NOT_FOUND, e.to_string());
     let app = app.route(query.workspace).await.map_err(not_found)?;
+    if fuzukue_proto::is_inbox_upload_path(Path::new(&path)) {
+        let file = tokio::task::spawn_blocking(move || {
+            let full = inbox::attachment(&app.project_dir, &app.state_dir, &path)?.canonicalize()?;
+            mcp::workspace_read::open_regular_source(&full)
+        }).await.map_err(|error| not_found(error.into()))?.map_err(not_found)?;
+        return file_browser::stream_file(file, fuzukue_proto::MAX_ATTACHMENT_BYTES)
+            .map_err(|status| (status, status.to_string()));
+    }
     let full = safe_join(&app.project_dir, &path).map_err(not_found)?;
-    tokio::fs::read(&full).await.map_err(|e| not_found(e.into()))
+    let bytes = tokio::fs::read(&full).await.map_err(|e| not_found(e.into()))?;
+    Ok(bytes.into_response())
 }
 
 async fn client_loop(
@@ -1507,6 +1523,7 @@ async fn serve_workspace(
             // 旧来のクライアントにも通常の承認スタイルを使わせる。
             mail_restricted: false,
             mcp_tools: mcp::available_tool_names(app.mail.is_some()),
+            folder_attachments: true,
         }).chain(settings);
         for event in events {
             if tx.send(send(&Envelope { workspace: None, seq: 0, event })).await.is_err() {
@@ -1790,6 +1807,7 @@ async fn serve_workspace(
 
     let reader = async {
         let mut uploads = inbox::Uploads::default();
+        let mut folder_upload = folder_attachment::FolderUpload::default();
         let mut lsp = app.lsp.connection(reply.clone());
         let mut scoped_paper = false;
         let mut approval_updates: Option<tokio::sync::broadcast::Receiver<fuzukue_proto::ApprovalSummary>> = None;
@@ -2133,24 +2151,51 @@ async fn serve_workspace(
                         Err(_) => break,
                     }
                 }
+                Ok(ClientMsg::FolderAttachment { id, request }) if supports_chat => {
+                    if matches!(request, fuzukue_proto::FolderAttachmentRequest::Reference { .. })
+                        && (grant_principal != "local_user" || !github_report_client)
+                    {
+                        let _ = reply.send(ServerEvent::FolderReferenceUnavailable { id });
+                        continue;
+                    }
+                    let state = app.state_dir.clone();
+                    let slots = app.folder_copy_slots.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let event = folder_upload.receive(&state, slots, id, request);
+                        (folder_upload, event)
+                    }).await {
+                        Ok((next, event)) => {
+                            folder_upload = next;
+                            let _ = reply.send(event);
+                        }
+                        Err(_) => break,
+                    }
+                }
                 Ok(ClientMsg::UploadAttachment { id, name, size, offset, data, session }) if supports_chat => {
                     let project = app.project_dir.clone();
+                    let state = app.state_dir.clone();
                     match tokio::task::spawn_blocking(move || {
-                        let event = uploads.receive(&project, id, name, size, offset, &data);
+                        let event = uploads.receive(&project, &state, id, name, size, offset, &data);
                         (uploads, event)
                     }).await {
                         Ok((next, mut event)) => {
                             uploads = next;
-                            if protocol >= 13 {
-                                if let ServerEvent::AttachmentUploaded { path: Some(path), proposal, .. } = &mut event {
-                                    let attached = session.as_deref().map(|id| app.hub.thread_attachments(id)).unwrap_or_default();
-                                    *proposal = Some(inbox::proposal(&app.project_dir, path, &attached).await
-                                        .unwrap_or_else(|| fuzukue_proto::InboxProposal {
-                                            to: "inbox".into(), title: None, reference_id: None,
-                                        }));
-                                }
+                            if protocol >= 13 && matches!(event, ServerEvent::AttachmentUploaded { path: Some(_), .. }) {
+                                let app = app.clone();
+                                let reply = reply.clone();
+                                tokio::spawn(async move {
+                                    if let ServerEvent::AttachmentUploaded { path: Some(path), proposal, .. } = &mut event {
+                                        let attached = session.as_deref().map(|id| app.hub.thread_attachments(id)).unwrap_or_default();
+                                        *proposal = Some(inbox::proposal(&app.project_dir, &app.state_dir, path, &attached).await
+                                            .unwrap_or_else(|| fuzukue_proto::InboxProposal {
+                                                to: "inbox".into(), title: None, reference_id: None,
+                                            }));
+                                    }
+                                    let _ = reply.send(event);
+                                });
+                            } else {
+                                let _ = reply.send(event);
                             }
-                            let _ = reply.send(event);
                         }
                         Err(_) => break,
                     }
@@ -2396,7 +2441,16 @@ async fn serve_workspace(
                     };
                     let _ = reply.send(ServerEvent::CardSaveResult { request, outcome });
                 }
-                Ok(ClientMsg::CancelAttachment { id }) => uploads.cancel(id),
+                Ok(ClientMsg::CancelAttachment { id }) => {
+                    uploads.cancel(id);
+                    match tokio::task::spawn_blocking(move || {
+                        folder_upload.cancel(id);
+                        folder_upload
+                    }).await {
+                        Ok(next) => folder_upload = next,
+                        Err(_) => break,
+                    }
+                }
                 Ok(msg @ (ClientMsg::NewThread | ClientMsg::NewAttachedThread { .. })) if protocol >= 4 => {
                     let deck = match &msg {
                         ClientMsg::NewAttachedThread { deck } => Some(deck.as_str()),
@@ -2634,7 +2688,7 @@ fn prepare_prompt_thread(app: &Workspace, prompt: &mut ClientMsg) -> anyhow::Res
     anyhow::ensure!(!text.trim().is_empty() || !paths.is_empty(), "メッセージを入力する");
     anyhow::ensure!(paths.len() <= fuzukue_proto::MAX_ATTACHMENTS, "添付が多すぎます");
     for path in paths {
-        inbox::attachment(&app.project_dir, path)?;
+        attachment_read_path(&app.project_dir, &app.state_dir, path)?;
     }
     let id = app.hub.edit_threads(|store| store.create(None))?;
     *session = id.clone();
@@ -3201,20 +3255,36 @@ fn finish_goal_desk_turn(app: &Arc<Workspace>, session: &str, kind: TurnKind) {
     }
 }
 
-fn with_attachments(project: &Path, text: &str, paths: &[String]) -> anyhow::Result<(String, Vec<PathBuf>)> {
-    anyhow::ensure!(paths.len() <= fuzukue_proto::MAX_ATTACHMENTS, "添付が多すぎます");
-    let files = paths.iter().map(|path| inbox::attachment(project, path))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let images = screenshots::png_attachments(&files)?;
-    let prompt = if paths.is_empty() {
-        text.to_owned()
+fn attachment_read_path(project: &Path, state: &Path, path: &str) -> anyhow::Result<PathBuf> {
+    if fuzukue_proto::is_folder_attachment(path) {
+        folder_attachment::resolve(state, path)
     } else {
-        let files: Vec<_> = paths.iter().zip(files).map(|(path, read_path)| {
-            serde_json::json!({"path": path, "read_path": read_path})
-        }).collect();
-        let files = serde_json::to_string(&files)?;
-        harness_format!("{text}\n\n(secretaire) Attachments. Use read_path to read and path with file_inbox: {files}", "{text}\n\n(secretaire) 添付ファイル。read_path は読み込みに、path は file_inbox に使う: {files}")
-    };
+        inbox::attachment(project, state, path)?.canonicalize().map_err(Into::into)
+    }
+}
+
+fn with_attachments(project: &Path, state: &Path, text: &str, paths: &[String]) -> anyhow::Result<(String, Vec<PathBuf>)> {
+    anyhow::ensure!(paths.len() <= fuzukue_proto::MAX_ATTACHMENTS, "添付が多すぎます");
+    if paths.is_empty() {
+        return Ok((text.to_owned(), Vec::new()));
+    }
+    let mut entries = Vec::new();
+    let mut files = Vec::new();
+    for path in paths {
+        let read_path = attachment_read_path(project, state, path)?;
+        if fuzukue_proto::is_folder_attachment(path) {
+            entries.push(serde_json::json!({"read_path": read_path, "kind": "read-only folder"}));
+        } else {
+            entries.push(serde_json::json!({"path": path, "read_path": read_path}));
+            files.push(read_path);
+        }
+    }
+    let images = screenshots::png_attachments(&files)?;
+    let entries = serde_json::to_string(&entries)?;
+    let prompt = harness_format!(
+        "{text}\n\n(secretaire) Attachments: {entries}\nUse read_path with the filesystem read tools. For read-only folders, list a small part at a time and leave the folder unchanged. Use path with file_inbox for individual files.",
+        "{text}\n\n(secretaire) 添付: {entries}\n読み取りツールには read_path を使う。読み取り専用フォルダは必要な範囲だけを一覧し、変更しない。個別ファイルを file_inbox で整理するときは path を使う。"
+    );
     Ok((prompt, images))
 }
 
@@ -3223,7 +3293,7 @@ async fn rewrite_reply(app: &Arc<Workspace>, session: &str, item: &str) -> anyho
     let _work = app.admit_work()?;
     anyhow::ensure!(!app.delegates.is_running(session), "Worker is running");
     let ((prompt, images), items) = app.hub.edit_threads(|threads| {
-        threads.rewrite(session, item, |text, paths| with_attachments(&app.project_dir, text, paths))
+        threads.rewrite(session, item, |text, paths| with_attachments(&app.project_dir, &app.state_dir, text, paths))
     })?;
     app.hub.publish(ServerEvent::ReplySuperseded { session: session.into(), items });
     let prompt = harness_format!(
@@ -3318,7 +3388,7 @@ async fn replay_prompts(app: &Arc<Workspace>) {
             }
             Work::Prompt { text, paths } => {
                 if !matches!(app.drain.claim(&app.state_dir, session, &record.id), Ok(true)) { continue; }
-                let result = match with_attachments(&app.project_dir, &text, &paths) {
+                let result = match with_attachments(&app.project_dir, &app.state_dir, &text, &paths) {
                     Ok((prompt, images)) => start_user_prompt(app, session.clone(), settings, prompt, None, images).await,
                     Err(error) => Err(error),
                 };
@@ -3410,7 +3480,7 @@ async fn handle_from_client(
         | ClientMsg::RecordSourceFingerprint { .. } | ClientMsg::GetThreadHistory { .. } | ClientMsg::GetThreadTail { .. }
         | ClientMsg::ListExtensions | ClientMsg::GrantExtension { .. } | ClientMsg::SetExtensionEnabled { .. }
         | ClientMsg::UpdateExtension { .. } | ClientMsg::RenderExtension { .. } | ClientMsg::ExtensionUiEvent { .. }
-        | ClientMsg::Hello { .. } | ClientMsg::SetLocale { .. } | ClientMsg::ListWorkspaces | ClientMsg::OpenWorkspace { .. } | ClientMsg::SwitchWorkspace { .. } | ClientMsg::CompleteWorkspacePath { .. } | ClientMsg::BrowseWorkspace { .. } | ClientMsg::ListFiles { .. } | ClientMsg::FindFiles { .. } | ClientMsg::ResolveFile { .. } | ClientMsg::CreateWorkspace { .. } | ClientMsg::InWorkspace { .. } | ClientMsg::NewThread | ClientMsg::NewAttachedThread { .. } | ClientMsg::UploadAttachment { .. } | ClientMsg::CancelAttachment { .. } => {}
+        | ClientMsg::Hello { .. } | ClientMsg::SetLocale { .. } | ClientMsg::ListWorkspaces | ClientMsg::OpenWorkspace { .. } | ClientMsg::SwitchWorkspace { .. } | ClientMsg::CompleteWorkspacePath { .. } | ClientMsg::BrowseWorkspace { .. } | ClientMsg::ListFiles { .. } | ClientMsg::FindFiles { .. } | ClientMsg::ResolveFile { .. } | ClientMsg::CreateWorkspace { .. } | ClientMsg::InWorkspace { .. } | ClientMsg::NewThread | ClientMsg::NewAttachedThread { .. } | ClientMsg::UploadAttachment { .. } | ClientMsg::FolderAttachment { .. } | ClientMsg::CancelAttachment { .. } => {}
         ClientMsg::RenameThread { id, title } => app.hub.edit_threads(|store| store.rename(&id, &title))?,
         ClientMsg::AttachThread { id, decks } => { app.hub.edit_threads(|store| store.attach(&id, &decks))?; }
         ClientMsg::DetachThread { id, deck } => { app.hub.edit_threads(|store| store.detach(&id, &deck))?; }
@@ -3512,8 +3582,9 @@ async fn handle_from_client(
                 (text, paths, prompt, Vec::new())
             } else {
                 let project = app.project_dir.clone();
+                let state = app.state_dir.clone();
                 tokio::task::spawn_blocking(move || {
-                    let (prompt, images) = with_attachments(&project, &text, &paths)?;
+                    let (prompt, images) = with_attachments(&project, &state, &text, &paths)?;
                     Ok::<_, anyhow::Error>((text, paths, prompt, images))
                 }).await??
             };

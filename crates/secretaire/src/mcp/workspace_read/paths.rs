@@ -24,6 +24,7 @@ pub(crate) struct ReadScope {
     sensitive_aliases: Vec<PathBuf>,
     access: Option<Access>,
     results: Option<result_spill::Owner>,
+    attachments: Vec<(PathBuf, bool)>,
 }
 
 impl ReadScope {
@@ -43,12 +44,24 @@ impl ReadScope {
             sensitive_aliases: folder_grants::protected_aliases(),
             access: None,
             results: None,
+            attachments: Vec::new(),
         })
     }
 
     pub(in crate::mcp) fn with_results(mut self, owner: result_spill::Owner) -> Self {
         self.results = Some(owner);
         self
+    }
+
+    pub(in crate::mcp) fn with_attachments(mut self, attachments: Vec<(PathBuf, bool)>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    fn allows_attachment(&self, path: &Path, stored_only: bool) -> bool {
+        self.attachments.iter().any(|(root, stored)| {
+            (!stored_only || *stored) && path.starts_with(root)
+        })
     }
 
     fn allows_result(&self, path: &Path) -> bool {
@@ -92,6 +105,7 @@ impl ReadScope {
         );
         ensure!(
             !self.protected.iter().any(|root| path.starts_with(root))
+                || self.allows_attachment(path, true)
                 || self
                     .scratch
                     .as_ref()
@@ -116,14 +130,16 @@ impl ReadScope {
 
     pub(super) fn check(&self, path: &Path) -> Result<()> {
         self.check_protected(path)?;
-        ensure!(self.allows_result(path) || self.in_scope(path) || self.granted(path, false)?, OutsideScope(path.into()));
+        ensure!(self.allows_result(path) || self.allows_attachment(path, false)
+            || self.in_scope(path) || self.granted(path, false)?, OutsideScope(path.into()));
         Ok(())
     }
 
     /// Call immediately before traversing a directory or reading a file discovered by a scan.
     pub(super) fn audit_read(&self, path: &Path) -> Result<()> {
         self.check_protected(path)?;
-        ensure!(self.allows_result(path) || self.in_scope(path) || self.granted(path, true)?, "Folder access expired or was revoked");
+        ensure!(self.allows_result(path) || self.allows_attachment(path, false)
+            || self.in_scope(path) || self.granted(path, true)?, "Folder access expired or was revoked");
         Ok(())
     }
 
@@ -146,12 +162,14 @@ impl ReadScope {
             ensure!(absolute.canonicalize()? == absolute, "MCP result path contains an alias");
             return Ok(absolute);
         }
-        if !self.in_scope(&absolute) && self.access.is_none() {
+        if !self.in_scope(&absolute) && !self.allows_attachment(&absolute, false) && self.access.is_none() {
             return Err(OutsideScope(absolute).into());
         }
         let resolved = absolute.canonicalize().context("Could not resolve workspace path")?;
         self.check_protected(&resolved)?;
-        if self.in_scope(&absolute) {
+        if self.allows_attachment(&absolute, false) {
+            ensure!(absolute == resolved, "Attachment reads cannot traverse symlinks");
+        } else if self.in_scope(&absolute) {
             ensure!(self.in_scope(&resolved), "Symlink target is outside the workspace read scope");
         } else {
             // Refuse aliases for externally granted reads. The descriptor walk also

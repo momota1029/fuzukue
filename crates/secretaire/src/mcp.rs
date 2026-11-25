@@ -1928,7 +1928,20 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             Box::pin(git_read::call(scope, args)).await?
         }
         Tool::WorkspaceRead(tool) => {
+            let project_dir = app.project_dir.clone();
+            let state = app.state_dir.clone();
+            let paths = app.hub.thread_inbox_paths(session);
+            let attachments = tokio::task::spawn_blocking(move || {
+                let inbox = state.join("inbox").canonicalize().ok();
+                paths.iter().filter_map(|path| {
+                    let root = crate::attachment_read_path(&project_dir, &state, path).ok()?;
+                    let stored = !path.starts_with("inbox/folders/ref-")
+                        && inbox.as_ref().is_some_and(|inbox| root.starts_with(inbox));
+                    Some((root, stored))
+                }).collect()
+            }).await?;
             let scope = workspace_read::ReadScope::new(project, &app.state_dir, None)?
+                .with_attachments(attachments)
                 .with_results(result_spill::Owner::thread(session))
                 .with_grants(crate::folder_grants::Access { hub: app.hub.clone(), session: session.into(), worker_grants: None });
             Box::pin(call_read_tool(app, session, None, tool, scope, args)).await?

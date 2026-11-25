@@ -345,7 +345,10 @@ impl Index {
                 if !dir.starts_with(project) {
                     continue;
                 }
-                for item in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+                for item in WalkDir::new(dir).into_iter()
+                    .filter_entry(|entry| !entry.path().strip_prefix(project).is_ok_and(fuzukue_proto::is_inbox_upload_path))
+                    .filter_map(Result::ok)
+                {
                     let path = item.path();
                     if !item.file_type().is_file() || path.extension().is_none_or(|ext| ext != "md")
                     {

@@ -1742,7 +1742,8 @@ impl Workbench {
             ServerEvent::ClientCommand { command } => self.on_client_command(command, cx),
             event @ (ServerEvent::ChatCapabilities { .. } | ServerEvent::ChatSettingsChanged { .. }
             | ServerEvent::CodexModels { .. } | ServerEvent::CodexPartner { .. }
-                | ServerEvent::AttachmentProgress { .. } | ServerEvent::AttachmentUploaded { .. } | ServerEvent::InboxFiled { .. }
+                 | ServerEvent::FolderReferenceUnavailable { .. }
+                 | ServerEvent::AttachmentProgress { .. } | ServerEvent::AttachmentUploaded { .. } | ServerEvent::InboxFiled { .. }
                 | ServerEvent::GitHubConnectCard { .. } | ServerEvent::TurnActivity { .. }
                 | ServerEvent::ChatActivity { .. } | ServerEvent::ChatWaiting { .. } | ServerEvent::BackgroundCommands { .. }
                 | ServerEvent::Consulting { .. }) => self.on_chat_event(event, cx),

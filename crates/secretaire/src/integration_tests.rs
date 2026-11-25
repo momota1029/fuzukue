@@ -574,6 +574,53 @@ async fn mcp_request_raw_for(app: &Arc<Workspace>, session: &str, method: &str, 
     response["result"].clone()
 }
 
+#[tokio::test]
+async fn folder_drop_mcp_reads_only_from_the_conversation_that_received_the_attachment() -> Result<()> {
+    let project = TempProject::new()?;
+    let state = TempProject::new()?;
+    let source = TempProject::new()?;
+    let folder = source.path().canonicalize()?;
+    fs::write(folder.join("notes.txt"), "synthetic folder attachment")?;
+    fs::create_dir(folder.join(".git"))?;
+    fs::write(folder.join(".git/config"), "synthetic metadata")?;
+    std::os::unix::fs::symlink(project.path(), folder.join("outside"))?;
+    let app = Arc::new(Workspace::new(
+        project.path().canonicalize()?, String::new(), state.path().to_path_buf(), Arc::new(Hub::new()),
+    ));
+    let session = app.hub.edit_threads(|store| store.create(None))?;
+    let other = app.hub.edit_threads(|store| store.create(None))?;
+    let mut upload = crate::folder_attachment::FolderUpload::default();
+    let path = match upload.receive(&app.state_dir, app.folder_copy_slots.clone(), 1,
+        fuzukue_proto::FolderAttachmentRequest::Reference {
+            path: folder.to_str().unwrap().into(), name: "synthetic".into(),
+        }
+    ) {
+        ServerEvent::AttachmentUploaded { path: Some(path), error: None, .. } => path,
+        event => anyhow::bail!("Could not attach folder: {event:?}"),
+    };
+    app.hub.publish(ServerEvent::UserPrompt {
+        session: session.clone(), item: "user:folder".into(), text: "Inspect the synthetic notes".into(),
+        paths: vec![path.clone()], to_worker: false,
+    });
+    assert_eq!(app.hub.thread_inbox_paths(&session), [path]);
+    async fn read(app: &Arc<Workspace>, session: &str, path: PathBuf) -> Value {
+        mcp_request_for(app, session, "tools/call", json!({
+            "name": "fs_read", "arguments": { "path": path }
+        })).await
+    }
+    let ok = read(&app, &session, folder.join("notes.txt")).await;
+    assert_eq!(ok["isError"], false, "{ok}");
+    assert!(ok.to_string().contains("synthetic folder attachment"), "{ok}");
+    for result in [
+        read(&app, &other, folder.join("notes.txt")).await,
+        read(&app, &session, folder.join(".git/config")).await,
+        read(&app, &session, folder.join("outside")).await,
+    ] {
+        assert_eq!(result["isError"], true, "{result}");
+    }
+    Ok(())
+}
+
 async fn mcp_call(app: &Arc<Workspace>, name: &str, arguments: Value) -> Value {
     mcp_request(
         app,

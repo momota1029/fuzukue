@@ -147,6 +147,57 @@ pub const RESEARCH_ISSUE_APPROVAL: &str = "research-issue";
 pub const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 pub const ATTACHMENT_CHUNK_BYTES: usize = 512 * 1024;
 pub const MAX_ATTACHMENTS: usize = 8;
+pub const MAX_FOLDER_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_FOLDER_ATTACHMENT_ENTRIES: usize = 10_000;
+pub const MAX_FOLDER_ATTACHMENT_DEPTH: usize = 64;
+pub const MAX_FOLDER_ATTACHMENT_PATH_BYTES: usize = 4096;
+pub const MAX_FOLDER_ATTACHMENT_BATCH: usize = 64;
+
+/// The two folder attachment kinds use opaque inbox paths in conversation history.
+pub fn is_folder_attachment(path: &str) -> bool {
+    path.starts_with("inbox/folders/")
+}
+
+pub fn folder_attachment_excludes(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        ".git" | ".hg" | ".svn" | "target" | "node_modules" | ".lake" | ".gradle"
+            | ".fuzukue" | ".labo" | ".ssh" | ".aws" | ".codex" | ".claude"
+            | ".gnupg" | ".azure" | ".kube" | ".docker" | ".password-store" | ".git-credentials"
+            | "__pycache__" | ".venv" | ".env" | ".envrc" | ".npmrc" | ".netrc"
+            | "keystore.properties" | "remote-token"
+    ) || [".env.", "id_rsa", "id_ed25519"].iter().any(|prefix| name.starts_with(prefix))
+        || [".pem", ".key", ".p12", ".pfx"].iter().any(|suffix| name.ends_with(suffix))
+}
+
+/// Automatically discovered workspace content excludes the legacy upload directories.
+pub fn is_inbox_upload_path(path: &std::path::Path) -> bool {
+    let mut parts = path.iter();
+    if !parts.next().is_some_and(|part| part == "inbox") {
+        return false;
+    }
+    let Some(name) = parts.next().and_then(|part| part.to_str()) else { return false };
+    name == "folders" || (name.len() == 10 && name.bytes().enumerate().all(|(i, byte)|
+        if i == 4 || i == 7 { byte == b'-' } else { byte.is_ascii_digit() }
+    ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum FolderAttachmentRequest {
+    Reference { path: String, name: String },
+    Begin { name: String, bytes: u64, entries: usize },
+    Entries { entries: Vec<FolderAttachmentEntry> },
+    Finish,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FolderAttachmentEntry {
+    Directory { path: String },
+    FileChunk { path: String, size: u64, offset: u64, data: String },
+}
 pub const CLAUDE_MODELS: &[&str] = &[
     "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2",
 ];
@@ -1050,6 +1101,7 @@ pub enum ClientMsg {
     SetChatSettings { session: String, settings: ChatSettings },
     /// チャンクは接続内で昇順に送る。最後のチャンクで受信済みパスを返す。
     UploadAttachment { id: u64, name: String, size: u64, offset: u64, data: String, #[serde(default, skip_serializing_if = "Option::is_none")] session: Option<String> },
+    FolderAttachment { id: u64, request: FolderAttachmentRequest },
     FileInbox { session: String, path: String, to: String },
     Ledger { request: u64, action: LedgerAction },
     SearchLibrary {
@@ -2407,6 +2459,8 @@ pub enum ServerEvent {
         mail_restricted: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mcp_tools: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        folder_attachments: bool,
     },
     DelegateSettingsChanged { settings: DelegateSettings },
     WorkerApprovalPolicyChanged {
@@ -2422,6 +2476,7 @@ pub enum ServerEvent {
     ChatSettingsChanged { session: String, settings: ChatSettings },
     ClientScreenshotRequested { id: u64 },
     ScreenshotSaved { request: u64, path: Option<String>, error: Option<String> },
+    FolderReferenceUnavailable { id: u64 },
     AttachmentProgress { id: u64, offset: u64 },
     AttachmentUploaded {
         id: u64, path: Option<String>, error: Option<String>,

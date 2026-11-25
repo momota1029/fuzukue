@@ -29,13 +29,14 @@ impl Uploads {
     pub(crate) fn receive(
         &mut self,
         project: &Path,
+        state: &Path,
         id: u64,
         name: String,
         size: u64,
         offset: u64,
         data: &str,
     ) -> ServerEvent {
-        match self.chunk(project, id, name, size, offset, data) {
+        match self.chunk(project, state, id, name, size, offset, data) {
             Ok(Ok(path)) => ServerEvent::AttachmentUploaded {
                 id,
                 path: Some(path),
@@ -58,6 +59,7 @@ impl Uploads {
     fn chunk(
         &mut self,
         project: &Path,
+        state: &Path,
         id: u64,
         name: String,
         size: u64,
@@ -98,7 +100,8 @@ impl Uploads {
                 .context("サーバー時刻が不正です")?
                 .format("%Y-%m-%d")
                 .to_string();
-            let dir = directory(&directory(project, "inbox", true)?, &date, true)?;
+            fs::create_dir_all(state)?;
+            let dir = directory(&directory(state, "inbox", true)?, &date, true)?;
             let temp = tempfile::Builder::new()
                 .prefix(".upload-")
                 .tempfile_in(&dir)?;
@@ -148,13 +151,12 @@ impl Uploads {
                 format!("{stem}-{suffix}")
             };
             let path = dir.join(candidate);
+            let relative = path.strip_prefix(state)?;
+            if project != state && fs::symlink_metadata(project.join(relative)).is_ok() {
+                continue;
+            }
             match temp.persist_noclobber(&path) {
-                Ok(_) => {
-                    return Ok(Ok(path
-                        .strip_prefix(project)?
-                        .to_string_lossy()
-                        .into_owned()))
-                }
+                Ok(_) => return Ok(Ok(relative.to_string_lossy().into_owned())),
                 Err(e) if e.error.kind() == ErrorKind::AlreadyExists => temp = e.file,
                 Err(e) => return Err(e.error.into()),
             }
@@ -175,7 +177,7 @@ fn component(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn directory(parent: &Path, name: &str, create: bool) -> Result<PathBuf> {
+pub(crate) fn directory(parent: &Path, name: &str, create: bool) -> Result<PathBuf> {
     component(name)?;
     let path = parent.join(name);
     if create {
@@ -193,7 +195,15 @@ fn directory(parent: &Path, name: &str, create: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub(crate) fn attachment(project: &Path, path: &str) -> Result<PathBuf> {
+pub(crate) fn attachment(project: &Path, state: &Path, path: &str) -> Result<PathBuf> {
+    match attachment_at(state, path) {
+        Err(error) if error.downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == ErrorKind::NotFound) => attachment_at(project, path),
+        result => result,
+    }
+}
+
+fn attachment_at(project: &Path, path: &str) -> Result<PathBuf> {
     let parts: Vec<_> = path.split('/').collect();
     let ["inbox", date, name] = parts.as_slice() else {
         anyhow::bail!("inbox/YYYY-MM-DD/ファイル名 を指定してください");
@@ -221,8 +231,9 @@ pub(crate) struct FileArgs {
     pub bibliography: Option<toml::Table>,
 }
 
-pub(crate) fn file(project: &Path, args: FileArgs) -> Result<serde_json::Value> {
-    let source = attachment(project, &args.path)?;
+fn file(project: &Path, state: &Path, args: FileArgs) -> Result<serde_json::Value> {
+    let source = attachment(project, state, &args.path)?;
+    let source_root = if source.starts_with(state) { state } else { project };
     let original = source
         .file_name()
         .and_then(|n| n.to_str())
@@ -312,7 +323,7 @@ pub(crate) fn file(project: &Path, args: FileArgs) -> Result<serde_json::Value> 
     // Keep every source until the complete destination has been published.
     let mut written = Vec::new();
     for (source, dest) in &files {
-        if let Err(err) = fs::hard_link(source, dest) {
+        if let Err(err) = link_or_copy(source, dest) {
             for path in written {
                 let _ = fs::remove_file(path);
             }
@@ -333,12 +344,24 @@ pub(crate) fn file(project: &Path, args: FileArgs) -> Result<serde_json::Value> 
     let mut remaining = Vec::new();
     for source in sources {
         if fs::remove_file(&source).is_err() {
-            remaining.push(source.strip_prefix(project)?.to_path_buf());
+            remaining.push(source.strip_prefix(source_root)?.to_path_buf());
         }
     }
     Ok(
         serde_json::json!({ "path": target.strip_prefix(project)?, "remaining_in_inbox": remaining }),
     )
+}
+
+fn link_or_copy(source: &Path, dest: &Path) -> Result<()> {
+    match fs::hard_link(source, dest) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::CrossesDevices => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(dest.parent().context("Missing destination folder")?)?;
+    std::io::copy(&mut fs::File::open(source)?, &mut temp)?;
+    temp.persist_noclobber(dest)?;
+    Ok(())
 }
 
 fn deck_directory(project: &Path, path: &str) -> Result<PathBuf> {
@@ -364,10 +387,11 @@ fn deck_directory(project: &Path, path: &str) -> Result<PathBuf> {
 
 pub(crate) async fn proposal(
     project: &Path,
+    state: &Path,
     path: &str,
     attached: &[String],
 ) -> Option<InboxProposal> {
-    let file = attachment(project, path).ok()?;
+    let file = attachment(project, state, path).ok()?;
     let ext = file.extension()?.to_str()?.to_ascii_lowercase();
     let paper = |path: &str| {
         let root = project.join(path);
@@ -474,7 +498,7 @@ pub(crate) async fn confirmed_file(
     ensure!(app.hub.has_thread(session), "スレッドが見つからない");
     let mut bibliography = None;
     if to == "references" {
-        let source = attachment(&app.project_dir, path)?;
+        let source = attachment(&app.project_dir, &app.state_dir, path)?;
         if source
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
@@ -542,7 +566,8 @@ pub(crate) async fn file_and_report(
     args: FileArgs,
 ) -> Result<serde_json::Value> {
     let path = args.path.clone();
-    let result = crate::references::run(app, move |project| file(project, args)).await?;
+    let state = app.state_dir.clone();
+    let result = crate::references::run(app, move |project| file(project, &state, args)).await?;
     app.record_artifacts(session, result["path"].as_str());
     app.hub.publish_snapshot(ServerEvent::InboxFiled {
         path,
@@ -562,28 +587,28 @@ mod tests {
         let mut uploads = Uploads::default();
         let p = root.path();
         for name in ["../secret", "a/b", "a\\b", "C:secret", ".hidden"] {
-            assert!(uploads.chunk(p, 1, name.into(), 0, 0, "").is_err());
+            assert!(uploads.chunk(p, p, 1, name.into(), 0, 0, "").is_err());
         }
         assert!(uploads
-            .chunk(p, 1, "a".into(), MAX_ATTACHMENT_BYTES + 1, 0, "")
+            .chunk(p, p, 1, "a".into(), MAX_ATTACHMENT_BYTES + 1, 0, "")
             .is_err());
-        assert!(uploads.chunk(p, 1, "a".into(), 1, 0, "YWJj").is_err());
+        assert!(uploads.chunk(p, p, 1, "a".into(), 1, 0, "YWJj").is_err());
         let oversized = STANDARD.encode(vec![0; ATTACHMENT_CHUNK_BYTES + 1]);
         assert!(uploads
-            .chunk(p, 1, "a".into(), MAX_ATTACHMENT_BYTES, 0, &oversized)
+            .chunk(p, p, 1, "a".into(), MAX_ATTACHMENT_BYTES, 0, &oversized)
             .is_err());
         assert_eq!(
-            uploads.chunk(p, 1, "file.txt".into(), 3, 0, "YQ==")?,
+            uploads.chunk(p, p, 1, "file.txt".into(), 3, 0, "YQ==")?,
             Err(1)
         );
         assert!(uploads
-            .chunk(p, 1, "file.txt".into(), 3, 2, "Yw==")
+            .chunk(p, p, 1, "file.txt".into(), 3, 2, "Yw==")
             .is_err());
         let path = uploads
-            .chunk(p, 1, "file.txt".into(), 3, 1, "YmM=")?
+            .chunk(p, p, 1, "file.txt".into(), 3, 1, "YmM=")?
             .unwrap();
-        assert_eq!(fs::read(attachment(p, &path)?)?, b"abc");
-        let other = uploads.chunk(p, 2, "file.txt".into(), 0, 0, "")?.unwrap();
+        assert_eq!(fs::read(attachment(p, p, &path)?)?, b"abc");
+        let other = uploads.chunk(p, p, 2, "file.txt".into(), 0, 0, "")?.unwrap();
         assert_ne!(other, path);
         Ok(())
     }
@@ -601,6 +626,7 @@ mod tests {
             "bib_key = 'sample'\ntitle = 'Sample'",
         )?;
         let receipt = file(
+            p,
             p,
             FileArgs {
                 path: "inbox/2026-11-19/paper.pdf".into(),
@@ -626,15 +652,15 @@ mod tests {
             rename: rename.map(str::to_owned),
             bibliography: None,
         };
-        assert!(file(p, args("research/demo", None)).is_err());
-        assert!(file(p, args("research/..", None)).is_err());
-        assert!(file(p, args("research/demo", Some("../notes"))).is_err());
+        assert!(file(p, p, args("research/demo", None)).is_err());
+        assert!(file(p, p, args("research/..", None)).is_err());
+        assert!(file(p, p, args("research/demo", Some("../notes"))).is_err());
         assert_eq!(fs::read_to_string(inbox.join("notes.txt"))?, "new");
         assert_eq!(
             fs::read_to_string(p.join("research/demo/notes.txt"))?,
             "old"
         );
-        file(p, args("research/demo", Some("new.txt")))?;
+        file(p, p, args("research/demo", Some("new.txt")))?;
         assert_eq!(fs::read_to_string(p.join("research/demo/new.txt"))?, "new");
         assert!(!inbox.join("notes.txt").exists());
         Ok(())
@@ -689,7 +715,7 @@ mod tests {
             "xref\n0 6\n{xref}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{position}\n%%EOF\n"
         ));
         project.write(path, &pdf);
-        let metadata = proposal(project.path(), path, &[]).await.unwrap();
+        let metadata = proposal(project.path(), project.path(), path, &[]).await.unwrap();
         assert_eq!(metadata.to, "references");
         assert_eq!(metadata.title, classified.title);
         assert_eq!(metadata.reference_id, classified.reference_id);
@@ -731,10 +757,11 @@ mod tests {
         ] {
             let path = format!("inbox/2026-11-19/{name}");
             project.write(&path, "fixture");
-            let route = proposal(project.path(), &path, &attached).await.unwrap();
+            let route = proposal(project.path(), project.path(), &path, &attached).await.unwrap();
             assert_eq!(route.to, expected);
             assert!(project.path().join(&path).is_file());
             let receipt = file(
+                project.path(),
                 project.path(),
                 FileArgs {
                     path,
@@ -751,7 +778,7 @@ mod tests {
         for name in ["loose.tex", "loose.png", "note.txt"] {
             let path = format!("inbox/2026-11-19/{name}");
             project.write(&path, "fixture");
-            assert!(proposal(project.path(), &path, &[]).await.is_none());
+            assert!(proposal(project.path(), project.path(), &path, &[]).await.is_none());
         }
         Ok(())
     }
@@ -762,7 +789,7 @@ mod tests {
         let outside = tempfile::tempdir()?;
         std::os::unix::fs::symlink(outside.path(), project.path().join("inbox"))?;
         assert!(Uploads::default()
-            .chunk(project.path(), 1, "file".into(), 0, 0, "")
+            .chunk(project.path(), project.path(), 1, "file".into(), 0, 0, "")
             .is_err());
         fs::remove_file(project.path().join("inbox"))?;
         fs::create_dir_all(project.path().join("inbox/2026-11-19"))?;
@@ -771,7 +798,7 @@ mod tests {
             outside.path().join("secret"),
             project.path().join("inbox/2026-11-19/file"),
         )?;
-        assert!(attachment(project.path(), "inbox/2026-11-19/file").is_err());
+        assert!(attachment(project.path(), project.path(), "inbox/2026-11-19/file").is_err());
         Ok(())
     }
 }

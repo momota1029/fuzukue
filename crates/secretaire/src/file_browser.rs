@@ -113,6 +113,9 @@ impl Root {
             } else {
                 format!("{path}/{name}")
             };
+            if fuzukue_proto::is_inbox_upload_path(Path::new(&path)) {
+                return None;
+            }
             let mut stat = statat(&fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW).ok()?;
             if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
                 let relative = self.resolve(&path, hidden).ok()?;
@@ -347,15 +350,19 @@ pub(crate) async fn download(
         .route(query.workspace)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
-    let (file, size) = tokio::task::spawn_blocking(move || -> Result<_> {
+    let file = tokio::task::spawn_blocking(move || -> Result<_> {
         let (_, file) = Root::new(&app.project_dir)?.open_file(&query.path)?;
-        let size = file.metadata()?.len();
-        Ok((file, size))
+        Ok(file)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(|_| StatusCode::NOT_FOUND)?;
-    if size > MAX_OPEN_FILE_BYTES {
+    stream_file(file, MAX_OPEN_FILE_BYTES)
+}
+
+pub(crate) fn stream_file(file: File, cap: u64) -> Result<Response, StatusCode> {
+    let size = file.metadata().map_err(|_| StatusCode::NOT_FOUND)?.len();
+    if size > cap {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let reader = tokio::fs::File::from_std(file).take(size);

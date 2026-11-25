@@ -826,6 +826,11 @@ impl Hub {
         self.inner.lock().unwrap().threads.as_ref().map(|store| store.artifacts(id)).unwrap_or_default()
     }
 
+    pub(crate) fn thread_inbox_paths(&self, id: &str) -> Vec<String> {
+        self.inner.lock().unwrap().threads.as_ref()
+            .map(|store| store.inbox_paths(id)).unwrap_or_default()
+    }
+
     pub fn thread_attachments(&self, id: &str) -> Vec<String> {
         self.inner.lock().unwrap().threads.as_ref().map(|store| store.attached(id)).unwrap_or_default()
     }

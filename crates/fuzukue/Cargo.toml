@@ -88,6 +88,9 @@ tempfile = "3"
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 unicode-script = "0.5"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [patch.crates-io]
 gpui-base = { path = "../../vendor/gpui-base" }
 gpui-pdf = { path = "../../vendor/gpui-pdf" }

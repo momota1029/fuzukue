@@ -152,7 +152,8 @@ const IGNORED_DIRS: &[&str] = &[".git", "target", ".lake", "node_modules", ".tem
 
 pub(crate) fn is_ignored(project: &Path, path: &Path) -> bool {
     let rel = path.strip_prefix(project).unwrap_or(path);
-    rel.components().any(|c| c.as_os_str().to_str().is_some_and(|s| IGNORED_DIRS.contains(&s) || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-")))
+    fuzukue_proto::is_inbox_upload_path(rel)
+        || rel.components().any(|c| c.as_os_str().to_str().is_some_and(|s| IGNORED_DIRS.contains(&s) || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-")))
 }
 
 fn is_card_change(project: &Path, path: &Path) -> bool {

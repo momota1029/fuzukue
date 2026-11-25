@@ -1,0 +1,15 @@
+{
+  "steps": [
+    {"action": "size", "width": 1080, "height": 760},
+    {"action": "locale", "locale": "en"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "wait_event", "event": "threads"},
+    {"action": "drop_folder_fixture"},
+    {"action": "wait_element", "id": "copy-folder-1"},
+    {"action": "screenshot", "name": "folder-drop-preview"},
+    {"action": "click", "id": "copy-folder-1"},
+    {"action": "wait_event", "event": "attachment_uploaded"},
+    {"action": "screenshot", "name": "folder-drop-copied"}
+  ]
+}

@@ -14,7 +14,7 @@ use image::{Frame, ImageFormat, ImageReader};
 use super::{attachment_chip, status_speech};
 use crate::conn::HttpTarget;
 
-fn attachment_image_format(name: &str) -> Option<ImageFormat> {
+pub(super) fn attachment_image_format(name: &str) -> Option<ImageFormat> {
     match Path::new(name)
         .extension()?
         .to_str()?

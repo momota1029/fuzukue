@@ -92,6 +92,7 @@ enum Step {
     ClientRollbackPreview,
     GitHubReportPreview,
     ScreenshotCaptureFixture,
+    DropFolderFixture,
     SelfUpdatePreview {
         #[serde(default)] canary: bool,
         #[serde(default)] waiting: bool,
@@ -359,7 +360,7 @@ fn seed_composer_context(view: &mut Workbench, cx: &mut Context<Workbench>) {
     view.chats.get_mut(&session).unwrap().settings.permission_mode =
         fuzukue_proto::PermissionMode::BypassPermissions;
     view.on_event(ServerEvent::ChatCapabilities {
-        effort_levels: vec![], mail_restricted: false, mcp_tools: vec![],
+        effort_levels: vec![], mail_restricted: false, mcp_tools: vec![], folder_attachments: false,
     }, cx);
     view.on_event(ServerEvent::WorkerApprovalPolicyChanged {
         policy: fuzukue_proto::WorkerApprovalPolicy::Auto, shell_rules: None,
@@ -540,6 +541,17 @@ impl Runner {
                 ensure!(!self.read_only, "Screenshot capture fixture needs an isolated workbench");
                 let png = screenshot_fixture_png()?;
                 self.update(cx, |view, _, _| view.stub_screenshot_capture(Ok(png)))?;
+            }
+            Step::DropFolderFixture => {
+                ensure!(!self.read_only, "Folder drop needs an isolated fixture");
+                let directory = tempfile::tempdir()?;
+                // The shot runner removes its temporary directory when the scenario ends.
+                let folder = directory.keep().join("sample-repository");
+                std::fs::create_dir_all(folder.join(".git"))?;
+                std::fs::write(folder.join("notes.txt"), "Synthetic attachment fixture\n")?;
+                self.update(cx, |view, _, cx| {
+                    view.add_attachments(view.active.clone(), vec![folder], cx);
+                })?;
             }
             Step::SelfUpdatePreview { canary, waiting } => {
                 self.update(cx, |view, _, cx| {
@@ -2332,7 +2344,7 @@ mod tests {
                 view.out = out.into();
                 view.switch_session("worker-approval".into(), cx);
                 view.on_event(ServerEvent::ChatCapabilities {
-                    effort_levels: Vec::new(), mail_restricted: false, mcp_tools: Vec::new(),
+                    effort_levels: Vec::new(), mail_restricted: false, mcp_tools: Vec::new(), folder_attachments: false,
                 }, cx);
                 view.on_event(ServerEvent::WorkerApprovalPolicyChanged { policy: Ask, shell_rules: None }, cx);
             });
@@ -4883,7 +4895,7 @@ mod tests {
                     view.switch_session("attachment-fixture".into(), cx);
                     view.out = out.into();
                     view.on_event(ServerEvent::ChatCapabilities {
-                        effort_levels: vec![], mail_restricted: false, mcp_tools: vec![],
+                        effort_levels: vec![], mail_restricted: false, mcp_tools: vec![], folder_attachments: true,
                     }, cx);
                 });
                 cx.spawn(async move |cx| {
@@ -4949,6 +4961,73 @@ mod tests {
                     cx.update(|cx| cx.quit());
                 }).detach();
             });
+        completed.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn folder_drop_preview_requires_confirmation_and_can_cancel() {
+        use fuzukue_proto::FolderAttachmentRequest as Request;
+        let (result, completed) = std::sync::mpsc::channel();
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+            gpui_kit::init(cx);
+            math::init(cx);
+            let (handle, view) = open_workbench(cx).unwrap();
+            let (out, messages) = std::sync::mpsc::channel();
+            let session = "folder-attachment-fixture";
+            view.update(cx, |view, cx| {
+                view.switch_session(session.into(), cx);
+                view.threads_loaded = true;
+                view.out = out.into();
+                view.on_event(ServerEvent::ChatCapabilities {
+                    effort_levels: vec![], mail_restricted: false, mcp_tools: vec![], folder_attachments: true,
+                }, cx);
+            });
+            cx.spawn(async move |cx| {
+                let mut runner = Runner { handle, view, target: None, output: PathBuf::new(),
+                    read_only: false, seen: HashMap::new() };
+                let outcome: Result<()> = async {
+                    let directory = tempfile::tempdir()?;
+                    let folder = directory.path().join("synthetic-archive");
+                    std::fs::create_dir_all(folder.join(".git"))?;
+                    std::fs::write(folder.join(".git/ignored"), b"ignored")?;
+                    std::fs::write(folder.join("notes.txt"), b"abc")?;
+                    let id = runner.update(cx, |view, _, cx| {
+                        view.add_attachments(session.into(), vec![folder], cx);
+                        view.shot_last_attachment_id()
+                    })?;
+                    let copy = format!("copy-folder-{id}");
+                    runner.step(Step::WaitElement { id: copy.clone() }, cx).await?;
+                    ensure!(!messages.try_iter().any(|msg| matches!(msg, ClientMsg::FolderAttachment { .. })),
+                        "the preview sent a request before confirmation");
+                    runner.click(cx, ClickTarget::Element { id: copy })?;
+                    let start = Instant::now();
+                    loop {
+                        runner.frame(cx)?;
+                        if let Some(request) = messages.try_iter().find_map(|msg| match msg {
+                            ClientMsg::FolderAttachment { id: found, request } if found == id => Some(request),
+                            _ => None,
+                        }) {
+                            ensure!(matches!(request, Request::Begin { bytes: 3, entries: 1, .. }),
+                                "the copy did not match the preview");
+                            break;
+                        }
+                        ensure!(start.elapsed() < Duration::from_millis(TIMEOUT_MS), "copy did not start");
+                        pause(cx, 30).await;
+                    }
+                    runner.click(cx, ClickTarget::Element { id: format!("remove-attachment-{id}") })?;
+                    ensure!(messages.try_iter().any(|msg| matches!(msg, ClientMsg::CancelAttachment { id: found } if found == id)),
+                        "removing the chip did not cancel the copy");
+                    runner.update(cx, |view, _, cx| {
+                        view.on_event(ServerEvent::AttachmentProgress { id, offset: 0 }, cx);
+                    })?;
+                    ensure!(!messages.try_iter().any(|msg| matches!(msg, ClientMsg::FolderAttachment { .. })),
+                        "the canceled copy accepted a late acknowledgement");
+                    Ok(())
+                }.await;
+                let _ = result.send(outcome);
+                cx.update(|cx| cx.quit());
+            }).detach();
+        });
         completed.recv().unwrap().unwrap();
     }
 
@@ -5083,7 +5162,7 @@ mod tests {
                 view.update(cx, |view, cx| {
                     view.switch_session("thread-1".into(), cx);
                     view.on_event(ServerEvent::ChatCapabilities {
-                        effort_levels: vec!["high".into()], mail_restricted: false, mcp_tools: vec![],
+                        effort_levels: vec!["high".into()], mail_restricted: false, mcp_tools: vec![], folder_attachments: false,
                     }, cx);
                 });
                 let (out, messages) = std::sync::mpsc::channel();
@@ -5733,7 +5812,7 @@ mod tests {
                 view.out = out.into();
                 view.protocol = PROTOCOL_VERSION;
                 view.on_event(ServerEvent::ChatCapabilities {
-                    effort_levels: vec!["high".into()], mail_restricted: false, mcp_tools: vec![],
+                    effort_levels: vec!["high".into()], mail_restricted: false, mcp_tools: vec![], folder_attachments: false,
                 }, cx);
                 view.on_event(ServerEvent::Threads { threads: vec![ThreadView {
                             github: Default::default(),

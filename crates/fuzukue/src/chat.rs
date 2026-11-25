@@ -2,7 +2,6 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +58,8 @@ use super::math;
 
 #[path = "clipboard_attach.rs"]
 mod clipboard_attach;
+#[path = "attachment_drop.rs"]
+mod attachment_drop;
 #[path = "attachment_image.rs"]
 mod attachment_image;
 #[path = "chat_activity.rs"]
@@ -75,6 +76,7 @@ use chat_activity::{status_row, status_speech, STATUS_OPTICAL_OFFSET};
 use chat_transcript::{MarkdownPart, RowEstimate, TranscriptRows, TranscriptStyle, TranscriptView};
 pub(crate) use chat_transcript::TranscriptPosition;
 
+use attachment_drop::DropState;
 use attachment_image::{decode_attachment_image, AttachmentImage, AttachmentThumbnail};
 
 const LONG_PARTNER_TOOL_RUN: usize = 4;
@@ -3040,6 +3042,7 @@ pub(super) struct ChatCapabilities {
     pub(super) effort_levels: Vec<String>,
     pub(super) mail_restricted: bool,
     pub(super) mcp_tools: Vec<String>,
+    pub(super) folder_attachments: bool,
 }
 
 struct DraftAttachment {
@@ -3053,6 +3056,7 @@ struct DraftAttachment {
 enum AttachmentState {
     Reading,
     Uploading { bytes: Vec<u8>, sent: u64 },
+    Drop(DropState),
     Saved(String),
     Failed(String),
 }
@@ -3247,22 +3251,14 @@ impl Drop for ComposerDrafts {
     }
 }
 
-fn read_attachment(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let meta = file.metadata()?;
-    anyhow::ensure!(meta.is_file(), tr!("chat-choose-a-regular-file"));
-    anyhow::ensure!(
-        meta.len() <= MAX_ATTACHMENT_BYTES,
-        tr!("chat-attachments-are-limited-to-50-mib-per-file")
-    );
-    let mut bytes = Vec::new();
-    file.take(MAX_ATTACHMENT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() as u64 <= MAX_ATTACHMENT_BYTES,
-        tr!("chat-attachments-are-limited-to-50-mib-per-file")
-    );
-    Ok(bytes)
+fn attachment_label(name: &str, path: &str) -> String {
+    if path.starts_with("inbox/folders/ref-") {
+        tr!("chat-folder-read-only", name = name.to_owned())
+    } else if fuzukue_proto::is_folder_attachment(path) {
+        tr!("chat-folder-copied", name = name.to_owned())
+    } else {
+        name.to_owned()
+    }
 }
 
 fn attachment_chip(name: &str, cx: &gpui_kit::App) -> gpui_kit::Div {
@@ -3508,9 +3504,10 @@ impl Workbench {
                 AttachmentThumbnail {
                     id: format!("chat-message-image-{id}-{index}").into(),
                     name: name.clone(),
-                    label: name,
+                    label: attachment_label(&name, path),
                     decoded: chat.inbox.get(path).and_then(|entry| entry.preview.clone()),
-                    saved: Some((self.connection_epoch, self.http.clone(), path.clone())),
+                    saved: (!fuzukue_proto::is_folder_attachment(path))
+                        .then(|| (self.connection_epoch, self.http.clone(), path.clone())),
                 }
             }))
     }
@@ -3606,11 +3603,13 @@ impl Workbench {
                 effort_levels,
                 mail_restricted,
                 mcp_tools,
+                folder_attachments,
             } => {
                 self.chat_capabilities = Some(ChatCapabilities {
                     effort_levels,
                     mail_restricted,
                     mcp_tools,
+                    folder_attachments,
                 });
             }
             ServerEvent::CodexModels { models } => self.codex_models = models,
@@ -3659,14 +3658,13 @@ impl Workbench {
                 }
             }
             ServerEvent::Consulting { session, active } => self.chat(&session, cx).set_consulting(active),
+            ServerEvent::FolderReferenceUnavailable { id } => self.folder_reference_unavailable(id, cx),
             ServerEvent::AttachmentProgress { id, offset } => {
-                if let Some(draft) = self
-                    .chats
-                    .values_mut()
-                    .find_map(|chat| chat.attachments.iter_mut().find(|draft| draft.id == id))
-                {
-                    draft.send_chunk(offset, &self.out);
+                let out = self.out.clone();
+                if let Some(draft) = self.drop_draft(id) {
+                    draft.send_chunk(offset, &out);
                 }
+                self.advance_drop(id, offset, cx);
             }
             ServerEvent::AttachmentUploaded { id, path, error, proposal } => {
                 let mut saved_for = None;
@@ -3674,8 +3672,8 @@ impl Workbench {
                     let index = chat.attachments.iter().position(|draft| draft.id == id)?;
                     Some((chat, index))
                 }) {
-                    if matches!(chat.attachments[index].state, AttachmentState::Uploading { .. }) {
-                        if let Some(path) = &path {
+                    if chat.attachments[index].transferring() {
+                        if let Some(path) = path.as_ref().filter(|path| !fuzukue_proto::is_folder_attachment(path)) {
                             chat.inbox.insert(path.clone(), InboxEntry {
                                 proposal, pending: false, destination: None, error: None,
                                 preview: chat.attachments[index].preview.clone(),
@@ -3733,22 +3731,24 @@ impl Workbench {
             .values_mut()
             .flat_map(|chat| &mut chat.attachments)
         {
-            if matches!(
-                draft.state,
-                AttachmentState::Reading | AttachmentState::Uploading { .. }
-            ) {
+            if matches!(draft.state, AttachmentState::Reading | AttachmentState::Drop(DropState::Inspecting(_)))
+                || draft.transferring()
+            {
+                if let AttachmentState::Drop(state) = &draft.state {
+                    state.cancel();
+                }
                 draft.state =
                     AttachmentState::Failed(tr!("chat-connection-lost-select-the-attachment-again").into());
             }
         }
     }
 
-    fn choose_attachments(&mut self, cx: &mut Context<Self>) {
+    fn choose_attachments(&mut self, folder: bool, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some(tr!("chat-choose-attachments").into()),
+            files: !folder,
+            directories: folder,
+            multiple: !folder,
+            prompt: Some(if folder { tr!("chat-attach-folder") } else { tr!("chat-choose-attachments") }.into()),
         });
         let session = self.active.clone();
         let epoch = self.connection_epoch;
@@ -3796,13 +3796,14 @@ impl Workbench {
             return;
         }
         for path in paths {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            self.queue_attachment(&session, name, move || read_attachment(&path), cx);
+            self.queue_dropped_path(&session, path, cx);
         }
         cx.notify();
+    }
+
+    #[cfg(all(test, target_os = "linux", feature = "headless-shot"))]
+    pub(super) fn shot_last_attachment_id(&self) -> u64 {
+        self.chats[&self.active].attachments.last().unwrap().id
     }
 
     pub(super) fn restore_composer_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -4129,6 +4130,9 @@ impl Workbench {
         let can_send = self.threads_loaded && (is_command || !blocked && (has_content || ime));
         let attachment_menu = cx.weak_entity();
         let can_choose_files = enabled && chat.attachments.len() < MAX_ATTACHMENTS;
+        let can_choose_folder = can_choose_files && self.chat_capabilities.as_ref()
+            .is_some_and(|capabilities| capabilities.folder_attachments);
+        let copying_folder = self.copying_folder();
         let chips = h_flex()
             .flex_wrap()
             .gap_2()
@@ -4148,7 +4152,8 @@ impl Workbench {
                         ),
                         None,
                     ),
-                    AttachmentState::Saved(_) => (draft.name.clone(), None),
+                    AttachmentState::Drop(state) => (state.label(&draft.name), None),
+                    AttachmentState::Saved(path) => (attachment_label(&draft.name, path), None),
                     AttachmentState::Failed(reason) => {
                         (format!("{}{STATUS_SEPARATOR}{reason}", draft.name), Some(reason.clone()))
                     }
@@ -4163,7 +4168,10 @@ impl Workbench {
                             chat.attachments.iter().position(|draft| draft.id == id)
                         {
                             let draft = chat.attachments.remove(index);
-                            if matches!(draft.state, AttachmentState::Uploading { .. }) {
+                            if let AttachmentState::Drop(state) = &draft.state {
+                                state.cancel();
+                            }
+                            if draft.transferring() {
                                 let _ = this.out.send(ClientMsg::CancelAttachment { id });
                             } else if matches!(draft.state, AttachmentState::Saved(_)) {
                                 this.record_composer_attachments(&draft.session, cx);
@@ -4180,10 +4188,18 @@ impl Workbench {
                     name: draft.name.clone(),
                     label,
                     decoded: draft.preview.clone().filter(|_| !matches!(draft.state, AttachmentState::Failed(_))),
-                    saved: saved_path.map(|path| (self.connection_epoch, self.http.clone(), path.clone())),
+                    saved: saved_path.filter(|path| !fuzukue_proto::is_folder_attachment(path))
+                        .map(|path| (self.connection_epoch, self.http.clone(), path.clone())),
                 };
                 h_flex().max_w_full().gap_1().items_start()
                     .child(preview)
+                    .children(matches!(draft.state, AttachmentState::Drop(DropState::Preview(_))).then(|| {
+                        inline_button(SharedString::from(format!("copy-folder-{id}")))
+                            .label(tr!("chat-folder-copy"))
+                            .disabled(copying_folder)
+                            .tooltip(tr!("chat-folder-copy-exclusions"))
+                            .on_click(cx.listener(move |this, _, _, cx| this.confirm_folder_copy(id, cx)))
+                    }))
                     .children(saved_path.and_then(|path| {
                         self.attachment_filing_menu(&draft.session, path, cx)
                     }))
@@ -4336,12 +4352,18 @@ impl Workbench {
                             })
                             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                                 let files = attachment_menu.clone();
+                                let folder = attachment_menu.clone();
                                 let screenshot = attachment_menu.clone();
                                 menu.item(PopupMenuItem::new(tr!("chat-attach-files"))
                                     .disabled(!can_choose_files)
                                     .on_click(move |_, _, cx| {
-                                        let _ = files.update(cx, |this, cx| this.choose_attachments(cx));
+                                        let _ = files.update(cx, |this, cx| this.choose_attachments(false, cx));
                                     }))
+                                    .item(PopupMenuItem::new(tr!("chat-attach-folder"))
+                                        .disabled(!can_choose_folder)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = folder.update(cx, |this, cx| this.choose_attachments(true, cx));
+                                        }))
                                     .item(PopupMenuItem::new(tr!("screenshot-capture")).icon(Symbol::Camera.icon())
                                         .on_click(move |_, window, cx| {
                                             let _ = screenshot.update(cx, |this, cx| this.capture_screenshot(window, cx));
@@ -4927,6 +4949,14 @@ fn role_effort_items(
 static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl DraftAttachment {
+    fn transferring(&self) -> bool {
+        match &self.state {
+            AttachmentState::Uploading { .. } => true,
+            AttachmentState::Drop(state) => state.on_server(),
+            _ => false,
+        }
+    }
+
     fn send_chunk(&mut self, offset: u64, out: &crate::conn::Sender) {
         let AttachmentState::Uploading { bytes, sent } = &mut self.state else {
             return;

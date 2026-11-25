@@ -600,7 +600,11 @@ pub fn find_decks(root: &Path) -> Vec<PathBuf> {
     const SKIP: &[&str] = &[".git", "target", ".lake", "node_modules", ".temp"];
     let mut out: Vec<PathBuf> = walkdir::WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !e.file_name().to_str().is_some_and(|s| SKIP.contains(&s) || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-")))
+        .filter_entry(|e| {
+            !e.path().strip_prefix(root).is_ok_and(fuzukue_proto::is_inbox_upload_path)
+                && !e.file_name().to_str().is_some_and(|s| SKIP.contains(&s)
+                    || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-"))
+        })
         .filter_map(Result::ok)
         // deck.toml のほか、writing-harness の論文（harness.toml）と古い cards.toml も
         // デッキとして数える。DeckConfig::read と同じ並び。
