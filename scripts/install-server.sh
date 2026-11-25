@@ -2,6 +2,7 @@
 set -eu
 exec python3 - "$0" "$@" <<'PY'
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -339,7 +340,7 @@ def extract(archive, binary, dest):
     dest.chmod(0o755)
 
 
-def install_version(root, version, binary, checksum, populate):
+def install_version(root, version, binary, checksum, populate, verify_existing=False):
     dest = root / version
     exe = dest / binary
     existing = os.path.lexists(dest)
@@ -352,8 +353,10 @@ def install_version(root, version, binary, checksum, populate):
         if os.path.lexists(exe):
             require(exe.is_file() and not exe.is_symlink() and os.access(exe, os.X_OK),
                     f"Existing executable is unusable: {exe}")
-            # The desktop updater may have replaced this executable in place.
-            return f"{version}/{binary}"
+            # Packaged desktops may have been updated in place. A source
+            # install always uses the binary from the current build.
+            if not verify_existing or digest(exe) == checksum:
+                return f"{version}/{binary}"
 
     with tempfile.TemporaryDirectory(dir=root, prefix=".stage-") as temp:
         stage = Path(temp) / "payload"
@@ -422,21 +425,23 @@ def set_link(root, name, target):
         link.replace(path)
 
 
-def launcher_text(header, root, binary, macos):
+def launcher_text(header, root, binary, macos, legacy=False):
     if macos:
+        source_case = "" if legacy else f"    local-*/{binary}) ;;\n"
+        release_target = "" if legacy else '[ "${target#v}" != "$target" ] && '
         return f"""#!/bin/sh
 {header}root={shlex.quote(str(root))}
 target=$(readlink "$root/current") || exit 1
 case "$target" in
     */*/*) exit 1 ;;
     v[0-9]*/{binary}) ;;
-    *) echo 'Invalid fuzukue release pointer.' >&2; exit 1 ;;
+{source_case}    *) echo 'Invalid fuzukue release pointer.' >&2; exit 1 ;;
 esac
 if [ "$#" -eq 1 ] && [ "$1" = --version ]; then
     printf '%s %s\\n' '{binary}' "${{target%/*}}"
     exit 0
 fi
-if [ -x /bin/launchctl ] && [ ! -e "$root/../auto-update-off" ]; then
+if {release_target}[ -x /bin/launchctl ] && [ ! -e "$root/../auto-update-off" ]; then
     /bin/launchctl kickstart "gui/$(/usr/bin/id -u)/{UPDATE_AGENT}" >/dev/null 2>&1 || :
 fi
 exec "$root/$target" "$@"
@@ -451,12 +456,32 @@ esac
 """
 
 
+def managed_launcher(root, binary, macos):
+    launcher = Path.home() / ".local/bin" / binary
+    header = f"# Managed by fuzukue release installer ({binary})\n"
+    text = launcher_text(header, root, binary, macos)
+    check_file(launcher, "#!/bin/sh\n" + header)
+    require(not launcher.exists() or launcher.read_text(encoding="utf-8") in
+            (text, launcher_text(header, root, binary, macos, legacy=True)),
+            f"Launcher points to a different install root: {launcher}")
+    return launcher, text
+
+
+@contextmanager
+def install_lock(root):
+    root.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(root / ".install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), "r+") as lock:
+        require(stat.S_ISREG(os.fstat(lock.fileno()).st_mode), "Invalid install lock file.")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def systemctl(*args, check=True, capture=False):
     return subprocess.run(["systemctl", "--user", *args], check=check, text=True,
                           stdout=subprocess.PIPE if capture else None)
 
 
-def unit_text(project, launcher, port):
+def unit_text(project, launcher, port, loopback=False):
     def quote(value):
         value = str(value)
         require(not any(ord(char) < 32 or ord(char) == 127 for char in value),
@@ -470,6 +495,8 @@ def unit_text(project, launcher, port):
         )
     ]
     paths.append(quote(f"PATH={agent_search_path()}"))
+    if loopback:
+        paths.append(quote(f"FUZUKUE_ADDR=127.0.0.1:{port}"))
     return f"""{UNIT_HEADER}# Health port: {port}
 [Unit]
 Description=fuzukue packaged server
@@ -506,7 +533,7 @@ def check_health(port, expected_exe):
     raise ValueError(f"{UNIT} failed its startup health check on port {port}.")
 
 
-def switch(root, launcher, text, unit, new_unit, current, previous, candidate, backup):
+def switch(root, launcher, text, unit, new_unit, current, previous, candidate, backup, finish=None):
     old_unit = unit.read_text(encoding="utf-8") if unit and unit.is_file() else None
     had_launcher = launcher.is_file()
     active = enabled = False
@@ -530,6 +557,8 @@ def switch(root, launcher, text, unit, new_unit, current, previous, candidate, b
             systemctl("start", UNIT)
             port = int((new_unit or old_unit).splitlines()[1].split()[-1])
             check_health(port, root / candidate)
+        if finish:
+            finish()
     except (ValueError, OSError, subprocess.CalledProcessError):
         if must_start:
             systemctl("stop", UNIT, check=False)
@@ -565,16 +594,17 @@ def launch_domain():
     return domain
 
 
-def agent_text(project, launcher, port):
+def agent_text(project, launcher, port, packaged=True):
     home = Path.home()
     logs = home / "Library/Logs/fuzukue"
     env = {
         "HOME": str(home),
         "PATH": agent_search_path(),
         "FUZUKUE_ADDR": f"127.0.0.1:{port}",
-        "FUZUKUE_MACOS_PACKAGE": "1",
         "XDG_STATE_HOME": str(xdg("XDG_STATE_HOME", ".local/state")),
     }
+    if packaged:
+        env["FUZUKUE_MACOS_PACKAGE"] = "1"
     payload = plistlib.dumps({
         "Label": AGENT,
         "ProgramArguments": [str(launcher), str(project)],
@@ -737,7 +767,7 @@ def scheduled_update():
     client = base / "client"
     old_server = read_link(server, "current", "secretaire")
     old_client = read_link(client, "current", "fuzukue")
-    if not old_server:
+    if not old_server or not TAG.fullmatch(old_server.split("/")[0]):
         return
     rows = cached_releases(base)
     tags = [row["tag_name"] for row in rows
@@ -761,7 +791,8 @@ def scheduled_update():
             server_tag = installed.split("/")[0] if installed else None
         # A running desktop keeps its old image. Launch the new client only after
         # the corresponding server has passed its health check.
-        if old_client and server_tag == tag and semver(tag) > semver(old_client.split("/")[0]):
+        client_tag = old_client.split("/")[0] if old_client else None
+        if client_tag and server_tag == tag and (not TAG.fullmatch(client_tag) or semver(tag) > semver(client_tag)):
             subprocess.run(command + ["--client"], check=True)
     except subprocess.CalledProcessError:
         failures = retry.get("failures", 0) + 1
@@ -790,9 +821,9 @@ def agent_idle(unit):
         return False
 
 
-def switch_launchd(root, launcher, text, unit, new_unit, current, previous, candidate, backup):
+def switch_launchd(root, launcher, text, unit, new_unit, current, previous, candidate, backup, finish=None):
     old_unit = unit.read_text(encoding="utf-8") if unit and unit.is_file() else None
-    had_launcher = launcher.is_file()
+    old_launcher = launcher.read_text(encoding="utf-8") if launcher.is_file() else None
     domain = launch_domain() if old_unit is not None or new_unit is not None else None
     active = domain is not None and agent_status(unit, domain) is not None
     if active:
@@ -804,7 +835,7 @@ def switch_launchd(root, launcher, text, unit, new_unit, current, previous, cand
     if active and must_start:
         stop_agent(unit, domain)
     try:
-        if not had_launcher:
+        if old_launcher != text:
             write_file(launcher, text, 0o755)
         set_link(root, "previous", backup)
         set_link(root, "current", candidate)
@@ -814,13 +845,17 @@ def switch_launchd(root, launcher, text, unit, new_unit, current, previous, cand
         if must_start:
             launchctl("bootstrap", domain, str(unit))
             check_agent_health(unit, domain, port)
+        if finish:
+            finish()
     except (ValueError, OSError, subprocess.CalledProcessError):
         if must_start and agent_status(unit, domain) is not None:
             stop_agent(unit, domain)
         set_link(root, "current", current)
         set_link(root, "previous", previous)
-        if not had_launcher:
+        if old_launcher is None:
             launcher.unlink(missing_ok=True)
+        elif old_launcher != text:
+            write_file(launcher, old_launcher, 0o755)
         if new_unit is not None:
             if old_unit is None:
                 unit.unlink(missing_ok=True)
@@ -860,7 +895,81 @@ def uninstall(root, launcher, unit, binary, macos):
     print(f"Uninstalled {binary}. Settings and data were kept.")
 
 
+def setup_built(argv):
+    parser = argparse.ArgumentParser(prog="setup-unix.sh")
+    parser.add_argument("build", type=Path)
+    parser.add_argument("commit")
+    parser.add_argument("project", type=Path)
+    parser.add_argument("--skip-agents", action="store_true")
+    args = parser.parse_args(argv)
+    require(COMMIT.fullmatch(args.commit), "Expected a checkout commit.")
+    home = Path.home().resolve()
+    project = args.project.resolve(strict=True)
+    require(project.is_dir() and home in project.parents, "Use a project folder inside your home.")
+
+    macos = os.uname().sysname == "Darwin"
+    base = mac_base() if macos else xdg("XDG_DATA_HOME", ".local/share") / "fuzukue"
+    server = base / "server" if macos else base
+    client = base / "client"
+    unit = agent_path(AGENT) if macos else xdg("XDG_CONFIG_HOME", ".config") / "systemd/user" / UNIT
+    header = AGENT_HEADER if macos else UNIT_HEADER
+    for root in (base, server, client):
+        require(not root.is_symlink(), f"Unexpected install root: {root}")
+    server, client = server.resolve(), client.resolve()
+    check_file(unit, header)
+    for root, binary in ((server, "secretaire"), (client, "fuzukue")):
+        managed_launcher(root, binary, macos)
+        built = args.build / binary
+        require(built.is_file() and os.access(built, os.X_OK), f"Missing build output: {built}")
+    if not args.skip_agents:
+        check_agents(offer=True)
+
+    def stage(root, binary):
+        built = args.build / binary
+        checksum = digest(built)
+        return install_version(root, f"local-{args.commit}-{checksum}", binary, checksum,
+                               lambda dest: shutil.copy2(built, dest), verify_existing=True)
+
+    # Lock in a consistent order. Stage both versions before stopping a server.
+    with install_lock(server), install_lock(client):
+        check_file(unit, header)
+        server_launcher, server_text = managed_launcher(server, "secretaire", macos)
+        client_launcher, client_text = managed_launcher(client, "fuzukue", macos)
+        old_server = read_link(server, "current", "secretaire")
+        old_client = read_link(client, "current", "fuzukue")
+        previous_server = read_link(server, "previous", "secretaire")
+        previous_client = read_link(client, "previous", "fuzukue")
+        next_server = stage(server, "secretaire")
+        next_client = stage(client, "fuzukue")
+        port = 7878
+        activate = switch_launchd if macos else switch
+        service_text = (agent_text(project, server_launcher, port, packaged=False) if macos
+                        else unit_text(project, server_launcher, port, loopback=True))
+
+        def configure_client():
+            # Use the client's settings writer to retain the rest of settings.toml.
+            def save_settings():
+                subprocess.run([str(client / next_client), "--configure-external"], check=True)
+
+            activate(client, client_launcher, client_text, None, None,
+                     old_client, previous_client, next_client,
+                     old_client if old_client and old_client != next_client else previous_client,
+                     finish=save_settings)
+
+        activate(server, server_launcher, server_text, unit, service_text,
+                 old_server, previous_server, next_server,
+                 old_server if old_server and old_server != next_server else previous_server,
+                 finish=configure_client)
+        if macos:
+            update_schedule(base, remove=True)
+    print(f"Server is listening on 127.0.0.1:{port}. Open the desktop with:")
+    print("  " + shlex.quote(str(client_launcher)))
+
+
 def main():
+    if sys.argv[1:2] == ["--setup-built"]:
+        setup_built(sys.argv[2:])
+        return
     if sys.argv[1:] == ["--scheduled-update"]:
         scheduled_update()
         return
@@ -940,16 +1049,7 @@ def main():
         return
     root = root.resolve()
     rejected = root / ".rejected-auto-release"
-    launcher = Path.home() / ".local/bin" / binary
-    header = f"# Managed by fuzukue release installer ({binary})\n"
-    text = launcher_text(header, root, binary, macos)
-
-    def check_launcher():
-        check_file(launcher, "#!/bin/sh\n" + header)
-        require(not launcher.exists() or launcher.read_text(encoding="utf-8") == text,
-                f"Launcher points to a different install root: {launcher}")
-
-    check_launcher()
+    launcher, text = managed_launcher(root, binary, macos)
     unit = None
     unit_header = AGENT_HEADER if macos else UNIT_HEADER
     if not args.client:
@@ -989,7 +1089,8 @@ def main():
             return
         active_tag = current.split("/")[0] if current else None
         if args.automatic:
-            if (off.exists() or not active_tag or semver(args.version) <= semver(active_tag)
+            if (off.exists() or not active_tag
+                    or (TAG.fullmatch(active_tag) and semver(args.version) <= semver(active_tag))
                     or (rejected.is_file() and rejected.read_text(encoding="utf-8").strip() == args.version)):
                 return
             if not args.client and not agent_idle(unit):
@@ -1041,12 +1142,9 @@ def main():
         return
     if args.uninstall and not root.exists() and not launcher.exists() and not (unit and unit.exists()):
         return
-    root.mkdir(parents=True, exist_ok=True)
-    with os.fdopen(os.open(root / ".install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), "r+") as lock:
-        require(stat.S_ISREG(os.fstat(lock.fileno()).st_mode), "Invalid install lock file.")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with install_lock(root):
         # Recheck ownership after waiting for another installer or uninstaller.
-        check_launcher()
+        managed_launcher(root, binary, macos)
         if unit:
             check_file(unit, unit_header)
         run()

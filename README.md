@@ -15,29 +15,20 @@ The project is early. The maintainer uses it for daily work, and setup and workf
 - Browse a research deck’s exploration tree to see questions and conjectures by branch or by status. [Sample exploration tree](examples/lab/research/curvature/exploration/tree.json)
 - Receive desktop update notices from the connected server and resume interrupted downloads. [Client distribution and updates](docs/update.md)
 
-## Install from a release
-
-When a matching release is published, use [install-server.sh](scripts/install-server.sh) for the Linux or WSL2 server, [install-client.sh](scripts/install-client.sh) for Linux desktop, or [install-client.ps1](scripts/install-client.ps1) for Windows desktop. See the [installation guide](docs/install.md#english) for prerequisites, release channels, and migration.
-
-To run both components on the same Mac when macOS beta packages are available, see the [macOS beta quick start (Japanese)](docs/install-mac.md).
-
 ## Quick start from source
 
-Install Git and a Rust toolchain. From the repository root, build the server and start it with the sample workspace.
+On macOS or Linux, clone into your home directory and run setup from your desktop session. It detects your OS and architecture, builds both components from the clone, and starts a user service. The preview shows any prerequisites to install. [Mac setup guide (Japanese)](docs/install-mac.md)
 
 ```sh
-cargo build --locked --release -p secretaire
-./target/release/secretaire examples/lab
+cd "$HOME"
+git clone https://github.com/momota1029/fuzukue.git
+cd fuzukue
+sh scripts/setup-unix.sh --dry-run
+sh scripts/setup-unix.sh
+"$HOME/.local/bin/fuzukue"
 ```
 
-The server listens on `127.0.0.1:7878` by default. On Linux or macOS, use a second terminal at the repository root to build and start the desktop client. The GUI build requires platform development tools. The macOS desktop build and runtime are still being verified. [Mac guide](docs/mac.md)
-
-```sh
-cargo build --locked --release --manifest-path crates/fuzukue/Cargo.toml
-FUZUKUE_URL=ws://127.0.0.1:7878/ws ./crates/fuzukue/target/release/fuzukue
-```
-
-On Linux or macOS, you can also build and launch both processes with [`scripts/run.sh`](scripts/run.sh) by passing it `examples/lab`.
+The default project is `examples/lab`. To use an existing folder under your home directory, pass `--project "$HOME/path/to/project"`. On Linux, use a systemd user session and a Wayland or X11 desktop with Vulkan support. To update, close the desktop, run `git pull --ff-only`, and run setup again with the same project option.
 
 On Windows, run the server in WSL2 and the desktop client on Windows. Set up Ubuntu in WSL2, clone the repository onto a local Windows drive, and install the Rust MSVC toolchain and the Visual Studio Build Tools C++ workload. From the Windows clone, use PowerShell to preview and then run setup. The script builds the server in WSL and the client on Windows, configures the connection, and creates a Start menu shortcut. [Windows guide](docs/windows.md) · [Setup script](scripts/setup-windows.ps1)
 
@@ -49,6 +40,10 @@ On Windows, run the server in WSL2 and the desktop client on Windows. Set up Ubu
 To work with an agent, install its CLI and sign in with your own account in the environment where `secretaire` runs.
 
 For Android source builds and signed APKs, follow the [Android guide](android/README.md). The repository includes an [Android release script](scripts/release-android.sh).
+
+## Install from a release
+
+When matching packages are published, use [install-server.sh](scripts/install-server.sh) for the server, [install-client.sh](scripts/install-client.sh) for macOS or Linux desktop, or [install-client.ps1](scripts/install-client.ps1) for Windows desktop. macOS beta installations with launchd can update both components from GitHub Releases. [Installation guide](docs/install.md#english) · [Mac release setup (Japanese)](docs/install-mac.md#配布版へ切り替える)
 
 ## Add a custom skill
 

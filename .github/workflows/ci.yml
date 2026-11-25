@@ -5,6 +5,12 @@ name: CI
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      build-macos-desktop:
+        description: Build both macOS binaries with the clone setup script
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,6 +34,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Test source installer with offline fixtures
+        run: python3 scripts/release/test-setup-unix.py
       - uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
@@ -42,9 +50,9 @@ jobs:
           cargo "+$RUST_TOOLCHAIN" test --locked --workspace
 
   macos:
-    name: secretaire compile check (macOS)
+    name: Source setup and server compile check (macOS)
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,9 +62,27 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
-          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'crates/fuzukue/Cargo.lock') }}
           restore-keys: cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+      - name: Preview setup from this clone
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          plan=$(sh scripts/setup-unix.sh --dry-run --skip-agents)
+          printf '%s\n' "$plan"
+          case "$plan" in
+            *"Build secretaire and fuzukue for "*apple-darwin*) ;;
+            *) exit 1 ;;
+          esac
       - name: Check the server
+        if: ${{ !inputs.build-macos-desktop }}
         run: cargo "+$RUST_TOOLCHAIN" check --locked -p secretaire --jobs 2
+      - name: Build the server and desktop from the clone
+        if: ${{ inputs.build-macos-desktop }}
+        env:
+          CARGO_BUILD_JOBS: '2'
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
+          TMPDIR: ${{ runner.temp }}
+        run: sh scripts/setup-unix.sh --build-only
 
 # Cards run in cards.yml. Android JVM tests run manually (see android/README.md).

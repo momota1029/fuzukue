@@ -3168,6 +3168,19 @@ fn main() {
             return;
         }
     }
+    #[cfg(unix)]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--configure-external")) {
+        let result = if std::env::args_os().len() == 2 {
+            appearance::configure_external()
+        } else {
+            Err(anyhow::anyhow!("Usage: fuzukue --configure-external"))
+        };
+        if let Err(err) = result {
+            eprintln!("{}", tr!("workbench-cannot-update-settings", detail = format!("{err:#}")));
+            std::process::exit(1);
+        }
+        return;
+    }
     updater::offer_renamed_executable();
     gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(|cx| {
         gpui_kit::init(cx);

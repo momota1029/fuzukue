@@ -654,6 +654,26 @@ pub fn configure_wsl(arguments: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(super) fn configure_external() -> anyhow::Result<()> {
+    let path = settings_path().ok_or_else(|| anyhow::anyhow!(tr!("settings-settings-directory-not-found")))?;
+    crate::settings_file::initialize_model_setup(&path)?;
+    crate::settings_file::update(&path, |settings| {
+        let server = settings
+            .entry("server")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!(tr!("settings-invalid-toml-or-settings-value")))?;
+        if server.get("mode").and_then(toml::Value::as_str) == Some("external") {
+            return Ok(false);
+        }
+        server.insert("mode".into(), toml::Value::String("external".into()));
+        Ok(true)
+    })?;
+    println!("{}", path.display());
+    Ok(())
+}
+
 impl Appearance {
     pub fn new(window: &mut Window, cx: &mut Context<Workbench>) -> Self {
         let path = settings_path();

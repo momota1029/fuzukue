@@ -15,27 +15,20 @@ fuzukue は、AI エージェントと一緒に数学のノートや原稿を書
 - 研究デッキの探索ツリーを開き、問いや予想を枝ごと、または進捗状況ごとに確認できます。[探索ツリーの例](examples/lab/research/curvature/exploration/tree.json)
 - 接続先サーバーからデスクトップ版の更新通知を受け取り、中断したダウンロードを再開できます。[クライアントの配布と更新](docs/update.md)
 
-## リリースからインストールする
-
-対応パッケージは [インストールガイド](docs/install.md) を参照してください。同じ Mac でサーバーとクライアントを試す手順は [Mac のベータ版ガイド](docs/install-mac.md) にあります。
-
 ## ソースから起動する
 
-Git と Rust のツールチェーンを用意します。リポジトリのルートでサーバーをビルドし、サンプルのワークスペースを開きます。
+macOS / Linux では、ホームディレクトリにクローンして、デスクトップにログインした状態でセットアップします。OS と CPU を自動で判定し、クローンからサーバーとクライアントをビルドしてユーザーサービスを起動します。必要なツールはプレビューで確認できます。[Mac のセットアップガイド](docs/install-mac.md)
 
 ```sh
-cargo build --locked --release -p secretaire
-./target/release/secretaire examples/lab
+cd "$HOME"
+git clone https://github.com/momota1029/fuzukue.git
+cd fuzukue
+sh scripts/setup-unix.sh --dry-run
+sh scripts/setup-unix.sh
+"$HOME/.local/bin/fuzukue"
 ```
 
-サーバーの既定の待ち受けは `127.0.0.1:7878` です。Linux または macOS では、別のターミナルを開き、リポジトリのルートからデスクトップクライアントをビルドして起動します。GUI のビルドには OS ごとの開発ツールが必要です。macOS でのデスクトップのビルドと動作は検証途上です。[Mac ガイド](docs/mac.md)
-
-```sh
-cargo build --locked --release --manifest-path crates/fuzukue/Cargo.toml
-FUZUKUE_URL=ws://127.0.0.1:7878/ws ./crates/fuzukue/target/release/fuzukue
-```
-
-Linux または macOS では、[`scripts/run.sh`](scripts/run.sh) に `examples/lab` を渡すと、サーバーとクライアントをまとめてビルドし、起動できます。
+既定のプロジェクトは `examples/lab` です。ホームディレクトリ内の既存フォルダーを使うには `--project "$HOME/path/to/project"` を付けます。Linux では systemd のユーザーセッションと、Vulkan を使える Wayland または X11 のデスクトップ環境が必要です。更新時はクライアントを閉じ、`git pull --ff-only` のあとで同じプロジェクト指定でセットアップを再実行します。
 
 Windows では、サーバーを WSL2 で、クライアントを Windows で動かします。WSL2 に Ubuntu を用意し、Windows のローカルドライブ上にリポジトリをクローンして、Rust の MSVC ツールチェーンと Visual Studio Build Tools の C++ ワークロードを入れます。Windows 側のクローンから PowerShell でセットアップの内容を確認し、実行します。スクリプトは WSL 側でサーバー、Windows 側でクライアントをビルドし、接続を設定してスタートメニューにショートカットを作成します。[Windows ガイド](docs/windows.md) · [セットアップスクリプト](scripts/setup-windows.ps1)
 
@@ -47,6 +40,10 @@ Windows では、サーバーを WSL2 で、クライアントを Windows で動
 エージェントを使う場合は、`secretaire` を動かす環境に対応する CLI を入れ、自分のアカウントでログインします。
 
 Android のソースビルドと署名済み APK の作成手順は [Android ガイド](android/README.md) を参照してください。リポジトリには [Android のリリーススクリプト](scripts/release-android.sh) があります。
+
+## リリースからインストールする
+
+対応する配布パッケージが公開されたら、[インストールガイド](docs/install.md) の手順で導入できます。Mac のベータ版では、LaunchAgent を登録するとサーバーとクライアントの配布版を自動で更新できます。[Mac の配布版への切り替え](docs/install-mac.md#配布版へ切り替える)
 
 ## 自作スキルを追加する
 

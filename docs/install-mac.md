@@ -1,18 +1,46 @@
-# Mac で fuzukue のベータ版を試す
+# Mac で fuzukue を使う
 
-同じ Mac でサーバー `secretaire` とデスクトップクライアント `fuzukue` を動かす手順です。案内されたプリリリースに Mac 用の両方のパッケージがそろってから始めます。この手順は Apple Silicon を優先します。Intel Mac では、同じリリースに `macos-x86_64` の両パッケージが必要です。
+同じ Mac でサーバー `secretaire` とデスクトップクライアント `fuzukue` を動かします。クローンから始める場合、公開リリースを待つ必要はありません。
 
-## 1. 準備する
+## クローンからセットアップする
+
+Mac にログインし、「ターミナル」を開きます。初めて Git を使うときに macOS が開発ツールの導入を求めたら、Apple の案内に従うか、`xcode-select --install` を実行します。
+
+```sh
+cd "$HOME"
+git clone https://github.com/momota1029/fuzukue.git
+cd fuzukue
+sh scripts/setup-unix.sh --dry-run
+sh scripts/setup-unix.sh
+"$HOME/.local/bin/fuzukue"
+```
+
+- プレビューは macOS のバージョンと CPU を表示し、必要なツールを確認します。Apple Silicon では Rosetta を使わないターミナルで実行します。
+- このクローンのデスクトップビルドには、macOS SDK と C/C++ コンパイラを含む **Command Line Tools**、Python 3.8 以降、Rust 1.95 以降が必要です。GPUI Kit は `runtime_shaders` を有効にしており、アプリの起動時に macOS の Metal API でシェーダーをコンパイルします。フル版 Xcode と追加の Metal Toolchain のダウンロードは不要です。[Apple の Command Line Tools ガイド](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)
+- セットアップは不足しているツールの導入コマンドを表示します。公式インストーラーを開く、または実行する場合は対話端末で確認します。Rust と Cargo の依存関係の取得にはインターネット接続が必要です。初回のビルドには時間がかかります。
+- 既定ではサンプル `examples/lab` を開きます。手元のプロジェクトを使う場合は `sh scripts/setup-unix.sh --project "$HOME/my-project"` のようにホームディレクトリ内の既存フォルダーを渡します。
+- サーバーはログインユーザーの LaunchAgent から `127.0.0.1:7878` で起動します。セットアップはクライアントの接続モードを「外部」に設定します。クライアントから同じ Mac のサーバーに接続する際にトークンは不要です。クライアントを開いたまま更新する場合は、次回起動時に新しい実行ファイルが使われます。
+- Claude Code と Codex CLI の有無とログイン状態が表示されます。会話を試すには、自分の Mac で `claude auth login` または `codex login` を実行します。状態を再確認するには `sh scripts/install-server.sh --check-agents` を実行します。CLI を確認せずにセットアップするには `--skip-agents` を使います。
+
+クローンから更新するときは、クライアントを閉じて `git pull --ff-only` を実行し、同じ `--project` の指定でセットアップを再実行します。サーバーの起動確認が通ってからクライアントのランチャーを切り替えます。
+サーバーのログは `~/Library/Logs/fuzukue/` にあり、LaunchAgent の状態と停止方法は [配布版の接続手順](#3-起動して接続する) と共通です。削除するときはクローンで `sh scripts/install-client.sh --uninstall` と `sh scripts/install-server.sh --uninstall` を実行します。
+サーバーのソース自己更新によるサービスの切り替えは Linux の組み込み systemd サービス用です。Mac の自動更新を使うには、以下の手順で公開された配布版へ移行します。
+
+Mac には Linux の Bubblewrap による作業役・レシピのホスト隔離がありません。CLI の通常の確認を使い、最初は専用フォルダーで短い会話とファイルの表示を試します。
+
+## 配布版へ切り替える
+
+案内されたプリリリースにサーバーとクライアント両方のパッケージがそろったら、同じクローンで以下の配布版インストーラーを実行できます。サーバーの LaunchAgent を登録するコマンドには、使い続けたいプロジェクトフォルダーを渡します。配布版のインストール後は LaunchAgent が GitHub Releases のベータ版を確認します。
+
+### 1. 準備する
 
 - 「ターミナル」で `uname -m` と `sw_vers -productVersion` を実行します。Apple Silicon ではネイティブのターミナルを使い、`arm64` と表示されることを確かめます。Intel Mac では `x86_64` です。
 - `python3 --version` で Python 3.8 以降を確認します。入っていなければ [Python の macOS インストーラー](https://www.python.org/downloads/macos/)を使えます。ベータ版の実行に Rust や Xcode は不要です。Git などを使うときに macOS から求められた場合は `xcode-select --install` で Command Line Tools を入れます。
 - 会話を試すには、Claude Code か Codex CLI のどちらか一つに、自分の Mac の同じユーザーでログインします。サーバーのインストール時に CLI の有無と版、ログインの有無が表示されます。両方がなくても、サーバーの起動とファイルの表示を試せます。
 
-最初の試用はホーム配下の専用フォルダーで行います。Mac には Linux の Bubblewrap による作業役・レシピのホスト隔離がありません。CLI の通常の確認を使い、まず短い会話とファイルの表示を試します。
+### 2. インストールする
 
-## 2. インストールする
-
-[GitHub Releases](https://github.com/momota1029/fuzukue/releases) から、案内されたプリリリースの **Source code (zip)** を取得して展開します。ターミナルで展開したフォルダーに移動します。以下の `v0.2.0-beta.1` は例です。案内されたタグに置き換え、サーバーとクライアントに同じタグを使います。
+クローンがある場合はクローンのルートから実行します。配布版から始める場合は [GitHub Releases](https://github.com/momota1029/fuzukue/releases) から案内されたプリリリースの **Source code (zip)** を取得し、展開したフォルダーでターミナルを開きます。以下の `v0.2.0-beta.1` は例です。案内されたタグに置き換え、サーバーとクライアントに同じタグを使います。
 
 ```sh
 export FUZUKUE_CHANNEL=beta FUZUKUE_VERSION=v0.2.0-beta.1
@@ -38,7 +66,7 @@ fuzukue --version
 
 ランチャーは `~/.local/bin`、版ごとの実行ファイルは `~/Library/Application Support/fuzukue/install/server` と `client` に入ります。 `--version` はランチャーが選んだタグを表示します。`export PATH=…` を新しいターミナルでも使うなら `~/.zshrc` に入れます。フルパスの `"$HOME/.local/bin/secretaire"` と `"$HOME/.local/bin/fuzukue"` でも起動できます。
 
-### 「開発元を検証できない」と表示されたとき
+#### 「開発元を検証できない」と表示されたとき
 
 このベータ版はアドホック署名で配布するため、ダウンロード方法や macOS の設定によって Gatekeeper が起動を止めることがあります。起動を一度試した後、「システム設定」→「プライバシーとセキュリティ」の「このまま開く」が表示される場合は、配布元を確認したうえで選びます。 [Apple の案内](https://support.apple.com/ja-jp/102445)
 
@@ -52,7 +80,7 @@ xattr -p com.apple.quarantine "$exe"
 xattr -d com.apple.quarantine "$exe"
 ```
 
-## 3. 起動して接続する
+### 3. 起動して接続する
 
 ターミナルで試用フォルダーを作り、ログイン中の自分のユーザーに LaunchAgent を登録します。LaunchAgent は登録時のターミナルの PATH と一般的な CLI の保存先を使います。独自の場所に CLI や Node.js がある場合は、その場所を先に PATH に通します。作業履歴など Git を使う機能を試す場合は `git init "$HOME/fuzukue-dogfood"` も実行します。
 
@@ -74,7 +102,7 @@ FUZUKUE_URL=ws://127.0.0.1:7878/ws "$HOME/.local/bin/fuzukue"
 
 ログは `~/Library/Logs/fuzukue/` に出ます。状態は `launchctl print "gui/$(id -u)/com.fuzukue.secretaire"` で確認できます。一時停止には `launchctl bootout "gui/$(id -u)/com.fuzukue.secretaire"` を使います。次回ログイン時には再び起動します。ログインし直さず起動するには、同じインストールコマンドを再実行します。
 
-### ターミナルで直接起動する
+#### ターミナルで直接起動する
 
 LaunchAgent の登録や CLI の認証で困った場合は、登録済みのサーバーを一時停止してから次を実行します。この起動方法ではインストーラーを手動で再実行して更新します。サーバーを止めるにはターミナルで Ctrl-C を押します。
 
@@ -82,7 +110,7 @@ LaunchAgent の登録や CLI の認証で困った場合は、登録済みのサ
 FUZUKUE_ADDR=127.0.0.1:7878 "$HOME/.local/bin/secretaire" "$HOME/fuzukue-dogfood"
 ```
 
-## 4. 更新する・戻す・外す
+### 4. 更新する・戻す・外す
 
 LaunchAgent で使う場合、自動更新は既定でオンです。ログイン時、起動時とおおむね 1 時間ごとに、公開 GitHub Releases の beta をトークンなしで確認します。初回に指定した `FUZUKUE_VERSION` は初回導入のタグです。更新は今より新しく、両方のパッケージがそろった版を選びます。
 
@@ -111,6 +139,6 @@ sh scripts/install-server.sh --uninstall
 
 登録と実行ファイルを外し、設定、サーバーの状態、ログ、作業フォルダーを残します。設定は通常 `~/Library/Application Support/fuzukue/`、サーバーの状態は `${XDG_STATE_HOME:-$HOME/.local/state}/fuzukue/` にあります。
 
-## 5. 困ったとき
+### 5. 困ったとき
 
 案内を受けた相手に、macOS のバージョン、`uname -m`、両ランチャーの `--version`、止まった手順、表示されたエラーを伝えます。LaunchAgent なら `secretaire.err.log`、手動起動ならターミナルの末尾も添えられます。送る前にトークン、会話や原稿の内容、環境固有のパスを取り除きます。画面が開く場合は、PDF 表示、会話、再起動のうちどこまで通ったかも記録します。

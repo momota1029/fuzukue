@@ -17,7 +17,7 @@ brew install --cask mactex-no-gui
 #   Codex: https://developers.openai.com/codex
 ```
 
-クライアントのビルドには Xcode のコマンドラインツールが要る（`xcode-select --install`）。GPUI が Metal を使うため。
+クライアントのビルドには macOS SDK とコンパイラを含む Command Line Tools が要る（`xcode-select --install`）。GPUI はアプリの起動時に Metal シェーダーをコンパイルする。導入手順は [Mac のセットアップガイド](install-mac.md) を参照。
 
 ## 本を始める
 

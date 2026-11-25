@@ -1,5 +1,9 @@
 # サーバーをサービスとして動かす
 
+macOS と Linux でクローンからサーバーとクライアントをまとめて導入するには、[セットアップスクリプト](../README.ja.md#ソースから起動する) を使う。macOS では LaunchAgent、Linux では配布インストーラーと共通の `fuzukue-release.service` を登録する。Linux 側のログは `journalctl --user -u fuzukue-release.service` で見る。クローンの更新後はセットアップを再実行する。
+
+以下は `secretaire service` が管理する Linux 専用の `fuzukue.service` の手順。
+
 Linux / WSL2 で `secretaire` を systemd ユーザーサービスにすると、クライアントを開く前からサーバーを動かせる。
 起動時に指定したプロジェクトを開き、クライアントがつながっていなくても自動査読、Issue スレッド、長期目標などの処理が続く。
 その間も利用枠を消費し、利用枠が 95% を超えたときの作業停止は引き続き適用される。
