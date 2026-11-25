@@ -1,8 +1,11 @@
 //! プロジェクトと一緒に持ち運べる会話の記録。イベントは Hub と同じ順序で処理する。
 
 use fuzukue_proto::{GitHubActivity, GitHubAuthor, GitHubLink, GitHubPolicy, ThreadGitHub};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{BufWriter, Write};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::ops::{Deref, DerefMut};
+use std::time::{Instant, SystemTime};
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
@@ -189,6 +192,8 @@ struct Transcript {
     items: Vec<Entry>,
     index: HashMap<String, usize>,
     hidden_replies: HashSet<String>,
+    job_tools: HashMap<String, usize>,
+    job_children: HashMap<String, Vec<usize>>,
 }
 
 impl Transcript {
@@ -202,6 +207,12 @@ impl Transcript {
     }
 
     fn push(&mut self, entry: Entry) {
+        if let Some(job) = fuzukue_proto::delegate_job_id(&entry.meta.item, &entry.meta.actor) {
+            self.job_children.entry(job.into()).or_default().push(self.items.len());
+            if entry.meta.tool.is_some() {
+                *self.job_tools.entry(job.into()).or_default() += 1;
+            }
+        }
         self.index.insert(entry.meta.item.clone(), self.items.len());
         self.items.push(entry);
     }
@@ -583,7 +594,7 @@ impl Transcript {
         workers: Option<&BTreeSet<String>>,
         restore_tool: &impl Fn(ServerEvent) -> ServerEvent,
     ) -> Vec<ServerEvent> {
-        let (events, workers, before) = self.tail(id, workers, restore_tool);
+        let (events, workers, before) = self.tail(id, workers, false, restore_tool);
         before.map(|before| ServerEvent::ThreadHistoryStart { session: id.into(), before, workers })
             .into_iter().chain(events).collect()
     }
@@ -592,9 +603,10 @@ impl Transcript {
         &self,
         id: &str,
         workers: Option<&BTreeSet<String>>,
+        compact: bool,
         restore_tool: &impl Fn(ServerEvent) -> ServerEvent,
     ) -> (Vec<ServerEvent>, Vec<String>, Option<u64>) {
-        let (tail, first) = self.replay_before(id, self.items.len(), restore_tool);
+        let (tail, first) = self.replay_before(id, self.items.len(), compact, restore_tool);
         // Include workers whose rows precede the contiguous tail.
         let active_entries: BTreeSet<_> = workers.into_iter().flatten()
             .filter_map(|job| self.index.get(job).copied())
@@ -602,7 +614,7 @@ impl Transcript {
             .collect();
         let workers = active_entries.iter().map(|&index| self.items[index].meta.item.clone()).collect();
         let events = active_entries.into_iter()
-            .flat_map(|index| self.events(id, &self.items[index..=index]).map(restore_tool))
+            .flat_map(|index| self.page_events(id, &self.items[index], compact, restore_tool))
             .chain(tail)
             .collect();
         (events, workers, (first != 0).then_some(first as u64))
@@ -612,6 +624,7 @@ impl Transcript {
         &self,
         id: &str,
         before: usize,
+        compact: bool,
         restore_tool: &impl Fn(ServerEvent) -> ServerEvent,
     ) -> (Vec<ServerEvent>, usize) {
         // Entry ordinals are stable as new entries append. The loaded
@@ -619,24 +632,125 @@ impl Transcript {
         let mut size = ReplaySize(0);
         let mut page = Vec::new();
         let mut first = before;
-        let start = before.saturating_sub(INITIAL_HISTORY_ENTRIES);
-        for index in (start..before).rev() {
-            let events: Vec<_> = self.events(id, &self.items[index..=index]).map(restore_tool).collect();
-            for event in &events {
-                serde_json::to_writer(&mut size, event).expect("serializable history event");
-            }
-            // Keep the newest entry whole even when it exceeds the byte budget.
-            if size.0 > INITIAL_HISTORY_BYTES && !page.is_empty() {
-                break;
+        let mut entries = 0;
+        for index in (0..before).rev() {
+            let entry = &self.items[index];
+            let events = self.page_events(id, entry, compact, restore_tool);
+            if !compact || !events.is_empty() {
+                for event in &events {
+                    serde_json::to_writer(&mut size, event).expect("serializable history event");
+                }
+                if entries >= INITIAL_HISTORY_ENTRIES || (!page.is_empty() && size.0 > INITIAL_HISTORY_BYTES) {
+                    break;
+                }
+                entries += 1;
             }
             first = index;
             page.extend(events.into_iter().rev());
-            if size.0 >= INITIAL_HISTORY_BYTES {
-                break;
+        }
+        if compact && before == self.items.len() {
+            // Jobs can occupy every slot in even a compact tail. Include the
+            // latest user/assistant exchange as sparse rows before that tail.
+            let present = |event: &ServerEvent| matches!(event,
+                ServerEvent::UserPrompt { to_worker: false, .. }
+                | ServerEvent::TextDelta { actor: Actor::User | Actor::Claude, .. }
+                | ServerEvent::TextDelta { actor: Actor::Codex { parent_tool_use: None, .. }, .. }
+            );
+            let mut needs_user = !page.iter().any(|event| matches!(event,
+                ServerEvent::UserPrompt { to_worker: false, .. } | ServerEvent::TextDelta { actor: Actor::User, .. }));
+            let mut needs_partner = !page.iter().any(|event| matches!(event,
+                ServerEvent::TextDelta { actor: Actor::Claude | Actor::Codex { parent_tool_use: None, .. }, .. }));
+            for entry in self.items[..first].iter().rev().filter(|entry| entry.meta.tool.is_none()) {
+                if !needs_user && !needs_partner { break; }
+                if !(entry.meta.actor == Actor::User && needs_user || crate::routing::is_partner(&entry.meta.actor) && needs_partner) {
+                    continue;
+                }
+                let events = self.page_events(id, entry, true, restore_tool);
+                if events.iter().any(present) {
+                    needs_user &= entry.meta.actor != Actor::User;
+                    needs_partner &= !crate::routing::is_partner(&entry.meta.actor);
+                    page.extend(events.into_iter().rev());
+                }
             }
         }
         page.reverse();
         (page, first)
+    }
+
+    fn replay_from(&self, id: &str, start: usize, compact: bool) -> (Vec<ServerEvent>, Option<u64>) {
+        let mut size = ReplaySize(0);
+        let mut page = Vec::new();
+        let mut end = start;
+        let mut entries = 0;
+        for entry in &self.items[start..] {
+            let events = self.page_events(id, entry, compact, &bound_history_tool);
+            if !compact || !events.is_empty() {
+                if entries >= INITIAL_HISTORY_ENTRIES { break; }
+                entries += 1;
+            }
+            for event in &events {
+                serde_json::to_writer(&mut size, event).expect("serializable history event");
+            }
+            if size.0 > INITIAL_HISTORY_BYTES && !page.is_empty() {
+                break;
+            }
+            end += 1;
+            page.extend(events);
+            if size.0 >= INITIAL_HISTORY_BYTES {
+                break;
+            }
+        }
+        (page, (end < self.items.len()).then_some(end as u64))
+    }
+
+    fn page_events(
+        &self, id: &str, entry: &Entry, compact: bool,
+        restore_tool: &impl Fn(ServerEvent) -> ServerEvent,
+    ) -> Vec<ServerEvent> {
+        if compact && fuzukue_proto::delegate_job_id(&entry.meta.item, &entry.meta.actor).is_some() {
+            return Vec::new();
+        }
+        self.events(id, std::slice::from_ref(entry)).filter_map(|event| {
+            let event = restore_tool(event);
+            if compact {
+                compact_job_event(event, |job| self.job_tools.get(job).copied())
+            } else {
+                Some(event)
+            }
+        }).collect()
+    }
+
+    fn job_details(&self, id: &str, job: &str, before: Option<u64>) -> (Vec<ServerEvent>, Option<u64>) {
+        let Some(&root) = self.index.get(job) else { return (Vec::new(), None) };
+        let mut events: Vec<_> = if before.is_none() {
+            self.events(id, &self.items[root..=root]).collect()
+        } else {
+            Vec::new()
+        };
+        let mut size = ReplaySize(0);
+        for event in &events {
+            serde_json::to_writer(&mut size, event).expect("serializable job event");
+        }
+        let mut children = Vec::new();
+        let indices: &[usize] = self.job_children.get(job).map_or(&[], Vec::as_slice);
+        let end = indices.partition_point(|&index| before.is_none_or(|before| (index as u64) < before));
+        let mut first = end;
+        for index in (end.saturating_sub(INITIAL_HISTORY_ENTRIES)..end).rev() {
+            let entry = &self.items[indices[index]];
+            let entry_events: Vec<_> = self.events(id, std::slice::from_ref(entry)).collect();
+            for event in &entry_events {
+                serde_json::to_writer(&mut size, event).expect("serializable job event");
+            }
+            if size.0 > INITIAL_HISTORY_BYTES && !children.is_empty() {
+                break;
+            }
+            first = index;
+            children.extend(entry_events.into_iter().rev());
+            if size.0 >= INITIAL_HISTORY_BYTES { break; }
+        }
+        events.extend(children.into_iter().rev());
+        let next_before = (first > 0 && first < end).then(|| indices[first] as u64);
+        (events, next_before)
     }
 
     fn events<'a>(&'a self, id: &'a str, entries: &'a [Entry]) -> impl Iterator<Item = ServerEvent> + 'a {
@@ -762,10 +876,125 @@ pub(crate) struct LibraryMessage {
     pub text: String,
 }
 
+// Clean transcripts can be discarded. Pending mutations keep their transcript
+// until the portable file has been successfully replaced.
+struct TranscriptSlot {
+    source: Option<TranscriptSource>,
+    loaded: OnceCell<LoadedTranscript>,
+    dirty: Cell<bool>,
+    accessed: Cell<Instant>,
+}
+
+struct TranscriptSource {
+    path: PathBuf,
+    session: String,
+    legacy: Option<String>,
+    after: u64,
+    timeline: state::Timeline,
+}
+
+struct LoadedTranscript {
+    value: Transcript,
+    error: Option<String>,
+    weight: usize,
+}
+
+impl TranscriptSlot {
+    fn new(value: Transcript) -> Self {
+        Self {
+            source: None,
+            loaded: OnceCell::from(LoadedTranscript { value, error: None, weight: 0 }),
+            dirty: Cell::new(false),
+            accessed: Cell::new(Instant::now()),
+        }
+    }
+
+    fn lazy(source: TranscriptSource) -> Self {
+        Self {
+            source: Some(source),
+            loaded: OnceCell::new(),
+            dirty: Cell::new(false),
+            accessed: Cell::new(Instant::now()),
+        }
+    }
+
+    fn get(&self) -> &LoadedTranscript {
+        self.accessed.set(Instant::now());
+        self.loaded.get_or_init(|| {
+            let source = self.source.as_ref().expect("unloaded transcript has a source");
+            match source.read() {
+                Ok((value, weight)) => LoadedTranscript { value, weight, error: None },
+                Err(error) => {
+                    tracing::warn!(path=?source.path, %error, "could not open transcript");
+                    LoadedTranscript { value: Transcript::default(), weight: 0, error: Some(format!("{error:#}")) }
+                }
+            }
+        })
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(error) = &self.get().error {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+
+    fn cache_weight(&self) -> Option<usize> {
+        let data = self.loaded.get()?;
+        (self.source.is_some() && !self.dirty.get()).then(|| {
+            data.weight.max(data.value.items.len() * (std::mem::size_of::<Entry>() + 256))
+        })
+    }
+}
+
+impl Deref for TranscriptSlot {
+    type Target = Transcript;
+
+    fn deref(&self) -> &Transcript {
+        &self.get().value
+    }
+}
+
+impl DerefMut for TranscriptSlot {
+    fn deref_mut(&mut self) -> &mut Transcript {
+        self.get();
+        self.dirty.set(true);
+        &mut self.loaded.get_mut().unwrap().value
+    }
+}
+
+impl TranscriptSource {
+    fn read(&self) -> Result<(Transcript, usize)> {
+        let text = std::fs::read_to_string(&self.path)?;
+        let (_, body) = fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
+        let mut transcript = Transcript::read(body)?;
+        let mut recovered = Transcript::default();
+        let mut weight = text.len();
+        self.timeline.visit_session(&self.session, |env, bytes| {
+            if env.seq > self.after {
+                weight = weight.saturating_add(bytes as usize);
+                recovered.observe(&env.event);
+            }
+        });
+        transcript.merge(recovered);
+        if let Some(legacy) = &self.legacy {
+            self.timeline.visit_session(legacy, |env, bytes| {
+                if env.seq > self.after {
+                    weight = weight.saturating_add(bytes as usize);
+                    transcript.restore_tool(env.event);
+                }
+            });
+        }
+        transcript.hide_saved_blank_replies();
+        Ok((transcript, weight))
+    }
+}
+
 struct Thread {
     path: PathBuf,
     front: Front,
-    transcript: Transcript,
+    transcript: TranscriptSlot,
+    page_revision: u64,
     library_revision: u64,
     library_updated: i64,
     active: bool,
@@ -780,7 +1009,8 @@ impl Thread {
         Ok(Self {
             path,
             front: serde_yaml::from_str(front)?,
-            transcript: Transcript::read(body)?,
+            transcript: TranscriptSlot::new(Transcript::read(body)?),
+            page_revision: 0,
             library_revision: 0,
             library_updated: 0,
             active: false,
@@ -788,7 +1018,29 @@ impl Thread {
         })
     }
 
+    fn read_lazy(path: PathBuf, timeline: &state::Timeline) -> Result<Self> {
+        let mut input = BufReader::new(std::fs::File::open(&path)?);
+        let mut text = String::new();
+        input.read_line(&mut text)?;
+        ensure!(matches!(text.as_str(), "---\n" | "---\r\n"), "missing thread front matter");
+        loop {
+            let start = text.len();
+            ensure!(input.read_line(&mut text)? != 0, "unterminated thread front matter");
+            if matches!(&text[start..], "---" | "---\n" | "---\r\n") {
+                break;
+            }
+        }
+        let (front, _) = fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
+        let front: Front = serde_yaml::from_str(front)?;
+        let transcript = TranscriptSlot::lazy(TranscriptSource {
+            path: path.clone(), session: front.id.clone(), legacy: front.migrated_from.clone(),
+            after: 0, timeline: timeline.clone(),
+        });
+        Ok(Self { path, front, transcript, page_revision: 0, library_revision: 0, library_updated: 0, active: false, suggestions: Vec::new() })
+    }
+
     fn save(&self) -> Result<()> {
+        self.transcript.check()?;
         let dir = self.path.parent().context("missing thread directory")?;
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         {
@@ -798,6 +1050,7 @@ impl Thread {
             output.flush()?;
         }
         tmp.persist(&self.path)?;
+        self.transcript.dirty.set(false);
         Ok(())
     }
 
@@ -964,6 +1217,83 @@ fn record_delegate_name(input: &mut serde_json::Value, change: &fuzukue_proto::D
     input["label_source"] = serde_json::json!(change.label_source);
 }
 
+/// Use the ordinary job row events with a small summary payload. Child events
+/// remain in the journal and are sent only to a connection that opens the job.
+pub(crate) fn compact_job_event(
+    mut event: ServerEvent, count: impl FnOnce(&str) -> Option<usize>,
+) -> Option<ServerEvent> {
+    if let Some((session, job)) = event.worker_child() {
+        return match event {
+            ServerEvent::ToolCall { .. } => count(job).map(|tools| ServerEvent::ThreadJobActivity {
+                session: session.into(), job: job.into(), tools,
+            }),
+            _ => None,
+        };
+    }
+    match &mut event {
+        ServerEvent::ToolCall { item, name, input, .. }
+            if item.starts_with(fuzukue_proto::DELEGATE_JOB) && name == "delegate" =>
+        {
+            if let Some(fields) = input.as_object_mut() {
+                fields.retain(|key, _| matches!(key.as_str(),
+                    "agent" | "title" | "label" | "label_source" | "card_id" | "queued_at_ms"
+                    | "model" | "started_at_ms" | "dismissed_from_panel"));
+                fields.insert("details_deferred".into(), true.into());
+                fields.insert("tool_count".into(), count(item).unwrap_or(0).into());
+            }
+        }
+        ServerEvent::ToolResult { item, output, .. } if item.starts_with(fuzukue_proto::DELEGATE_JOB) => {
+            if let Ok(mut report) = serde_json::from_str::<fuzukue_proto::DelegateReport>(output) {
+                report.text.clear();
+                report.changes.clear();
+                report.attempts.clear();
+                report.files = None;
+                *output = serde_json::to_string(&report).expect("serializable job report");
+            } else {
+                output.clear();
+            }
+        }
+        ServerEvent::DelegateProgress { .. } => return None,
+        _ => {}
+    }
+    Some(event)
+}
+
+pub(crate) fn bound_history_tool(mut event: ServerEvent) -> ServerEvent {
+    // Delegate reports drive the worker panel and require their typed payload.
+    const LIMIT: usize = 32 * 1024;
+    match &mut event {
+        ServerEvent::ToolResult { item, output, .. }
+            if !item.starts_with(fuzukue_proto::DELEGATE_JOB) && output.len() > LIMIT =>
+        {
+            let end = output.floor_char_boundary(LIMIT - '…'.len_utf8());
+            output.truncate(end);
+            output.push('…');
+        }
+        ServerEvent::ToolCall { item, input, .. }
+            if !item.starts_with(fuzukue_proto::DELEGATE_JOB) =>
+        {
+            struct Limit(usize);
+            impl Write for Limit {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+                        std::io::Error::other("history tool input exceeds byte budget")
+                    })?;
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            if serde_json::to_writer(Limit(LIMIT), &*input).is_err() {
+                *input = serde_json::json!({"truncated": true});
+            }
+        }
+        _ => {}
+    }
+    event
+}
+
 pub fn history_session(event: &ServerEvent) -> Option<&str> {
     match event {
         ServerEvent::LocalNotice { session, .. }
@@ -986,28 +1316,107 @@ pub fn history_session(event: &ServerEvent) -> Option<&str> {
     }
 }
 
+const CACHE_PAGE_BYTES: usize = 1024 * 1024;
+
+type SessionStamp = [Option<(u64, u64)>; 2];
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HistoryRevision {
+    modified: SystemTime,
+    length: u64,
+    journal: SessionStamp,
+    legacy: Option<SessionStamp>,
+    after: u64,
+}
+
+impl Thread {
+    fn history_revision(&self) -> Option<HistoryRevision> {
+        if self.transcript.dirty.get() {
+            return None;
+        }
+        let source = self.transcript.source.as_ref()?;
+        let metadata = self.path.metadata().ok()?;
+        Some(HistoryRevision {
+            modified: metadata.modified().ok()?,
+            length: metadata.len(),
+            journal: source.timeline.session_stamp(&self.front.id),
+            legacy: source.legacy.as_ref().map(|id| source.timeline.session_stamp(id)),
+            after: source.after,
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum PagePosition {
+    Tail(BTreeSet<String>),
+    Before(u64),
+    From(u64),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum PageRevision {
+    Tail(HistoryRevision),
+    Completed { generation: u64, revision: u64 },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PageKey {
+    session: String,
+    revision: PageRevision,
+    position: PagePosition,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct HistoryPage {
+    events: Vec<ServerEvent>,
+    next: Option<u64>,
+    #[serde(default)]
+    workers: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TailCheckpoint {
+    revision: HistoryRevision,
+    workers: BTreeSet<String>,
+    page: HistoryPage,
+}
+
 pub struct Store {
     project: PathBuf,
     state_dir: PathBuf,
+    timeline: state::Timeline,
     threads: BTreeMap<String, Thread>,
     migrations: HashMap<String, String>,
     restored_generations: HashMap<String, u64>,
+    pages: RefCell<VecDeque<(PageKey, HistoryPage)>>,
     pub partner_default: ChatSettings,
     pub worker_default: DelegateSettings,
     pub worker_default_configured: bool,
 }
 
 impl Store {
+    #[cfg(test)]
     pub fn load(
         project: &Path,
         state_dir: &Path,
         records: &BTreeMap<String, state::SessionRecord>,
     ) -> Self {
+        Self::load_indexed(project, state_dir, records, state::Timeline::open(state_dir))
+    }
+
+    pub(crate) fn load_indexed(
+        project: &Path,
+        state_dir: &Path,
+        records: &BTreeMap<String, state::SessionRecord>,
+        timeline: state::Timeline,
+    ) -> Self {
         let mut store = Self {
             project: project.into(),
             state_dir: state_dir.into(),
+            timeline,
             threads: BTreeMap::new(),
             restored_generations: HashMap::new(),
+            pages: RefCell::new(VecDeque::new()),
             migrations: std::fs::read(state_dir.join("removed-thread-migrations.json")).ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default(),
             partner_default: state::load_partner_default(state_dir),
@@ -1027,7 +1436,7 @@ impl Store {
             {
                 continue;
             }
-            match Thread::read(entry.path()) {
+            match Thread::read_lazy(entry.path(), &store.timeline) {
                 Ok(mut thread) if is_thread(&thread.front.id) => {
                     if let Some(deck) = thread.front.promoted_to.take() {
                         if !thread.front.attached.contains(&deck) {
@@ -1049,82 +1458,79 @@ impl Store {
             }
         }
 
-        // Recover a turn that was in progress when the server stopped from the local journal.
-        let mut recovered = HashMap::<String, Transcript>::new();
-        let mut legacy = HashMap::<String, Option<(u64, Transcript)>>::new();
-        let mut last_legacy_seq = 0;
-        let mut legacy_tools = HashMap::<String, Vec<ServerEvent>>::new();
-        state::read_timeline(state_dir, |env| {
-            if let Some(id) = history_session(&env.event) {
-                if store.contains(id) {
-                    recovered.entry(id.into()).or_default().observe(&env.event);
-                } else if is_legacy_session(id) {
-                    last_legacy_seq = env.seq;
-                    let migration = legacy.entry(id.into()).or_insert_with(|| {
-                        (store.migrated_thread(id).is_none() && old_migration_id(id).is_some())
-                            .then(|| (0, Transcript::default()))
-                    });
-                    if let Some((last, transcript)) = migration {
-                        *last = env.seq;
-                        transcript.observe(&env.event);
-                    }
-                    if matches!(
-                        env.event,
-                        ServerEvent::ToolCall { .. } | ServerEvent::ToolResult { .. }
-                    ) {
-                        legacy_tools.entry(id.into()).or_default().push(env.event);
-                    }
+        // Discover legacy aliases from offsets. Only sessions without an existing
+        // portable transcript need to be materialized for migration.
+        let mut migrations = Vec::new();
+        for session in store.timeline.sessions().into_iter().filter(|session| is_legacy_session(session)) {
+            if let Some(id) = store.migrated_thread(&session).map(str::to_owned) {
+                if let Some(source) = store.threads.get_mut(&id).and_then(|t| t.transcript.source.as_mut()) {
+                    source.legacy.get_or_insert(session);
                 }
+            } else if old_migration_id(&session).is_some() {
+                migrations.push(session);
             }
-        });
-        for (id, transcript) in recovered {
-            store
-                .threads
-                .get_mut(&id)
-                .unwrap()
-                .transcript
-                .merge(transcript);
         }
-        let mut migrations = legacy
-            .into_iter()
-            .filter_map(|(session, entry)| entry.map(|entry| (session, entry)))
-            .peekable();
-        if migrations.peek().is_some() {
+        if !migrations.is_empty() {
             let tabs = workspace::scan(project, &[]);
             let timestamp = state::legacy_timeline_timestamp(state_dir)
                 .unwrap_or_else(|| now().timestamp_millis());
-            for (session, (last, transcript)) in migrations {
-                // Old envelopes carry sequence numbers but no per-event timestamps.
-                let seq_distance = last_legacy_seq.saturating_sub(last);
-                let updated =
-                    timestamp.saturating_sub(i64::try_from(seq_distance).unwrap_or(i64::MAX));
-                let session_id = records
-                    .get(&session)
-                    .and_then(|record| record.claude_session_id.clone());
-                if let Err(e) = store.migrate(&session, session_id, transcript, &tabs, updated) {
-                    tracing::warn!("could not migrate {session}: {e:#}");
+            let last_seq = store.timeline.latest_legacy_sequence();
+            for session in migrations {
+                let mut transcript = Transcript::default();
+                let mut last = 0;
+                store.timeline.visit_session(&session, |env, _| {
+                    last = env.seq;
+                    transcript.observe(&env.event);
+                    transcript.restore_tool(env.event);
+                });
+                transcript.hide_saved_blank_replies();
+                let updated = timestamp.saturating_sub(i64::try_from(last_seq.saturating_sub(last)).unwrap_or(i64::MAX));
+                let session_id = records.get(&session).and_then(|record| record.claude_session_id.clone());
+                if let Err(error) = store.migrate(&session, session_id, transcript, &tabs, updated) {
+                    tracing::warn!("could not migrate {session}: {error:#}");
                 }
             }
         }
-        for (session, events) in legacy_tools {
-            let id = store.migrated_thread(&session).map(str::to_owned);
-            if let Some(thread) = id.and_then(|id| store.threads.get_mut(&id)) {
-                for event in events {
-                    thread.transcript.restore_tool(event);
-                }
+        // Artifact and comment-application recovery updates metadata advertised
+        // in the workspace snapshot. Inspect just the sessions that can need it.
+        let recovery_sessions = store.timeline.snapshot_recovery_sessions();
+        for session in recovery_sessions {
+            let id = store.migrated_thread(&session).unwrap_or(&session).to_owned();
+            let Some(thread) = store.threads.get_mut(&id) else { continue };
+            if thread.transcript.check().is_err() {
+                continue;
             }
-        }
-        for thread in store.threads.values_mut() {
-            thread.transcript.hide_saved_blank_replies();
             let recovered = thread.recover_artifacts(project);
             let interrupted = thread.finish_interrupted_applications();
             if recovered || interrupted {
                 if let Err(error) = thread.save() {
                     tracing::warn!("could not upgrade {}: {error:#}", thread.path.display());
                 }
+            } else {
+                thread.transcript.dirty.set(false);
             }
+            store.trim_transcripts();
         }
         store
+    }
+
+    pub(crate) fn trim_transcripts(&mut self) {
+        const CACHE_THREADS: usize = 8;
+        const CACHE_BYTES: usize = 24 * 1024 * 1024;
+
+        let mut cached: Vec<_> = self.threads.values_mut().filter_map(|thread| {
+            (!thread.active).then(|| thread.transcript.cache_weight())
+                .flatten()
+                .map(|weight| (thread.transcript.accessed.get(), weight, &mut thread.transcript))
+        }).collect();
+        cached.sort_unstable_by_key(|(accessed, _, _)| std::cmp::Reverse(*accessed));
+        let mut total: usize = 0;
+        for (rank, (_, weight, transcript)) in cached.into_iter().enumerate() {
+            total = total.saturating_add(weight);
+            if rank >= CACHE_THREADS || total > CACHE_BYTES {
+                transcript.loaded.take();
+            }
+        }
     }
 
     fn migrated_thread(&self, session: &str) -> Option<&str> {
@@ -1224,17 +1630,19 @@ impl Store {
     }
 
     pub(crate) fn library_threads(
-        &self,
+        &mut self,
         known: impl Fn(&str, &LibraryStamp) -> bool,
     ) -> Vec<LibraryThread> {
-        self.threads.iter().map(|(id, thread)| {
+        let ids: Vec<_> = self.threads.keys().cloned().collect();
+        ids.into_iter().map(|id| {
+            let thread = &self.threads[&id];
             let stamp = LibraryStamp {
                 title: thread.front.title.clone(),
                 decks: thread.front.attached.clone(),
                 updated: thread.front.updated.max(thread.library_updated),
                 revision: thread.library_revision,
             };
-            let messages = (!known(id, &stamp)).then(|| {
+            let messages = (!known(&id, &stamp)).then(|| {
                 thread.transcript.items.iter().enumerate()
                     .filter(|(_, entry)| {
                         !entry.meta.superseded && entry.meta.tool.is_none() && !entry.meta.is_delegated()
@@ -1247,7 +1655,8 @@ impl Store {
                     })
                     .collect()
             });
-            LibraryThread { id: id.clone(), stamp, messages }
+            self.trim_transcripts();
+            LibraryThread { id, stamp, messages }
         }).collect()
     }
 
@@ -1319,14 +1728,95 @@ impl Store {
         Some(self.restored_generations.get(id).copied().unwrap_or(0))
     }
 
+    fn completed_page_key(&self, id: &str, thread: &Thread, position: PagePosition) -> PageKey {
+        PageKey {
+            session: id.into(), position,
+            revision: PageRevision::Completed {
+                generation: self.restored_generations.get(id).copied().unwrap_or(0),
+                revision: thread.page_revision,
+            },
+        }
+    }
+
+    fn cached_page(&self, key: &PageKey) -> Option<HistoryPage> {
+        let mut pages = self.pages.borrow_mut();
+        let position = pages.iter().position(|(cached, _)| cached == key)?;
+        let entry = pages.remove(position).unwrap();
+        let page = entry.1.clone();
+        pages.push_front(entry);
+        Some(page)
+    }
+
+    fn cache_page(&self, key: PageKey, page: HistoryPage) {
+        let mut size = ReplaySize(0);
+        if serde_json::to_writer(&mut size, &page).is_err() || size.0 > CACHE_PAGE_BYTES {
+            return;
+        }
+        let mut pages = self.pages.borrow_mut();
+        pages.push_front((key, page));
+        pages.truncate(8);
+    }
+
+    fn checkpoint_path(&self, id: &str) -> PathBuf {
+        self.state_dir.join("thread-tails-v1").join(format!("{:x}.json", Sha256::digest(id.as_bytes())))
+    }
+
+    fn read_tail_checkpoint(&self, key: &PageKey, workers: &BTreeSet<String>) -> Option<HistoryPage> {
+        let file = std::fs::File::open(self.checkpoint_path(&key.session)).ok()?;
+        if file.metadata().ok()?.len() > CACHE_PAGE_BYTES as u64 { return None; }
+        let mut bytes = Vec::new();
+        file.take(CACHE_PAGE_BYTES as u64 + 1).read_to_end(&mut bytes).ok()?;
+        let saved: TailCheckpoint = serde_json::from_slice(&bytes).ok()?;
+        (PageRevision::Tail(saved.revision) == key.revision && &saved.workers == workers).then_some(saved.page)
+    }
+
+    fn write_tail_checkpoint(&self, key: &PageKey, workers: &BTreeSet<String>, page: &HistoryPage) -> Result<()> {
+        let path = self.checkpoint_path(&key.session);
+        let dir = path.parent().unwrap();
+        let PageRevision::Tail(revision) = &key.revision else { return Ok(()) };
+        let encoded = serde_json::to_vec(&TailCheckpoint {
+            revision: revision.clone(), workers: workers.clone(), page: page.clone(),
+        })?;
+        if encoded.len() > CACHE_PAGE_BYTES { return Ok(()); }
+        std::fs::create_dir_all(dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(&encoded)?;
+        file.persist(path)?;
+        Ok(())
+    }
+
     pub(crate) fn history_tail(
         &self,
         id: &str,
         workers: &BTreeSet<String>,
+        compact: bool,
         restore_tool: impl Fn(ServerEvent) -> ServerEvent,
     ) -> Option<(Vec<ServerEvent>, Vec<String>, Option<u64>)> {
         let thread = self.threads.get(id).filter(|thread| thread.path.is_file())?;
-        Some(thread.transcript.tail(id, Some(workers), &restore_tool))
+        let key = compact.then(|| thread.history_revision()).flatten().map(|revision| PageKey {
+            session: id.into(), revision: PageRevision::Tail(revision),
+            position: PagePosition::Tail(workers.clone()),
+        });
+        if let Some(key) = &key {
+            if let Some(page) = self.cached_page(key) {
+                return Some((page.events, page.workers, page.next));
+            }
+            if let Some(page) = self.read_tail_checkpoint(key, workers) {
+                let result = (page.events.clone(), page.workers.clone(), page.next);
+                self.cache_page(key.clone(), page);
+                return Some(result);
+            }
+        }
+        thread.transcript.check().ok()?;
+        let (events, sparse, next) = thread.transcript.tail(id, Some(workers), compact, &restore_tool);
+        if let Some(key) = key {
+            let page = HistoryPage { events: events.clone(), workers: sparse.clone(), next };
+            if let Err(error) = self.write_tail_checkpoint(&key, workers, &page) {
+                tracing::debug!(%error, session=id, "could not cache thread tail");
+            }
+            self.cache_page(key, page);
+        }
+        Some((events, sparse, next))
     }
 
     pub(crate) fn scoped_history_page(
@@ -1334,6 +1824,7 @@ impl Store {
         id: &str,
         before: u64,
         generation: Option<u64>,
+        compact: bool,
     ) -> Result<(Vec<ServerEvent>, Option<u64>), fuzukue_proto::ThreadHistoryFailure> {
         use fuzukue_proto::ThreadHistoryFailure::*;
         let thread = self.threads.get(id).ok_or(NotFound)?;
@@ -1343,17 +1834,65 @@ impl Store {
         if thread.front.archived || !thread.path.is_file() {
             return Err(Unavailable);
         }
-        self.history_page(id, before).ok_or(Stale)
+        self.history_page_mode(id, before, compact).ok_or(Stale)
     }
 
     pub(crate) fn history_page(&self, id: &str, before: u64) -> Option<(Vec<ServerEvent>, Option<u64>)> {
+        self.history_page_mode(id, before, false)
+    }
+
+    fn history_page_mode(&self, id: &str, before: u64, compact: bool) -> Option<(Vec<ServerEvent>, Option<u64>)> {
         let thread = self.threads.get(id).filter(|thread| !thread.front.archived && thread.path.is_file())?;
+        let key = compact.then(|| self.completed_page_key(id, thread, PagePosition::Before(before)));
+        if let Some(page) = key.as_ref().and_then(|key| self.cached_page(key)) {
+            return Some((page.events, page.next));
+        }
+        thread.transcript.check().ok()?;
         let before = usize::try_from(before).ok()?;
         if before == 0 || before > thread.transcript.items.len() {
             return None;
         }
-        let (events, first) = thread.transcript.replay_before(id, before, &|event| event);
-        Some((events, (first != 0).then_some(first as u64)))
+        let (events, first) = thread.transcript.replay_before(id, before, compact, &bound_history_tool);
+        let next = (first != 0).then_some(first as u64);
+        if let Some(key) = key.filter(|_| before < thread.transcript.items.len()) {
+            self.cache_page(key, HistoryPage { events: events.clone(), workers: Vec::new(), next });
+        }
+        Some((events, next))
+    }
+
+    pub(crate) fn history_from(
+        &self, id: &str, start: u64, generation: u64,
+    ) -> Result<(Vec<ServerEvent>, Option<u64>), fuzukue_proto::ThreadHistoryFailure> {
+        use fuzukue_proto::ThreadHistoryFailure::*;
+        let thread = self.threads.get(id).ok_or(NotFound)?;
+        if self.history_generation(id) != Some(generation) {
+            return Err(Stale);
+        }
+        if !thread.path.is_file() { return Err(Unavailable); }
+        let key = self.completed_page_key(id, thread, PagePosition::From(start));
+        if let Some(page) = self.cached_page(&key) {
+            return Ok((page.events, page.next));
+        }
+        thread.transcript.check().map_err(|_| Unavailable)?;
+        let start = usize::try_from(start).map_err(|_| Stale)?;
+        if start > thread.transcript.items.len() {
+            return Err(Stale);
+        }
+        let (events, next) = thread.transcript.replay_from(id, start, true);
+        if next.is_some() {
+            self.cache_page(key, HistoryPage { events: events.clone(), workers: Vec::new(), next });
+        }
+        Ok((events, next))
+    }
+
+    pub(crate) fn job_details(&self, session: &str, job: &str, before: Option<u64>) -> (Vec<ServerEvent>, Option<u64>) {
+        self.threads.get(session).filter(|thread| thread.path.is_file()).map_or_else(Default::default, |thread| {
+            thread.transcript.job_details(session, job, before)
+        })
+    }
+
+    pub(crate) fn job_tool_count(&self, session: &str, job: &str) -> Option<usize> {
+        self.threads.get(session)?.transcript.job_tools.get(job).copied()
     }
 
     pub(crate) fn delegate_target(&self, query: &str, session: Option<&str>) -> Result<(String, String)> {
@@ -1897,7 +2436,8 @@ impl Store {
                 worker_pinned: false,
                 agent_overrides: Default::default(),
             },
-            transcript: Transcript::default(),
+            transcript: TranscriptSlot::new(Transcript::default()),
+            page_revision: 0,
             library_revision: 0,
             library_updated: 0,
             active: false,
@@ -1917,7 +2457,11 @@ impl Store {
             "スレッドファイルが既にある: {}",
             thread.path.display()
         );
-        thread.transcript = transcript;
+        thread.transcript = TranscriptSlot::new(transcript);
+        thread.transcript.source = Some(TranscriptSource {
+            path: thread.path.clone(), session: thread.front.id.clone(),
+            legacy: migrated_from.map(str::to_owned), after: 0, timeline: self.timeline.clone(),
+        });
         thread.front.session_id = session_id;
         thread.front.migrated_from = migrated_from.map(str::to_owned);
         thread.save()?;
@@ -2221,6 +2765,8 @@ impl Store {
         }
         trash.file_unrecorded(app, fuzukue_proto::TrashKind::Thread, id.into(), thread.front.title.clone(), &thread.path)?;
         self.threads.remove(id);
+        self.pages.borrow_mut().retain(|(key, _)| key.session != id);
+        let _ = std::fs::remove_file(self.checkpoint_path(id));
         self.restored_generations.remove(id);
         Ok(())
     }
@@ -2233,6 +2779,11 @@ impl Store {
             self.migrations.insert(legacy.clone(), id.clone());
         }
         thread.transcript.hide_saved_blank_replies();
+        thread.transcript.source = Some(TranscriptSource {
+            path: thread.path.clone(), session: id.clone(), legacy: None,
+            after: generation, timeline: self.timeline.clone(),
+        });
+        thread.transcript.dirty.set(false);
         let events = thread.transcript.events(&id, &thread.transcript.items).collect();
         self.threads.insert(id.clone(), thread);
         self.restored_generations.insert(id.clone(), generation);
@@ -2243,8 +2794,10 @@ impl Store {
         -> Result<(T, Vec<String>)> {
         let thread = self.threads.get_mut(id).context("Thread not found")?;
         ensure!(!thread.active, "Thread is running");
-        let entries = &mut thread.transcript.items;
-        let hidden = &thread.transcript.hidden_replies;
+        thread.transcript.check()?;
+        let transcript: &mut Transcript = &mut thread.transcript;
+        let entries = &mut transcript.items;
+        let hidden = &transcript.hidden_replies;
         let index = entries.iter().rposition(|entry| entry.meta.actor == Actor::User && !entry.meta.to_worker)
             .context("No previous user message")?;
         let user = &entries[index];
@@ -2268,6 +2821,7 @@ impl Store {
             return Err(error);
         }
         thread.library_revision = thread.library_revision.wrapping_add(1);
+        thread.page_revision = thread.page_revision.wrapping_add(1);
         Ok((prompt, items))
     }
 
@@ -2346,10 +2900,33 @@ impl Store {
         (items, summary)
     }
 
+    pub(crate) fn prepare_event(&self, event: &ServerEvent) {
+        let Some(thread) = history_session(event).and_then(|id| self.threads.get(id)) else { return };
+        // Load before append so this event reaches the transcript exactly once.
+        if !matches!(event, ServerEvent::TurnActivity { .. } | ServerEvent::ThreadRestored { .. }) {
+            thread.transcript.get();
+        }
+    }
+
     pub fn observe(&mut self, event: &ServerEvent, completed: bool) -> Result<bool> {
         let Some(thread) = history_session(event).and_then(|id| self.threads.get_mut(id)) else {
             return Ok(false);
         };
+        if let ServerEvent::TurnActivity { running, .. } = event {
+            thread.active = *running;
+            return Ok(false);
+        }
+        if matches!(event, ServerEvent::ThreadRestored { .. }) {
+            return Ok(false);
+        }
+        thread.transcript.check()?;
+        if matches!(event,
+            ServerEvent::ToolResult { .. } | ServerEvent::DelegateRenamed { .. }
+            | ServerEvent::DelegateDismissed { .. } | ServerEvent::CommentApplication { .. }
+            | ServerEvent::MessageDetails { .. } | ServerEvent::ReplySuperseded { .. }
+        ) || matches!(event, ServerEvent::ToolCall { name, .. } if name == "delegate" || event.worker_child().is_some()) {
+            thread.page_revision = thread.page_revision.wrapping_add(1);
+        }
         if matches!(event, ServerEvent::TurnEnded { actor, .. } if crate::routing::is_partner(actor)) {
             // Older transcripts recorded turn endings without distinguishing failed turns.
             let previous = thread.front.completed_partner_turns.unwrap_or_else(|| {
@@ -2415,10 +2992,6 @@ impl Store {
             }
             ServerEvent::UserPrompt { to_worker: true, .. } => {
                 thread.save()?;
-                return Ok(false);
-            }
-            ServerEvent::TurnActivity { running, .. } => {
-                thread.active = *running;
                 return Ok(false);
             }
             ServerEvent::TurnEnded { actor, .. } => {
@@ -2620,6 +3193,89 @@ fn project_dir(project: &Path, name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod archive_tests {
+    #[test]
+    fn worker_activity_never_displaces_conversation_in_compact_history() {
+        use super::*;
+        use serde_json::json;
+
+        let session = "thread-synthetic";
+        let job = "delegate:synthetic";
+        let mut transcript = Transcript::default();
+        for (item, actor, text) in [("first", Actor::User, "Synthetic question"), ("reply", Actor::Claude, "Synthetic reply")] {
+            transcript.observe(&ServerEvent::TextDelta {
+                session: session.into(), item: item.into(), actor, text: text.into(),
+            });
+        }
+        transcript.observe(&ServerEvent::ToolCall {
+            session: session.into(), item: job.into(), actor: Actor::System, name: "delegate".into(),
+            input: json!({"model":"synthetic", "title":"Synthetic job", "started_at_ms":1}),
+        });
+        let output = "Synthetic worker output ".repeat(256);
+        for index in 0..(INITIAL_HISTORY_ENTRIES * 2) {
+            let item = format!("{job}:tool-{index}");
+            transcript.observe(&ServerEvent::ToolCall {
+                session: session.into(), item: item.clone(), name: "synthetic_tool".into(),
+                actor: Actor::Codex { thread_id: "worker".into(), parent_tool_use: Some(job.into()) },
+                input: json!({"detail":output}),
+            });
+            transcript.observe(&ServerEvent::ToolResult {
+                session: session.into(), item, ok: true, output: output.clone(),
+            });
+        }
+        let workers = BTreeSet::from([job.into()]);
+        let (legacy, _, _) = transcript.tail(session, Some(&workers), false, &bound_history_tool);
+        assert!(!legacy.iter().any(|event| matches!(event, ServerEvent::TextDelta { item, .. } if item == "reply")));
+        let (events, _, _) = transcript.tail(session, Some(&workers), true, &bound_history_tool);
+        assert!(events.iter().any(|event| matches!(event, ServerEvent::TextDelta { item, .. } if item == "first")));
+        assert!(events.iter().any(|event| matches!(event, ServerEvent::TextDelta { item, .. } if item == "reply")));
+        assert!(events.iter().any(|event| matches!(event, ServerEvent::ToolCall { item, input, .. }
+            if item == job && input["tool_count"] == INITIAL_HISTORY_ENTRIES * 2)));
+        assert!(events.iter().all(|event| event.worker_child().is_none()));
+        let compact_bytes = serde_json::to_vec(&events).unwrap().len();
+        assert!(compact_bytes < 2048);
+        eprintln!("worker-dominated tail json bytes: legacy={} compact={compact_bytes}", serde_json::to_vec(&legacy).unwrap().len());
+        let (details, next_before) = transcript.job_details(session, job, None);
+        assert!(details.iter().any(|event| matches!(event, ServerEvent::ToolResult { output: detail, .. } if detail == &output)));
+        let (older, _) = transcript.job_details(session, job, next_before);
+        assert!(next_before.is_some() && older.first().is_some_and(|event| event.worker_child().is_some()));
+    }
+
+    #[test]
+    fn persisted_tail_does_not_materialize_history_at_either_scale() -> anyhow::Result<()> {
+        use super::*;
+
+        let page_size = |entries: usize| -> anyhow::Result<u64> {
+            let project = tempfile::tempdir()?;
+            let state = tempfile::tempdir()?;
+            let mut store = Store::load(project.path(), state.path(), &Default::default());
+            let id = store.create(None)?;
+            let path = store.threads[&id].path.clone();
+            let thread = store.threads.get_mut(&id).unwrap();
+            for index in 0..entries {
+                thread.transcript.observe(&ServerEvent::TextDelta {
+                    session: id.clone(), item: format!("synthetic-{index:06}"), actor: Actor::User,
+                    text: "Synthetic conversation content".repeat(4),
+                });
+            }
+            thread.save()?;
+            let workers = BTreeSet::new();
+            let (expected, _, _) = store.history_tail(&id, &workers, true, bound_history_tool).unwrap();
+            let checkpoint_bytes = store.checkpoint_path(&id).metadata()?.len();
+            drop(store);
+
+            let store = Store::load(project.path(), state.path(), &Default::default());
+            let (actual, _, _) = store.history_tail(&id, &workers, true, bound_history_tool).unwrap();
+            assert!(store.threads[&id].transcript.loaded.get().is_none());
+            assert_eq!(actual.len(), INITIAL_HISTORY_ENTRIES);
+            assert_eq!(serde_json::to_vec(&actual)?, serde_json::to_vec(&expected)?);
+            assert!(checkpoint_bytes < path.metadata()?.len());
+            Ok(checkpoint_bytes)
+        };
+        let one = page_size(INITIAL_HISTORY_ENTRIES * 2)?;
+        let ten = page_size(INITIAL_HISTORY_ENTRIES * 20)?;
+        assert!(one.abs_diff(ten) < 128);
+        Ok(())
+    }
     use super::*;
 
     #[test]
@@ -2666,14 +3322,14 @@ mod archive_tests {
                 transcript.hidden_replies.insert(item);
             }
         }
-        let (tail, mut before) = transcript.replay_before(id, count, &|event| event);
+        let (tail, mut before) = transcript.replay_before(id, count, false, &|event| event);
         let mut seen = tail.into_iter().rev().collect::<Vec<_>>();
         transcript.observe(&ServerEvent::TextDelta {
             session: id.into(), item: "live".into(), actor: Actor::User, text: "live append".into(),
         });
         let mut empty_page = false;
         while before != 0 {
-            let (events, next) = transcript.replay_before(id, before, &|event| event);
+            let (events, next) = transcript.replay_before(id, before, false, &|event| event);
             assert!(next < before);
             empty_page |= events.is_empty();
             seen.extend(events.into_iter().rev());

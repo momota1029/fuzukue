@@ -23,6 +23,11 @@ pub(crate) fn has_structured_result(name: &str) -> bool {
     )
 }
 
+pub(crate) fn may_record_path(name: &str) -> bool {
+    has_structured_result(name) || matches!(name.to_ascii_lowercase().as_str(),
+        "edit" | "write" | "multiedit" | "notebookedit" | "write_file" | "edit_file")
+}
+
 pub(crate) fn tool_paths(name: &str, input: Option<&Value>, output: Option<&str>) -> Vec<String> {
     let input = input.unwrap_or(&Value::Null);
     if has_structured_result(name) {

@@ -16,7 +16,7 @@ pub(crate) mod folder_grants;
 mod approval_queue;
 pub(crate) mod approval_store;
 
-const BACKLOG: usize = 10_000;
+use crate::state::{BACKLOG, BACKLOG_BYTES};
 const HANDOFF_LIMIT: usize = 3;
 const HANDOFF_WINDOW: Duration = Duration::from_secs(60 * 60);
 
@@ -35,7 +35,7 @@ pub struct Hub {
 
 struct Inner {
     next_seq: u64,
-    log: VecDeque<Envelope>,
+    log: ReplayLog,
     writer: Option<crate::state::TimelineWriter>,
     threads: Option<crate::threads::Store>,
     partner_started: HashMap<String, PartnerTurn>,
@@ -56,6 +56,43 @@ struct Inner {
     questions: HashMap<String, PendingQuestion>,
     question_clients: usize,
     question_clients_offline_since: Instant,
+}
+
+#[derive(Default)]
+struct ReplayLog {
+    items: VecDeque<(Envelope, u64)>,
+    bytes: u64,
+}
+
+impl ReplayLog {
+    fn push(&mut self, envelope: Envelope, size: u64) {
+        self.items.push_back((envelope, size));
+        self.bytes += size;
+        while self.items.len() > BACKLOG || self.items.len() > 1 && self.bytes > BACKLOG_BYTES {
+            self.bytes -= self.items.pop_front().unwrap().1;
+        }
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &Envelope> + Clone {
+        self.items.iter().map(|(envelope, _)| envelope)
+    }
+
+    fn retain_mut(&mut self, mut keep: impl FnMut(&mut Envelope) -> bool) {
+        self.items.retain_mut(|(envelope, size)| {
+            let keep = keep(envelope);
+            if !keep {
+                self.bytes -= *size;
+            }
+            keep
+        });
+    }
+}
+
+fn append_timeline(writer: &mut Option<crate::state::TimelineWriter>, env: &Envelope) -> u64 {
+    writer.as_mut().map_or_else(
+        || serde_json::to_vec(env).expect("serializable timeline envelope").len() as u64 + 1,
+        |writer| writer.append(env),
+    )
 }
 
 struct PendingQuestion {
@@ -140,7 +177,7 @@ pub(crate) fn worker_approval(request_id: &str, actor: &Actor) -> bool {
 impl Hub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), handoffs_ready: HashSet::new(), recent_handoffs: HashMap::new(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
+        Self { inner: Mutex::new(Inner { next_seq: 1, log: ReplayLog::default(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), handoffs_ready: HashSet::new(), recent_handoffs: HashMap::new(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
             epoch: format!("{:032x}", rand::random::<u128>()),
             approval_queue: Default::default(),
         }
@@ -152,17 +189,19 @@ impl Hub {
         {
             let mut inner = hub.inner.lock().unwrap();
             let mut workers = BTreeMap::new();
-            crate::state::read_timeline(dir, |envelope| {
+            inner.writer = crate::state::TimelineWriter::open(dir).ok();
+            let timeline = inner.writer.as_ref().map_or_else(
+                || crate::state::Timeline::open(dir), crate::state::TimelineWriter::timeline,
+            );
+            timeline.restore(|envelope, size| {
                 observe_approval(&mut inner, &envelope, ApprovalWaiter::Restored);
                 observe_question(&mut inner.questions, &envelope);
                 observe_worker(&mut workers, &envelope.event);
-                inner.next_seq = envelope.seq + 1;
-                inner.log.push_back(envelope);
-                if inner.log.len() > BACKLOG {
-                    inner.log.pop_front();
+                inner.next_seq = inner.next_seq.max(envelope.seq.saturating_add(1));
+                if let Some(size) = size {
+                    inner.log.push(envelope, size);
                 }
             });
-            inner.writer = crate::state::TimelineWriter::open(dir).ok();
             // Approval owners from the previous process cannot answer after restart.
             hub.close_approvals(&mut inner, "cancelled", |_| true);
             let held = crate::self_update::drain::Journal::default().records(dir).unwrap_or_default();
@@ -683,20 +722,23 @@ impl Hub {
         observe_worker(&mut inner.workers, &env.event);
         observe_background(&mut inner.background, &env.event);
         let journal_started_at = timing.as_ref().map(|_| Instant::now());
+        if let Some(threads) = inner.threads.as_ref() {
+            threads.prepare_event(&env.event);
+        }
         if replayable {
             inner.next_seq += 1;
-            if let Some(w) = inner.writer.as_mut() {
-                w.append(&env);
-            }
-            inner.log.push_back(env.clone());
-            if inner.log.len() > BACKLOG {
-                inner.log.pop_front();
-            }
+            let size = append_timeline(&mut inner.writer, &env);
+            inner.log.push(env.clone(), size);
         }
         // 送信は lock を握ったまま行い、backlog と live の順序を揃える。
         let journal_done_at = timing.as_ref().map(|_| Instant::now());
-        let saved = inner.threads.as_mut()
-            .map(|threads| threads.observe(&env.event, completed_session.is_some()));
+        let saved = inner.threads.as_mut().map(|threads| {
+            let saved = threads.observe(&env.event, completed_session.is_some());
+            if matches!(env.event, ServerEvent::TurnEnded { .. }) {
+                threads.trim_transcripts();
+            }
+            saved
+        });
         let transcript_done_at = timing.as_ref().map(|_| Instant::now());
         let seq = env.seq;
         let _ = self.tx.send(env);
@@ -747,9 +789,12 @@ impl Hub {
         state_dir: &std::path::Path,
     ) -> std::collections::BTreeMap<String, crate::state::SessionRecord> {
         let mut records = crate::state::load_sessions(state_dir);
-        let mut store = crate::threads::Store::load(project, state_dir, &records);
-        store.restore_sessions(&mut records);
         let mut inner = self.inner.lock().unwrap();
+        let timeline = inner.writer.as_ref().map_or_else(
+            || crate::state::Timeline::open(state_dir), crate::state::TimelineWriter::timeline,
+        );
+        let mut store = crate::threads::Store::load_indexed(project, state_dir, &records, timeline);
+        store.restore_sessions(&mut records);
         inner.threads = Some(store);
         inner.folder_grants = Some(crate::folder_grants::Store::load(state_dir));
         records
@@ -759,7 +804,7 @@ impl Hub {
         &self,
         known: impl Fn(&str, &crate::threads::LibraryStamp) -> bool,
     ) -> Vec<crate::threads::LibraryThread> {
-        self.inner.lock().unwrap().threads.as_ref()
+        self.inner.lock().unwrap().threads.as_mut()
             .map(|store| store.library_threads(known)).unwrap_or_default()
     }
 
@@ -913,13 +958,8 @@ impl Hub {
     fn broadcast_saved(&self, inner: &mut Inner, event: ServerEvent, snapshot: ServerEvent) {
         let env = Envelope { workspace: None, seq: inner.next_seq, event };
         inner.next_seq += 1;
-        if let Some(writer) = inner.writer.as_mut() {
-            writer.append(&env);
-        }
-        inner.log.push_back(env.clone());
-        if inner.log.len() > BACKLOG {
-            inner.log.pop_front();
-        }
+        let size = append_timeline(&mut inner.writer, &env);
+        inner.log.push(env.clone(), size);
         let _ = self.tx.send(env);
         let _ = self.tx.send(Envelope { workspace: None, seq: 0, event: snapshot });
     }
@@ -927,7 +967,9 @@ impl Hub {
     pub fn edit_threads<T>(&self, edit: impl FnOnce(&mut crate::threads::Store) -> anyhow::Result<T>) -> anyhow::Result<T> {
         let mut inner = self.inner.lock().unwrap();
         let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
-        let result = edit(threads)?;
+        let result = edit(threads);
+        threads.trim_transcripts();
+        let result = result?;
         let _ = self.tx.send(Envelope { workspace: None, seq: 0, event: threads.snapshot() });
         Ok(result)
     }
@@ -949,9 +991,14 @@ impl Hub {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn thread_tail(&self, session: String, request: u64) -> ServerEvent {
+        self.thread_tail_mode(session, request, false)
+    }
+
+    pub(crate) fn thread_tail_mode(&self, session: String, request: u64, compact: bool) -> ServerEvent {
         use fuzukue_proto::ThreadHistoryFailure::*;
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let threads = inner.threads.as_ref().expect("Workspace initializes the thread store");
         let Some(generation) = threads.history_generation(&session) else {
             return ServerEvent::ThreadHistoryFailed { session, request, reason: Some(NotFound) };
@@ -962,9 +1009,12 @@ impl Hub {
             let key = tool_key(&env.event)?;
             (key.0 == session && env.seq > generation).then_some((key, &env.event))
         }).collect();
-        match threads.history_tail(&session, &workers, |event| {
-            tool_key(&event).and_then(|key| tools.get(&key)).map(|&event| event.clone()).unwrap_or(event)
-        }) {
+        let tail = threads.history_tail(&session, &workers, compact, |event| {
+            let event = tool_key(&event).and_then(|key| tools.get(&key)).map(|&event| event.clone()).unwrap_or(event);
+            crate::threads::bound_history_tool(event)
+        });
+        inner.threads.as_mut().unwrap().trim_transcripts();
+        match tail {
             Some((events, workers, next_before)) => ServerEvent::ThreadTail {
                 session, request, generation, through: inner.next_seq - 1, events, workers, next_before,
             },
@@ -972,17 +1022,18 @@ impl Hub {
         }
     }
 
-    pub(crate) fn thread_history_page(
-        &self, session: String, request: u64, before: u64, generation: Option<u64>, scoped: bool,
+    pub(crate) fn thread_history_page_mode(
+        &self, session: String, request: u64, before: u64, generation: Option<u64>, scoped: bool, compact: bool,
     ) -> ServerEvent {
         use fuzukue_proto::ThreadHistoryFailure::Unavailable;
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let threads = inner.threads.as_ref().expect("Workspace initializes the thread store");
         let page = if scoped {
-            threads.scoped_history_page(&session, before, generation)
+            threads.scoped_history_page(&session, before, generation, compact)
         } else {
             threads.history_page(&session, before).ok_or(Unavailable)
         };
+        inner.threads.as_mut().unwrap().trim_transcripts();
         match page {
             Ok((events, next_before)) => ServerEvent::ThreadHistoryPage {
                 session, request, events, next_before,
@@ -991,6 +1042,35 @@ impl Hub {
             },
             Err(reason) => ServerEvent::ThreadHistoryFailed { session, request, reason: scoped.then_some(reason) },
         }
+    }
+
+    pub(crate) fn thread_history_from(&self, session: String, request: u64, start: u64, generation: u64) -> ServerEvent {
+        let mut inner = self.inner.lock().unwrap();
+        let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
+        let page = threads.history_from(&session, start, generation);
+        threads.trim_transcripts();
+        match page {
+            Ok((events, next_after)) => ServerEvent::ThreadHistoryFrom {
+                session, request, start, next_after, generation, through: inner.next_seq - 1, events,
+            },
+            Err(reason) => ServerEvent::ThreadHistoryFailed { session, request, reason: Some(reason) },
+        }
+    }
+
+    pub(crate) fn thread_job_details(&self, session: String, job: String, request: u64, before: Option<u64>) -> ServerEvent {
+        let mut inner = self.inner.lock().unwrap();
+        let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
+        let (events, next_before) = threads.job_details(&session, &job, before);
+        threads.trim_transcripts();
+        ServerEvent::ThreadJobDetails { session, job, request, through: inner.next_seq - 1, before, next_before, events }
+    }
+
+    pub(crate) fn thread_job_tool_count(&self, session: &str, job: &str) -> Option<usize> {
+        let mut inner = self.inner.lock().unwrap();
+        let threads = inner.threads.as_mut()?;
+        let count = threads.job_tool_count(session, job);
+        threads.trim_transcripts();
+        count
     }
 
     pub(crate) fn subscribe_transcripts(
@@ -1056,7 +1136,7 @@ impl Hub {
     }
 
     pub fn subscribe_client(&self, after: u64, include_threads: bool) -> (Vec<Envelope>, broadcast::Receiver<Envelope>) {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let rx = self.tx.subscribe();
         let threads = inner.threads.as_ref().filter(|_| include_threads);
         let cold_threads = threads.filter(|_| after == 0);
@@ -1126,6 +1206,11 @@ impl Hub {
                 turns: inner.running.iter().cloned().collect(), workers,
             } });
             backlog.push(Envelope { workspace: None, seq, event: threads.snapshot() });
+        }
+        if include_threads {
+            if let Some(threads) = inner.threads.as_mut() {
+                threads.trim_transcripts();
+            }
         }
         (backlog, rx)
     }
@@ -1232,7 +1317,7 @@ fn tool_key(event: &ServerEvent) -> Option<(&str, &str, bool)> {
 /// Use the transcript tail for messages and borrow the recent journal for tool details.
 fn replay_thread_tails(
     threads: &crate::threads::Store,
-    log: &VecDeque<Envelope>,
+    log: &ReplayLog,
     workers: &BTreeMap<String, BTreeSet<String>>,
 ) -> Vec<Envelope> {
     let tools: HashMap<_, _> = log.iter().filter_map(|env| {
@@ -1240,7 +1325,7 @@ fn replay_thread_tails(
     }).collect();
     threads.replay_tails(workers, |event| {
         let recorded = tool_key(&event).and_then(|key| tools.get(&key));
-        recorded.map(|e| (*e).clone()).unwrap_or(event)
+        crate::threads::bound_history_tool(recorded.map(|e| (*e).clone()).unwrap_or(event))
     }).map(|event| Envelope { workspace: None, seq: 0, event }).collect()
 }
 
@@ -1263,6 +1348,87 @@ fn keep_with_thread_tails(threads: &crate::threads::Store, event: &ServerEvent) 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[ignore = "generates a workspace-sized synthetic journal; run in release mode"]
+    fn synthetic_thread_performance() -> anyhow::Result<()> {
+        use std::io::{BufWriter, Write};
+        use std::time::Instant;
+
+        fn rss() -> String {
+            std::fs::read_to_string("/proc/self/status").ok()
+                .and_then(|status| status.lines().find(|line| line.starts_with("VmRSS:")).map(str::to_owned))
+                .unwrap_or_default()
+        }
+
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        std::fs::create_dir(project.path().join("threads"))?;
+        let payload = "synthetic ".repeat(61);
+        let path = state.path().join("thread-timeline.jsonl");
+        let mut journal = BufWriter::new(std::fs::File::create(&path)?);
+        let mut seq = 0;
+        for thread in 0..192 {
+            let id = format!("thread-perf-{thread}");
+            let mut transcript = BufWriter::new(std::fs::File::create(
+                project.path().join("threads").join(format!("{id}.md")),
+            )?);
+            writeln!(transcript, "---\nid: {id}\ntitle: Synthetic test {thread}\ncreated: 1\nupdated: 1\n---")?;
+            for message in 0..1906 {
+                seq += 1;
+                let item = format!("synthetic-{seq}");
+                let event = if message % 16 == 6 {
+                    ServerEvent::ToolCall {
+                        session: id.clone(), item, actor: Actor::Claude,
+                        name: "synthetic_tool".into(), input: json!({"data":payload}),
+                    }
+                } else if message % 16 == 7 {
+                    ServerEvent::ToolResult {
+                        session: id.clone(), item: format!("synthetic-{}", seq - 1),
+                        ok: true, output: payload.clone(),
+                    }
+                } else {
+                    let actor = if message % 2 == 0 { Actor::User } else { Actor::Claude };
+                    let role = if actor == Actor::User { "User" } else { "Claude" };
+                    writeln!(transcript, "<!-- labo-thread {} -->\n## {role}\n\n{payload}\n",
+                        json!({"item":item,"actor":actor}))?;
+                    ServerEvent::TextDelta {
+                        session: id.clone(), item, actor, text: payload.clone(),
+                    }
+                };
+                serde_json::to_writer(&mut journal, &Envelope { workspace: None, seq, event })?;
+                writeln!(journal)?;
+            }
+            transcript.flush()?;
+        }
+        journal.flush()?;
+        drop(journal);
+        eprintln!("journal_bytes={} events={seq} fixture_rss={}", path.metadata()?.len(), rss());
+        for run in 0..2 {
+            let start = Instant::now();
+            let hub = Hub::with_timeline(state.path());
+            let hub_ms = start.elapsed().as_secs_f64() * 1000.0;
+            hub.load_threads(project.path(), state.path());
+            let start_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let (initial, _) = hub.subscribe_transcripts(0, &TranscriptResume::default());
+            let initial_bytes: usize = initial.iter().map(|env| serde_json::to_vec(env).unwrap().len()).sum();
+            eprintln!("run={run} hub_ms={hub_ms:.2} workspace_ms={start_ms:.2} initial_bytes={initial_bytes} {}", rss());
+            let mut observations = Vec::new();
+            let mut response_bytes = 0;
+            for (request, thread) in [0, 191, 96, 1, 2, 3, 4, 190, 0, 191, 96, 189].into_iter().enumerate() {
+                let start = Instant::now();
+                let event = hub.thread_tail_mode(format!("thread-perf-{thread}"), request as u64, true);
+                assert!(matches!(&event, ServerEvent::ThreadTail { events, .. } if !events.is_empty()));
+                response_bytes += serde_json::to_vec(&Envelope { workspace: None, seq: 0, event })?.len();
+                observations.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            observations.sort_by(f64::total_cmp);
+            eprintln!("run={run} switch_median_ms={:.2} switch_max_ms={:.2} mean_switch_bytes={} after_switch_rss={}",
+                observations[observations.len()/2], observations[observations.len()-1],
+                response_bytes/observations.len(), rss());
+        }
+        Ok(())
+    }
 
     fn sample_question() -> Vec<Question> {
         questions::parse(&json!({"questions": [

@@ -136,6 +136,7 @@ class MainActivity : ComponentActivity() {
                     onWorkspace = remote::switchWorkspace,
                     onThread = remote::selectThread,
                     onOlderHistory = remote::requestOlderHistory,
+                    onRequestJob = remote::requestThreadJob,
                     onNewThread = remote::newThread,
                     onSend = remote::prompt,
                     onStopTurn = remote::interrupt,

@@ -41,6 +41,10 @@ sealed interface TimelineRow {
         val summary: String? = null,
         val ok: Boolean? = null,
         val report: JobReport? = null,
+        val detailRequest: ULong? = null,
+        val details: List<String>? = null,
+        val nextDetail: ULong? = null,
+        val loadingDetails: Boolean = false,
     ) : TimelineRow
 }
 
@@ -78,7 +82,7 @@ data class Timeline(
             event.actor.kind == "user" -> appendUser(event.item, event.text)
             event.actor.kind == "system" && event.item.startsWith("thread-plan:") ->
                 withRow(event.item, TimelineRow.Note(event.text))
-            jobChild(event.item, event.actor) -> this
+            childJob(event.item, event.actor) != null -> appendJobDetail(childJob(event.item, event.actor), event.text)
             else -> {
                 val previous = rows[event.item] as? TimelineRow.Message
                 val text = previous?.text.orEmpty() + event.text
@@ -101,7 +105,9 @@ data class Timeline(
                     withRow(event.item, previous?.copy(info = info) ?: TimelineRow.Job(info))
                 }
             }
-            jobChild(event.item, event.actor) -> this
+            childJob(event.item, event.actor) != null -> appendJobDetail(
+                childJob(event.item, event.actor), "${event.name}\n${event.input}",
+            )
             else -> {
                 val input = event.input as? JsonObject
                 val detail = listOf("command", "file_path", "path", "file")
@@ -116,12 +122,16 @@ data class Timeline(
                 withRow(event.item, previous.copy(ok = event.ok, report = report))
             }
             is TimelineRow.Tool -> withRow(event.item, previous.copy(ok = event.ok))
-            else -> this
+            else -> appendJobDetail(childJob(event.item), event.output)
         }
         is ServerEvent.ReplySuperseded -> copy(
             rows = rows - event.items,
             streamingSilencePrefixes = streamingSilencePrefixes - event.items,
         )
+        is ServerEvent.ThreadJobActivity -> {
+            val previous = rows[event.job] as? TimelineRow.Job
+            if (previous == null) this else withRow(event.job, previous.copy(info = previous.info.copy(toolCount = event.tools)))
+        }
         is ServerEvent.DelegateRenamed -> {
             val previous = rows[event.job] as? TimelineRow.Job
             if (previous == null) this else withRow(event.job, previous.copy(info = previous.info.copy(label = event.change.label)))
@@ -143,6 +153,19 @@ data class Timeline(
         is ServerEvent.Paused -> copy(pauseReason = event.reason)
         is ServerEvent.Resumed -> copy(pauseReason = null)
         is ServerEvent.ApprovalRequested -> this
+    }
+
+    internal fun updateJob(job: String, update: (TimelineRow.Job) -> TimelineRow.Job): Timeline {
+        val row = rows[job] as? TimelineRow.Job ?: return this
+        return withRow(job, update(row))
+    }
+
+    private fun appendJobDetail(job: String?, text: String): Timeline {
+        if (job == null || text.isBlank()) return this
+        return updateJob(job) { row ->
+            val details = row.details ?: return@updateJob row
+            row.copy(details = details.takeLast(127) + text.take(32 * 1024))
+        }
     }
 
     internal fun withActivity(running: Boolean): Timeline = withRunning(running, System.currentTimeMillis())
@@ -221,6 +244,7 @@ data class Timeline(
     }
 }
 
-private fun jobChild(item: String, actor: Actor): Boolean =
-    actor.parentToolUse?.startsWith("delegate:") == true ||
-        (item.startsWith("delegate:") && ':' in item.removePrefix("delegate:"))
+private fun childJob(item: String, actor: Actor? = null): String? =
+    actor?.parentToolUse?.takeIf { it.startsWith("delegate:") }
+        ?: item.removePrefix("delegate:").takeIf { item.startsWith("delegate:") && ':' in it }
+            ?.substringBefore(':')?.let { "delegate:$it" }

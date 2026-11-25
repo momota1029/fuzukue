@@ -71,7 +71,8 @@ pub const WORKSPACE_REQUESTS_PROTOCOL: u32 = 69;
 pub const LARGE_LEGACY_FRAME_PROTOCOL: u32 = 70;
 pub const LAZY_DECK_PROTOCOL: u32 = 71;
 pub const WORKSPACE_REQUEST_RECOVERY_PROTOCOL: u32 = 72;
-pub const PROTOCOL_VERSION: u32 = WORKSPACE_REQUEST_RECOVERY_PROTOCOL;
+pub const THREAD_WINDOW_PROTOCOL: u32 = 73;
+pub const PROTOCOL_VERSION: u32 = THREAD_WINDOW_PROTOCOL;
 pub const DECK_PAGE_BYTES: usize = 1024 * 1024;
 pub const CARD_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1203,6 +1204,16 @@ pub enum ClientMsg {
     GetThreadArtifacts { session: String },
     /// Fetch whole transcript entries strictly before the supplied cursor.
     GetThreadTail { session: String, request: u64 },
+    /// Fetch whole transcript entries starting at this inclusive ordinal.
+    GetThreadHistoryFrom { session: String, request: u64, start: u64, generation: u64 },
+    /// Subscribe to a worker while its details are expanded, or unsubscribe on collapse.
+    GetThreadJob {
+        session: String,
+        job: String,
+        request: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<u64>,
+    },
     GetThreadHistory {
         session: String,
         request: u64,
@@ -2384,6 +2395,27 @@ pub enum ServerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         through: Option<u64>,
     },
+    ThreadHistoryFrom {
+        session: String,
+        request: u64,
+        start: u64,
+        next_after: Option<u64>,
+        generation: u64,
+        through: u64,
+        events: Vec<ServerEvent>,
+    },
+    ThreadJobDetails {
+        session: String,
+        job: String,
+        request: u64,
+        through: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<u64>,
+        events: Vec<ServerEvent>,
+    },
+    ThreadJobActivity { session: String, job: String, tools: usize },
     ThreadHistoryFailed {
         session: String,
         request: u64,
@@ -2721,7 +2753,32 @@ pub enum ServerEvent {
 /// Reserved LocalNotice item for the latest status beside a thread's composer.
 pub const COMPOSER_NOTICE_ITEM: &str = "composer-status";
 
+/// Identify the worker that owns a child transcript entry.
+pub fn delegate_job_id<'a>(item: &'a str, actor: &'a Actor) -> Option<&'a str> {
+    if let Actor::Codex { parent_tool_use: Some(job), .. } = actor {
+        if job.starts_with(DELEGATE_JOB) {
+            return Some(job);
+        }
+    }
+    let (id, _) = item.strip_prefix(DELEGATE_JOB)?.split_once(':')?;
+    item.get(..DELEGATE_JOB.len() + id.len())
+}
+
 impl ServerEvent {
+    /// The worker that owns this row or activity event.
+    pub fn worker_child(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::TextDelta { session, item, actor, .. } | Self::ToolCall { session, item, actor, .. } =>
+                Some((session, delegate_job_id(item, actor)?)),
+            Self::UserPrompt { session, item, .. } | Self::ToolResult { session, item, .. }
+            | Self::MessageDetails { session, item, .. } =>
+                Some((session, delegate_job_id(item, &Actor::User)?)),
+            Self::TurnEnded { session, actor, .. } =>
+                Some((session, delegate_job_id("", actor)?)),
+            _ => None,
+        }
+    }
+
     /// The session whose saved transcript is updated by this event.
     pub fn transcript_session(&self) -> Option<&str> {
         match self {
@@ -2731,7 +2788,7 @@ impl ServerEvent {
             | Self::CommentApplication { session, .. } | Self::DelegateProgress { session, .. }
             | Self::DelegateRenamed { session, .. } | Self::DelegateDismissed { session, .. }
             | Self::ToolCall { session, .. } | Self::ToolResult { session, .. }
-            | Self::MessageDetails { session, .. } | Self::TurnEnded { session, .. } => Some(session),
+            | Self::ThreadJobActivity { session, .. } | Self::MessageDetails { session, .. } | Self::TurnEnded { session, .. } => Some(session),
             _ => None,
         }
     }
@@ -2743,7 +2800,8 @@ impl ServerEvent {
             | Self::ApprovalQueue { .. } | Self::ApprovalQueueChanged { .. } | Self::ApprovalDecisionResult { .. }
             | Self::FolderGrants { .. } | Self::FolderGrantsChanged { .. }
             | Self::ThreadHistoryStart { .. } | Self::ThreadHistoryPage { .. }
-            | Self::ThreadHistoryFailed { .. } | Self::ThreadTail { .. } | Self::ThreadSync { .. })
+            | Self::ThreadJobDetails { .. } | Self::ThreadJobActivity { .. }
+            | Self::ThreadHistoryFrom { .. } | Self::ThreadHistoryFailed { .. } | Self::ThreadTail { .. } | Self::ThreadSync { .. })
             || matches!(self, Self::LocalNotice { item, .. } if item == COMPOSER_NOTICE_ITEM)
     }
 }

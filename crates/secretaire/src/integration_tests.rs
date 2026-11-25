@@ -6036,7 +6036,7 @@ async fn dismiss_finished_jobs_updates_live_clients_and_saved_history() -> Resul
     };
     let empty_state = TestDir::new();
     let saved = threads::Store::load(project.path(), empty_state.path(), &Default::default());
-    let (reloaded, _, _) = saved.history_tail(&session, &Default::default(), |event| event).unwrap();
+    let (reloaded, _, _) = saved.history_tail(&session, &Default::default(), false, |event| event).unwrap();
     for events in [&tail, &reloaded] {
         for (job, ok, _) in jobs {
             assert!(events.iter().any(|event| matches!(event, ServerEvent::ToolCall { item, input, .. }

@@ -1475,6 +1475,12 @@ impl Workbench {
                         event @ ServerEvent::ThreadHistoryPage { .. } if env.workspace.is_some() => {
                             self.finish_thread_history(event, cx);
                         }
+                        event @ ServerEvent::ThreadHistoryFrom { .. } if self.transcripts.scoped && env.workspace.is_some() => {
+                            self.finish_thread_history_from(event, cx);
+                        }
+                        event @ ServerEvent::ThreadJobDetails { .. } if self.transcripts.scoped && env.workspace.is_some() => {
+                            self.finish_thread_job(event, cx);
+                        }
                         ServerEvent::ThreadHistoryFailed { session, request, reason } if env.workspace.is_some() => {
                             self.thread_history_failed(&session, request, reason, cx);
                         }
@@ -1884,6 +1890,9 @@ impl Workbench {
             }
             ServerEvent::DelegateDismissed { session, job } if render => {
                 self.chat(&session, cx).delegate_dismissed(&job);
+            }
+            ServerEvent::ThreadJobActivity { session, job, tools } if render => {
+                self.chat(&session, cx).update_job_tool_count(&job, tools, cx);
             }
             ServerEvent::DelegateProgress { session, job, summary } if render => {
                 self.chat(&session, cx).delegate_progress(&job, summary, cx);

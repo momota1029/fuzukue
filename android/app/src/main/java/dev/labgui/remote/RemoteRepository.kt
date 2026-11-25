@@ -242,6 +242,25 @@ internal class RemoteRepository(
         requestSelectionTail()
     }
 
+    fun requestThreadJob(session: String, job: String, older: Boolean) {
+        val current = state.value
+        if (current.selection != session || !current.canSend || replaying) return
+        val timeline = current.timeline(session)
+        val row = timeline.rows[job] as? TimelineRow.Job ?: return
+        if (!row.info.detailsDeferred) return
+        val before = if (older) row.nextDetail ?: return else null
+        if (older && row.loadingDetails) return
+        val request = if (older || row.detailRequest == null) ++nextHistoryRequest else null
+        if (sendToWorkspace(ClientMessage.GetThreadJob(session, job, request, before))) {
+            mutableState.value = current.withTimeline(session, timeline.updateJob(job) {
+                it.copy(
+                    detailRequest = request, details = if (older) it.details else null,
+                    nextDetail = if (older) it.nextDetail else null, loadingDetails = request != null,
+                )
+            })
+        }
+    }
+
     fun requestOlderHistory(target: ConversationTarget) {
         val current = state.value
         if (serverProtocol < THREAD_HISTORY_PROTOCOL || current.workspace != target.workspace ||
@@ -793,6 +812,27 @@ internal class RemoteRepository(
                 events.fold(current.withTimeline(event.session, loaded)) { next, echo ->
                     acknowledgePrompt(next, echo, reconnectPromptLimit)
                 }
+            }
+            is ServerEvent.ThreadJobDetails -> {
+                if (!selectionScoped || replaying || frame.workspace == null || frame.workspace != current.workspace) return
+                val timeline = current.timeline(event.session)
+                current.withTimeline(event.session, timeline.updateJob(event.job) { job ->
+                    if (job.detailRequest != event.request) job else job.copy(
+                        details = savedTranscriptEvents(event.session, event.events).mapNotNull { nested ->
+                            when (nested) {
+                                is ServerEvent.TextDelta -> nested.text
+                                is ServerEvent.UserPrompt -> nested.text
+                                is ServerEvent.ToolCall -> if (nested.item == event.job) null else "${nested.name}\n${nested.input}"
+                                is ServerEvent.ToolResult -> if (nested.item == event.job) {
+                                    runCatching { Protocol.json.decodeFromString<JobReport>(nested.output).text }.getOrNull()
+                                } else nested.output
+                                is ServerEvent.DelegateProgress -> nested.summary
+                                else -> null
+                            }?.takeIf { it.isNotBlank() }
+                        } + (if (event.before != null) job.details.orEmpty() else emptyList()),
+                        nextDetail = event.nextBefore, loadingDetails = false,
+                    )
+                })
             }
             is ServerEvent.ThreadHistoryPage -> {
                 if (replaying || (selectionScoped && frame.workspace == null)) return

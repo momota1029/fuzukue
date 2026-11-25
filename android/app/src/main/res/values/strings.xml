@@ -84,6 +84,8 @@
     <string name="error_token_save">端末の安全な保存領域にトークンを保存できません。</string>
     <string name="error_websocket">WebSocket に接続できません（HTTP %1$d）。URL を確認してください。</string>
     <string name="goal_paused">目標を休止中</string>
+    <string name="job_tool_count">ツール %1$d 件</string>
+    <string name="job_earlier_activity">以前の作業内容</string>
     <string name="job_done">完了</string>
     <string name="job_done_suffix">" · 完了"</string>
     <string name="job_failed">失敗</string>

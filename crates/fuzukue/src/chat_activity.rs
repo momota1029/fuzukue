@@ -843,6 +843,7 @@ mod tests {
             text_open: None,
             tools_open: false,
             earlier_tools_open: false,
+            deferred: None,
             report: None,
         };
         let compact = WorkerActivity::new(&block, false, 226_000);

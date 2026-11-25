@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     rc::Rc,
 };
@@ -156,6 +156,11 @@ impl<F: FnOnce(TextView, &App) -> TextView + 'static> RenderOnce for TranscriptM
 }
 
 impl TranscriptView {
+    pub(super) fn forget_rows(&self, removed: &HashSet<u64>) {
+        self.rows.borrow_mut().take();
+        self.markdown.borrow_mut().retain(|(row, _), _| !removed.contains(row));
+    }
+
     pub fn style(&self, style: TranscriptStyle) -> u64 {
         let mut current = self.style.borrow_mut();
         if current.as_ref() != Some(&style) {

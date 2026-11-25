@@ -6,11 +6,17 @@
 //! - `thread-sessions.json`: 会話 → { Claude のセッション ID, 作業ディレクトリ, チャット設定 }
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use fuzukue_proto::Envelope;
 use serde::{Deserialize, Serialize};
+
+#[path = "timeline_index.rs"]
+mod timeline;
+pub(crate) use timeline::{BACKLOG, BACKLOG_BYTES, Timeline};
 
 const LEGACY_TIMELINE: &str = "timeline.jsonl";
 const TIMELINE: &str = "thread-timeline.jsonl";
@@ -76,12 +82,14 @@ pub fn load_timeline(dir: &Path, keep: usize) -> Vec<Envelope> {
 }
 
 /// 旧タイムラインも読み込み、新しいイベントは別ファイルへ追記する。
+#[cfg(test)]
 pub fn read_timeline(dir: &Path, mut visit: impl FnMut(Envelope)) {
     for name in [LEGACY_TIMELINE, TIMELINE] {
         read_events(&dir.join(name), &mut visit);
     }
 }
 
+#[cfg(test)]
 fn read_events(path: &Path, mut visit: impl FnMut(Envelope)) {
     let Ok(file) = std::fs::File::open(path) else { return };
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
@@ -93,19 +101,55 @@ fn read_events(path: &Path, mut visit: impl FnMut(Envelope)) {
 
 pub struct TimelineWriter {
     file: std::fs::File,
+    timeline: Timeline,
+    repair_tail: bool,
 }
 
 impl TimelineWriter {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(TIMELINE))?;
-        Ok(Self { file })
+        let mut file = std::fs::OpenOptions::new().create(true).read(true).append(true).open(dir.join(TIMELINE))?;
+        Self::seal_line(&mut file)?;
+        Ok(Self { file, timeline: Timeline::open(dir), repair_tail: false })
     }
 
-    pub fn append(&mut self, env: &Envelope) {
-        if let Ok(line) = serde_json::to_string(env) {
-            let _ = writeln!(self.file, "{line}");
+    fn seal_line(file: &mut std::fs::File) -> std::io::Result<u64> {
+        let len = file.seek(SeekFrom::End(0))?;
+        if len > 0 {
+            let mut last = [0];
+            file.seek(SeekFrom::End(-1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                // Preserve an interrupted record verbatim and keep later records readable.
+                file.write_all(b"\n")?;
+                return Ok(len + 1);
+            }
         }
+        Ok(len)
+    }
+
+    pub(crate) fn timeline(&self) -> Timeline {
+        self.timeline.clone()
+    }
+
+    pub fn append(&mut self, env: &Envelope) -> u64 {
+        let mut line = serde_json::to_vec(env).expect("serializable timeline envelope");
+        line.push(b'\n');
+        let len = line.len() as u64;
+        let result = (|| -> std::io::Result<()> {
+            if self.repair_tail {
+                Self::seal_line(&mut self.file)?;
+            }
+            self.file.write_all(&line)?;
+            let end = self.file.stream_position()?;
+            self.timeline.record_append(end - len, end, env);
+            Ok(())
+        })();
+        self.repair_tail = result.is_err();
+        if let Err(error) = result {
+            tracing::error!(%error, seq=env.seq, "could not append timeline event");
+        }
+        len
     }
 }
 

@@ -84,6 +84,8 @@
     <string name="error_token_save">Couldn’t save the token to secure storage.</string>
     <string name="error_websocket">Couldn’t connect to WebSocket (HTTP %1$d). Check the URL.</string>
     <string name="goal_paused">Goal paused</string>
+    <string name="job_tool_count">%1$d tool calls</string>
+    <string name="job_earlier_activity">Earlier activity</string>
     <string name="job_done">Done</string>
     <string name="job_done_suffix">" · Done"</string>
     <string name="job_failed">Failed</string>

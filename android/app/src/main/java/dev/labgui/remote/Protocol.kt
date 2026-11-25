@@ -10,7 +10,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.decodeFromJsonElement
 
-const val PROTOCOL_VERSION = 67
+const val PROTOCOL_VERSION = 73
 internal const val MIN_PROTOCOL_VERSION = 18
 internal const val THREAD_HISTORY_PROTOCOL = 62
 internal const val FOLDER_ACCESS_REQUEST = "folder-access-"
@@ -33,6 +33,11 @@ sealed interface ClientMessage {
 
     @Serializable @SerialName("get_thread_tail")
     data class GetThreadTail(val session: String, val request: ULong) : ClientMessage
+
+    @Serializable @SerialName("get_thread_job")
+    data class GetThreadJob(
+        val session: String, val job: String, val request: ULong? = null, val before: ULong? = null,
+    ) : ClientMessage
 
     @Serializable @SerialName("get_thread_history")
     data class GetThreadHistory(
@@ -132,6 +137,8 @@ data class JobInfo(
     val title: String? = null,
     val label: String? = null,
     @SerialName("card_id") val cardId: String? = null,
+    @SerialName("details_deferred") val detailsDeferred: Boolean = false,
+    @SerialName("tool_count") val toolCount: Int = 0,
 ) {
     val displayTitle: String get() = label ?: title?.takeIf { it.isNotBlank() && it != cardId } ?: agent ?: model
 }
@@ -294,6 +301,13 @@ sealed interface ServerEvent {
         val session: String, val request: ULong, val events: List<JsonObject>,
         @SerialName("next_before") val nextBefore: ULong? = null, val generation: ULong? = null, val through: ULong? = null,
     ) : ServerEvent
+    @Serializable data class ThreadJobDetails(
+        val session: String, val job: String, val request: ULong, val events: List<JsonObject>,
+        val before: ULong? = null, @SerialName("next_before") val nextBefore: ULong? = null,
+    ) : ServerEvent
+    @Serializable data class ThreadJobActivity(
+        override val session: String, val job: String, val tools: Int,
+    ) : InThread
     @Serializable data class ThreadHistoryFailed(val session: String, val request: ULong, val reason: String? = null) : ServerEvent
     @Serializable data class ThreadHistoryInvalidated(val session: String) : ServerEvent
     @Serializable data class ThreadRestored(val session: String, val events: List<JsonObject>) : ServerEvent
@@ -385,6 +399,8 @@ object Protocol {
             "thread_sync" -> json.decodeFromJsonElement<ServerEvent.ThreadSync>(event)
             "thread_history_start" -> json.decodeFromJsonElement<ServerEvent.ThreadHistoryStart>(event)
             "thread_tail" -> json.decodeFromJsonElement<ServerEvent.ThreadTail>(event)
+            "thread_job_details" -> json.decodeFromJsonElement<ServerEvent.ThreadJobDetails>(event)
+            "thread_job_activity" -> json.decodeFromJsonElement<ServerEvent.ThreadJobActivity>(event)
             "thread_history_page" -> json.decodeFromJsonElement<ServerEvent.ThreadHistoryPage>(event)
             "thread_history_failed" -> json.decodeFromJsonElement<ServerEvent.ThreadHistoryFailed>(event)
             "thread_history_invalidated" -> json.decodeFromJsonElement<ServerEvent.ThreadHistoryInvalidated>(event)

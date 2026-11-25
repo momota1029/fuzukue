@@ -1256,6 +1256,27 @@ async fn serve_workspace(
     let _question_client = (question_protocol >= fuzukue_proto::QUESTION_PROTOCOL)
         .then(|| app.hub.register_question_client());
     let scoped = transcripts.is_some();
+    let compact_jobs = scoped && protocol >= fuzukue_proto::THREAD_WINDOW_PROTOCOL;
+    let open_jobs = std::sync::Mutex::new(std::collections::VecDeque::<(String, String)>::new());
+    let project_job = |event: ServerEvent| {
+        if !compact_jobs {
+            return Some(event);
+        }
+        let root = match &event {
+            ServerEvent::ToolCall { session, item, name, .. } if name == "delegate" => Some((session.as_str(), item.as_str())),
+            ServerEvent::ToolResult { session, item, .. } if item.starts_with(fuzukue_proto::DELEGATE_JOB)
+                && event.worker_child().is_none() => Some((session.as_str(), item.as_str())),
+            ServerEvent::DelegateProgress { session, job, .. } => Some((session.as_str(), job.as_str())),
+            _ => None,
+        };
+        if event.worker_child().or(root).is_some_and(|(session, job)| {
+            open_jobs.lock().unwrap().iter().any(|(owner, item)| owner == session && item == job)
+        }) {
+            return Some(event);
+        }
+        let session = event.transcript_session().unwrap_or_default().to_owned();
+        threads::compact_job_event(event, |job| app.hub.thread_job_tool_count(&session, job))
+    };
     let approval_queue = github_report_client && !canary() && protocol >= 11;
     use workspace_requests::ClientSupport;
     let request_support = ClientSupport::from_connection(
@@ -1468,8 +1489,11 @@ async fn serve_workspace(
         } else {
             last = last.max(env.seq);
         }
-        if supports(env) && tx.send(send(env)).await.is_err() {
-            return None;
+        if supports(env) {
+            if let Some(event) = project_job(env.event.clone()) {
+                let projected = Envelope { workspace: env.workspace.clone(), seq: env.seq, event };
+                tx.send(send(&projected)).await.ok()?;
+            }
         }
     }
 
@@ -1772,6 +1796,8 @@ async fn serve_workspace(
                             env.event = ServerEvent::ThreadHistoryInvalidated { session };
                         }
                     }
+                    let Some(event) = project_job(env.event) else { continue };
+                    env.event = event;
                     if supports(&env) {
                         if matches!(env.event, ServerEvent::DeckCardsChanged { .. }) {
                             env.event = deck_event(&project, protocol, env.event).await;
@@ -2553,14 +2579,35 @@ async fn serve_workspace(
                     }
                 }
                 Ok(ClientMsg::GetThreadTail { session, request }) if scoped && workspace_request => {
-                    let _ = reply.send(app.hub.thread_tail(session, request));
+                    let _ = reply.send(app.hub.thread_tail_mode(session, request, compact_jobs));
                 }
                 Ok(ClientMsg::GetThreadHistory { session, request, before, generation })
                     if thread_history && (!scoped || workspace_request) =>
                 {
-                    let _ = reply.send(app.hub.thread_history_page(session, request, before, generation, scoped));
+                    let _ = reply.send(app.hub.thread_history_page_mode(session, request, before, generation, scoped, compact_jobs));
                 }
-                Ok(ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { .. }) => {}
+                Ok(ClientMsg::GetThreadHistoryFrom { session, request, start, generation })
+                    if scoped && workspace_request && protocol >= fuzukue_proto::THREAD_WINDOW_PROTOCOL =>
+                {
+                    let _ = reply.send(app.hub.thread_history_from(session, request, start, generation));
+                }
+                Ok(ClientMsg::GetThreadJob { session, job, request, before }) if compact_jobs && workspace_request => {
+                    {
+                        let mut opened = open_jobs.lock().unwrap();
+                        opened.retain(|(owner, item)| owner != &session || item != &job);
+                        if request.is_some() {
+                            opened.push_back((session.clone(), job.clone()));
+                            if opened.len() > 4 {
+                                opened.pop_front();
+                            }
+                        }
+                    }
+                    if let Some(request) = request {
+                        let _ = reply.send(app.hub.thread_job_details(session, job, request, before));
+                    }
+                }
+                Ok(ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { .. }
+                    | ClientMsg::GetThreadHistoryFrom { .. } | ClientMsg::GetThreadJob { .. }) => {}
                 Ok(ClientMsg::GetThreadArtifacts { session }) if protocol >= 6 => {
                     let paths = app.hub.thread_artifacts(&session);
                     let artifacts = thread_artifacts::describe(&app.project_dir, paths).await;
@@ -3477,7 +3524,7 @@ async fn handle_from_client(
 
         ClientMsg::FileInbox { .. } | ClientMsg::SearchDecks { .. } | ClientMsg::Git { .. } | ClientMsg::History { .. } | ClientMsg::BranchReview { .. } | ClientMsg::ApplyComments { .. } | ClientMsg::CompactSession { .. } | ClientMsg::GetThreadArtifacts { .. } | ClientMsg::ArchiveThread { .. } | ClientMsg::PinThread { .. }
         | ClientMsg::GetLeanReadingCards { .. } | ClientMsg::LookupSymbol { .. } | ClientMsg::ReviewReports { .. } | ClientMsg::SearchLibrary { .. } | ClientMsg::AddMemo { .. } | ClientMsg::MoveMemo { .. } | ClientMsg::Ledger { .. } | ClientMsg::SaveSource { .. } | ClientMsg::EditorClosed { .. } | ClientMsg::SaveCard { .. } | ClientMsg::SelectPaper { .. } | ClientMsg::GetPaperPdfMap { .. }
-        | ClientMsg::RecordSourceFingerprint { .. } | ClientMsg::GetThreadHistory { .. } | ClientMsg::GetThreadTail { .. }
+        | ClientMsg::RecordSourceFingerprint { .. } | ClientMsg::GetThreadHistory { .. } | ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistoryFrom { .. } | ClientMsg::GetThreadJob { .. }
         | ClientMsg::ListExtensions | ClientMsg::GrantExtension { .. } | ClientMsg::SetExtensionEnabled { .. }
         | ClientMsg::UpdateExtension { .. } | ClientMsg::RenderExtension { .. } | ClientMsg::ExtensionUiEvent { .. }
         | ClientMsg::Hello { .. } | ClientMsg::SetLocale { .. } | ClientMsg::ListWorkspaces | ClientMsg::OpenWorkspace { .. } | ClientMsg::SwitchWorkspace { .. } | ClientMsg::CompleteWorkspacePath { .. } | ClientMsg::BrowseWorkspace { .. } | ClientMsg::ListFiles { .. } | ClientMsg::FindFiles { .. } | ClientMsg::ResolveFile { .. } | ClientMsg::CreateWorkspace { .. } | ClientMsg::InWorkspace { .. } | ClientMsg::NewThread | ClientMsg::NewAttachedThread { .. } | ClientMsg::UploadAttachment { .. } | ClientMsg::FolderAttachment { .. } | ClientMsg::CancelAttachment { .. } => {}

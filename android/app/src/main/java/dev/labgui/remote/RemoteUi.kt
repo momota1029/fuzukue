@@ -95,6 +95,7 @@ internal fun RemoteApp(
     onThread: (String?) -> Unit = {},
     onNewThread: () -> Unit = {},
     onOlderHistory: (ConversationTarget) -> Unit = {},
+    onRequestJob: (String, String, Boolean) -> Unit = { _, _, _ -> },
     onSend: (String, String) -> Boolean = { _, _ -> false },
     onStopTurn: (String) -> Unit = {},
     onStopWorker: (String, String) -> Unit = { _, _ -> },
@@ -206,7 +207,7 @@ internal fun RemoteApp(
                                 val target = ConversationTarget(state.workspace.orEmpty(), selected)
                                 Conversation(
                                     state, selected, onSend, onStopTurn, onStopWorker, onResolve, onRememberShellApproval,
-                                    Modifier.weight(1f), showPlanAboveConversation, openPlan, attachments, attachmentView, onOlderHistory,
+                                    Modifier.weight(1f), showPlanAboveConversation, openPlan, attachments, attachmentView, onOlderHistory, onRequestJob,
                                     openApprovalDock = openApprovalDock?.takeIf { it.first == target }?.second,
                                     onDecideQueuedApprovals = { requests, accept -> onDecideQueuedApprovals(target, requests, accept) },
                                     onDismissQueuedDecision = { onDismissQueuedDecision(target) },
@@ -534,6 +535,7 @@ private fun Conversation(
     showPlanAboveConversation: Boolean, onOpenPlan: () -> Unit,
     attachments: Attachments?, attachmentView: AttachmentView,
     onOlderHistory: (ConversationTarget) -> Unit,
+    onRequestJob: (String, String, Boolean) -> Unit,
     openApprovalDock: Int?,
     onDecideQueuedApprovals: (List<QueuedApproval>, Boolean) -> Unit, onDismissQueuedDecision: () -> Unit,
     onRetryApprovalQueue: () -> Unit,
@@ -552,6 +554,7 @@ private fun Conversation(
     val colors = MaterialTheme.colorScheme
     val plan = timeline.plan
     val listState = rememberLazyListState()
+    var shownFirstPage by rememberSaveable(session) { mutableStateOf(false) }
     val requestOlder by rememberUpdatedState { onOlderHistory(target) }
     val topScroll = remember(listState) {
         object : NestedScrollConnection {
@@ -570,6 +573,16 @@ private fun Conversation(
     }
     var displayedPages by remember(listState) { mutableIntStateOf(timeline.olderPages) }
     SideEffect {
+        if (!shownFirstPage && visibleRows.isNotEmpty()) {
+            val newestMessage = visibleRows.indexOfFirst { it.value is TimelineRow.Message }
+            if (newestMessage >= 3 && visibleRows.take(newestMessage).any {
+                    (it.value as? TimelineRow.Job)?.info?.detailsDeferred == true
+                }
+            ) {
+                listState.requestScrollToItem(newestMessage + pending.size + approvals.size)
+            }
+            shownFirstPage = true
+        }
         if (timeline.olderPages > displayedPages) {
             // In a reversed list the highest visible index is the topmost row.
             // Keep its offset even when a page inserts rows around a sparse worker.
@@ -606,7 +619,7 @@ private fun Conversation(
                         items(visibleRows, key = { "event/${it.key}" }) { entry ->
                             when (val row = entry.value) {
                                 is TimelineRow.Message -> MessageBubble(row, target, attachmentView.sent)
-                                is TimelineRow.Job -> JobPanel(row)
+                                is TimelineRow.Job -> JobPanel(row) { older -> onRequestJob(session, entry.key, older) }
                                 is TimelineRow.ApprovalOutcome -> ApprovalOutcomeRow(row)
                                 is TimelineRow.Note -> Text(row.text, color = colors.onSurfaceVariant,
                                     style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 8.dp))
@@ -871,7 +884,7 @@ private fun MessageBubble(
 }
 
 @Composable
-private fun JobPanel(job: TimelineRow.Job) {
+private fun JobPanel(job: TimelineRow.Job, onRequest: (older: Boolean) -> Unit) {
     val status = when (job.ok) {
         true -> stringResource(R.string.job_done)
         false -> stringResource(R.string.job_failed)
@@ -886,6 +899,24 @@ private fun JobPanel(job: TimelineRow.Job) {
         }
     }
     val time = job.report?.elapsed ?: elapsed.takeIf { startedAt != null && job.ok == null }
+    if (job.info.detailsDeferred) {
+        Panel(color = MaterialTheme.colorScheme.surfaceContainer) {
+            TextButton(onClick = { onRequest(false) }) {
+                Text(
+                    listOf(job.info.displayTitle, status, job.info.model,
+                        stringResource(R.string.job_tool_count, job.info.toolCount)).joinToString(" · "),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (job.nextDetail != null) {
+                TextButton(onClick = { onRequest(true) }, enabled = !job.loadingDetails) {
+                    Text(stringResource(R.string.job_earlier_activity))
+                }
+            }
+            job.details?.forEach { Text(it, style = MaterialTheme.typography.bodyMedium) }
+        }
+        return
+    }
     val detail = if (job.ok != null) job.report?.text?.takeIf { it.isNotBlank() } ?: job.summary else job.summary
     Panel(color = MaterialTheme.colorScheme.surfaceContainer) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {

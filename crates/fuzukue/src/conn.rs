@@ -1016,7 +1016,8 @@ impl Worker {
                         {
                             continue;
                         }
-                        if matches!(request, ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { generation: Some(_), .. })
+                        if matches!(request, ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistoryFrom { .. }
+                            | ClientMsg::GetThreadJob { .. } | ClientMsg::GetThreadHistory { generation: Some(_), .. })
                             && !synced
                         {
                             continue;
@@ -1027,6 +1028,7 @@ impl Worker {
                             ClientMsg::ListPendingApprovals { .. } | ClientMsg::SetLocale { .. } | ClientMsg::SelfUpdateStatus | ClientMsg::ListExtensions | ClientMsg::ListTests | ClientMsg::LookupSymbol { .. } | ClientMsg::SearchDecks { .. } | ClientMsg::SearchLibrary { .. } | ClientMsg::GetThreadArtifacts { .. } | ClientMsg::ListWorkspaces | ClientMsg::BrowseWorkspace { .. } | ClientMsg::ListFiles { .. } | ClientMsg::FindFiles { .. } | ClientMsg::ResolveFile { .. } | ClientMsg::ListAgents | ClientMsg::GetAgentStats | ClientMsg::GetAgentHistory { .. } | ClientMsg::GetPaperPdfMap { .. }
                                 | ClientMsg::ReviewReports { action: fuzukue_proto::ReviewReportsAction::List, .. }
                                 | ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { .. }
+                                | ClientMsg::GetThreadHistoryFrom { .. } | ClientMsg::GetThreadJob { .. }
                                  | ClientMsg::GitHubReport { action: fuzukue_proto::GitHubReportAction::Status, .. }
                                 | ClientMsg::Ledger { action: fuzukue_proto::LedgerAction::List, .. }
                                 | ClientMsg::History { request: fuzukue_proto::HistoryRequest::List { .. } | fuzukue_proto::HistoryRequest::Diff { .. }, .. }

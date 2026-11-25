@@ -389,6 +389,16 @@ struct DelegateBlock {
     tools_open: bool,
     earlier_tools_open: bool,
     report: Option<(bool, DelegateReport)>,
+    deferred: Option<DeferredJob>,
+}
+
+#[derive(Default)]
+struct DeferredJob {
+    open: bool,
+    tools: usize,
+    request: Option<u64>,
+    next_before: Option<u64>,
+    pending: Vec<(u64, ServerEvent)>,
 }
 
 const VISIBLE_DELEGATE_TOOLS: usize = 12;
@@ -507,6 +517,8 @@ enum Disclosure {
     Json,
     WorkerText,
     DelegateTools,
+    DelegateDetails,
+    MoreDelegateDetails,
     DelegateEarlierTools,
     DelegateTool(usize),
     Group,
@@ -526,7 +538,10 @@ impl Chat {
         scroller.set_scroll_handler(move |_, _, cx| {
             let workbench = workbench.clone();
             cx.defer(move |cx| {
-                let _ = workbench.update(cx, |_, cx| cx.notify());
+                let _ = workbench.update(cx, |view, cx| {
+                    view.history_scrolled(cx);
+                    cx.notify();
+                });
             });
         });
         Self {
@@ -998,6 +1013,8 @@ impl Chat {
     ) {
         if item.starts_with(DELEGATE_JOB) && name == "delegate" {
             if let Ok(mut job) = serde_json::from_value::<DelegateJob>(input.clone()) {
+                let compact = input["details_deferred"].as_bool() == Some(true);
+                let count = input["tool_count"].as_u64().unwrap_or(0) as usize;
                 if job.display.label.is_none() && job.display.card_id.is_none() {
                     job.display = fuzukue_proto::DelegateDisplay::from_title(job.title.as_deref(), None);
                 }
@@ -1011,6 +1028,9 @@ impl Chat {
                         started &= block.job.started_at_ms.is_none() && block.report.is_none();
                         job.dismissed_from_panel |= block.job.dismissed_from_panel;
                         block.job = job;
+                        if compact {
+                            block.deferred.get_or_insert_with(DeferredJob::default).tools = count;
+                        }
                         self.remeasure(row, cx);
                     }
                 } else {
@@ -1032,6 +1052,7 @@ impl Chat {
                             tools_open: false,
                             earlier_tools_open: false,
                             report: None,
+                            deferred: compact.then_some(DeferredJob { tools: count, ..DeferredJob::default() }),
                         }),
                     ));
                     self.append_row(cx);
@@ -1375,6 +1396,21 @@ impl Chat {
         self.scroller.scroll_to_end();
     }
 
+    pub(super) fn reveal_latest_conversation(&self) {
+        if !self.scroller.is_following_tail() {
+            return;
+        }
+        let latest = self.rows.iter().rposition(|row| {
+            matches!(row.content, Content::Message(_))
+                && (row.actor == Actor::User || is_partner(&row.actor))
+        });
+        if let Some(latest) = latest.filter(|&row| self.rows.len().saturating_sub(row) > 4) {
+            self.scroller.scroll_to(gpui_kit::ListOffset {
+                item_ix: latest.saturating_sub(1), offset_in_item: px(0.),
+            });
+        }
+    }
+
     pub(super) fn reveal_message(&self, item: &str) {
         if let Some(&index) = self.by_item.get(item) {
             self.scroller.scroll_to(gpui_kit::ListOffset { item_ix: index, offset_in_item: px(0.) });
@@ -1387,6 +1423,26 @@ impl Chat {
                 self.scroller.scroll_to(gpui_kit::ListOffset { item_ix: index, offset_in_item: px(0.) });
             }
         }
+    }
+
+    pub(super) fn buffer_job_event(&mut self, seq: u64, event: &ServerEvent) -> bool {
+        let Some((_, job)) = event.worker_child() else { return false };
+        let Some(&row) = self.by_item.get(job) else { return false };
+        let Content::Delegate(block) = &mut self.rows[row].content else { return false };
+        let Some(deferred) = &mut block.deferred else { return false };
+        if deferred.request.is_some() {
+            deferred.pending.push((seq, event.clone()));
+            return true;
+        }
+        !deferred.open
+    }
+
+    pub(super) fn update_job_tool_count(&mut self, job: &str, tools: usize, cx: &mut Context<Workbench>) {
+        let Some(&row) = self.by_item.get(job) else { return };
+        let Content::Delegate(block) = &mut self.rows[row].content else { return };
+        let Some(deferred) = &mut block.deferred else { return };
+        deferred.tools = tools;
+        self.remeasure(row, cx);
     }
 
     fn toggle(&mut self, row: usize, disclosure: Disclosure, show_worker_messages: bool, cx: &mut Context<Workbench>) {
@@ -1791,6 +1847,74 @@ fn chat_transcript_id(session: &str) -> ElementId {
 }
 
 impl Workbench {
+    fn toggle_thread_job(&mut self, session: &str, row: usize, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(session) else { return };
+        let Some(Row { content: Content::Delegate(block), .. }) = chat.rows.get_mut(row) else { return };
+        let Some(deferred) = &mut block.deferred else { return };
+        let request = (!deferred.open).then(chat_history::next_request);
+        if self.out.send(ClientMsg::GetThreadJob {
+            session: session.into(), job: block.id.clone(), request, before: None,
+        }).is_err() {
+            return;
+        }
+        deferred.open = request.is_some();
+        deferred.request = request;
+        deferred.pending.clear();
+        if !deferred.open {
+            deferred.tools = deferred.tools.max(block.progress.iter().filter(|entry| matches!(entry, DelegateEntry::Tool(_))).count());
+            block.progress.clear();
+            block.summary = None;
+            chat.delegate_items.retain(|_, (owner, _)| *owner != row);
+            if let Some((_, report)) = &mut block.report {
+                report.text.clear();
+                report.changes.clear();
+                report.attempts.clear();
+                report.files = None;
+            }
+        }
+        chat.remeasure(row, cx);
+    }
+
+    fn request_older_job_details(&mut self, session: &str, row: usize) {
+        let Some(chat) = self.chats.get_mut(session) else { return };
+        let Some(Row { content: Content::Delegate(block), .. }) = chat.rows.get_mut(row) else { return };
+        let Some(deferred) = &mut block.deferred else { return };
+        let Some(before) = deferred.next_before.filter(|_| deferred.open && deferred.request.is_none()) else { return };
+        let request = chat_history::next_request();
+        if self.out.send(ClientMsg::GetThreadJob {
+            session: session.into(), job: block.id.clone(), request: Some(request), before: Some(before),
+        }).is_ok() {
+            deferred.request = Some(request);
+        }
+    }
+
+    pub(crate) fn finish_thread_job(&mut self, event: ServerEvent, cx: &mut Context<Self>) {
+        let ServerEvent::ThreadJobDetails { session, job, request, through, before, next_before, events } = event
+            else { unreachable!() };
+        let Some(chat) = self.chats.get_mut(&session) else { return };
+        let Some(&row) = chat.by_item.get(&job) else { return };
+        let Content::Delegate(block) = &mut chat.rows[row].content else { return };
+        let Some(deferred) = &mut block.deferred else { return };
+        if deferred.request != Some(request) {
+            return;
+        }
+        deferred.request = None;
+        deferred.next_before = next_before;
+        let buffered = std::mem::take(&mut deferred.pending);
+        if before.is_some() {
+            chat.prepend_job_details(&job, events, cx);
+        } else {
+            chat.replay_updates(events.into_iter(), cx);
+        }
+        chat.replay_updates(buffered.into_iter().filter_map(|(seq, event)| {
+            (before.is_some() || seq > through).then_some(event)
+        }), cx);
+        let Content::Delegate(block) = &mut chat.rows[row].content else { return };
+        block.text_open = Some(true);
+        block.tools_open = true;
+        chat.remeasure(row, cx);
+    }
+
     pub(super) fn has_chat_quote(&self, window: &Window, cx: &gpui_kit::App) -> bool {
         TextSelection::quote_bounds(&chat_transcript_id(&self.active), window, cx).is_some()
     }
@@ -1828,8 +1952,19 @@ impl Workbench {
         if window.has_active_dialog(cx) {
             return;
         }
-        let chat = &self.chats[&self.active];
         let key = &event.keystroke;
+        if matches!(key.key.as_str(), "home" | "end") {
+            if !self.chat_focus.is_focused(window) {
+                return;
+            }
+            if key.modifiers.number_of_modifiers() == 0
+                && self.jump_thread_history(key.key == "end", cx)
+            {
+                cx.stop_propagation();
+                return;
+            }
+        }
+        let chat = &self.chats[&self.active];
         if self.chat_focus.is_focused(window) {
             let modifier_count = key.modifiers.number_of_modifiers();
             let plain = modifier_count == 0;
@@ -1837,7 +1972,7 @@ impl Workbench {
                 (modifier_count == u8::from(key.modifiers.shift) || event.prefer_character_input)
                     && text.chars().next().is_some_and(|c| !c.is_control())
             });
-            let down_at_bottom = plain && key.key == "down"
+            let down_at_bottom = plain && key.key == "down" && chat.history.next_after.is_none()
                 && (chat_at_bottom(&chat.scroller)
                     || chat_distance_to_bottom(&chat.scroller) <= window.line_height() + px(1.));
             if down_at_bottom || text.is_some() || (plain && matches!(key.key.as_str(), "enter" | "escape")) {
@@ -1857,6 +1992,7 @@ impl Workbench {
             }
         }
         if key.key != "space" && scroll_list_by_key(&chat.scroller, event, window) {
+            self.history_scrolled(cx);
             cx.stop_propagation();
             cx.notify();
         }
@@ -2027,8 +2163,12 @@ impl Workbench {
                     let press = chat.disclosure_press.clone();
                     disclosure_row(id, open, &label, color, press, cx, move |cx| {
                         entity.update(cx, |this, cx| {
-                            if let Some(chat) = this.chats.get_mut(&session) {
-                                chat.toggle(ix, part, this.appearance.settings.show_worker_messages, cx);
+                            match part {
+                                Disclosure::DelegateDetails => this.toggle_thread_job(&session, ix, cx),
+                                Disclosure::MoreDelegateDetails => this.request_older_job_details(&session, ix),
+                                _ => if let Some(chat) = this.chats.get_mut(&session) {
+                                    chat.toggle(ix, part, this.appearance.settings.show_worker_messages, cx);
+                                },
                             }
                         });
                     })
@@ -2193,6 +2333,16 @@ impl Workbench {
                         } else {
                             delegate_activity_name(&block.job).to_owned()
                         };
+                        if let Some(deferred) = &block.deferred {
+                            let calls = tr!("chat-tool-calls", calls = deferred.tools.max(delegate_tools(block).0));
+                            let label = [delegate_activity_name(&block.job), status, &block.job.model, &calls]
+                                .into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(STATUS_SEPARATOR);
+                            body = body.child(summary_toggle(
+                                format!("delegate-expand-{}", block.id).into(),
+                                Disclosure::DelegateDetails, deferred.open, label, theme.muted_foreground,
+                            ));
+                        }
+                        if block.deferred.as_ref().is_none_or(|job| job.open) {
                         let failed = matches!(&block.report, Some((false, _)));
                         let header = h_flex().flex_wrap().gap_2().items_center()
                             .line_height(UI_LINE_HEIGHT)
@@ -2213,6 +2363,13 @@ impl Workbench {
                                 .text_sm().text_color(theme.muted_foreground).child(summary.clone()));
                         }
                         let (calls, tool_failed) = delegate_tools(block);
+                        if let Some(job) = block.deferred.as_ref().filter(|job| job.next_before.is_some()) {
+                            body = body.child(summary_toggle(
+                                format!("delegate-more-{}", block.id).into(), Disclosure::MoreDelegateDetails,
+                                false, tr!("chat-earlier-worker-tools", calls = job.tools.saturating_sub(calls)),
+                                theme.muted_foreground,
+                            ));
+                        }
                         let tools_open = block.tools_open;
                         let earlier_calls = calls.saturating_sub(VISIBLE_DELEGATE_TOOLS);
                         if calls > 0 {
@@ -2328,6 +2485,7 @@ impl Workbench {
                                 .child(message_actions()
                                     .children(copy_message_action(&format!("{ix}-report"), text))
                                     .children(this.turn_history_action(&session, &block.id, &block.id, &entity))));
+                        }
                         }
                     }
                     Content::Tools(group) => {
@@ -2652,12 +2810,14 @@ impl Workbench {
         let quote_workbench = workbench.clone();
         let scroll_workbench = workbench.clone();
         let bounce = ScrollBounce::new("bounce", &scroller, rows).on_scroll(move |_, cx| {
-            let _ = scroll_workbench.update(cx, |_, cx| cx.notify());
+            let _ = scroll_workbench.update(cx, |view, cx| {
+                view.history_scrolled(cx);
+                cx.notify();
+            });
         });
         let bounce = if chat.history.before.is_some() && thread.is_none_or(|thread| !thread.archived) {
-            let session = self.active.clone();
             bounce.on_top_wheel(move |_, cx| {
-                let _ = workbench.update(cx, |view, _| view.request_older_history(&session));
+                let _ = workbench.update(cx, |view, cx| view.history_scrolled_older(cx));
             })
         } else {
             bounce
@@ -2765,7 +2925,7 @@ impl Workbench {
 
     pub(super) fn render_chat_footer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let chat = &self.chats[&self.active];
-        let show_latest = !chat_at_bottom(&chat.scroller);
+        let show_latest = chat.history.next_after.is_some() || !chat_at_bottom(&chat.scroller);
         let theme = cx.theme();
         let height = snap_chat_height(window.rem_size() * 1.5, window.scale_factor());
         let has_commands = self.chat_waiting.has_background_commands(&self.active);
@@ -2809,8 +2969,10 @@ impl Workbench {
                                 .text_color(theme.foreground)
                                 .shadow_sm()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.chats[&this.active].scroll_to_end();
-                                    cx.notify();
+                                    if !this.jump_thread_history(true, cx) {
+                                        this.chats[&this.active].scroll_to_end();
+                                        cx.notify();
+                                    }
                                 })),
                         )),
                 )

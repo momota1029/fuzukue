@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fuzukue_proto::{CachedSession, ClientMsg, ServerEvent, ThreadHistoryFailure};
@@ -19,6 +19,37 @@ pub(super) struct History {
     deferred_page_events: Vec<(u64, ServerEvent)>,
     page_through: HashMap<String, u64>,
     reset_position: Option<super::TranscriptPosition>,
+    jump: Option<Jump>,
+    forward: Option<PendingForward>,
+    pub(super) next_after: Option<u64>,
+    pages: VecDeque<LoadedPage>,
+    last_scroll: Option<ListOffset>,
+    direction: Option<Direction>,
+
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Jump {
+    History(u64),
+    Latest,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Older,
+    Newer,
+}
+
+struct PendingForward {
+    request: u64,
+    start: u64,
+    jump: bool,
+    events: Vec<(u64, ServerEvent)>,
+}
+
+struct LoadedPage {
+    start: u64,
+    rows: usize,
 }
 
 struct PendingTail {
@@ -39,7 +70,7 @@ pub(crate) struct Transcripts {
     advertised: Option<Vec<CachedSession>>,
 }
 
-fn next_request() -> u64 {
+pub(super) fn next_request() -> u64 {
     static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
     NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
 }
@@ -51,7 +82,7 @@ fn history_item(event: &ServerEvent) -> Option<Cow<'_, str>> {
         | ServerEvent::MessageDetails { item, .. } | ServerEvent::LocalNotice { item, .. }
         | ServerEvent::GitHubActivity { item, .. } => Some(Cow::Borrowed(item)),
         ServerEvent::DelegateProgress { job, .. } | ServerEvent::DelegateRenamed { job, .. }
-        | ServerEvent::DelegateDismissed { job, .. } => Some(Cow::Borrowed(job)),
+        | ServerEvent::DelegateDismissed { job, .. } | ServerEvent::ThreadJobActivity { job, .. } => Some(Cow::Borrowed(job)),
         ServerEvent::CommentApplication { application, .. } => Some(Cow::Owned(format!("comments-{}", application.thread))),
         _ => None,
     }
@@ -67,13 +98,98 @@ impl Workbench {
         {
             return;
         }
-        let Some(chat) = self.chats.get_mut(&self.active) else { return };
-        if chat.history.generation.is_some() || chat.history.tail.is_some() {
+        let session = self.active.clone();
+        let Some(chat) = self.chats.get_mut(&session) else { return };
+        if let Some(generation) = chat.history.generation {
+            match chat.history.jump {
+                Some(Jump::History(start)) => {
+                    self.request_history_from(&session, start, generation, true);
+                    return;
+                }
+                Some(Jump::Latest) => {}
+                None => return,
+            }
+        }
+        if chat.history.tail.is_some() {
             return;
         }
         let request = next_request();
-        if self.out.send(ClientMsg::GetThreadTail { session: self.active.clone(), request }).is_ok() {
+        if self.out.send(ClientMsg::GetThreadTail { session, request }).is_ok() {
             chat.history.tail = Some(PendingTail { request, events: Vec::new() });
+        }
+    }
+
+    fn request_history_from(&mut self, session: &str, start: u64, generation: u64, jump: bool) {
+        let history = &mut self.chats.get_mut(session).unwrap().history;
+        if history.forward.is_some() {
+            return;
+        }
+        let request = next_request();
+        if self.out.send(ClientMsg::GetThreadHistoryFrom { session: session.into(), request, start, generation }).is_ok() {
+            history.forward = Some(PendingForward { request, start, jump, events: Vec::new() });
+        }
+    }
+
+    pub(super) fn jump_thread_history(&mut self, latest: bool, cx: &mut Context<Self>) -> bool {
+        if !self.transcripts.scoped || self.protocol < fuzukue_proto::THREAD_WINDOW_PROTOCOL
+            || !self.threads.iter().any(|thread| thread.id == self.active)
+        {
+            return false;
+        }
+        let chat = self.chats.get_mut(&self.active).unwrap();
+        chat.cancel_history_prefetch(cx);
+        chat.history.forward = None;
+        chat.history.direction = None;
+        chat.history.reset_position = None;
+        chat.history.jump = Some(if latest { Jump::Latest } else { Jump::History(0) });
+        self.request_thread_tail();
+        cx.notify();
+        true
+    }
+
+    pub(super) fn history_scrolled(&mut self, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(&self.active) else { return };
+        let scroll = chat.scroller.logical_scroll_top();
+        let previous = chat.history.last_scroll.replace(scroll);
+        let Some(previous) = previous else { return };
+        let direction = match (scroll.item_ix, scroll.offset_in_item)
+            .partial_cmp(&(previous.item_ix, previous.offset_in_item))
+        {
+            Some(std::cmp::Ordering::Less) => Direction::Older,
+            Some(std::cmp::Ordering::Greater) => Direction::Newer,
+            _ => return,
+        };
+        self.prefetch_history(direction, false, cx);
+    }
+
+    pub(super) fn history_scrolled_older(&mut self, cx: &mut Context<Self>) {
+        self.prefetch_history(Direction::Older, true, cx);
+    }
+
+    fn prefetch_history(&mut self, direction: Direction, at_edge: bool, cx: &mut Context<Self>) {
+        const PREFETCH_ROWS: usize = 32;
+
+        if !matches!(self.status, ConnectionStatus::Connected) || self.receiving_backlog {
+            return;
+        }
+        let session = self.active.clone();
+        let Some(chat) = self.chats.get_mut(&session) else { return };
+        if chat.history.jump.is_some() {
+            return;
+        }
+        if chat.history.direction.replace(direction) != Some(direction) {
+            chat.cancel_history_prefetch(cx);
+        }
+        let top = chat.scroller.logical_scroll_top().item_ix;
+        let remaining = chat.scroller.max_offset_for_scrollbar().y + chat.scroller.scroll_px_offset_for_scrollbar().y;
+        match direction {
+            Direction::Older if at_edge || top <= PREFETCH_ROWS => self.request_older_history(&session),
+            Direction::Newer if remaining <= chat.scroller.viewport_bounds().size.height.max(gpui_kit::px(48.)) => {
+                if let (Some(start), Some(generation)) = (chat.history.next_after, chat.history.generation) {
+                    self.request_history_from(&session, start, generation, false);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -84,21 +200,41 @@ impl Workbench {
             else { unreachable!() };
         let Some(chat) = self.chats.get_mut(&session) else { return };
         let Some(pending) = chat.history.tail.take_if(|pending| pending.request == request) else { return };
+        let latest = chat.history.jump == Some(Jump::Latest);
+        if latest {
+            chat.clear_transcript_rows();
+            chat.history = History::default();
+        }
         chat.history.generation = Some(generation);
         chat.history.through = through;
         chat.history.before = next_before;
         chat.history.sparse_workers = workers;
+        let rows = chat.rows.len();
         chat.prepend_history(events, true, cx);
+        if chat.history.pages.is_empty() {
+            chat.history.pages.push_back(LoadedPage {
+                start: next_before.unwrap_or(0), rows: (chat.rows.len() - rows).saturating_sub(chat.sparse_history_rows()),
+            });
+        }
         chat.replay_updates(pending.events.into_iter().filter(|(seq, _)| *seq > through)
             .map(|(_, event)| event), cx);
         chat.reconcile_activity(chat.busy, self.transcripts.workers.get(&session), cx);
-        if let Some(position) = chat.history.reset_position.take() {
-            chat.restore_transcript_position(position);
+        if !matches!(chat.history.jump, Some(Jump::History(_))) {
+            if let Some(position) = chat.history.reset_position.take() {
+                chat.restore_transcript_position(position);
+            }
         }
+        if latest {
+            chat.scroll_to_end();
+        } else if chat.history.jump.is_none() {
+            chat.reveal_latest_conversation();
+        }
+        chat.history.last_scroll = Some(chat.scroller.logical_scroll_top());
         self.out.cache_transcript(&session, Some(generation));
         self.restore_approval_notices(&session, cx);
         if session == self.active {
             self.github_view();
+            self.request_thread_tail();
         }
     }
 
@@ -138,9 +274,8 @@ impl Workbench {
         self.transcripts.initial_controls.clear();
         for chat in self.chats.values_mut() {
             chat.history.tail = None;
-            chat.history.pending = None;
-            let deferred = std::mem::take(&mut chat.history.deferred_page_events);
-            chat.replay_updates(deferred.into_iter().map(|(_, event)| event), cx);
+            chat.history.forward = None;
+            chat.cancel_history_prefetch(cx);
         }
     }
 
@@ -198,10 +333,21 @@ impl Workbench {
         if let Some(tail) = &mut chat.history.tail {
             tail.events.push((seq, event.clone()));
         }
+        if let Some(page) = &mut chat.history.forward {
+            page.events.push((seq, event.clone()));
+        }
         if chat.history.generation.is_none() || (seq != 0 && seq <= chat.history.through) {
             return Some(false);
         }
+        if chat.buffer_job_event(seq, event) {
+            return Some(false);
+        }
         let item = history_item(event);
+        if chat.history.next_after.is_some()
+            && item.as_ref().is_some_and(|item| !chat.contains_history_item(item))
+        {
+            return Some(false);
+        }
         if seq != 0 && chat.history.page_through.values().all(|&through| seq > through) {
             chat.history.page_through.clear();
         }
@@ -282,7 +428,9 @@ impl Workbench {
             if let Some(chat) = event.transcript_session().and_then(|session| self.chats.get_mut(session)) {
                 let item_through = history_item(&event).and_then(|item|
                     chat.history.page_through.get(item.as_ref()).copied()).unwrap_or(0);
-                if chat.history.generation.is_some() && seq > chat.history.through.max(item_through) {
+                let belongs = chat.history.next_after.is_none()
+                    || history_item(&event).is_none_or(|item| chat.contains_history_item(&item));
+                if belongs && chat.history.generation.is_some() && seq > chat.history.through.max(item_through) {
                     chat.replay_updates(std::iter::once(event), cx);
                 }
             }
@@ -378,8 +526,10 @@ impl Workbench {
             return;
         }
         chat.history.pending = None;
-        chat.history.before =
-            next_before.filter(|next| chat.history.before.is_some_and(|before| *next < before));
+        let previous_before = chat.history.before;
+        let rows = chat.rows.len();
+        let sparse = chat.sparse_history_rows();
+        chat.history.before = next_before.filter(|next| previous_before.is_some_and(|before| *next < before));
         let items: HashSet<_> = if through.is_some() {
             events.iter().filter_map(history_item).filter(|item| !chat.contains_history_item(item))
                 .map(Cow::into_owned).collect()
@@ -388,6 +538,13 @@ impl Workbench {
         };
         let deferred = std::mem::take(&mut chat.history.deferred_page_events);
         chat.prepend_history(events, false, cx);
+        if !chat.history.pages.is_empty() && chat.history.before != previous_before {
+            chat.history.pages.push_front(LoadedPage {
+                start: chat.history.before.unwrap_or(0),
+                rows: chat.rows.len() - rows + sparse.saturating_sub(chat.sparse_history_rows()),
+            });
+            chat.trim_history_window(Direction::Older);
+        }
         if let Some(through) = through {
             chat.history.page_through.extend(items.iter().map(|item| (item.clone(), through)));
             chat.replay_updates(deferred.into_iter().filter_map(|(seq, event)| {
@@ -395,6 +552,64 @@ impl Workbench {
                 (!included || seq > through).then_some(event)
             }), cx);
         }
+        chat.history.last_scroll = Some(chat.scroller.logical_scroll_top());
+    }
+
+    pub(crate) fn finish_thread_history_from(&mut self, event: ServerEvent, cx: &mut Context<Self>) {
+        let ServerEvent::ThreadHistoryFrom { session, request, start, next_after, generation, through, events } = event
+            else { unreachable!() };
+        let Some(chat) = self.chats.get_mut(&session) else { return };
+        if chat.history.generation != Some(generation) {
+            return;
+        }
+        let Some(pending) = chat.history.forward.take_if(|pending| pending.request == request && pending.start == start)
+            else { return };
+        if pending.jump {
+            chat.clear_transcript_rows();
+            chat.history.before = (start != 0).then_some(start);
+            chat.history.pages.clear();
+            chat.history.sparse_workers.clear();
+            chat.history.page_through.clear();
+        }
+
+        let rows = chat.rows.len();
+        chat.history.next_after = next_after.filter(|&next| next > start);
+        chat.scroller.set_follow_mode(gpui_kit::FollowMode::Normal);
+        chat.grouping = Default::default();
+        chat.delegate_anchor = None;
+        chat.replay_updates(events.into_iter(), cx);
+        chat.history.pages.push_back(LoadedPage { start, rows: chat.rows.len().saturating_sub(rows) });
+        if chat.history.next_after.is_none() {
+            chat.history.through = through;
+            chat.replay_updates(pending.events.into_iter().filter_map(|(seq, event)| (seq > through).then_some(event)), cx);
+        }
+        if pending.jump {
+            if chat.rows.is_empty() && chat.history.next_after.is_some() {
+                chat.history.jump = chat.history.next_after.map(Jump::History);
+                if self.active == session {
+                    self.request_thread_tail();
+                }
+                return;
+            }
+            chat.history.jump = None;
+            if let Some(position) = chat.history.reset_position.take() {
+                chat.restore_transcript_position(position);
+            } else {
+                chat.scroller.scroll_to(ListOffset::default());
+            }
+        } else {
+            chat.trim_history_window(Direction::Newer);
+        }
+        if chat.history.next_after.is_none() {
+            let anchor = chat.scroller.logical_scroll_top();
+            chat.scroller.set_follow_mode(gpui_kit::FollowMode::Tail);
+            chat.scroller.scroll_to(anchor);
+        }
+        chat.history.last_scroll = Some(chat.scroller.logical_scroll_top());
+        if pending.jump {
+            self.restore_approval_notices(&session, cx);
+        }
+        cx.notify();
     }
 
     pub(crate) fn thread_history_failed(
@@ -405,7 +620,8 @@ impl Workbench {
             cx.notify();
             return;
         }
-        if chat.history.pending != Some(request) {
+        let from = chat.history.forward.take_if(|pending| pending.request == request);
+        if from.is_none() && chat.history.pending != Some(request) {
             return;
         }
         chat.history.pending = None;
@@ -417,8 +633,10 @@ impl Workbench {
                 }
             }
             Some(ThreadHistoryFailure::Unavailable) => {
-                let deferred = std::mem::take(&mut chat.history.deferred_page_events);
-                chat.replay_updates(deferred.into_iter().map(|(_, event)| event), cx);
+                if from.is_some_and(|pending| pending.jump) {
+                    chat.history.jump = None;
+                }
+                chat.cancel_history_prefetch(cx);
             }
             None => chat.history.before = None,
         }
@@ -426,6 +644,78 @@ impl Workbench {
 }
 
 impl Chat {
+    fn cancel_history_prefetch(&mut self, cx: &mut Context<Workbench>) {
+        self.history.pending = None;
+        if self.history.forward.as_ref().is_some_and(|pending| !pending.jump) {
+            self.history.forward = None;
+        }
+        let deferred = std::mem::take(&mut self.history.deferred_page_events);
+        self.replay_updates(deferred.into_iter().map(|(_, event)| event), cx);
+    }
+
+    fn trim_history_window(&mut self, direction: Direction) {
+        const KEPT_PAGES: usize = 4;
+        if self.history.pages.len() <= KEPT_PAGES {
+            return;
+        }
+
+        let anchor = self.scroller.logical_scroll_top();
+        let sparse = self.sparse_history_rows();
+        let range = match direction {
+            Direction::Older => {
+                let newest = self.history.pages.back().unwrap();
+                let offset = sparse + self.history.pages.iter().take(self.history.pages.len() - 1)
+                    .map(|page| page.rows).sum::<usize>();
+                if anchor.item_ix.saturating_add(32) >= offset || self.scroller.is_following_tail() {
+                    return;
+                }
+                self.history.next_after = Some(newest.start);
+                self.history.pages.pop_back();
+                self.scroller.set_follow_mode(gpui_kit::FollowMode::Normal);
+                offset..self.rows.len()
+            }
+            Direction::Newer => {
+                let oldest = self.history.pages.front().unwrap();
+                let end = sparse + oldest.rows;
+                if anchor.item_ix <= end {
+                    return;
+                }
+                self.history.pages.pop_front();
+                self.history.before = self.history.pages.front().map(|page| page.start);
+                sparse..end.min(self.rows.len())
+            }
+        };
+        self.remove_history_rows(range);
+    }
+
+    fn remove_history_rows(&mut self, range: std::ops::Range<usize>) {
+        let shift = |row: &mut usize| {
+            if range.contains(row) {
+                return false;
+            }
+            if *row >= range.end {
+                *row -= range.len();
+            }
+            true
+        };
+        self.by_item.retain(|_, row| shift(row));
+        self.pending_delegates.retain(|job| self.by_item.contains_key(job));
+        self.by_tool.retain(|_, (row, _)| shift(row));
+        self.by_approval.retain(|_, (row, _)| shift(row));
+        self.delegate_items.retain(|_, (row, _)| shift(row));
+        self.delegate_anchor = self.delegate_anchor.take().and_then(|mut row| shift(&mut row).then_some(row));
+        self.history.page_through.retain(|item, _| self.by_item.contains_key(item)
+            || self.by_tool.contains_key(item) || self.delegate_items.contains_key(item));
+        let removed = self.rows.drain(range.clone()).map(|row| row.id).collect();
+        self.scroller.splice(range, 0);
+        self.transcript.forget_rows(&removed);
+        self.clear_transcript_hover();
+    }
+
+    fn sparse_history_rows(&self) -> usize {
+        self.history.sparse_workers.iter().filter(|job| self.by_item.contains_key(*job)).count()
+    }
+
     fn contains_history_item(&self, item: &str) -> bool {
         self.by_item.contains_key(item)
             || self.by_tool.contains_key(item)
@@ -605,9 +895,31 @@ impl Chat {
         cx.notify();
     }
 
+    pub(super) fn prepend_job_details(&mut self, job: &str, events: Vec<ServerEvent>, cx: &mut Context<Workbench>) {
+        let sparse = std::mem::replace(&mut self.history.sparse_workers, vec![job.into()]);
+        self.prepend_history(events, false, cx);
+        self.history.sparse_workers = sparse;
+    }
+
     fn reset_transcript(&mut self) {
         let position = self.transcript_position().or_else(|| self.history.reset_position.take());
-        self.history = History { reset_position: position, ..History::default() };
+        let jump = self.history.jump.or_else(|| {
+            self.history.next_after?;
+            let item = self.scroller.logical_scroll_top().item_ix;
+            let mut offset = self.sparse_history_rows();
+            for page in &self.history.pages {
+                offset += page.rows;
+                if item < offset {
+                    return Some(Jump::History(page.start));
+                }
+            }
+            self.history.pages.front().map(|page| Jump::History(page.start))
+        });
+        self.history = History { reset_position: position, jump, ..History::default() };
+        self.clear_transcript_rows();
+    }
+
+    fn clear_transcript_rows(&mut self) {
         self.rows.clear();
         self.by_item.clear();
         self.by_tool.clear();
@@ -621,7 +933,7 @@ impl Chat {
         self.discard_transcript_layout();
     }
 
-    fn replay_updates(&mut self, events: impl Iterator<Item = ServerEvent>, cx: &mut Context<Workbench>) {
+    pub(super) fn replay_updates(&mut self, events: impl Iterator<Item = ServerEvent>, cx: &mut Context<Workbench>) {
         let busy = self.busy;
         let turn = self.turn.take();
         let notice = self.composer_notice.take();
@@ -642,6 +954,7 @@ impl Chat {
                 self.user_prompt(item, text, paths, to_worker, cx),
             ServerEvent::ToolResult { item, ok, output, .. } => self.tool_result(&item, ok, output, cx),
             ServerEvent::DelegateProgress { job, summary, .. } => self.delegate_progress(&job, summary, cx),
+            ServerEvent::ThreadJobActivity { job, tools, .. } => self.update_job_tool_count(&job, tools, cx),
             ServerEvent::DelegateRenamed { job, change, .. } => self.delegate_renamed(&job, &change, cx),
             ServerEvent::DelegateDismissed { job, .. } => self.delegate_dismissed(&job),
             ServerEvent::LocalNotice { item, text, localized, .. } if item != fuzukue_proto::COMPOSER_NOTICE_ITEM =>
@@ -709,6 +1022,138 @@ mod tests {
         let chat = &view.chats[session];
         let Content::Message(message) = &chat.rows[chat.by_item[item]].content else { panic!("missing message") };
         &message.text
+    }
+
+    #[test]
+    fn home_end_prefetch_and_job_details_preserve_the_transcript() {
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(|cx| {
+            gpui_kit::init(cx);
+            crate::math::init(cx);
+            let (window, view) = gpui_kit::open_window(gpui_kit::component::TitleBar::window_options(),
+                cx, |window, cx| cx.new(|cx| Workbench::new_with_target(window, cx, Some(Err("No socket fixture"))))).unwrap();
+            window.update(cx, |_, window, cx| view.update(cx, |view, cx| {
+                let (out, sent) = std::sync::mpsc::channel();
+                view.out = out.into();
+                view.on_conn(ConnEvent::Connected, window, cx);
+                deliver(view, window, cx, 0, ServerEvent::Welcome {
+                    protocol: PROTOCOL_VERSION, server: "fixture".into(), client_manifest: None, server_tailnet_url: None,
+                    selection_scoped_transcripts: true,
+                });
+                deliver(view, window, cx, 0, ServerEvent::WorkspaceSelected { id: WORKSPACE.into(), replay: true });
+                deliver(view, window, cx, 0, ServerEvent::Threads {
+                    threads: vec![serde_json::from_value(serde_json::json!({"id": A, "title": A, "updated": 1})).unwrap()],
+                });
+                deliver(view, window, cx, 0, ServerEvent::ThreadSync {
+                    epoch: "fixture".into(), through: 10, reset_sessions: vec![],
+                });
+                let request = view.chats[A].history.tail.as_ref().unwrap().request;
+                let job = "delegate:synthetic";
+                let events = vec![
+                    text(A, "latest", "Newest conversation reply"),
+                    ServerEvent::ToolCall {
+                        session: A.into(), item: job.into(), actor: Actor::System, name: "delegate".into(),
+                        input: serde_json::json!({"title":"Synthetic job", "model":"fixture", "started_at_ms":0,
+                            "details_deferred":true,"tool_count":500}),
+                    }
+                ];
+                deliver(view, window, cx, 0, ServerEvent::ThreadTail {
+                    session: A.into(), request, generation: 0, through: 10,
+                    events, workers: vec![], next_before: Some(600),
+                });
+                assert_eq!(body(view, A, "latest"), "Newest conversation reply");
+                let job_row = view.chats[A].by_item[job];
+                let Content::Delegate(block) = &view.chats[A].rows[job_row].content else { panic!("missing job") };
+                assert!(block.progress.is_empty());
+                assert_eq!(block.deferred.as_ref().unwrap().tools, 500);
+                view.toggle_thread_job(A, job_row, cx);
+                let detail = sent.try_iter().find_map(|event| match event {
+                    ClientMsg::InWorkspace { request, .. } => match *request {
+                        ClientMsg::GetThreadJob { request, .. } => request,
+                        _ => None,
+                    },
+                    _ => None,
+                }).expect("expansion requested details");
+                deliver(view, window, cx, 0, ServerEvent::ThreadJobDetails {
+                    session: A.into(), job: job.into(), request: detail, through: 10,
+                    before: None, next_before: None,
+                    events: vec![ServerEvent::TextDelta {
+                        session: A.into(), item: format!("{job}:detail"), text: "Synthetic activity".into(),
+                        actor: Actor::Codex { thread_id: "fixture".into(), parent_tool_use: Some(job.into()) },
+                    }],
+                });
+                let Content::Delegate(block) = &view.chats[A].rows[job_row].content else { panic!("missing job") };
+                assert_eq!(block.progress.len(), 1);
+
+                view.history_scrolled_older(cx);
+                let older = view.chats[A].history.pending.unwrap();
+                view.prefetch_history(Direction::Newer, false, cx);
+                assert!(view.chats[A].history.pending.is_none());
+                deliver(view, window, cx, 0, ServerEvent::ThreadHistoryPage {
+                    session: A.into(), request: older, events: vec![text(A, "ignored", "Cancelled page")],
+                    next_before: Some(300), generation: Some(0), through: Some(10),
+                });
+                assert!(!view.chats[A].by_item.contains_key("ignored"));
+
+                let home = gpui_kit::KeyDownEvent {
+                    keystroke: gpui_kit::Keystroke::parse("home").unwrap(), is_held: false, prefer_character_input: false,
+                };
+                view.input.update(cx, |input, cx| input.focus(window, cx));
+                view.chat_key_down(&home, window, cx);
+                assert!(view.chats[A].history.forward.is_none());
+                view.chat_focus.focus(window, cx);
+                view.chat_key_down(&home, window, cx);
+                let request = view.chats[A].history.forward.as_ref().unwrap().request;
+                deliver(view, window, cx, 0, ServerEvent::ThreadHistoryFrom {
+                    session: A.into(), request, generation: 0, start: 0, next_after: Some(1), through: 11,
+                    events: vec![text(A, "first", "First conversation message")],
+                });
+                assert_eq!(body(view, A, "first"), "First conversation message");
+                assert_eq!(view.chats[A].scroller.logical_scroll_top(), ListOffset::default());
+                view.prefetch_history(Direction::Newer, false, cx);
+                let request = view.chats[A].history.forward.as_ref().unwrap().request;
+                let anchor = view.chats[A].scroller.logical_scroll_top();
+                deliver(view, window, cx, 0, ServerEvent::ThreadHistoryFrom {
+                    session: A.into(), request, generation: 0, start: 1, next_after: Some(2), through: 11,
+                    events: vec![text(A, "second", "Second conversation message")],
+                });
+                assert_eq!(view.chats[A].scroller.logical_scroll_top(), anchor);
+
+                for start in 2..=4 {
+                    view.request_history_from(A, start, 0, false);
+                    let request = view.chats[A].history.forward.as_ref().unwrap().request;
+                    if start == 4 {
+                        let chat = &view.chats[A];
+                        chat.scroller.scroll_to(ListOffset { item_ix: chat.by_item["page-2-10"], offset_in_item: gpui_kit::px(3.) });
+                    }
+                    deliver(view, window, cx, 0, ServerEvent::ThreadHistoryFrom {
+                        session: A.into(), request, generation: 0, start, next_after: Some(start + 1), through: 11,
+                        events: (0..32).map(|item| text(A, &format!("page-{start}-{item}"), "Synthetic message")).collect(),
+                    });
+                }
+                let chat = &view.chats[A];
+                assert!(!chat.by_item.contains_key("first"));
+                assert_eq!(chat.history.pages.len(), 4);
+                assert_eq!(chat.scroller.logical_scroll_top(), ListOffset {
+                    item_ix: chat.by_item["page-2-10"], offset_in_item: gpui_kit::px(3.),
+                });
+
+                let end = gpui_kit::KeyDownEvent {
+                    keystroke: gpui_kit::Keystroke::parse("end").unwrap(), ..home
+                };
+                view.chat_key_down(&end, window, cx);
+                let request = view.chats[A].history.tail.as_ref().unwrap().request;
+                deliver(view, window, cx, 12, text(A, "latest", " + streamed"));
+                deliver(view, window, cx, 0, ServerEvent::ThreadTail {
+                    session: A.into(), request, generation: 0, through: 11, workers: vec![], next_before: Some(8),
+                    events: vec![text(A, "latest", "Newest conversation reply")],
+                });
+                assert_eq!(body(view, A, "latest"), "Newest conversation reply + streamed");
+                assert!(view.chats[A].scroller.is_following_tail());
+            })).unwrap();
+            cx.spawn(async move |cx| {
+                let _ = cx.update(|cx| cx.quit());
+            }).detach();
+        });
     }
 
     #[test]

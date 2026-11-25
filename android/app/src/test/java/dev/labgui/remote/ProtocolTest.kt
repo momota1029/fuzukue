@@ -27,7 +27,7 @@ class ProtocolTest {
     }
 
     @Test fun handshakeAndWorkspaceCommands() {
-        assertMessage("""{"type":"hello","protocol":67,"workspace":"lab","locale":"en","platform":"android","thread_history":true,"selection_scoped_transcripts":true}""", ClientMessage.Hello(workspace = "lab", locale = "en"))
+        assertMessage("""{"type":"hello","protocol":$PROTOCOL_VERSION,"workspace":"lab","locale":"en","platform":"android","thread_history":true,"selection_scoped_transcripts":true}""", ClientMessage.Hello(workspace = "lab", locale = "en"))
         assertEquals(ServerEvent.Welcome(MIN_PROTOCOL_VERSION), Protocol.decode(
             """{"seq":0,"event":{"type":"welcome","protocol":$MIN_PROTOCOL_VERSION,"server":"secretaire"}}""",
         ).event)
@@ -35,6 +35,26 @@ class ProtocolTest {
             """{"type":"in_workspace","id":"lab","request":{"type":"resolve","request_id":"codex:3","decision":"decline"}}""",
             ClientMessage.InWorkspace("lab", ClientMessage.Resolve("codex:3", "decline")),
         )
+    }
+
+    @Test fun compactJobUsesSeparatePagedDetails() {
+        val job = decodeEvent(
+            """{"type":"tool_call","session":"s","item":"delegate:j","actor":{"kind":"system"},"name":"delegate","input":{"model":"fixture","title":"Synthetic job","tool_count":500,"details_deferred":true}}""",
+        ) as ServerEvent.ToolCall
+        val initial = Timeline().reduceSaved(job)
+        val row = initial.rows.getValue("delegate:j") as TimelineRow.Job
+        assertTrue(row.info.detailsDeferred)
+        assertEquals(500, row.info.toolCount)
+        assertNull(row.details)
+        assertMessage(
+            """{"type":"get_thread_job","session":"s","job":"delegate:j","request":4,"before":17}""",
+            ClientMessage.GetThreadJob("s", "delegate:j", 4uL, 17uL),
+        )
+        val details = decodeEvent(
+            """{"type":"thread_job_details","session":"s","job":"delegate:j","request":4,"before":17,"next_before":2,"through":100,"events":[]}""",
+        ) as ServerEvent.ThreadJobDetails
+        assertEquals(17uL, details.before)
+        assertEquals(2uL, details.nextBefore)
     }
 
     @Test fun decodesNotificationRoutingAndTerminalUpdateStatus() {
