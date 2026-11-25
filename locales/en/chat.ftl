@@ -29,7 +29,6 @@ chat-worker-approval-help = Who decides eligible worker approvals in this worksp
 chat-worker-approval-ask = Ask me
 chat-worker-approval-advisor = Ask the advisor
 chat-worker-approval-auto = Auto-approve
-chat-awaiting-approval = Awaiting approval{ STATUS_SEPARATOR() }{ $summary }
 chat-approval-pending = Awaiting approval…
 chat-backend-model-and-reasoning-effort = Backend, model and reasoning effort
 chat-cannot-open-the-file-picker = Couldn’t open the file picker: { $err }

@@ -26,7 +26,6 @@ chat-worker-approval-help = このワークスペースで作業役からの対�
 chat-worker-approval-ask = 毎回確認
 chat-worker-approval-advisor = 方針役に相談
 chat-worker-approval-auto = 自動で許可
-chat-awaiting-approval = 承認待ち{ STATUS_SEPARATOR() }{ $summary }
 chat-approval-pending = 承認待ち…
 chat-backend-model-and-reasoning-effort = バックエンド・モデル・思考レベル
 chat-cannot-open-the-file-picker = ファイル選択を開けません: { $err }
