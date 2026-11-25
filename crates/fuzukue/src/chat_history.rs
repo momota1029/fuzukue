@@ -1101,8 +1101,12 @@ mod tests {
             crate::math::init(cx);
             let (window, view) = gpui_kit::open_window(gpui_kit::component::TitleBar::window_options(),
                 cx, |window, cx| cx.new(|cx| Workbench::new_with_target(window, cx, Some(Err("No socket fixture"))))).unwrap();
-            window.update(cx, |_, window, cx| view.update(cx, |view, cx| {
-                let (out, sent) = std::sync::mpsc::channel();
+            let (out, sent) = std::sync::mpsc::channel();
+            window.update(cx, |_, window, cx| {
+                window.draw(cx).clear(cx);
+            }).unwrap();
+            let job = "delegate:synthetic";
+            let summary = window.update(cx, |_, window, cx| view.update(cx, |view, cx| {
                 view.out = out.into();
                 view.on_conn(ConnEvent::Connected, window, cx);
                 deliver(view, window, cx, 0, ServerEvent::Welcome {
@@ -1117,7 +1121,6 @@ mod tests {
                     epoch: "fixture".into(), through: 10, reset_sessions: vec![],
                 });
                 let request = view.chats[A].history.tail.as_ref().unwrap().request;
-                let job = "delegate:synthetic";
                 let summary: JobSummary = serde_json::from_value(serde_json::json!({
                     "id":job, "position":20, "status":"running", "tools":500, "had_tool_error":false,
                     "job":{"model":"fixture","started_at_ms":0}, "last_tool":"Read notes.md",
@@ -1173,16 +1176,15 @@ mod tests {
                     next_before: Some(300), generation: Some(0), through: Some(10),
                 });
                 assert!(!view.chats[A].by_item.contains_key("ignored"));
+                summary
+            })).unwrap();
 
-                let home = gpui_kit::KeyDownEvent {
-                    keystroke: gpui_kit::Keystroke::parse("home").unwrap(), is_held: false, prefer_character_input: false,
-                };
-                view.input.update(cx, |input, cx| input.focus(window, cx));
-                view.chat_key_down(&home, window, cx);
-                assert!(view.chats[A].history.forward.is_none());
-                view.chat_focus.focus(window, cx);
-                view.chat_key_down(&home, window, cx);
-                let request = view.chats[A].history.forward.as_ref().unwrap().request;
+            window.update(cx, |_, window, cx| {
+                window.blur(cx);
+                assert!(window.dispatch_keystroke(gpui_kit::Keystroke::parse("home").unwrap(), cx));
+            }).unwrap();
+            window.update(cx, |_, window, cx| view.update(cx, |view, cx| {
+                let request = view.chats[A].history.forward.as_ref().expect("Home should request history from row zero").request;
                 deliver(view, window, cx, 0, ServerEvent::ThreadHistoryFrom {
                     session: A.into(), request, generation: 0, start: 0, next_after: Some(1), through: 11,
                     events: vec![text(A, "first", "First conversation message")],
@@ -1218,11 +1220,14 @@ mod tests {
                 assert_eq!(chat.scroller.logical_scroll_top(), ListOffset {
                     item_ix: chat.by_item["page-2-10"], offset_in_item: gpui_kit::px(3.),
                 });
+                view.input.update(cx, |input, cx| input.focus(window, cx));
+            })).unwrap();
 
-                let end = gpui_kit::KeyDownEvent {
-                    keystroke: gpui_kit::Keystroke::parse("end").unwrap(), ..home
-                };
-                view.chat_key_down(&end, window, cx);
+            window.update(cx, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                assert!(window.dispatch_keystroke(gpui_kit::Keystroke::parse("end").unwrap(), cx));
+            }).unwrap();
+            window.update(cx, |_, window, cx| view.update(cx, |view, cx| {
                 let request = view.chats[A].history.tail.as_ref().unwrap().request;
                 deliver(view, window, cx, 12, text(A, "latest", " + streamed"));
                 deliver(view, window, cx, 0, ServerEvent::ThreadTail {

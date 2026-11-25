@@ -39,6 +39,12 @@ pub(super) struct Screenshots {
     capture_fixture: Option<Result<Vec<u8>>>,
 }
 
+impl Screenshots {
+    pub(super) fn preview_open(&self) -> bool {
+        self.preview.is_some()
+    }
+}
+
 struct Preview {
     image: Arc<Image>,
     note: Entity<TextareaState>,

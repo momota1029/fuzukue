@@ -42,6 +42,10 @@ struct Detail {
 }
 
 impl History {
+    pub(super) fn is_open(&self) -> bool {
+        self.panel.is_some()
+    }
+
     pub(super) fn close(&mut self) -> bool {
         self.panel.take().is_some()
     }

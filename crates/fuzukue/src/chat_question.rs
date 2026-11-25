@@ -9,7 +9,7 @@ use gpui_kit::component::{
     v_flex, ActiveTheme as _,
 };
 use gpui_kit::{
-    div, prelude::*, px, App, Context, Entity, FocusHandle, KeyDownEvent, Render, SharedString,
+    div, prelude::*, px, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, Render, SharedString,
     Window,
 };
 
@@ -51,6 +51,11 @@ impl QuestionField {
 }
 
 impl QuestionCard {
+    pub(super) fn focused_input(&self, window: &Window, cx: &App) -> Option<&Entity<InputState>> {
+        self.fields.iter().filter_map(|field| field.input.as_ref())
+            .find(|input| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     pub(super) fn new(
         request_id: String,
         questions: Vec<Question>,

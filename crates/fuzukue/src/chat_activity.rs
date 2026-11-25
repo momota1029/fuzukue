@@ -844,6 +844,7 @@ impl Workbench {
         let panel = panel.clone();
         div()
             .id(activity_id("details"))
+            .key_context("WorkbenchJobList")
             .relative()
             .w(width)
             .rounded_md()

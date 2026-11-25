@@ -231,7 +231,7 @@ struct Workbench {
     chat_focus: gpui_kit::FocusHandle,
     view_focus: gpui_kit::FocusHandle,
     app_menu: menu_bar::MenuBar,
-    _close_key: gpui_kit::Subscription,
+    _workbench_keys: gpui_kit::Subscription,
     /// 検索・添付の参照先、および概要の表示に使うデッキ情報。
     tabs: Vec<TabView>,
     workspace_title: Option<String>,
@@ -436,19 +436,19 @@ fn focused_composition<I: Focusable + EntityInputHandler>(
     input.read(cx).focus_handle(cx).is_focused(window) && composing(input, window, cx)
 }
 
-/// Handle navigation only in the dispatch subtree of a scroll viewport.
+/// Apply the standard scroll distances for a list navigation key.
 fn scroll_list_by_key(
     list: &gpui_kit::ListState,
-    event: &gpui_kit::KeyDownEvent,
+    key: &gpui_kit::Keystroke,
     window: &Window,
 ) -> bool {
-    let modifiers = event.keystroke.modifiers;
+    let modifiers = key.modifiers;
     if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
         return false;
     }
     let line = window.line_height();
     let page = list.viewport_bounds().size.height.max(line);
-    match (event.keystroke.key.as_str(), modifiers.shift) {
+    match (key.key.as_str(), modifiers.shift) {
         ("up", false) => list.scroll_by(-line),
         ("down", false) => list.scroll_by(line),
         ("pageup", false) | ("space", true) => list.scroll_by(-page),
@@ -491,9 +491,9 @@ impl Workbench {
         let root_focus = view_focus.clone();
         let view = cx.weak_entity();
         let window_id = window.window_handle().window_id();
-        // A view switch can remove the focused input. In that frame there is
-        // no focused descendant to carry Escape up to the Workbench.
-        let close_key = cx.intercept_keystrokes(move |event, window, cx| {
+        // A view switch can remove the focused input. Window shortcuts must also
+        // work when there is no focused descendant to carry a key to Workbench.
+        let workbench_keys = cx.intercept_keystrokes(move |event, window, cx| {
             if window.window_handle().window_id() != window_id {
                 return;
             }
@@ -501,6 +501,12 @@ impl Workbench {
             if !window.has_active_dialog(cx)
                 && view.update(cx, |this, cx| {
                     this.handle_app_menu_key(&event.keystroke, window, cx)
+                }).unwrap_or(false)
+            {
+                cx.stop_propagation();
+            } else if matches!(event.keystroke.key.as_str(), "home" | "end" | "pageup" | "pagedown")
+                && view.update(cx, |this, cx| {
+                    this.thread_navigation_key(event, window, cx)
                 }).unwrap_or(false)
             {
                 cx.stop_propagation();
@@ -756,7 +762,7 @@ impl Workbench {
             chat_focus: cx.focus_handle(),
             view_focus,
             app_menu: menu_bar::MenuBar::new(cx),
-            _close_key: close_key,
+            _workbench_keys: workbench_keys,
             built_pdfs: HashMap::new(),
             paper_pdf: Default::default(),
             protocol: 0,
@@ -2311,6 +2317,7 @@ impl Render for Workbench {
             let loading = self.receiving_backlog && (!self.threads_loaded || self.transcripts.scoped)
                 && (self.workspaces.active.is_some() || self.protocol >= 4);
             chat_col
+                .key_context("ThreadConversation")
                 .children(self.render_paper_jobs(window, cx))
                 .child(div().flex_1().min_h_0()
                     .when(loading, |pane| pane.flex().items_center().justify_center()

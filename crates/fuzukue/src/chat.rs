@@ -12,7 +12,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use gpui_kit::base::{Disableable as _, ElementExt as _, ScrollBounce, Selectable, StyledExt as _, TextSelection, TextSelectionScopeId};
 use gpui_kit::base::actions::{SelectDown, SelectUp};
-use gpui_kit::base::input::{Enter, MoveDown, MoveUp};
+use gpui_kit::base::input::{Enter, MoveDown, MoveUp, RopeExt as _};
 use gpui_kit::base::text::editor_host::{parse_markdown, BlockNode};
 use gpui_kit::base::text::MarkdownExtensions;
 use gpui_kit::component::{
@@ -1989,22 +1989,88 @@ impl Workbench {
         true
     }
 
+    pub(super) fn thread_navigation_key(
+        &mut self,
+        event: &gpui_kit::KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = &event.keystroke;
+        let modifiers = key.modifiers;
+        let plain = modifiers.number_of_modifiers() == 0;
+        let control = modifiers.control && modifiers.number_of_modifiers() == 1;
+        let endpoint = match key.key.as_str() {
+            "home" if plain || control => Some(false),
+            "end" if plain || control => Some(true),
+            "pageup" | "pagedown" if plain => None,
+            _ => return false,
+        };
+        let in_context = |name| event.context_stack.iter().any(|context| context.contains(name));
+        if window.has_active_dialog(cx)
+            || self.workspace_browser_open()
+            || self.palette.is_some()
+            || self.app_menu.is_expanded()
+            || self.history.is_open()
+            || self.screenshots.preview_open()
+            || (self.paper_pdf_visible() && self.paper_pdf.popup.is_some())
+            || in_context("PopupMenu")
+            || in_context("WorkbenchJobList")
+        {
+            return false;
+        }
+        let composer_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+        let thread_focused = composer_focused || in_context("ThreadConversation")
+            || self.sidebar.thread_focus.get(&self.active).is_some_and(|focus| focus.is_focused(window));
+        // In a split view, only route keys from the conversation side.
+        if !thread_focused && (self.right != super::RightPane::None || self.settings_open
+            || self.symbols.is_open() || self.thread_info_visible())
+        {
+            return false;
+        }
+
+        if composer_focused {
+            if composing(&self.input, window, cx) {
+                return false;
+            }
+            let text = self.input.read(cx).text();
+            let input_uses_key = if control { text.lines_len() > 1 } else { text.len() > 0 };
+            if input_uses_key {
+                return false;
+            }
+        } else if in_context("Input") {
+            let title = self.thread_title_edit.as_ref()
+                .map(|(_, input)| input)
+                .filter(|input| input.read(cx).focus_handle(cx).is_focused(window));
+            let input = title.or_else(|| self.question_drafts.values()
+                .find_map(|card| card.read(cx).focused_input(window, cx)));
+            if input.is_none_or(|input| !control && input.read(cx).text().len() > 0) {
+                return false;
+            }
+        }
+
+        if let Some(latest) = endpoint {
+            if self.jump_thread_history(latest, cx) {
+                return true;
+            }
+            let chat = &self.chats[&self.active];
+            if latest {
+                chat.scroll_to_end();
+            } else {
+                chat.scroller.scroll_to(gpui_kit::ListOffset::default());
+            }
+        } else {
+            scroll_list_by_key(&self.chats[&self.active].scroller, key, window);
+        }
+        self.history_scrolled(cx);
+        cx.notify();
+        true
+    }
+
     fn chat_key_down(&mut self, event: &gpui_kit::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
         }
         let key = &event.keystroke;
-        if matches!(key.key.as_str(), "home" | "end") {
-            if !self.chat_focus.is_focused(window) {
-                return;
-            }
-            if key.modifiers.number_of_modifiers() == 0
-                && self.jump_thread_history(key.key == "end", cx)
-            {
-                cx.stop_propagation();
-                return;
-            }
-        }
         let chat = &self.chats[&self.active];
         if self.chat_focus.is_focused(window) {
             let modifier_count = key.modifiers.number_of_modifiers();
@@ -2032,7 +2098,9 @@ impl Workbench {
                 return;
             }
         }
-        if key.key != "space" && scroll_list_by_key(&chat.scroller, event, window) {
+        if matches!(key.key.as_str(), "up" | "down")
+            && scroll_list_by_key(&chat.scroller, key, window)
+        {
             self.history_scrolled(cx);
             cx.stop_propagation();
             cx.notify();

@@ -38,6 +38,7 @@ mod pane_resize_test;
 mod question_card_test;
 mod scroll_regression;
 mod selection_region;
+mod thread_navigation;
 
 const TIMEOUT_MS: u64 = 15_000;
 
@@ -219,6 +220,7 @@ enum Step {
     AssertCardScrollbarDrag,
     AssertPaneTextSelection,
     AssertTranscriptScrollGrowth,
+    AssertThreadNavigationKeys,
     AssertChatReplayLoad,
     AssertThreadHistoryPaging,
     AssertSidebarWidth {
@@ -1244,6 +1246,7 @@ impl Runner {
             Step::AssertCardScrollbarDrag => self.assert_card_scrollbar_drag(cx).await?,
             Step::AssertPaneTextSelection => self.assert_pane_text_selection(cx).await?,
             Step::AssertTranscriptScrollGrowth => self.assert_transcript_scroll_growth(cx)?,
+            Step::AssertThreadNavigationKeys => self.assert_thread_navigation_keys(cx).await?,
             Step::AssertChatReplayLoad => self.assert_chat_replay_load(cx)?,
             Step::AssertThreadHistoryPaging => self.assert_thread_history_paging(cx)?,
             Step::AssertSidebarWidth { width } => {
@@ -6172,9 +6175,13 @@ mod tests {
         assert!((page_y(runner, cx)? - (top - wheel)).abs() < px(2.));
         let blank = runner.update(cx, |_, window, _| window.shot_element_bounds("pdf-scroll").unwrap().center())?;
         runner.click(cx, ClickTarget::Coordinates { x: blank.x.into(), y: blank.y.into() })?;
+        runner.frame(cx)?;
+        let transcript = runner.update(cx, |view, _, _| view.chats[&view.active].scroller.clone())?;
+        let thread_position = (transcript.logical_scroll_top(), transcript.is_following_tail());
         for key in ["home", "pagedown", "space", "shift-space", "pageup", "down", "up", "end", "home"] {
             runner.step(Step::Key { key: key.into() }, cx).await?;
             runner.frame(cx)?;
+            assert_eq!((transcript.logical_scroll_top(), transcript.is_following_tail()), thread_position, "PDF {key} moved the thread");
             let y = page_y(runner, cx)?;
             if matches!(key, "home" | "pageup" | "up") {
                 assert!((y - top).abs() < px(2.), "{key}: {y:?} vs {top:?}");

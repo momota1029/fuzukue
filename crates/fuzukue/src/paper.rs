@@ -1088,8 +1088,8 @@ impl Workbench {
                             .tab_index(0)
                             .relative()
                             .size_full()
-                            .on_key_down(cx.listener(|this, event, window, cx| {
-                                if scroll_list_by_key(&this.read_list, event, window) {
+                            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                                if scroll_list_by_key(&this.read_list, &event.keystroke, window) {
                                     if this.paper_jump.take().is_some() {
                                         let end = this.read_rows.len();
                                         this.read_list.remeasure_items(end..end + 1);
@@ -1289,6 +1289,7 @@ impl Workbench {
         Some(
             div()
                 .id("paper-jobs")
+                .key_context("WorkbenchJobList")
                 .w_full()
                 .flex_none()
                 .max_h(px(180.))

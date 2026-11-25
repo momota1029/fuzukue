@@ -1,0 +1,7 @@
+{
+  "steps": [
+    {"action": "size", "width": 820, "height": 750},
+    {"action": "assert_thread_navigation_keys"},
+    {"action": "screenshot", "name": "thread-navigation"}
+  ]
+}

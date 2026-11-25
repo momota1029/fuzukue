@@ -711,6 +711,11 @@ mod tests {
     }
 
     #[test]
+    fn thread_navigation_keys_follow_the_focused_control() {
+        run_scenario(Step::AssertThreadNavigationKeys, |_, _| {});
+    }
+
+    #[test]
     fn transcript_pages_at_the_top_and_retains_the_reader_position() {
         run_scenario(Step::AssertThreadHistoryPaging, |_, _| {});
     }
