@@ -5,6 +5,7 @@ use fuzukue_proto::{
 };
 
 use super::*;
+use crate::{conn::ConnEvent, ConnectionStatus};
 
 #[test]
 fn workspace_requests_headless_review_queue_and_reply() {
@@ -114,19 +115,22 @@ fn workspace_requests_headless_recovers_draft_in_inbox_after_workspace_switch_an
         math::init(cx);
         let (handle, view) = open_workbench_at_size(cx, 1100., 900.).unwrap();
         let (out, messages) = std::sync::mpsc::channel();
-        view.update(cx, |view, cx| {
-            view.protocol = fuzukue_proto::WORKSPACE_REQUEST_RECOVERY_PROTOCOL;
-            view.status = crate::ConnectionStatus::Connected;
-            view.out = out.into();
-            view.workspaces.active = Some("viewer".into());
-            view.out.select_workspace(Some("viewer".into()));
-            view.switch_session("other-thread".into(), cx);
-        });
         cx.spawn(async move |cx| {
             let mut runner = Runner {
                 handle, view, target: None, output: PathBuf::new(), read_only: false, seen: HashMap::new(),
             };
             let outcome: Result<()> = async {
+                // The headless connection worker publishes its initial status asynchronously.
+                runner.wait_for(cx, "the disconnected fixture", TIMEOUT_MS, |view, _| {
+                    matches!(&view.status, ConnectionStatus::Detail(message) if message == "Not connected")
+                }).await?;
+                runner.update(cx, |view, window, cx| {
+                    view.protocol = fuzukue_proto::WORKSPACE_REQUEST_RECOVERY_PROTOCOL;
+                    view.out = out.into();
+                    view.on_conn(ConnEvent::Connected, window, cx);
+                    view.workspace_selected("viewer".into(), true, window, cx);
+                    view.switch_session("other-thread".into(), cx);
+                })?;
                 let wait = |id: &str| Step::WaitElement { id: id.into() };
                 let click = |id: &str| Step::Click { id: Some(id.into()), x: None, y: None };
                 let draft = WorkspaceRequestDraft {
@@ -137,6 +141,10 @@ fn workspace_requests_headless_recovers_draft_in_inbox_after_workspace_switch_an
                 let snapshot = || ServerEvent::WorkspaceRequestDrafts {
                     drafts: vec![draft.clone()], other_workspaces: vec![], complete: true,
                 };
+                let reported_draft = || messages.try_iter().any(|message| matches!(message,
+                    ClientMsg::InWorkspace { id, request } if id == "source" && matches!(request.as_ref(),
+                        ClientMsg::WorkspaceRequestSurface { inbox_revision: Some(revision), .. }
+                        if revision == &draft.revision)));
                 runner.update(cx, |view, _, cx| {
                     view.on_event(ServerEvent::WorkspaceRequestDrafts {
                         drafts: vec![], other_workspaces: vec![WorkspaceRequestDraftLocation {
@@ -175,24 +183,25 @@ fn workspace_requests_headless_recovers_draft_in_inbox_after_workspace_switch_an
                 runner.update(cx, |_, window, _| {
                     assert!(window.shot_element_bounds("workspace-request-preview").is_none());
                 })?;
-                assert!(messages.try_iter().any(|message| matches!(message,
-                    ClientMsg::InWorkspace { id, request } if id == "source" && matches!(request.as_ref(),
-                        ClientMsg::WorkspaceRequestSurface { inbox_revision: Some(revision), .. }
-                        if revision == "persisted-revision"))));
+                assert!(reported_draft(), "opening the draft after a workspace switch must report its surface");
 
                 runner.update(cx, |view, window, cx| {
-                    view.on_conn(crate::conn::ConnEvent::Disconnected("fixture".into()), window, cx);
+                    view.on_conn(ConnEvent::Disconnected("fixture".into()), window, cx);
                 })?;
                 runner.frame(cx)?;
                 runner.update(cx, |view, window, cx| {
                     assert!(window.shot_element_bounds("workspace-request-pending-0").is_none());
-                    view.on_conn(crate::conn::ConnEvent::Connected, window, cx);
+                    view.on_conn(ConnEvent::Connected, window, cx);
+                    view.workspace_selected("source".into(), true, window, cx);
                     view.on_event(snapshot(), cx);
                     cx.notify();
                 })?;
+                runner.step(wait("workspace-request-open-inbox"), cx).await?;
+                runner.step(click("workspace-request-open-inbox"), cx).await?;
                 runner.step(wait("workspace-request-pending-0"), cx).await?;
                 runner.step(click("workspace-request-pending-0"), cx).await?;
                 runner.step(wait("accept-workspace-request-inbox-draft"), cx).await?;
+                assert!(reported_draft(), "opening the draft after reconnect must report its surface again");
                 runner.step(click("accept-workspace-request-inbox-draft"), cx).await?;
                 assert!(messages.try_iter().any(|message| matches!(message,
                     ClientMsg::InWorkspace { id, request } if id == "source" && matches!(request.as_ref(),
