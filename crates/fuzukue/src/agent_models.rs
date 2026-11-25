@@ -332,8 +332,12 @@ impl Workbench {
                 ),
             )
             .children((self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL).then(|| {
-                let default = self.agent_settings.consult.clone()
-                    .or_else(|| self.agent_settings.tier_models.get(&Tier::Heavy).cloned())
+                let settings = &self.agent_settings;
+                let heavy = Tier::Heavy;
+                let default = settings.consult.as_ref().filter(|selection| selection.model.is_some()).cloned()
+                    .or_else(|| settings.tier_models.get(&heavy).filter(|selection| selection.model.is_some()).cloned())
+                    .or_else(|| settings.tiers.models.get(&heavy)?.iter().find(|entry| entry.selection.model.is_some())
+                        .map(|entry| entry.selection.clone()))
                     .or_else(|| planner_model.clone());
                 role(
                     "model-role-escalation",

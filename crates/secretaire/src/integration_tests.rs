@@ -1931,6 +1931,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             &["goal", "context"]),
         ("replan", &[("reason", "string"), ("pace", "string")], &["reason"]),
         ("consult", &[("question", "string"), ("context", "string")], &["question"]),
+        ("escalate_request", &[("scope", "string"), ("reason", "string"), ("context", "string")], &["scope", "reason"]),
         ("list_agents", &[], &[]),
         ("agent_stats", &[("agent", "string")], &[]),
         ("tier_stats", &[("agent", "string")], &[]),

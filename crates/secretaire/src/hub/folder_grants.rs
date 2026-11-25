@@ -26,7 +26,7 @@ impl Inner {
     fn current_turn(&self, session: &str) -> Option<Instant> {
         self.partner_started
             .get(session)
-            .map(|started| started.instant)
+            .map(|started| started.observed.instant)
     }
 
     fn live_thread(&self, session: &str) -> bool {

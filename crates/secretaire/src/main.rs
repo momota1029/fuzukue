@@ -2747,11 +2747,14 @@ async fn prompt_codex_with_images(
     if switched && !matches!(kind, TurnKind::Escalated) {
         partner_notice(app, &session, settings.model.as_deref());
     }
+    let request = matches!(kind, TurnKind::UserConversation).then(|| front_desk::Request {
+        prompt: prompt.clone(), images: images.clone(),
+    });
     let prompt = handover(if switched || fresh { summary } else { None }, &prompt);
     if let Some(event) = event {
         app.hub.publish(event);
     }
-    app.hub.publish(ServerEvent::TurnActivity { session: session.clone(), running: true });
+    app.hub.publish_partner_turn_started(&session, request, matches!(kind, TurnKind::Escalated));
     let app = app.clone();
     tokio::spawn(async move {
         let mut prompt = prompt;
@@ -2807,9 +2810,13 @@ async fn prompt_codex_with_images(
                 Err(error) if error.is::<crate::cancellation::Cancelled>() => fuzukue_proto::AgentOutcome::Cancelled,
                 Err(_) => fuzukue_proto::AgentOutcome::Failed,
             };
-            app.end_partner_turn(&session, fuzukue_proto::Actor::Codex {
+            let handed_off = app.end_partner_turn(&session, fuzukue_proto::Actor::Codex {
                 thread_id: thread_id.clone(), parent_tool_use: None,
             }, result.is_ok(), Some((kind, outcome)), matches!(kind, TurnKind::Escalated).then_some(&settings));
+            if handed_off {
+                app.hub.take_user_steer(&session);
+                break;
+            }
             if isolated {
                 drop(_start);
                 codex.close_worker(&thread_id).await;
@@ -2859,6 +2866,20 @@ async fn prompt_claude(
     prompt_claude_with_images(app, session, prompt, user_event, Vec::new(), TurnKind::Conversation, None).await.map(|_| ())
 }
 
+async fn prompt_escalated_partner(
+    app: &Arc<Workspace>, session: &str, selection: fuzukue_proto::AgentSelection,
+    prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let settings = fuzukue_proto::ChatSettings {
+        permission_mode: app.partner_turn_settings(session).permission_mode,
+        ..selection.chat_settings()
+    };
+    match selection.backend {
+        AgentBackend::Codex => prompt_codex_with_images(app, session.into(), settings, prompt, user_event, images, TurnKind::Escalated, None).await,
+        AgentBackend::Claude => prompt_claude_turn(app, session, prompt, user_event, images, TurnKind::Escalated, None, Some(settings)).await.map(|_| ()),
+    }
+}
+
 async fn prompt_claude_with_images(
     app: &Arc<Workspace>, session: &str, prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind,
     report: Option<String>,
@@ -2887,6 +2908,7 @@ async fn prompt_claude_turn(
             partner_notice(app, session, app.chat_settings(session).model.as_deref());
         }
     }
+    let escalation_images = if matches!(kind, TurnKind::UserConversation) { images.clone() } else { Vec::new() };
     let images = screenshots::claude_images(images).await?;
     let (s, user_event) = match claude_session_for(app, session, user_event, escalation.as_ref()).await {
         Ok(started) => started,
@@ -2903,7 +2925,7 @@ async fn prompt_claude_turn(
     let result = if is_report || matches!(kind, TurnKind::WorkerDigest | TurnKind::GoalDecision(_)) {
         s.try_background_prompt(prompt, kind, report).await
     } else {
-        s.prompt_with_auth(&prompt, images, kind, github_auth, escalation).await.map(|()| true)
+        s.prompt_with_auth(&prompt, images, kind, github_auth, escalation, escalation_images).await.map(|()| true)
     };
     match result {
         Ok(false) => return Ok(false),
@@ -3049,7 +3071,8 @@ async fn replay_prompts(app: &Arc<Workspace>) {
         if record.claimed || record.review.is_some() { continue; }
         let session = &record.session;
         if !matches!(record.work, Work::Claude(_) | Work::Prompt { .. } | Work::Compact { .. }) { continue; }
-        if !seen.insert(session.clone()) || app.hub.thread_running(session) || app.issue_threads.intake_turn(session) { continue; }
+        if !seen.insert(session.clone()) || app.hub.thread_running(session)
+            || app.hub.partner_handoff_pending(session) || app.issue_threads.intake_turn(session) { continue; }
         if !record.ready(now) { continue; }
         if !app.hub.read_threads(|store| store.is_live(session)) {
             app.drain.finish(&app.state_dir, session, &record.id, Some("The target thread is closed".into()));
@@ -3314,18 +3337,15 @@ async fn handle_from_client(
             let settings = app.partner_turn_settings(&session);
             let work = app.admit_work();
             let intake_turn = app.issue_threads.intake_turn(&session);
+            let handoff_pending = app.hub.partner_handoff_pending(&session);
             if escalating {
                 let result = async {
                     anyhow::ensure!(!prompt.trim().is_empty(), "Use /escalate followed by a message");
-                    anyhow::ensure!(!intake_turn && !app.hub.thread_active(&session) && !has_held_prompt(app, &session)?,
+                    anyhow::ensure!(!intake_turn && !handoff_pending && !app.hub.thread_active(&session) && !has_held_prompt(app, &session)?,
                         "Wait for the current turn and queued messages to finish");
                     let _work = work?;
                     let selection = app.escalation_model(&session).await?;
-                    let settings = fuzukue_proto::ChatSettings { permission_mode: settings.permission_mode, ..selection.chat_settings() };
-                    match selection.backend {
-                        AgentBackend::Codex => prompt_codex_with_images(app, session.clone(), settings, prompt, user_event, images, TurnKind::Escalated, None).await,
-                        AgentBackend::Claude => prompt_claude_turn(app, &session, prompt, user_event, images, TurnKind::Escalated, None, Some(settings)).await.map(|_| ()),
-                    }
+                    prompt_escalated_partner(app, &session, selection, prompt, user_event, images).await
                 }.await;
                 if let Err(error) = result {
                     commands::escalation_unavailable(&app.hub, &session, format!("{error:#}"));
@@ -3335,22 +3355,23 @@ async fn handle_from_client(
             let wants_codex = AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex;
             let running = app.hub.thread_running(&session);
             let prior_codex = app.session_records.lock().unwrap().get(&session).is_some_and(|record| record.last_partner_codex);
-            if !intake_turn && work.is_ok() && running && prior_codex && wants_codex && app.hub.compaction(&session).is_none() {
+            if !handoff_pending && !intake_turn && work.is_ok() && running && prior_codex && wants_codex && app.hub.compaction(&session).is_none() {
                 let thread = app.session_records.lock().unwrap().get(&session)
                     .and_then(|record| record.codex_thread_id.clone()).context("Codex のスレッドが見つからない")?;
                 let codex = app.running_codex().await.context("Codex が停止した")?;
-                let prompt = app.partner_input(&session, prompt).await?;
-                codex.steer_with_images(&thread, &prompt, &images).await?;
+                let steering = app.partner_input(&session, prompt.clone()).await?;
+                codex.steer_with_images(&thread, &steering, &images).await?;
                 app.hub.set_github_auth_request(&session,
                     github_auth_request(TurnKind::UserConversation, "", user_event.as_ref()));
                 app.hub.mark_user_steer(&session);
                 let event = user_event.unwrap();
                 send_latency::expect_echo(&event, "codex_steer");
                 app.hub.publish(event);
+                app.hub.update_partner_request(&session, front_desk::Request { prompt, images });
                 return Ok(());
             }
             let switching = running && prior_codex != wants_codex;
-            if switching || intake_turn || work.is_err() || app.hub.compaction(&session).is_some() || has_held_prompt(app, &session)? {
+            if handoff_pending || switching || intake_turn || work.is_err() || app.hub.compaction(&session).is_some() || has_held_prompt(app, &session)? {
                 let (item, text, paths) = match user_event.as_ref().unwrap() {
                     ServerEvent::UserPrompt { item, text, paths, .. } => (item, text, paths.clone()),
                     ServerEvent::TextDelta { item, text, .. } => (item, text, Vec::new()),

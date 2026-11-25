@@ -17,6 +17,8 @@ mod approval_queue;
 pub(crate) mod approval_store;
 
 const BACKLOG: usize = 10_000;
+const HANDOFF_LIMIT: usize = 3;
+const HANDOFF_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Default)]
 pub(crate) struct TranscriptResume {
@@ -36,7 +38,9 @@ struct Inner {
     log: VecDeque<Envelope>,
     writer: Option<crate::state::TimelineWriter>,
     threads: Option<crate::threads::Store>,
-    partner_started: HashMap<String, Observed>,
+    partner_started: HashMap<String, PartnerTurn>,
+    handoffs_ready: HashSet<String>,
+    recent_handoffs: HashMap<String, VecDeque<tokio::time::Instant>>,
     last_partner_progress: Option<tokio::time::Instant>,
     folder_grants: Option<crate::folder_grants::Store>,
     running: HashSet<String>,
@@ -90,6 +94,14 @@ struct Observed {
     timestamp: i64,
 }
 
+struct PartnerTurn {
+    observed: Observed,
+    request: Option<crate::front_desk::Request>,
+    request_revision: u64,
+    handoff: Option<crate::front_desk::Escalation>,
+    escalated: bool,
+}
+
 impl Observed {
     fn now() -> Self {
         Self { instant: Instant::now(), timestamp: chrono::Utc::now().timestamp_millis() }
@@ -128,7 +140,7 @@ pub(crate) fn worker_approval(request_id: &str, actor: &Actor) -> bool {
 impl Hub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
+        Self { inner: Mutex::new(Inner { next_seq: 1, log: VecDeque::new(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), handoffs_ready: HashSet::new(), recent_handoffs: HashMap::new(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
             epoch: format!("{:032x}", rand::random::<u128>()),
             approval_queue: Default::default(),
         }
@@ -281,7 +293,7 @@ impl Hub {
         };
         let mut blockers = Vec::new();
         for (session, started) in &inner.partner_started {
-            blockers.push(blocker(BlockerKind::Turn, Some(session), session, thread_title(session), started.timestamp));
+            blockers.push(blocker(BlockerKind::Turn, Some(session), session, thread_title(session), started.observed.timestamp));
         }
         for (session, (_, started_at)) in &inner.compactions {
             if !inner.running.contains(session) {
@@ -467,12 +479,94 @@ impl Hub {
 
     pub(crate) fn partner_elapsed(&self, session: &str) -> Option<u64> {
         self.inner.lock().unwrap().partner_started.get(session)
-            .map(|started| started.instant.elapsed().as_millis() as u64)
+            .map(|started| started.observed.instant.elapsed().as_millis() as u64)
     }
 
-    pub(crate) fn publish_partner_turn_ended(&self, session: &str, actor: Actor, completed: bool) -> Option<(usize, String)> {
+    pub(crate) fn publish_partner_turn_started(
+        &self, session: &str, request: Option<crate::front_desk::Request>, escalated: bool,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.partner_started.insert(session.into(), PartnerTurn {
+            observed: Observed::now(),
+            request,
+            request_revision: 0,
+            handoff: None,
+            escalated,
+        });
+        self.publish_locked(&mut inner, ServerEvent::TurnActivity {
+            session: session.into(), running: true,
+        }, None, ApprovalWaiter::Backend);
+    }
+
+    pub(crate) fn escalation_turn(&self, session: &str) -> anyhow::Result<(Instant, u64)> {
+        let inner = self.inner.lock().unwrap();
+        let turn = inner.partner_started.get(session)
+            .ok_or_else(|| anyhow::anyhow!("Escalation requires an active front desk turn"))?;
+        anyhow::ensure!(turn.request.is_some(), "Escalation requires an ordinary user turn");
+        anyhow::ensure!(turn.handoff.is_none(), "Escalation is available once per user request");
+        Ok((turn.observed.instant, turn.request_revision))
+    }
+
+    pub(crate) fn update_partner_request(&self, session: &str, request: crate::front_desk::Request) {
+        if let Some(turn) = self.inner.lock().unwrap().partner_started.get_mut(session) {
+            if turn.request.is_some() && turn.handoff.is_none() {
+                turn.request = Some(request);
+                turn.request_revision += 1;
+            }
+        }
+    }
+
+    pub(crate) fn request_escalation(
+        &self, session: &str, request_turn: (Instant, u64), handoff: crate::front_desk::Escalation,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { partner_started, recent_handoffs, .. } = &mut *inner;
+        let turn = partner_started.get_mut(session)
+            .ok_or_else(|| anyhow::anyhow!("The front desk turn has ended"))?;
+        anyhow::ensure!((turn.observed.instant, turn.request_revision) == request_turn,
+            "The front desk request has changed");
+        anyhow::ensure!(turn.request.is_some() && turn.handoff.is_none(),
+            "Escalation is available once per user request");
+        let now = tokio::time::Instant::now();
+        recent_handoffs.retain(|_, attempts| {
+            while attempts.front().is_some_and(|at| now.duration_since(*at) >= HANDOFF_WINDOW) {
+                attempts.pop_front();
+            }
+            !attempts.is_empty()
+        });
+        let attempts = recent_handoffs.entry(session.into()).or_default();
+        anyhow::ensure!(attempts.len() < HANDOFF_LIMIT,
+            "This thread already used {HANDOFF_LIMIT} model handoffs in the past hour. The user can still send /escalate.");
+        attempts.push_back(now);
+        turn.handoff = Some(handoff);
+        Ok(())
+    }
+
+    pub(crate) fn partner_handoff_pending(&self, session: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.handoffs_ready.contains(session)
+            || inner.partner_started.get(session).is_some_and(|turn| turn.escalated || turn.handoff.is_some())
+    }
+
+    pub(crate) fn finish_partner_handoff(&self, session: &str) {
+        self.inner.lock().unwrap().handoffs_ready.remove(session);
+    }
+
+    pub(crate) fn publish_partner_turn_ended(
+        &self, session: &str, actor: Actor, completed: bool,
+    ) -> (Option<(usize, String)>, Option<(crate::front_desk::Escalation, crate::front_desk::Request)>) {
+        let mut inner = self.inner.lock().unwrap();
+        let handoff = inner.partner_started.get_mut(session)
+            .and_then(|turn| turn.handoff.take().zip(turn.request.take()))
+            .filter(|_| completed);
+        if handoff.is_some() {
+            // Reserve the gap between TurnEnded and the replacement turn's start.
+            inner.handoffs_ready.insert(session.into());
+        }
         let event = ServerEvent::TurnEnded { session: session.into(), actor };
-        self.publish_event(event, completed.then_some(session))
+        let title = self.publish_locked(&mut inner, event,
+            (completed && handoff.is_none()).then_some(session), ApprovalWaiter::Backend);
+        (title, handoff)
     }
 
     fn publish_event(&self, event: ServerEvent, completed_session: Option<&str>) -> Option<(usize, String)> {
@@ -535,7 +629,9 @@ impl Hub {
         if let Some((session, running)) = activity {
             let was_idle = inner.running.is_empty();
             if running {
-                inner.partner_started.entry(session.clone()).or_insert_with(Observed::now);
+                inner.partner_started.entry(session.clone()).or_insert_with(|| PartnerTurn {
+                    observed: Observed::now(), request: None, request_revision: 0, handoff: None, escalated: false,
+                });
                 inner.running.insert(session.clone());
             } else {
                 inner.running.remove(session);

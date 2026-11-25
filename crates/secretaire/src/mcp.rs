@@ -34,11 +34,11 @@ pub(crate) const SERVER_NAME: &str = "fuzukue";
 pub(crate) fn front_desk_instructions() -> &'static str {
     harness_text!(
         "\n\nUse consult for a design fork, conflicting requirements, or a risky or irreversible decision.\n\
-         Use consult when you have gone around the same question twice. It returns advice for a single question and leaves the plan as it is.\n\
+         When the user asks for a stronger or more capable model in any wording, call escalate_request for the current request without asking for confirmation. Use it on your own judgment after repeated failed attempts, two passes over the same unresolved question, or evidence you cannot reconcile. Use scope reply for an answer and task for work. Give a concrete reason and preserve relevant progress in context. A successful call hands off this request once. Finish the turn without another answer. When the handoff has already happened, continue directly and do not request it again.\n\
          Use the available tools for requested thread, sidebar, and server settings changes instead of asking the user to click. For ordinary delegation, pass model and optional effort only when the user requests a specific model for that job. Otherwise use the configured routing.\n\
          For bounded blind section math, call request_review with explicit isolation, API backend and model, ordered targets, and only the permitted source ranges. Keep the request_key across retries and read the receipt with read_section_review.",
         "\n\n設計の分かれ道、要件の衝突、影響が大きい判断や取り消せない判断では consult を使う。\n\
-         同じ問いで二度行き詰まったときも consult を使う。一問への助言が返り、方針はそのまま。\n\
+         利用者が「上位のモデルを使って」「強いモデルで考えて」「上のものを出せ」など、言い方を問わずより強いモデルを求めたら、確認を挟まず escalate_request を使う。試行が繰り返し失敗した、同じ問いで二度行き詰まった、食い違う証拠を解消できない場合も、自分で判断して使う。返答なら scope は reply、作業なら task。具体的な理由を記録し、済んだ作業や根拠は context に残す。成功したら今の依頼が一度だけ引き継がれるので、返答を書かずにターンを終える。すでに引き継ぎを受けた場合はそのまま進める。\n\
          利用者がスレッドや左欄の操作、サーバー設定の変更を頼んだら、クリックを頼まず、対応する道具を使う。通常の委譲では、利用者がその仕事のモデルを指定したときに model と任意の effort を渡す。省略時は設定済みの振り分けを使う。\n\
          抜粋限定の節の数学査読では request_review に isolation、API の backend と model、掲載順の対象、許可された原文の範囲を明示する。再送には同じ request_key を使い、記録は read_section_review で読む。",
     )
@@ -51,6 +51,7 @@ pub(crate) enum Tool {
     Plan,
     Replan,
     Consult,
+    EscalateRequest,
     Desk(desk::Tool),
     WorkspaceRead(workspace_read::Tool),
     WorkspaceWrite(workspace_write::Tool),
@@ -151,7 +152,7 @@ pub(crate) enum Tool {
 }
 
 impl Tool {
-    const ALL: [Self; 67] = [
+    const ALL: [Self; 68] = [
         Self::CodexRun,
         Self::BuildPaper,
         Self::BuildPapers,
@@ -212,6 +213,7 @@ impl Tool {
         Self::Plan,
         Self::Replan,
         Self::Consult,
+        Self::EscalateRequest,
         Self::ListAgents,
         Self::AgentStats,
         Self::TierStats,
@@ -263,6 +265,7 @@ impl Tool {
             Self::Plan => "plan",
             Self::Replan => "replan",
             Self::Consult => "consult",
+            Self::EscalateRequest => "escalate_request",
             Self::Desk(tool) => tool.name(),
             Self::WorkspaceRead(tool) => tool.name(),
             Self::HarnessCandidates(tool) => tool.name(),
@@ -474,6 +477,11 @@ impl Tool {
                 "Ask the planner a one-off, read-only question. The current plan and recent conversation are included automatically.",
                 "方針役に一度だけ相談して答えを受け取る。現在の方針と直近の会話は自動で渡す。"
             ), json!({"question":{"type":"string"}, "context":{"type":"string"}}), &["question"]),
+            Self::EscalateRequest => (harness_text!(
+                "Hand the current user request to the configured escalation model once. Call without confirmation when the user asks for a stronger model or when progress is genuinely blocked. Give a concrete reason. After success, finish this turn without replying. If the call is refused, continue the current turn.",
+                "今の依頼を設定済みの上位モデルへ一度だけ引き継ぐ。利用者が強いモデルを求めたときや実際に行き詰まったときに、確認を挟まず使う。具体的な理由を添える。成功したら返答を書かずにターンを終え、拒否されたら今のターンを続ける。"
+            ), json!({"scope":{"type":"string","enum":["reply","task"]}, "reason":{"type":"string"},
+                "context":{"type":"string"}}), &["scope","reason"]),
             Self::Desk(tool) => tool.schema(),
             Self::GitRead => return git_read::definition(),
             Self::GitCommitScoped => return git_write::definition(),
@@ -1036,14 +1044,14 @@ pub(crate) fn codex_tool_policy(allow: Option<&[String]>) -> Value {
     // Codex cannot prompt in scoped threads. Preapprove named built-ins that
     // fuzukue authorizes for the job, planner, or active front desk turn.
     let tools = worker_tools().filter(|tool| !matches!(tool, Tool::Recipe(_)))
-        .chain(PLANNER_TOOLS).chain([Tool::Escalate, Tool::Consult])
+        .chain(PLANNER_TOOLS).chain([Tool::Escalate, Tool::Consult, Tool::EscalateRequest])
         .chain(allow.is_none().then_some(Tool::Desk(desk::Tool::Queue)))
         .chain(allow.is_none().then_some(Tool::Desk(desk::Tool::JobWriteAudit)))
         .chain(allow.is_none().then_some(Tool::FolderGrants));
     for tool in tools {
         let name = tool.name();
         let permitted = match allow {
-            Some(names) => !matches!(tool, Tool::Consult) && names.iter().any(|entry| entry == name),
+            Some(names) => !matches!(tool, Tool::Consult | Tool::EscalateRequest) && names.iter().any(|entry| entry == name),
             None => !matches!(tool, Tool::AskFrontDesk | Tool::Escalate
                 | Tool::ClientScreenshot | Tool::CaptureScreenshot) && !tool.writes(),
         };
@@ -1723,7 +1731,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
     ensure!(!matches!(tool, Tool::SelfUpdate) || claude.is_some() || codex.is_some(), "self_update requires a front desk session");
     ensure!(!matches!(tool, Tool::Watch) || claude.is_some() || codex.is_some(),
         "監視の操作には受付のセッションが必要");
-    ensure!(!matches!(tool, Tool::Desk(_) | Tool::Consult) || claude.is_some() || codex.is_some(),
+    ensure!(!matches!(tool, Tool::Desk(_) | Tool::Consult | Tool::EscalateRequest) || claude.is_some() || codex.is_some(),
         "A front desk session is required");
     ensure!(!git_write || claude.is_some() || codex.is_some(), "Git の変更にはパートナーのセッションが必要");
     ensure!(import.is_none() || claude.is_some() || codex.is_some(), "取り込みの承認にはパートナーのセッションが必要");
@@ -1942,6 +1950,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             let args = parse_args(args)?;
             serde_json::to_value(crate::planner::consult(app, session, args).await?)?
         }
+        Tool::EscalateRequest => crate::front_desk::request_escalation(app, session, parse_args(args)?).await?,
         Tool::Desk(desk::Tool::ListJobs) => {
             let (data, text) = desk::list_jobs(app, args)?;
             let mut result = text_result(text, false);

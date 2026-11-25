@@ -100,6 +100,7 @@ enum Step {
     },
     ResolveApproval { decision: String },
     SeedApprovalDock,
+    SeedComposerContext,
     AssertApprovalDockScrolled,
     ResolveApprovalDock,
     WaitResearchIssue { number: u64, state: fuzukue_proto::ResearchIssueState },
@@ -348,6 +349,41 @@ struct Runner {
 
 const THREAD_SWITCH_ROWS: usize = 300;
 
+fn seed_composer_context(view: &mut Workbench, cx: &mut Context<Workbench>) {
+    let session = String::from("composer-context-fixture");
+    view.protocol = fuzukue_proto::PROTOCOL_VERSION;
+    view.threads_loaded = true;
+    view.switch_session(session.clone(), cx);
+    view.chats.get_mut(&session).unwrap().settings.permission_mode =
+        fuzukue_proto::PermissionMode::BypassPermissions;
+    view.on_event(ServerEvent::ChatCapabilities {
+        effort_levels: vec![], mail_restricted: false, mcp_tools: vec![],
+    }, cx);
+    view.on_event(ServerEvent::WorkerApprovalPolicyChanged {
+        policy: fuzukue_proto::WorkerApprovalPolicy::Auto, shell_rules: None,
+    }, cx);
+    let model = "gpt-fixture-model-with-a-long-provider-identifier-and-release-suffix";
+    let started_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis() as u64;
+    view.on_event(ServerEvent::ToolCall {
+        session: session.clone(), item: "delegate:composer-context".into(),
+        actor: fuzukue_proto::Actor::System, name: "delegate".into(),
+        input: serde_json::json!({
+            "title": "原稿の確認", "model": model, "started_at_ms": started_at_ms,
+            "selection": {"backend": "codex", "model": model, "effort": "high"},
+            "routing": {"tier": "heavy", "reason": "Fixture"}
+        }),
+    }, cx);
+    view.on_event(ServerEvent::SessionStats {
+        session, agent: "codex".into(), model: model.into(), effort: Some("high".into()),
+        context_tokens: Some(813_577), context_window: Some(1_000_000),
+        input_tokens: 813_577, output_tokens: 120, thinking_tokens: None,
+        cost_usd: None, cache_read_tokens: None, cache_write_tokens: None,
+        context_breakdown: None, auto_compact_threshold: None, mcp_tools: None,
+        connected: Some(true), turns: 2,
+    }, cx);
+}
+
 fn seed_thread_switch(view: &mut Workbench, cx: &mut Context<Workbench>) {
     use fuzukue_proto::Actor;
 
@@ -585,6 +621,7 @@ impl Runner {
                 ensure!(!self.read_only, "approval dock needs an isolated fixture");
                 self.update(cx, |view, window, cx| view.seed_approval_dock_fixture(window, cx))?;
             }
+            Step::SeedComposerContext => self.update(cx, |view, _, cx| seed_composer_context(view, cx))?,
             Step::AssertApprovalDockScrolled => {
                 self.wait_for(cx, "approval dock scroll", TIMEOUT_MS, |view, _| view.approval_dock_scrolled()).await?;
             }
@@ -4907,59 +4944,116 @@ mod tests {
 
     #[test]
     fn composer_status_fits_and_aligns_with_stop() {
-        use fuzukue_proto::{PermissionMode, WorkerApprovalPolicy};
-
         let (result, completed) = std::sync::mpsc::channel();
         gpui_kit::platform::headless()
             .with_assets(gpui_kit::assets::Assets)
             .run(move |cx| {
                 gpui_kit::init(cx);
                 math::init(cx);
-                let outcome = (|| -> Result<()> {
-                    for width in [600, 1440] {
-                        let (handle, view) = open_workbench_at_size(cx, width as f32, 900.)?;
-                        handle.update(cx, |_, window, cx| -> Result<()> {
-                            view.update(cx, |view, cx| {
-                                view.shot_locale("ja".into(), window, cx);
-                                view.protocol = fuzukue_proto::PROTOCOL_VERSION;
-                                view.threads_loaded = true;
-                                let session = String::from("thread-1");
-                                view.switch_session(session.clone(), cx);
-                                view.chats.get_mut(&session).unwrap().settings.permission_mode =
-                                    PermissionMode::BypassPermissions;
-                                view.on_event(ServerEvent::ChatCapabilities {
-                                    effort_levels: vec![], mail_restricted: false, mcp_tools: vec![],
-                                }, cx);
-                                view.on_event(ServerEvent::WorkerApprovalPolicyChanged {
-                                    policy: WorkerApprovalPolicy::Ask, shell_rules: None,
-                                }, cx);
-                                view.on_event(ServerEvent::TurnActivity { session, running: true }, cx);
-                            });
-                            window.draw(cx).clear(cx);
-                            ensure!(window.viewport_size().width == px(width as f32),
-                                "expected {width}px window, got {}", window.viewport_size().width);
-                            let bounds = |id: &str| window.shot_element_bounds(id)
-                                .with_context(|| format!("element is not visible at {width}px: {id}"));
-                            let ring = bounds("context-progress")?;
-                            let ring_button = bounds("composer-context-ring")?;
-                            let stop = bounds("stop-prompt")?;
-                            let permission = bounds("permission-picker")?;
-                            let worker = bounds("worker-approval-picker")?;
-                            ensure!((ring.right() - stop.right()).abs() <= px(1.),
-                                "ring edge {} differs from Stop edge {} at {width}px", ring.right(), stop.right());
-                            ensure!(permission.left() >= bounds("attach-file")?.left()
-                                    && permission.right() <= worker.left()
-                                    && worker.right() <= ring_button.left()
-                                    && (permission.center().y - ring_button.center().y).abs() <= px(1.)
-                                    && (worker.center().y - ring_button.center().y).abs() <= px(1.),
-                                "composer status controls must fit side by side at {width}px");
+                cx.set_reduce_motion(true);
+                cx.spawn(async move |cx| {
+                    let outcome: Result<()> = async {
+                        for width in [600, 1440] {
+                            let (handle, view) = cx.update(|cx| open_workbench_at_size(cx, width as f32, 900.))?;
+                            let mut runner = Runner { handle, view, target: None, output: PathBuf::new(),
+                                read_only: false, seen: HashMap::new() };
+                            runner.step(Step::Locale { locale: "ja".into() }, cx).await?;
+                            runner.step(Step::SeedComposerContext, cx).await?;
+                            runner.frame(cx)?;
+                            runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-trigger".into() })?;
+                            runner.step(Step::WaitElement { id: "chat-tail-activity-job-model-0".into() }, cx).await?;
+                            runner.update(cx, |_, window, _| {
+                                let chip = window.shot_element_bounds("chat-tail-activity-job-model-0").unwrap();
+                                assert!(chip.left() >= px(0.) && chip.right() <= window.viewport_size().width);
+                            })?;
+                            runner.key(cx, "Escape")?;
+                            for theme in [ShotTheme::Dark, ShotTheme::Light] {
+                                runner.step(Step::Theme { theme }, cx).await?;
+                                runner.step(Step::Hover { id: "chat-input".into() }, cx).await?;
+                                runner.step(Step::Hover { id: "composer-context-ring".into() }, cx).await?;
+                                runner.step(Step::WaitElement { id: "composer-context-tooltip".into() }, cx).await?;
+                                runner.update(cx, |_, window, _| -> Result<()> {
+                                    let viewport = window.viewport_size();
+                                    ensure!(viewport.width == px(width as f32), "expected {width}px window");
+                                    let bounds = |id: &str| window.shot_element_bounds(id)
+                                        .with_context(|| format!("element is not visible at {width}px: {id}"));
+                                    let ring = bounds("context-progress")?;
+                                    let button = bounds("composer-context-ring")?;
+                                    let stop = bounds("stop-prompt")?;
+                                    let permission = bounds("permission-picker")?;
+                                    let worker = bounds("worker-approval-picker")?;
+                                    let composer = bounds("composer-input-frame")?;
+                                    let tooltip = bounds("composer-context-tooltip")?;
+                                    ensure!((button.center().x - stop.center().x).abs() <= px(1.)
+                                            && (ring.center().x - button.center().x).abs() <= px(1.)
+                                            && (ring.center().y - button.center().y).abs() <= px(1.),
+                                        "context ring must be centered in its circular target and aligned under Stop");
+                                    ensure!(composer.left() <= permission.left()
+                                            && permission.right() <= worker.left() && worker.right() <= button.left()
+                                            && (permission.center().y - button.center().y).abs() <= px(1.)
+                                            && (worker.center().y - button.center().y).abs() <= px(1.),
+                                        "composer status controls must fit side by side at {width}px");
+                                    ensure!(tooltip.bottom() < composer.top() && tooltip.right() <= stop.right()
+                                            && tooltip.top() >= px(0.) && tooltip.left() >= px(0.),
+                                        "tooltip must clear the composer and stay within the viewport: {tooltip:?}, {composer:?}");
+                                    Ok(())
+                                })??;
+                            }
+                        }
+                        Ok(())
+                    }.await;
+                    result.send(outcome).unwrap();
+                    cx.update(|cx| cx.quit());
+                }).detach();
+            });
+        completed.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn composer_sends_typed_escalation_and_ordinary_prompts() {
+        let (result, completed) = std::sync::mpsc::channel();
+        gpui_kit::platform::headless()
+            .with_assets(gpui_kit::assets::Assets)
+            .run(move |cx| {
+                gpui_kit::init(cx);
+                math::init(cx);
+                let (handle, view) = open_workbench(cx).unwrap();
+                let (out, messages) = std::sync::mpsc::channel();
+                let session = String::from("escalation-fixture");
+                view.update(cx, |view, cx| {
+                    view.switch_session(session.clone(), cx);
+                    view.threads_loaded = true;
+                    view.protocol = fuzukue_proto::PROTOCOL_VERSION;
+                    view.out = out.into();
+                });
+                cx.spawn(async move |cx| {
+                    let outcome: Result<()> = async {
+                        let runner = Runner { handle, view, target: None, output: PathBuf::new(),
+                            read_only: false, seen: HashMap::new() };
+                        let click = |id: &str| ClickTarget::Element { id: id.into() };
+                        let expect_prompt = |expected: &str| -> Result<()> {
+                            let message = messages.try_recv()?;
+                            ensure!(matches!(message, ClientMsg::Prompt { session: target, text }
+                                if target == session && text == expected), "expected prompt {expected:?}");
+                            ensure!(matches!(messages.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                                "unexpected extra message");
                             Ok(())
-                        })??;
-                    }
-                    Ok(())
-                })();
-                result.send(outcome).unwrap();
-                cx.spawn(async move |cx| cx.update(|cx| cx.quit())).detach();
+                        };
+                        runner.frame(cx)?;
+                        runner.click(cx, click("chat-input"))?;
+                        runner.type_text(cx, "Ordinary reply")?;
+                        runner.frame(cx)?;
+                        runner.click(cx, click("send-prompt"))?;
+                        expect_prompt("Ordinary reply")?;
+                        runner.click(cx, click("chat-input"))?;
+                        runner.type_text(cx, "/escalate Manual reply")?;
+                        runner.key(cx, "Ctrl+Enter")?;
+                        expect_prompt("/escalate Manual reply")?;
+                        Ok(())
+                    }.await;
+                    result.send(outcome).unwrap();
+                    cx.update(|cx| cx.quit());
+                }).detach();
             });
         completed.recv().unwrap().unwrap();
     }

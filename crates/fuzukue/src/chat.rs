@@ -135,6 +135,7 @@ pub(super) struct Chat {
     pub busy: bool,
     turn: Option<TurnStatus>,
     composer_notice: Option<String>,
+    composer_bounds: Rc<Cell<gpui_kit::Bounds<Pixels>>>,
     pub(super) codex_thread_id: Option<String>,
     pub(super) settings: ChatSettings,
     attachments: Vec<DraftAttachment>,
@@ -545,6 +546,7 @@ impl Chat {
             busy: false,
             turn: None,
             composer_notice: None,
+            composer_bounds: Default::default(),
             codex_thread_id: None,
             settings: ChatSettings::default(),
             attachments: Vec::new(),
@@ -3319,6 +3321,7 @@ fn context_usage_tooltip(groups: impl IntoIterator<Item = ContextUsage>) -> (Str
 struct ContextRingTrigger {
     button: Button,
     tooltip: String,
+    composer_bounds: Rc<Cell<gpui_kit::Bounds<Pixels>>>,
 }
 
 impl Selectable for ContextRingTrigger {
@@ -3335,16 +3338,41 @@ impl gpui_kit::RenderOnce for ContextRingTrigger {
     fn render(self, _: &mut Window, _: &mut gpui_kit::App) -> impl IntoElement {
         let open = self.is_open();
         let tooltip = self.tooltip;
+        let composer_bounds = self.composer_bounds;
         div().id("composer-context")
             .when(!open, |trigger| {
-                trigger.tooltip(move |window, cx| {
-                    let label = tooltip.clone();
-                    Tooltip::element(move |_, _| div().id("composer-context-tooltip").child(label.clone()))
-                        .line_height(UI_LINE_HEIGHT)
-                        .build(window, cx)
+                trigger.tooltip(move |_, cx| {
+                    cx.new(|_| ComposerTooltip {
+                        label: tooltip.clone(),
+                        composer_bounds: composer_bounds.clone(),
+                    }).into()
                 })
             })
             .child(self.button)
+    }
+}
+
+struct ComposerTooltip {
+    label: String,
+    composer_bounds: Rc<Cell<gpui_kit::Bounds<Pixels>>>,
+}
+
+impl gpui_kit::Render for ComposerTooltip {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Anchor to the input frame so the tooltip clears a multiline draft as well.
+        let composer = self.composer_bounds.get();
+        let gap = px(8.);
+        let label = self.label.clone();
+        let tooltip = Tooltip::element(move |_, _| div().id("composer-context-tooltip").whitespace_normal().child(label.clone()))
+            .m_0()
+            .max_w(composer.size.width.min(window.viewport_size().width) - gap * 2.)
+            .line_height(UI_LINE_HEIGHT)
+            .build(window, cx);
+        div().child(gpui_kit::anchored()
+            .anchor(Anchor::BottomRight)
+            .position(point(composer.right() - gap, composer.top() - gap))
+            .snap_to_window_with_margin(gap)
+            .child(tooltip))
     }
 }
 
@@ -3943,22 +3971,13 @@ impl Workbench {
     }
 
     pub(super) fn send_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.send_prompt_with_escalation(false, window, cx);
-    }
-
-    fn send_prompt_with_escalation(&mut self, escalate: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.threads_loaded || composing(&self.input, window, cx) {
             return;
         }
-        let mut text = self.input.read(cx).value().to_string();
-        let command = text.strip_prefix('/').and_then(|body| body.split_whitespace().next());
-        let escalation = command == Some("escalate") && self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL;
-        if escalate {
-            if text.trim().is_empty() || fuzukue_proto::slash::is_command(&text) {
-                return;
-            }
-            text = format!("/escalate {text}");
-        } else if self.protocol >= fuzukue_proto::SLASH_COMMAND_PROTOCOL && fuzukue_proto::slash::is_command(&text) && !escalation {
+        let text = self.input.read(cx).value().to_string();
+        let command = text.strip_prefix('/').and_then(|body| body.split(char::is_whitespace).next());
+        let explicit_escalation = command == Some("escalate") && self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL;
+        if self.protocol >= fuzukue_proto::SLASH_COMMAND_PROTOCOL && fuzukue_proto::slash::is_command(&text) && !explicit_escalation {
             if self.out.send(ClientMsg::Prompt { session: self.active.clone(), text }).is_ok() {
                 self.input.update(cx, |input, cx| input.clean(window, cx));
                 self.record_composer_text(cx);
@@ -3982,7 +4001,7 @@ impl Workbench {
         if paths.is_empty() && text.trim().is_empty() {
             return;
         }
-        let msg = if let Some(job) = chat.worker_target.clone().filter(|_| self.protocol >= 14 && !escalate && !escalation) {
+        let msg = if let Some(job) = chat.worker_target.clone().filter(|_| self.protocol >= 14 && !explicit_escalation) {
             ClientMsg::WorkerPrompt { session, job, text, paths }
         } else if worker_running && (12..14).contains(&self.protocol) {
             ClientMsg::RolePrompt { session, text, paths, to_worker: !chat.delegate_to_partner }
@@ -4242,6 +4261,7 @@ impl Workbench {
                         })),
                 )
             });
+        let composer_bounds = chat.composer_bounds.clone();
         v_flex()
             .relative()
             .w_full()
@@ -4264,7 +4284,8 @@ impl Workbench {
                     }))
             }))
             .child(
-                h_flex().w_full()
+                h_flex().id("composer-input-frame").w_full()
+                    .on_prepaint(move |bounds, _, _| composer_bounds.set(bounds))
                     .items_end()
                     .rounded(px(23.))
                     .border_1()
@@ -4302,14 +4323,6 @@ impl Workbench {
                             }),
                     )
                     .child(input)
-                    .children((self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL && !turn_running
-                        && chat.worker_target.is_none() && !text.trim().is_empty()
-                        && !fuzukue_proto::slash::is_command(&text) && can_send).then(|| {
-                        Button::new("send-escalated-prompt").ghost().small().flex_none()
-                            .label(tr!("chat-escalate-action")).tooltip(tr!("chat-send-escalated"))
-                            .accessibility_label(tr!("chat-send-escalated"))
-                            .on_click(cx.listener(|this, _, window, cx| this.send_prompt_with_escalation(true, window, cx)))
-                    }))
                     .child(
                         h_flex().flex_none().ml_1().w(COMPOSER_ACTION_SIZE)
                             .child(action.w(COMPOSER_ACTION_SIZE)
@@ -4319,10 +4332,12 @@ impl Workbench {
             )
             .child(
                 composer_footer()
-                    .pr(COMPOSER_END_PADDING)
-                    .children(self.chat_permission_menu(cx))
-                    .children(self.worker_approval_menu(cx))
-                    .children(self.composer_context_ring(cx)),
+                    .pr(COMPOSER_END_PADDING.to_pixels(window.rem_size())
+                        + (COMPOSER_ACTION_SIZE - COMPOSER_FOOTER_HEIGHT.to_pixels(window.rem_size())) / 2.)
+                    .child(h_flex().max_w_full().justify_end().flex_wrap().gap_1()
+                        .children(self.chat_permission_menu(cx))
+                        .children(self.worker_approval_menu(cx))
+                        .children(self.composer_context_ring(cx))),
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.add_attachments(this.active.clone(), paths.paths().to_vec(), cx);
@@ -4380,13 +4395,14 @@ impl Workbench {
             .w(COMPOSER_FOOTER_HEIGHT)
             .h(COMPOSER_FOOTER_HEIGHT)
             .px_0()
+            .rounded(px(999.))
             .accessibility_label(tr!("chat-context-usage"))
-            .child(h_flex().w_full().justify_end().child(ring));
+            .child(ring);
         let groups = std::rc::Rc::new(groups);
         Some(
             Popover::new(format!("composer-context-popover-{}", self.active))
                 .anchor(Anchor::BottomRight)
-                .trigger(ContextRingTrigger { button, tooltip })
+                .trigger(ContextRingTrigger { button, tooltip, composer_bounds: self.chats[&self.active].composer_bounds.clone() })
                 .content(move |_, _, cx| context_usage_details(&groups, cx.theme().muted_foreground))
                 .into_any_element(),
         )

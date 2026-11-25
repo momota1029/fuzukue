@@ -1054,7 +1054,7 @@ async fn launch_assignment(
                 if can_edit {
                     instructions.push_str(crate::mcp::workspace_write::GUIDANCE);
                 }
-                instructions.push_str("\n\nIf tests are still failing after your attempt, verification rejects the change, or you lack confidence to proceed, report the reason with escalate (trigger tests, rejected, or confidence). Finish the turn after recording it. Report concrete evidence.");
+                instructions.push_str("\n\nIf tests still fail, verification rejects the change, or two attempts leave you at the same blocker or with contradictory evidence, report escalation needed with escalate (trigger tests, rejected, or confidence). Include what you tried and the concrete evidence, then end the turn so the job can take its bounded tier retry. If escalation is unavailable, report the blocker to the front desk.");
                 instructions.push_str(worker_tests());
                 instructions.push_str(crate::references::ledger::worker_hint());
                 if can_search {
@@ -1560,7 +1560,7 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
                 return;
             }
         }
-        if app.hub.thread_active(&session) {
+        if app.hub.thread_active(&session) || app.hub.partner_handoff_pending(&session) {
             drop(start);
             tokio::select! {
                 _ = events.recv() => {}

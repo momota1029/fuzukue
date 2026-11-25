@@ -104,6 +104,39 @@ fn authored(id: u64, body: &str, login: &str) -> Value {
     comment
 }
 
+#[tokio::test]
+async fn escalation_refuses_intake_and_automatic_turns() -> Result<()> {
+    use crate::front_desk::{request_escalation, Request};
+
+    let fixture = Fixture::new()?;
+    let (_registry, app) = fixture.workspace()?;
+    let session = app.hub.edit_threads(|store| store.create(None))?;
+    let args = || serde_json::from_value(json!({"scope":"task","reason":"Two attempts were blocked"}));
+
+    app.hub.publish_partner_turn_started(&session, None, false);
+    let error = request_escalation(&app, &session, args()?).await.unwrap_err();
+    assert_eq!(error.to_string(), "Escalation requires an ordinary user turn");
+
+    // Even an active user request cannot authorize escalation while GitHub intake owns the turn.
+    app.hub.publish_partner_turn_started(&session, Some(Request {
+        prompt: "Ordinary request".into(), images: Vec::new(),
+    }), false);
+    app.issue_threads.test_start_automatic_turn(&session, GitHubPolicy::Allow);
+    let error = request_escalation(&app, &session, args()?).await.unwrap_err();
+    assert_eq!(error.to_string(), "Escalation is unavailable in automatic GitHub turns");
+
+    let event = GitHubActivity {
+        id: "fixture-intake".into(), link: link(&app, 12)?, actor: "owner".into(),
+        author: GitHubAuthor::Owner, kind: Kind::Comment, excerpt: "New issue".into(),
+        body: None, url: "https://github.com/example-owner/lab/issues/12".into(),
+        at: Utc::now().to_rfc3339(), review_comment: None, intake: true,
+    };
+    app.issue_threads.active.lock().unwrap().get_mut(&session).unwrap().events.push(event);
+    let error = request_escalation(&app, &session, args()?).await.unwrap_err();
+    assert_eq!(error.to_string(), "Escalation is unavailable in issue intake");
+    Ok(())
+}
+
 #[test]
 fn classifies_shared_logins_markers_and_apps() -> Result<()> {
     use GitHubAuthor::{Agent, Other, Owner};

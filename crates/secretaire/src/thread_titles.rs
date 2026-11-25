@@ -25,11 +25,11 @@ impl Workspace {
     pub(crate) fn end_partner_turn(
         self: &Arc<Self>, session: &str, actor: Actor, completed: bool,
         usage: Option<(TurnKind, AgentOutcome)>, escalation: Option<&fuzukue_proto::ChatSettings>,
-    ) {
+    ) -> bool {
         let backend = match &actor {
             Actor::Claude => fuzukue_proto::AgentBackend::Claude,
             Actor::Codex { .. } => fuzukue_proto::AgentBackend::Codex,
-            _ => return,
+            _ => return false,
         };
         let duration_ms = self.hub.partner_elapsed(session);
         let mut details = self.session_stats.take_details(session, backend, duration_ms);
@@ -54,14 +54,14 @@ impl Workspace {
                 });
             }
         }
-        let Some((turn, input)) = self
-            .hub
-            .publish_partner_turn_ended(session, actor, completed)
-        else {
-            return;
-        };
+        let (title, handoff) = self.hub.publish_partner_turn_ended(session, actor, completed);
+        if let Some((handoff, request)) = handoff {
+            tokio::spawn(handoff.run(self.clone(), session.to_owned(), request));
+            return true;
+        }
+        let Some((turn, input)) = title else { return false };
         if crate::canary() {
-            return;
+            return false;
         }
         let (app, session) = (self.clone(), session.to_owned());
         tokio::spawn(async move {
@@ -80,6 +80,7 @@ impl Workspace {
                 .hub
                 .edit_threads(|store| store.apply_title_summary(&session, turn, title));
         });
+        false
     }
 }
 

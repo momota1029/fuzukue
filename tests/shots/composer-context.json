@@ -1,0 +1,26 @@
+{
+  "steps": [
+    {"action": "size", "width": 600, "height": 850},
+    {"action": "locale", "locale": "ja"},
+    {"action": "theme", "theme": "dark"},
+    {"action": "seed_composer_context"},
+    {"action": "wait_element", "id": "stop-prompt"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "原稿のこの段落をもう一度見て"},
+    {"action": "hover", "id": "composer-context-ring"},
+    {"action": "wait_element", "id": "composer-context-tooltip"},
+    {"action": "screenshot", "name": "composer-context-narrow"},
+    {"action": "click", "id": "chat-tail-activity-trigger"},
+    {"action": "wait_element", "id": "chat-tail-activity-job-model-0"},
+    {"action": "screenshot", "name": "composer-job-chips-narrow"},
+    {"action": "key", "key": "Escape"},
+    {"action": "size", "width": 1440, "height": 850},
+    {"action": "theme", "theme": "light"},
+    {"action": "hover", "id": "composer-context-ring"},
+    {"action": "wait_element", "id": "composer-context-tooltip"},
+    {"action": "screenshot", "name": "composer-context-wide"},
+    {"action": "click", "id": "chat-tail-activity-trigger"},
+    {"action": "wait_element", "id": "chat-tail-activity-job-model-0"},
+    {"action": "screenshot", "name": "composer-job-chips-wide"}
+  ]
+}

@@ -128,6 +128,149 @@ with open(sys.argv[1], "w", buffering=1) as log:
 }
 
 #[tokio::test]
+async fn front_desk_model_handoff_uses_one_reply_and_bounds_self_escalation() -> Result<()> {
+    let project = TempProject::new()?;
+    let state = tempfile::tempdir()?;
+    let mut app = Workspace::new(project.path().into(), "127.0.0.1:7878".into(), state.path().into(),
+        Arc::new(Hub::with_timeline(state.path())));
+    let script = state.path().join("claude-handoff");
+    let gate = project.path().join("handoff-gate");
+    let log = project.path().join("handoff-inputs.jsonl");
+    fs::write(&script, r#"#!/usr/bin/python3
+import json, sys, time
+from pathlib import Path
+
+def arg(flag):
+    return sys.argv[sys.argv.index(flag)+1] if flag in sys.argv else None
+def emit(kind, **fields):
+    print(json.dumps(dict(type=kind, **fields)), flush=True)
+
+model = arg("--model")
+session = arg("--resume") or "fixture-handoff-session"
+emit("system", subtype="init", session_id=session, model=model)
+for line in sys.stdin:
+    payload = json.loads(line)
+    if payload.get("type") != "user":
+        continue
+    text = payload["message"]["content"][1]["text"]
+    with open("handoff-inputs.jsonl", "a") as log:
+        log.write(json.dumps([model, text], ensure_ascii=False) + "\n")
+    gate = Path("handoff-gate")
+    decision = "reply"
+    if model == "claude-sonnet-5-5":
+        decision = gate.read_text() if gate.exists() else "reply"
+        if decision.startswith("{"):
+            item = str(time.time_ns())
+            emit("assistant", message={"id": item, "model": model, "content": [{
+                "type": "tool_use", "id": item, "name": "mcp__fuzukue__escalate_request",
+                "input": json.loads(decision),
+            }]})
+        while decision == "wait" or decision.startswith("{"):
+            time.sleep(0.01)
+            decision = gate.read_text()
+    if decision == "reply":
+        emit("assistant", message={"id": str(time.time_ns()), "model": model,
+            "content": [{"type":"text", "text":"Fixture reply"}]})
+    emit("result", result="Fixture reply" if decision == "reply" else "", session_id=session, is_error=False)
+"#)?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+    app.claude_program = Some(script);
+    let ordinary = "claude-sonnet-5-5";
+    let elevated = fuzukue_proto::CLAUDE_OPUS;
+    app.set_partner_default(AgentSelection::from_model(Some(ordinary.into()), None).chat_settings()).await?;
+    app.set_agent_role_model(AgentModelRole::Escalation, Some(AgentSelection::from_model(Some(elevated.into()), None))).await?;
+    let app = Arc::new(app);
+    let session = app.hub.edit_threads(|store| store.create_titled(None, Some("Model handoff".into())))?;
+    let (_, mut events) = app.hub.subscribe(u64::MAX);
+    let call = |arguments| mcp_request_for(&app, &session, "tools/call", json!({
+        "name": "escalate_request", "arguments": arguments,
+    }));
+    let release = |decision| -> std::io::Result<()> {
+        let next = gate.with_extension("next");
+        fs::write(&next, decision)?;
+        fs::rename(next, &gate)
+    };
+
+    let natural_request = "上位のモデルを使って、この結論を見直して";
+    let reasoning_blocker = "Two attempts produced incompatible bounds at x = 0.";
+    let progress = "The numerator is already reduced to x squared.";
+    for (request, scope, reason) in [
+        (natural_request, "reply", "The user requested the higher model."),
+        ("Check the bound again", "task", reasoning_blocker),
+        ("Check the other endpoint", "task", "The boundary cases still disagree."),
+    ] {
+        let arguments = json!({"scope":scope, "reason":reason, "context":progress});
+        fs::write(&gate, arguments.to_string())?;
+        send(&app, &session, request).await?;
+        let tool_input = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let ServerEvent::ToolCall { session: id, name, input, .. } = events.recv().await?.event {
+                    if id == session && name == "mcp__fuzukue__escalate_request" {
+                        return Ok::<_, anyhow::Error>(input);
+                    }
+                }
+            }
+        }).await??;
+        assert_eq!(tool_input, arguments);
+        let response = call(tool_input.clone()).await;
+        assert_eq!(response["isError"], false, "{response}");
+        assert_eq!(mcp_data(&response)["model"], elevated);
+        let duplicate = call(tool_input).await;
+        assert_eq!(duplicate["isError"], true, "{duplicate}");
+        assert!(duplicate.to_string().contains("once per user request"), "{duplicate}");
+        release("handoff")?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(events.recv().await?.event, ServerEvent::TurnEnded { session: id, .. } if id == session) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        }).await??;
+        fs::remove_file(&gate)?;
+        let details = reply(&mut events, &session).await.with_context(|| format!(
+            "escalated reply to {request:?}: {}", fs::read_to_string(&log).unwrap_or_default(),
+        ))?;
+        assert!(details.escalated);
+        assert_eq!(details.selection.model.as_deref(), Some(elevated));
+
+        send(&app, &session, "Ordinary follow-up").await?;
+        let details = reply(&mut events, &session).await.with_context(|| format!(
+            "ordinary reply after {request:?}: {}", fs::read_to_string(&log).unwrap_or_default(),
+        ))?;
+        assert!(!details.escalated);
+        assert_eq!(details.selection.model.as_deref(), Some(ordinary));
+    }
+
+    fs::write(&gate, "wait")?;
+    send(&app, &session, "Another ordinary request").await?;
+    let denied = call(json!({"scope":"task", "reason":reasoning_blocker, "context":progress})).await;
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert!(denied.to_string().contains("3 model handoffs in the past hour"), "{denied}");
+    release("reply")?;
+    assert!(!reply(&mut events, &session).await.context("reply after reaching the handoff limit")?.escalated);
+    fs::remove_file(&gate)?;
+    send(&app, &session, "/escalate An explicit override after the limit").await?;
+    assert!(reply(&mut events, &session).await?.escalated);
+
+    let inputs: Vec<(String, String)> = fs::read_to_string(log)?.lines()
+        .map(serde_json::from_str).collect::<serde_json::Result<_>>()?;
+    let models: Vec<_> = inputs.iter().map(|(model, _)| model.as_str()).collect();
+    assert_eq!(models, [ordinary, elevated, ordinary, ordinary, elevated, ordinary,
+                        ordinary, elevated, ordinary, ordinary, elevated]);
+    assert!(inputs[1].1.contains(natural_request));
+    let (_, recorded) = inputs[4].1.rsplit_once("\n\n").context("handoff context missing")?;
+    let recorded: Value = serde_json::from_str(recorded)?;
+    assert_eq!(recorded, json!({
+        "request": "Check the bound again", "reason": reasoning_blocker, "progress": progress,
+    }));
+    assert!(crate::state::load_timeline(state.path(), 200).iter().any(|entry| {
+        matches!(&entry.event, ServerEvent::ToolCall { session: id, name, input, .. }
+            if id == &session && name == "mcp__fuzukue__escalate_request" && input["reason"] == reasoning_blocker)
+    }));
+    Ok(())
+}
+
+#[tokio::test]
 async fn live_models_resume_claude_and_reload_toml_for_existing_threads() -> Result<()> {
     let project = TempProject::new()?;
     let state = tempfile::tempdir()?;

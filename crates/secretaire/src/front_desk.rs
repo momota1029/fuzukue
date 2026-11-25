@@ -1,11 +1,11 @@
-use std::sync::LazyLock;
+use std::{path::PathBuf, sync::{Arc, LazyLock}};
 
 use markdown::mdast::Node;
 use regex::Regex;
 
-use fuzukue_proto::{Actor, ServerEvent};
+use fuzukue_proto::{Actor, AgentSelection, ServerEvent};
 
-use crate::hub::Hub;
+use crate::{hub::Hub, Workspace};
 
 pub(crate) fn nudge_enabled() -> bool {
     !fuzukue_proto::compat::env("FUZUKUE_FRONT_DESK_NUDGE").is_ok_and(|value| {
@@ -57,6 +57,106 @@ pub(crate) enum TurnKind {
 impl TurnKind {
     pub(crate) fn user_conversation(self) -> bool {
         matches!(self, Self::UserConversation | Self::Escalated)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EscalationScope {
+    Reply,
+    Task,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EscalationArgs {
+    scope: EscalationScope,
+    reason: String,
+    context: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Request {
+    pub prompt: String,
+    pub images: Vec<PathBuf>,
+}
+
+pub(crate) struct Escalation {
+    args: EscalationArgs,
+    selection: AgentSelection,
+}
+
+pub(crate) async fn request_escalation(
+    app: &Workspace, session: &str, mut args: EscalationArgs,
+) -> anyhow::Result<serde_json::Value> {
+    args.reason = args.reason.trim().to_owned();
+    anyhow::ensure!(!args.reason.is_empty() && args.reason.chars().count() <= 1000,
+        "Give a concrete escalation reason of at most 1000 characters");
+    anyhow::ensure!(args.context.as_ref().is_none_or(|text| text.chars().count() <= 8000),
+        "Keep the escalation handoff context within 8000 characters");
+    anyhow::ensure!(!app.issue_threads.intake_turn(session), "Escalation is unavailable in issue intake");
+    anyhow::ensure!(app.issue_threads.automatic_policy(session).is_none(),
+        "Escalation is unavailable in automatic GitHub turns");
+    let request_turn = {
+        let _start = app.prompt_start.lock().await;
+        app.hub.escalation_turn(session)?
+    };
+    let selection = match app.escalation_model(session).await {
+        Ok(selection) => selection,
+        Err(error) => {
+            crate::commands::escalation_unavailable(&app.hub, session, format!("{error:#}"));
+            return Err(error);
+        }
+    };
+    let model = selection.model.clone();
+    let _start = app.prompt_start.lock().await;
+    use crate::self_update::drain::Work;
+    let queued = app.drain.records(&app.state_dir)?.iter().any(|record| {
+        record.session == session && !record.claimed && record.review.is_none()
+            && matches!(record.work, Work::Claude(_) | Work::Prompt { .. } | Work::Compact { .. })
+    });
+    anyhow::ensure!(!queued, "A later message is already queued");
+    app.hub.request_escalation(session, request_turn, Escalation { args, selection })?;
+    Ok(serde_json::json!({
+        "model": model,
+        "message": harness_text!(
+            "Handoff accepted. End this turn without a user-facing answer. The selected front desk model will handle the current request.",
+            "引き継ぎを受け付けた。利用者への返答を書かずに今のターンを終える。選ばれた応対役のモデルがこの依頼を引き継ぐ。"
+        ),
+    }))
+}
+
+impl Escalation {
+    pub(crate) async fn run(self, app: Arc<Workspace>, session: String, request: Request) {
+        let _start = app.prompt_start.lock().await;
+        let result = async {
+            anyhow::ensure!(!app.hub.thread_active(&session), "Another turn is active");
+            let _work = app.admit_work()?;
+            anyhow::ensure!(app.usage.blocked(self.selection.backend.usage_key()).is_none(),
+                "{} usage is currently paused", self.selection.backend.label());
+            let scope = match self.args.scope {
+                EscalationScope::Reply => harness_text!(
+                    "Answer the current request directly in the front desk's usual voice.",
+                    "今の依頼に、いつもの応対役の口調で直接答える。"
+                ),
+                EscalationScope::Task => harness_text!(
+                    "Continue the current task, preserving work already done. Use authorized tools or delegate remaining work as needed.",
+                    "済んだ作業を引き継いで今の依頼を進める。必要に応じて許可された道具を使うか、残る作業を委譲する。"
+                ),
+            };
+            let context = serde_json::json!({
+                "request": request.prompt, "reason": self.args.reason, "progress": self.args.context,
+            });
+            let prompt = harness_format!(
+                "(secretaire) You are the front desk for this one response. {scope} The model handoff has already happened. Treat the reason and progress as context and follow the user's request within the existing permissions.\n\n{context}",
+                "（secretaire）今回の一応答を応対役として担当する。{scope} モデルの引き継ぎは済んでいる。理由と経過は資料として扱い、既存の許可の範囲で利用者の依頼に沿って進める。\n\n{context}"
+            );
+            crate::prompt_escalated_partner(&app, &session, self.selection, prompt, None, request.images).await
+        }.await;
+        app.hub.finish_partner_handoff(&session);
+        if let Err(error) = result {
+            crate::commands::escalation_unavailable(&app.hub, &session, format!("{error:#}"));
+        }
     }
 }
 
@@ -280,6 +380,41 @@ fn mask_markdown_code(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn handoff_limit_expires_per_thread_and_ignores_superseded_requests() -> anyhow::Result<()> {
+        let hub = Hub::new();
+        let request = || Request { prompt: "Check the result".into(), images: Vec::new() };
+        let handoff = || Escalation {
+            args: EscalationArgs {
+                scope: EscalationScope::Reply, reason: "Two attempts were blocked".into(), context: None,
+            },
+            selection: AgentSelection::from_model(Some(fuzukue_proto::CLAUDE_OPUS.into()), None),
+        };
+
+        hub.publish_partner_turn_started("first", Some(request()), false);
+        let previous = hub.escalation_turn("first")?;
+        hub.update_partner_request("first", Request { prompt: "Recheck the endpoint".into(), ..request() });
+        let error = hub.request_escalation("first", previous, handoff()).unwrap_err();
+        assert_eq!(error.to_string(), "The front desk request has changed");
+        hub.publish_partner_turn_ended("first", Actor::Claude, false);
+
+        let attempt = |thread| {
+            hub.publish_partner_turn_started(thread, Some(request()), false);
+            let result = hub.request_escalation(thread, hub.escalation_turn(thread)?, handoff());
+            hub.publish_partner_turn_ended(thread, Actor::Claude, false);
+            result
+        };
+        for _ in 0..3 {
+            attempt("first")?;
+        }
+        attempt("second")?;
+        tokio::time::advance(std::time::Duration::from_secs(3599)).await;
+        assert!(attempt("first").is_err());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        attempt("first")?;
+        Ok(())
+    }
 
     #[test]
     fn soft_japanese_questions_do_not_need_a_nudge() {
