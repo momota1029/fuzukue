@@ -4,7 +4,7 @@ use fuzukue_proto::{GitHubActivity, GitHubAuthor, GitHubLink, GitHubPolicy, Thre
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, Metadata};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::time::{Instant, SystemTime};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{durable, state, workspace};
+
+mod save_files;
+use save_files::SaveFiles;
 
 use fuzukue_proto::{AgentBackend, AgentSelection, ChatSettings, DelegateJob, DelegateReport, DelegateSettings, JobStatus, JobSummary};
 
@@ -1179,48 +1182,6 @@ impl FileVersion {
     }
 }
 
-fn previous_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!(".{}.previous", path.file_name().unwrap().to_string_lossy()))
-}
-
-fn preserve_previous(file: &mut File, path: &Path, dir: &Path) -> Result<()> {
-    file.sync_all()?;
-    let previous = previous_path(path);
-    let staging = tempfile::Builder::new().prefix(".fuzukue-thread-backup-").tempdir_in(dir)?;
-    let staged = staging.path().join("previous");
-    if fs::hard_link(path, &staged).is_err() {
-        let mut copy = File::create_new(&staged)?;
-        copy.set_permissions(file.metadata()?.permissions())?;
-        std::io::copy(file, &mut copy)?;
-        copy.sync_all()?;
-    }
-    fs::rename(staged, previous)?;
-    durable::sync_dir(dir)?;
-    Ok(())
-}
-
-fn remove_stale_thread_temps(entry: &fs::DirEntry) -> std::io::Result<()> {
-    // Leave recent files alone in case another process is writing this workspace.
-    let name = entry.file_name();
-    let Some(name) = name.to_str() else { return Ok(()) };
-    let temp_file = name.strip_prefix(".tmp").is_some_and(|suffix|
-        suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()));
-    let backup_dir = name.starts_with(".fuzukue-thread-backup-");
-    if !temp_file && !backup_dir {
-        return Ok(());
-    }
-    let metadata = entry.metadata()?;
-    if metadata.modified()?.elapsed().unwrap_or_default().as_secs() < 3600 {
-        return Ok(());
-    }
-    if temp_file && metadata.is_file() {
-        fs::remove_file(entry.path())?;
-    } else if backup_dir && metadata.is_dir() {
-        fs::remove_dir_all(entry.path())?;
-    }
-    Ok(())
-}
-
 struct Thread {
     path: PathBuf,
     file_version: RefCell<Option<FileVersion>>,
@@ -1291,27 +1252,30 @@ impl Thread {
     fn save(&self) -> Result<()> {
         self.transcript.check().with_context(|| format!("Thread file {}", self.path.display()))?;
         let dir = self.path.parent().context("missing thread directory")?;
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        {
-            let mut output = BufWriter::new(tmp.as_file_mut());
-            write!(output, "---\n{}---\n", serde_yaml::to_string(&self.front)?)?;
-            self.transcript.write_markdown(&mut output)?;
-            output.flush()?;
-        }
-        match File::open(&self.path) {
-            Ok(mut file) => {
-                let version = FileVersion::read(file.metadata()?)?;
-                ensure!(self.file_version.borrow().as_ref() == Some(&version),
-                    "Thread file {} changed on disk", self.path.display());
-                preserve_previous(&mut file, &self.path, dir)?;
-                ensure!(FileVersion::read(fs::symlink_metadata(&self.path)?)? == version,
-                    "Thread file {} changed while saving", self.path.display());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                && self.file_version.borrow().is_none() => {}
-            Err(error) => return Err(error).with_context(|| format!("Thread file {}", self.path.display())),
-        }
-        let file = durable::persist(tmp, &self.path)?;
+        let files = SaveFiles::open(dir)?;
+        let file = files.replace(
+            &self.path,
+            |output| {
+                write!(output, "---\n{}---\n", serde_yaml::to_string(&self.front)?)?;
+                self.transcript.write_markdown(output)
+            },
+            || {
+                match File::open(&self.path) {
+                    Ok(mut file) => {
+                        let version = FileVersion::read(file.metadata()?)?;
+                        ensure!(self.file_version.borrow().as_ref() == Some(&version),
+                            "Thread file {} changed on disk", self.path.display());
+                        files.preserve_previous(&mut file, &self.path)?;
+                        ensure!(FileVersion::read(fs::symlink_metadata(&self.path)?)? == version,
+                            "Thread file {} changed while saving", self.path.display());
+                        Ok(())
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                        && self.file_version.borrow().is_none() => Ok(()),
+                    Err(error) => Err(error).with_context(|| format!("Thread file {}", self.path.display())),
+                }
+            },
+        )?;
         self.file_version.replace(Some(FileVersion::read(file.metadata()?)?));
         self.transcript.dirty.set(false);
         Ok(())
@@ -1709,15 +1673,17 @@ impl Store {
         };
         store.reload_model_defaults();
         let dir = crate::safe_join(project, "threads").ok();
+        if let Some(dir) = &dir {
+            if let Err(error) = save_files::reconcile(dir) {
+                tracing::warn!(path=?dir, %error, "could not reconcile thread save files");
+            }
+        }
         for entry in dir
             .and_then(|dir| std::fs::read_dir(dir).ok())
             .into_iter()
             .flatten()
             .flatten()
         {
-            if let Err(error) = remove_stale_thread_temps(&entry) {
-                tracing::warn!(path=?entry.path(), %error, "could not remove stale thread temporary file");
-            }
             if entry.path().extension().is_none_or(|e| e != "md")
                 || !entry.file_type().is_ok_and(|kind| kind.is_file())
             {
@@ -3121,12 +3087,10 @@ impl Store {
             removed.insert(legacy.clone(), id.into());
             durable::json(&path, &removed)?;
         }
+        let files = SaveFiles::open(thread.path.parent().context("missing thread directory")?)?;
         trash.file_unrecorded(app, fuzukue_proto::TrashKind::Thread, id.into(), thread.front.title.clone(), &thread.path)?;
-        let backup = previous_path(&thread.path);
-        if let Err(error) = fs::remove_file(&backup) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path=?backup, %error, "could not remove previous version of trashed thread");
-            }
+        if let Err(error) = files.remove_previous(&thread.path) {
+            tracing::warn!(path=?thread.path, %error, "could not remove previous version of trashed thread");
         }
         self.threads.remove(id);
         self.pages.borrow_mut().retain(|(key, _)| key.session != id);
@@ -3582,12 +3546,12 @@ mod archive_tests {
         let path = threads.path(&id)?;
         let original = fs::read(&path)?;
         threads.rename(&id, "Second generation")?;
-        assert_eq!(fs::read(previous_path(&path))?, original);
+        let previous = path.with_file_name(fuzukue_proto::THREAD_SAVE_DIR)
+            .join(format!("{}.previous", path.file_name().unwrap().to_string_lossy()));
+        assert_eq!(fs::read(&previous)?, original);
         let valid = fs::read(&path)?;
-        let stale = path.with_file_name(".tmpABC123");
-        File::create(&stale)?.set_modified(SystemTime::UNIX_EPOCH)?;
-        let recent = path.with_file_name(".tmpDEF456");
-        File::create(&recent)?;
+        let legacy_temp = path.with_file_name(".tmpABC123");
+        File::create(&legacy_temp)?;
 
         for data in [vec![], vec![0; 18_800_000], [&valid[..], b"partial"].concat()] {
             fs::write(&path, &data)?;
@@ -3597,10 +3561,66 @@ mod archive_tests {
                 matches!(event, ServerEvent::Error { message } if message.contains(filename.as_ref()))));
             assert!(reopened.rename(&id, "Cannot replace").is_err());
             assert_eq!(fs::read(&path)?, data);
-            assert_eq!(fs::read(previous_path(&path))?, original);
+            assert_eq!(fs::read(&previous)?, original);
         }
-        assert!(!stale.exists());
-        assert!(recent.is_file());
+        assert!(!legacy_temp.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn previous_generation_migrates_and_tracks_the_live_filename() -> anyhow::Result<()> {
+        use super::*;
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let project = project.path().canonicalize()?;
+        let state = state.path();
+        let mut store = Store::load(&project, state, &Default::default());
+        let id = store.create(None)?;
+        let path = store.path(&id)?;
+        let name = path.file_name().unwrap().to_string_lossy();
+        let private = path.with_file_name(fuzukue_proto::THREAD_SAVE_DIR);
+        let previous = private.join(format!("{name}.previous"));
+        let legacy = path.with_file_name(format!(".{name}.previous"));
+        let orphan = path.with_file_name(".deleted.md.previous");
+
+        let first = fs::read(&path)?;
+        store.rename(&id, "Second generation")?;
+        assert_eq!(fs::read(&previous)?, first);
+        let second = fs::read(&path)?;
+        store.rename(&id, "Third generation")?;
+        assert_eq!(fs::read(&previous)?, second);
+        assert_eq!(fs::read_dir(&private)?.count(), 2);
+
+        fs::rename(&previous, &legacy)?;
+        fs::write(&orphan, &first)?;
+        fs::write(private.join("staged-thread"), b"interrupted save")?;
+        fs::write(private.join("staged-previous"), b"interrupted backup")?;
+        let legacy_staging = path.with_file_name(".fuzukue-thread-backup-abcd12");
+        fs::create_dir(&legacy_staging)?;
+        fs::write(legacy_staging.join("previous"), &first)?;
+        drop(store);
+
+        let mut store = Store::load(&project, state, &Default::default());
+        assert_eq!(store.path(&id)?, path);
+        assert_eq!(fs::read(&previous)?, second);
+        assert!(!legacy.exists() && !orphan.exists() && !legacy_staging.exists());
+        assert_eq!(fs::read_dir(&private)?.count(), 2);
+
+        let moved = path.with_file_name("moved.md");
+        fs::rename(&path, &moved)?;
+        store = Store::load(&project, state, &Default::default());
+        assert_eq!(store.path(&id)?, moved);
+        assert!(!previous.exists());
+        store.rename(&id, "Moved thread")?;
+        assert!(private.join("moved.md.previous").is_file());
+
+        let workspace = crate::Workspace::new(
+            project, String::new(), state.to_owned(), std::sync::Arc::new(crate::Hub::new()),
+        );
+        store.trash(&workspace, &crate::trash::Store::new(state), &id)?;
+        assert!(!moved.exists());
+        assert!(!store.contains(&id));
+        assert_eq!(fs::read_dir(&private)?.count(), 1);
         Ok(())
     }
 

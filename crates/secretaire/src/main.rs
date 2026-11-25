@@ -907,6 +907,11 @@ async fn file_handler(
             .map_err(|status| (status, status.to_string()));
     }
     let full = safe_join(&app.project_dir, &path).map_err(not_found)?;
+    if fuzukue_proto::is_thread_save_artifact(Path::new(&path))
+        || fuzukue_proto::is_thread_save_artifact(&full)
+    {
+        return Err(not_found(anyhow::anyhow!("private thread save path")));
+    }
     let bytes = tokio::fs::read(&full).await.map_err(|e| not_found(e.into()))?;
     Ok(bytes.into_response())
 }

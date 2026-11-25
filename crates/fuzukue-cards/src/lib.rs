@@ -601,7 +601,8 @@ pub fn find_decks(root: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = walkdir::WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
-            !e.path().strip_prefix(root).is_ok_and(fuzukue_proto::is_inbox_upload_path)
+            !fuzukue_proto::is_thread_save_artifact(e.path())
+                && !e.path().strip_prefix(root).is_ok_and(fuzukue_proto::is_inbox_upload_path)
                 && !e.file_name().to_str().is_some_and(|s| SKIP.contains(&s)
                     || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-"))
         })
@@ -1058,7 +1059,9 @@ impl Graph {
             if !dir.exists() {
                 continue; // カードのないプロジェクトは 0 枚として扱う
             }
-            for entry in walkdir::WalkDir::new(&dir).sort_by_file_name() {
+            for entry in walkdir::WalkDir::new(&dir).sort_by_file_name().into_iter()
+                .filter_entry(|entry| !fuzukue_proto::is_thread_save_artifact(entry.path()))
+            {
                 let entry = entry?;
                 let p = entry.path();
                 if !entry.file_type().is_file() || p.extension().is_none_or(|e| e != "md") {

@@ -59,7 +59,7 @@ async fn folder_drop_synthetic_reference_stays_outside_workspace_and_prompt() ->
         path: repo.to_str().unwrap().into(), name: "synthetic repository".into(),
     }));
     assert_eq!(crate::folder_attachment::resolve(&state, &path)?, repo);
-    let saved = fs::read_dir(state.join("inbox/folders"))?.next().unwrap()?.path();
+    let saved = state.join(Path::new(&path).parent().unwrap());
     let files: Vec<_> = fs::read_dir(saved)?.collect::<std::io::Result<_>>()?;
     assert_eq!(files.len(), 1);
     assert!(files[0].metadata()?.len() < 4096);

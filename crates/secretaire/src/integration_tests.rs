@@ -708,11 +708,10 @@ fn thread_transcript_restores_from_journal_and_project_markdown() -> Result<()> 
     hub.edit_threads(|store| store.rename(&id, "続きの研究"))?;
     // A second reply has reached the journal but not the end-of-turn Markdown write.
     hub.publish(text("assistant:2", Actor::Claude, "途中の回答"));
+    let path = hub.thread_path(&id)?;
     drop(hub);
 
-    let path = fs::read_dir(project.path().join("threads"))?.next().unwrap()?.path();
-    let filename = path.file_name().unwrap().to_string_lossy();
-    assert!(filename.ends_with(&format!("-{id}.md")));
+    assert!(path.file_name().unwrap().to_string_lossy().ends_with(&format!("-{id}.md")));
     let markdown = fs::read_to_string(path)?;
     assert!(markdown.contains("session_id: claude-uuid"));
     assert!(markdown.contains("## User\n\n\n質問から題を作る\n続き"));
@@ -886,7 +885,12 @@ fn first_prompt_creates_an_unattached_thread() -> Result<()> {
     assert!(app.hub.has_thread(&id));
     assert!(app.hub.thread_attachments(&id).is_empty());
     assert!(crate::prepare_prompt_thread(&app, &mut prompt)?.is_none());
-    assert_eq!(fs::read_dir(project.path().join("threads"))?.count(), 1);
+    let thread_count = fs::read_dir(project.path().join("threads"))?
+        .filter(|entry| entry.as_ref().is_ok_and(|entry| {
+            entry.path().extension().is_some_and(|extension| extension == "md")
+        }))
+        .count();
+    assert_eq!(thread_count, 1);
     Ok(())
 }
 
@@ -991,16 +995,14 @@ fn legacy_chats_migrate_once_without_changing_the_state_backups() -> Result<()> 
         if session == &tab && output == "review evidence")));
     assert!(initial.iter().any(|env| matches!(&env.event, ServerEvent::TextDelta { session, actor: Actor::Codex { .. }, text, .. }
         if session == &tab && text == "査読結果")));
-    for entry in fs::read_dir(project.path().join("threads"))? {
-        let entry = entry?;
-        let is_main = entry.file_name().to_string_lossy().ends_with(&format!("-{main}.md"));
-        let markdown = fs::read_to_string(entry.path())?;
+    for (id, session) in [(&main, "cli-main"), (&tab, "cli-research")] {
+        let markdown = fs::read_to_string(app.hub.thread_path(id)?)?;
         let (front, _) = fuzukue_cards::split_frontmatter(&markdown).unwrap();
         let front: serde_yaml::Value = serde_yaml::from_str(front)?;
         for field in ["created", "updated"] {
             assert!(chrono::DateTime::parse_from_rfc3339(front[field].as_str().unwrap()).is_ok());
         }
-        assert_eq!(front["session_id"].as_str(), Some(if is_main { "cli-main" } else { "cli-research" }));
+        assert_eq!(front["session_id"].as_str(), Some(session));
     }
     app.record_session(&main, |record| record.claude_session_id = Some("new-cli-id".into()));
     app.hub.edit_threads(|store| store.rename(&main, "新しい題"))?;
@@ -1180,9 +1182,9 @@ async fn create_research_mcp_attaches_a_thread_with_drafts_and_provenance() -> R
     assert_eq!(config.meta.kind, "research");
     assert_eq!(config.meta.title, "積距離の研究");
     assert_eq!(config.meta.summary, "距離と集中の関係");
-    let entry = fs::read_dir(project.path().join("threads"))?.next().unwrap()?;
-    let from = format!("threads/{}", entry.file_name().to_string_lossy());
-    assert!(fs::read_to_string(entry.path())?.contains("attached:\n- papers/prior\n- research/product-metrics"));
+    let path = app.hub.thread_path(&id)?;
+    let from = format!("threads/{}", path.file_name().unwrap().to_string_lossy());
+    assert!(fs::read_to_string(path)?.contains("attached:\n- papers/prior\n- research/product-metrics"));
     for (card, kind) in [("q-metric", "question"), ("p-metric", "plan")] {
         let draft = &graph.cards[card];
         assert_eq!(draft.kind, kind);
@@ -8185,6 +8187,71 @@ timeout = 1
     assert_eq!(repeated.pop().unwrap().await?.state, TestState::Cancelled);
     let mut timed = app.run_tests(Some("timeout"), None).await?;
     assert_eq!(timed.pop().unwrap().await?.state, TestState::TimedOut);
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_save_files_stay_out_of_git_and_workspace_scans() -> Result<()> {
+    use fuzukue_proto::{LibraryKind, THREAD_SAVE_DIR};
+
+    let project = TempProject::new()?;
+    let root = project.path().canonicalize()?;
+    let state = TempProject::new()?;
+    let start = || Arc::new(Workspace::new(
+        root.clone(), String::new(), state.path().to_owned(), Arc::new(Hub::new()),
+    ));
+    let app = start();
+    let git = |args: &[&str]| -> Result<String> {
+        let output = Command::new("git").current_dir(&root).args(args).output()?;
+        anyhow::ensure!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    git(&["init", "--quiet", "--template="])?;
+    fs::create_dir(root.join("cards"))?;
+    fs::write(root.join("deck.toml"), "kind = 'paper'\ndirs = ['cards', 'threads']\n")?;
+    let visible = root.join("cards/visible.md");
+    let card = |id: &str, title: &str| format!("---\nid: {id}\ntitle: {title}\n---\nExample.\n");
+    fs::write(&visible, card("visible", "VisibleExample"))?;
+
+    let id = app.hub.edit_threads(|store| store.create(None))?;
+    let path = app.hub.thread_path(&id)?;
+    let before = git(&["status", "--porcelain", "--untracked-files=all"])?;
+    assert!(before.contains(path.file_name().unwrap().to_str().unwrap()));
+    app.hub.edit_threads(|store| store.rename(&id, "A newer title"))?;
+    let private = root.join("threads").join(THREAD_SAVE_DIR);
+    assert!(private.join(format!("{}.previous", path.file_name().unwrap().to_string_lossy())).is_file());
+    let hidden = private.join("hidden.md");
+    fs::write(&hidden, card("hidden", "PrivateSaveExample"))?;
+    fs::write(private.join("deck.toml"), "kind = 'paper'\n")?;
+    fs::write(
+        private.join("copy.md"),
+        fs::read_to_string(&path)?.replace(&id, "thread-private-copy"),
+    )?;
+    assert_eq!(git(&["status", "--porcelain", "--untracked-files=all"])?, before);
+    assert!(!before.contains(THREAD_SAVE_DIR));
+    drop(app);
+
+    let app = start();
+    assert_eq!(app.hub.thread_path(&id)?, path);
+    assert!(!app.hub.has_thread("thread-private-copy"));
+    let entries = crate::file_browser::list(&root, "threads", true)?.entries;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, path.file_name().unwrap().to_string_lossy());
+    assert!(crate::file_browser::find(&root, THREAD_SAVE_DIR, true, &[])?.entries.is_empty());
+    assert_eq!(fuzukue_cards::find_decks(&root), [root.clone()]);
+    let graph = fuzukue_cards::Graph::open(&root)?;
+    assert!(graph.cards.contains_key("visible"));
+    assert!(!graph.cards.contains_key("hidden"));
+    assert!(app.graph.deck_for_file(&root, state.path(), &visible).is_some());
+    assert!(app.graph.deck_for_file(&root, state.path(), &hidden).is_none());
+
+    for (query, expected) in [("PrivateSaveExample", 0), ("VisibleExample", 1)] {
+        let result = crate::library::search(app.clone(), crate::library::Search {
+            query: query.into(), kinds: vec![LibraryKind::Card], deck: None,
+            sort: Default::default(), offset: 0, limit: 10, protocol: fuzukue_proto::PROTOCOL_VERSION,
+        }).await?;
+        assert_eq!(result.hits.len(), expected, "{query}");
+    }
     Ok(())
 }
 

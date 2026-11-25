@@ -651,7 +651,11 @@ impl Repo {
             return self.read_files(&self.project, [relative]);
         }
         let paths = walkdir::WalkDir::new(&root).follow_links(false).into_iter()
-            .filter_entry(|entry| entry.file_name() != ".git" && !entry.file_name().to_string_lossy().starts_with(".fuzukue-trash-"))
+            .filter_entry(|entry| {
+                entry.file_name() != ".git"
+                    && !entry.file_name().to_string_lossy().starts_with(".fuzukue-trash-")
+                    && !fuzukue_proto::is_thread_save_artifact(entry.path())
+            })
             .filter_map(|entry| match entry {
                 Ok(entry) if entry.file_type().is_dir() => None,
                 Ok(entry) => Some(Ok(entry.path().strip_prefix(&self.project).unwrap().to_string_lossy().into_owned())),

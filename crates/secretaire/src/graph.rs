@@ -98,6 +98,9 @@ impl WorkspaceGraph {
     pub(crate) fn deck_for_file(
         &self, project: &Path, state: &Path, file: &Path,
     ) -> Option<fuzukue_proto::FileDeck> {
+        if fuzukue_proto::is_thread_save_artifact(file) {
+            return None;
+        }
         self.with_graph(project, state, false, |graph| {
             let project = project.canonicalize().ok()?;
             let mut fallback = None;
@@ -270,6 +273,9 @@ struct Stamp {
 }
 
 fn stamp(path: PathBuf) -> Option<Stamp> {
+    if fuzukue_proto::is_thread_save_artifact(&path) {
+        return None;
+    }
     let meta = fs::metadata(&path).ok()?;
     meta.is_file().then_some(())?;
     Some(Stamp {
@@ -344,7 +350,7 @@ impl Cache {
             FileSet::new(),
         );
         while let Some(root) = roots.pop_first() {
-            if !visited.insert(root.clone()) {
+            if fuzukue_proto::is_thread_save_artifact(&root) || !visited.insert(root.clone()) {
                 continue;
             }
             let cfg = if root.starts_with(project) {

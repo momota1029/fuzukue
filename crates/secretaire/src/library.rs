@@ -346,7 +346,10 @@ impl Index {
                     continue;
                 }
                 for item in WalkDir::new(dir).into_iter()
-                    .filter_entry(|entry| !entry.path().strip_prefix(project).is_ok_and(fuzukue_proto::is_inbox_upload_path))
+                    .filter_entry(|entry| {
+                        !fuzukue_proto::is_thread_save_artifact(entry.path())
+                            && !entry.path().strip_prefix(project).is_ok_and(fuzukue_proto::is_inbox_upload_path)
+                    })
                     .filter_map(Result::ok)
                 {
                     let path = item.path();

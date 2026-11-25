@@ -164,13 +164,48 @@ pub fn folder_attachment_excludes(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     matches!(
         name.as_str(),
-        ".git" | ".hg" | ".svn" | "target" | "node_modules" | ".lake" | ".gradle"
+        THREAD_SAVE_DIR | ".git" | ".hg" | ".svn" | "target" | "node_modules" | ".lake" | ".gradle"
             | ".fuzukue" | ".labo" | ".ssh" | ".aws" | ".codex" | ".claude"
             | ".gnupg" | ".azure" | ".kube" | ".docker" | ".password-store" | ".git-credentials"
             | "__pycache__" | ".venv" | ".env" | ".envrc" | ".npmrc" | ".netrc"
             | "keystore.properties" | "remote-token"
     ) || [".env.", "id_rsa", "id_ed25519"].iter().any(|prefix| name.starts_with(prefix))
         || [".pem", ".key", ".p12", ".pfx"].iter().any(|suffix| name.ends_with(suffix))
+}
+
+/// The private directory used for durable thread saves.
+pub const THREAD_SAVE_DIR: &str = ".fuzukue-thread-save";
+
+/// Identify a previous generation left by an older server, returning its Markdown name.
+pub fn legacy_thread_previous(name: &str) -> Option<&str> {
+    name.strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".previous"))
+        .filter(|name| name.ends_with(".md"))
+}
+
+/// Identify staging names used before thread saves had a private directory.
+pub fn is_legacy_thread_temp(name: &str) -> bool {
+    name.starts_with(".fuzukue-thread-backup-")
+        || name.strip_prefix(".tmp").is_some_and(|suffix| {
+            suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
+/// Workspace discovery skips private thread saves, including artifacts awaiting migration.
+pub fn is_thread_save_artifact(path: &std::path::Path) -> bool {
+    let mut in_threads = false;
+    for part in path.components() {
+        let name = part.as_os_str();
+        if name == THREAD_SAVE_DIR
+            || in_threads && name.to_str().is_some_and(|name| {
+                legacy_thread_previous(name).is_some() || is_legacy_thread_temp(name)
+            })
+        {
+            return true;
+        }
+        in_threads = name == "threads";
+    }
+    false
 }
 
 /// Automatically discovered workspace content excludes the legacy upload directories.

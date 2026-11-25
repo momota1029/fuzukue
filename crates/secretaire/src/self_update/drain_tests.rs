@@ -725,7 +725,7 @@ async fn shutdown_restart_waits_for_trial_and_usage_then_replays_input_and_goal_
     let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
     let goal = workspace.hub.edit_threads(|threads| threads.create(None))?;
     crate::planner::write_test_plan(&workspace, &goal)?;
-    let reset = crate::usage::now() + 3;
+    let reset = crate::usage::now() + 3600;
     workspace
         .usage
         .update_claude(&serde_json::json!({"unifiedWindows":{"five_hour":{
@@ -792,9 +792,19 @@ async fn shutdown_restart_waits_for_trial_and_usage_then_replays_input_and_goal_
     assert_eq!(prompt_count(&new_workspace, "held input marker"), 0);
     next.trial_pending
         .store(false, std::sync::atomic::Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(prompt_count(&new_workspace, "held input marker"), 0);
+    assert_eq!(prompt_count(&new_workspace, "Resume test goal"), 0);
+
+    // Expire the restored window explicitly so restart can take as long as needed.
+    new_workspace
+        .usage
+        .update_claude(&serde_json::json!({"unifiedWindows":{"five_hour":{
+            "utilization":0.99, "resetsAt":crate::usage::now() - 1, "status":"rejected"
+        }}}));
+    assert!(new_workspace.usage.blocked("claude").is_none());
     until(|| prompt_count(&new_workspace, "held input marker") == 1).await?;
     until(|| prompt_count(&new_workspace, "Resume test goal") == 1).await?;
-    assert!(crate::usage::now() >= reset);
     tokio::time::sleep(Duration::from_millis(350)).await;
     assert_eq!(prompt_count(&new_workspace, "held input marker"), 1);
     assert_eq!(prompt_count(&new_workspace, "Resume test goal"), 1);

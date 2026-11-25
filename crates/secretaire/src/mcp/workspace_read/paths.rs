@@ -87,6 +87,7 @@ impl ReadScope {
     }
 
     fn check_protected(&self, path: &Path) -> Result<()> {
+        ensure!(!fuzukue_proto::is_thread_save_artifact(path), "Access denied to private thread saves");
         if result_spill::is_spill_path(path) {
             ensure!(self.allows_result(path), "Use the exact MCP result path from this session's tool reply. The result may have expired.");
             return Ok(());

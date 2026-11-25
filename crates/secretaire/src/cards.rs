@@ -188,6 +188,7 @@ const IGNORED_DIRS: &[&str] = &[".git", "target", ".lake", "node_modules", ".tem
 pub(crate) fn is_ignored(project: &Path, path: &Path) -> bool {
     let rel = path.strip_prefix(project).unwrap_or(path);
     fuzukue_proto::is_inbox_upload_path(rel)
+        || fuzukue_proto::is_thread_save_artifact(path)
         || rel.components().any(|c| c.as_os_str().to_str().is_some_and(|s| IGNORED_DIRS.contains(&s) || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-")))
 }
 
@@ -687,7 +688,13 @@ fn is_pdf(project: &Path, path: &Path) -> bool {
 pub fn artifacts(project: &Path) -> ServerEvent {
     let mut pdfs: Vec<String> = walkdir::WalkDir::new(project)
         .into_iter()
-        .filter_entry(|e| !e.file_name().to_str().is_some_and(|s| IGNORED_DIRS.contains(&s) || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-")))
+        .filter_entry(|e| {
+            !fuzukue_proto::is_thread_save_artifact(e.path())
+                && !e.file_name().to_str().is_some_and(|s| {
+                    IGNORED_DIRS.contains(&s) || s.starts_with(".fuzukue-research-")
+                        || s.starts_with(".fuzukue-book-import-")
+                })
+        })
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("pdf"))
         .filter_map(|e| e.path().strip_prefix(project).ok().map(|p| p.to_string_lossy().replace('\\', "/")))

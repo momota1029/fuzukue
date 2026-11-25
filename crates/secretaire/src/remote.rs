@@ -1401,6 +1401,25 @@ trusted_proxy = ["127.0.0.1"]"#,
     #[tokio::test]
     async fn android_download_requires_https_and_the_configured_remote_identity() -> Result<()> {
         use tower::ServiceExt;
+
+        // Tracing callsite interest is process-wide. Run the audit assertions
+        // with a global subscriber in a dedicated test process.
+        const CHILD: &str = "FUZUKUE_TEST_ANDROID_DOWNLOAD_AUDIT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "remote::tests::android_download_requires_https_and_the_configured_remote_identity",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            return Ok(());
+        }
+
         struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
         impl Write for LogWriter {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1412,7 +1431,7 @@ trusted_proxy = ["127.0.0.1"]"#,
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
             .with_writer(move || LogWriter(writer.clone())).finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
+        tracing::subscriber::set_global_default(subscriber)?;
         let dir = tempfile::tempdir()?;
         let access = Arc::new(Access::with_whois(
             dir.path(),

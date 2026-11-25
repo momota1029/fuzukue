@@ -64,6 +64,11 @@ impl Root {
         let full = self.path.join(path).canonicalize()?;
         let relative = full.strip_prefix(&self.path)?;
         ensure!(
+            !fuzukue_proto::is_thread_save_artifact(Path::new(path))
+                && !fuzukue_proto::is_thread_save_artifact(relative),
+            "private thread save path"
+        );
+        ensure!(
             hidden || !hidden_path(path) && !hidden_path(&relative.to_string_lossy()),
             "hidden path"
         );
@@ -113,7 +118,10 @@ impl Root {
             } else {
                 format!("{path}/{name}")
             };
-            if fuzukue_proto::is_inbox_upload_path(Path::new(&path)) {
+            let relative = Path::new(&path);
+            if fuzukue_proto::is_inbox_upload_path(relative)
+                || fuzukue_proto::is_thread_save_artifact(relative)
+            {
                 return None;
             }
             let mut stat = statat(&fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW).ok()?;
