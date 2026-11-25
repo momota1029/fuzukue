@@ -61,6 +61,7 @@ impl TurnState {
 }
 
 struct ActiveTurn {
+    exec: crate::mcp::exec::Turn,
     history: Option<crate::history::PartnerTurn>,
     before: Option<Snapshot>,
     resume_prompt: Option<PendingPrompt>,
@@ -688,6 +689,7 @@ impl ClaudeSession {
         // The reader can observe a rejected resume while we are writing to its stdin.
         turns.idle_since = None;
         turns.active = Some(ActiveTurn {
+            exec: Default::default(),
             history, before, resume_prompt, kind, acted_or_asked: false, last_text: String::new(),
             interrupted: false, compaction: None, escalation: prompt.escalation.clone(), records: prompt.records.clone(),
         });
@@ -901,6 +903,7 @@ impl ClaudeSession {
         let (complete, mut result) = tokio::sync::oneshot::channel();
         turns.idle_since = None;
         turns.active = Some(ActiveTurn {
+            exec: Default::default(),
             history: None, before: None, resume_prompt: None,
             kind: TurnKind::Conversation, acted_or_asked: false, last_text: String::new(),
             interrupted: false, compaction: Some(Compaction { complete, boundary: None }), escalation: None,
@@ -933,6 +936,7 @@ impl ClaudeSession {
             turn.before = None;
             turn.resume_prompt = None;
             turn.interrupted = true;
+            turn.exec.cancel.cancel();
             self.interrupt_claude().await?;
         }
         Ok(())
@@ -986,6 +990,7 @@ impl ClaudeSession {
         turn.before = None;
         turn.resume_prompt = None;
         turn.interrupted = true;
+            turn.exec.cancel.cancel();
         turns.drain_notice = Some(wait);
         if reap {
             // EOF cleanup records the interrupted input and leaves unclaimed prompts in the journal.
@@ -1269,6 +1274,17 @@ impl ClaudeSession {
 
     pub(crate) fn mcp_key(&self) -> Option<&str> {
         self.mcp_key.as_deref()
+    }
+
+    pub(crate) async fn exec_turn(&self) -> Option<(String, Arc<crate::cancellation::Cancellation>)> {
+        let turns = self.state.lock().await;
+        let turn = turns.active.as_ref()?;
+        if turn.interrupted || !turn.kind.user_conversation()
+            || self.process.lock().await.settings.permission_mode == PermissionMode::Plan
+        {
+            return None;
+        }
+        Some((turn.exec.id.clone(), turn.exec.cancel.clone()))
     }
 
     pub(crate) async fn check_mcp(&self, reads_mail: bool, writes: bool) -> Result<bool> {

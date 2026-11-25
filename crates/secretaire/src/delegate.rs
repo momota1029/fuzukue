@@ -124,6 +124,8 @@ struct RunningJob {
     started: std::sync::atomic::AtomicBool,
     drain_notice: Mutex<Option<i64>>,
     capture_scope: Mutex<Option<crate::capture::WorkerStorage>>,
+    exec: Mutex<Option<crate::mcp::exec::Worker>>,
+    exec_revoked: std::sync::atomic::AtomicBool,
     workspace_read_scope: Mutex<Option<crate::mcp::workspace_read::ReadScope>>,
     approval_scope: Mutex<Option<Arc<approval::JobScope>>>,
     workspace_write_scope: Mutex<Option<Arc<crate::mcp::workspace_write::Scope>>>,
@@ -412,6 +414,28 @@ impl Workers {
             .map(|job| job.tools.lock().unwrap().clone())
     }
 
+    fn revoke_exec(&self, id: &str) {
+        if let Some(job) = self.running.lock().unwrap().get(id) {
+            job.exec_revoked.store(true, std::sync::atomic::Ordering::Release);
+            // Drop authorization for new calls. Any already-running command
+            // observes the same cancellation token.
+            if let Some(exec) = job.exec.lock().unwrap().take() {
+                exec.cancel.cancel();
+            }
+        }
+    }
+
+    pub(crate) fn exec_scope(&self, id: &str) -> Result<crate::mcp::exec::Worker> {
+        let jobs = self.running.lock().unwrap();
+        let job = jobs.get(id).context("Job not found")?;
+        job.cancel.check()?;
+        ensure!(!job.exec_revoked.load(std::sync::atomic::Ordering::Acquire), "exec is unavailable after automatic worker input");
+        let scope = job.exec.lock().unwrap().clone();
+        let scope = scope.context("exec requires a trusted worker launched with full-access")?;
+        scope.cancel.check()?;
+        Ok(scope)
+    }
+
     pub(crate) fn capture_scope(&self, id: &str) -> Result<crate::capture::WorkerStorage> {
         let jobs = self.running.lock().unwrap();
         let job = jobs.get(id).context("Job not found")?;
@@ -569,16 +593,16 @@ pub async fn start(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, agent: Option<&str>, caller: AgentCaller, routing: TierRequest,
     touches: Option<Vec<String>>,
 ) -> Result<String> {
-    start_with_grants(app, session, prompt, title, None, agent, caller, routing, touches, Vec::new(), None).await
+    start_with_grants(app, session, prompt, title, None, agent, caller, routing, touches, Vec::new(), None, false).await
 }
 
 pub(crate) async fn start_with_grants(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, label: Option<String>, agent: Option<&str>, caller: AgentCaller,
-    routing: TierRequest, touches: Option<Vec<String>>, folder_grants: Vec<String>, selection: Option<AgentSelection>,
+    routing: TierRequest, touches: Option<Vec<String>>, folder_grants: Vec<String>, selection: Option<AgentSelection>, exec_trusted: bool,
 ) -> Result<String> {
     let request = Assignment {
         prompt, title, label, worktree: None, agent: agent.map(str::to_owned),
-        selection, caller: Some(caller), adopted: None, routing, touches, issue: None, isolation: None, folder_grants,
+        selection, caller: Some(caller), adopted: None, routing, touches, issue: None, isolation: None, folder_grants, exec_trusted,
     };
     start_assignment(app, session, request).await
 }
@@ -607,7 +631,7 @@ pub async fn start_for_issue(
         "Link the issue before delegating in its worktree");
     let request = Assignment {
         prompt, title, label, worktree: Some(crate::github::worktree_path(&app.project_dir, number)?), agent: agent.map(str::to_owned),
-        selection, caller: Some(caller), adopted: None, routing, touches, issue: Some(number), isolation: None, folder_grants,
+        selection, caller: Some(caller), adopted: None, routing, touches, issue: Some(number), isolation: None, folder_grants, exec_trusted: false,
     };
     start_assignment(app, session, request).await
 }
@@ -628,7 +652,7 @@ pub(crate) async fn queue_issue_assignment(
     let job = format!("{DELEGATE_JOB}{}", mail::session_key());
     let assignment = Assignment {
         prompt, title: None, label: None, worktree: Some(directory), agent: None, selection: Some(selection),
-        caller: None, adopted: None, routing: Default::default(), touches: None, issue: None, isolation: None, folder_grants: Vec::new(),
+        caller: None, adopted: None, routing: Default::default(), touches: None, issue: None, isolation: None, folder_grants: Vec::new(), exec_trusted: false,
     };
     let (_, run) = launch_assignment(app, session, job, assignment, false).await?;
     Ok(run)
@@ -659,7 +683,7 @@ async fn launch(
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
     let _accept = app.admit_work()?;
     let job = format!("{DELEGATE_JOB}{}", mail::session_key());
-    let request = Assignment { prompt, title, label: None, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None, folder_grants: Vec::new() };
+    let request = Assignment { prompt, title, label: None, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None, folder_grants: Vec::new(), exec_trusted: false };
     launch_assignment(app, session, job, request, false).await
 }
 
@@ -683,6 +707,8 @@ pub(crate) struct Assignment {
     isolation: Option<blind::Isolation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     folder_grants: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    exec_trusted: bool,
 }
 
 impl Assignment {
@@ -711,7 +737,7 @@ pub(crate) async fn restore_assignment(app: &Arc<App>, session: String, id: Stri
 async fn launch_assignment(
     app: &Arc<App>, session: &str, job: String, request: Assignment, restore: bool,
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
-    let Assignment { prompt, title, label, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, folder_grants } = request.clone();
+    let Assignment { prompt, title, label, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, folder_grants, exec_trusted } = request.clone();
     let blind = isolation.is_some();
     app.hub.validate_worker_grants(session, &folder_grants)?;
     let is_planner = request.is_planner();
@@ -799,6 +825,8 @@ async fn launch_assignment(
         input: Mutex::new((!blind).then(|| tx.clone())), cancel: Arc::default(),
         started: false.into(), drain_notice: Default::default(),
         capture_scope: Default::default(),
+        exec: Default::default(),
+        exec_revoked: false.into(),
         workspace_read_scope: Default::default(),
         workspace_write_scope: Default::default(),
         approval_scope: Default::default(),
@@ -994,6 +1022,13 @@ async fn launch_assignment(
             };
             let read_only = execution.is_some_and(|policy| policy.sandbox == crate::worker_execution::Sandbox::ReadOnly);
             let tools = if read_only { crate::mcp::read_only_worker_tools(tools) } else { tools };
+            let mut tools = tools;
+            let exec_allowed = exec_trusted && execution.is_some_and(|policy| {
+                policy.full && policy.sandbox == crate::worker_execution::Sandbox::FullAccess
+            });
+            if !exec_allowed {
+                tools.retain(|tool| tool != crate::mcp::exec::NAME);
+            }
             *input.job.tools.lock().unwrap() = tools.clone();
             let cwd = worktree.as_deref().unwrap_or(&app.project_dir);
             crate::issue_threads::attach_worktree(&app, &session, cwd)?;
@@ -1113,6 +1148,19 @@ async fn launch_assignment(
                 let settings = ChatSettings { permission_mode, ..model.selection.chat_settings() };
                 let attempt_cancel: Arc<Cancellation> = Arc::default();
                 input.attempt_cancel = attempt_cancel.clone();
+                let exec_turn = crate::mcp::exec::Turn::default();
+                if exec_allowed && !input.job.exec_revoked.load(std::sync::atomic::Ordering::Acquire) {
+                    let scope = launch.scope.as_ref().expect("worker scope");
+                    *input.job.exec.lock().unwrap() = Some(crate::mcp::exec::Worker {
+                        cwd: scope.cwd.clone(),
+                        scratch: scope.scratch.clone(),
+                        backend: model.selection.backend,
+                        cancel: exec_turn.cancel.clone(),
+                        job_cancel: cancel.clone(),
+                        attempt_cancel: attempt_cancel.clone(),
+                        turn: exec_turn.id.clone(),
+                    });
+                }
                 let (_, events) = app.hub.subscribe(u64::MAX);
                 let on_model = |observed: &RunMetadata| {
                     if observed.model.is_none() && observed.effort.is_none() {
@@ -1151,6 +1199,8 @@ async fn launch_assignment(
                     run, &cancel, &attempt_cancel, events, &session, &job, WORKER_IDLE,
                     |event| record.lock().unwrap().observe(event, jobs::now()),
                 ).await;
+                drop(exec_turn);
+                input.job.exec.lock().unwrap().take();
                 if cancel.check().is_ok() {
                     let reported = input.job.retry.lock().unwrap().take();
                     if let Some(reason) = reported {
@@ -1337,9 +1387,12 @@ fn desk_message(app: &App, session: &str, job: &str, label: &str, text: &str) {
     });
 }
 
-pub fn message_worker(app: &App, job: &str, text: &str) -> Result<String> {
+pub fn message_worker(app: &App, caller_session: &str, job: &str, text: &str, exec_trusted: bool) -> Result<String> {
     ensure!(!text.trim().is_empty(), "作業役に送る文を指定する");
     let (session, job) = app.delegates.jobs.target(job)?;
+    if !exec_trusted || session != caller_session {
+        app.delegates.revoke_exec(&job);
+    }
     app.delegates.steer(app, &session, &job, text, ServerEvent::TextDelta {
         session: session.clone(), item: format!("{job}:desk:{}", mail::session_key()), actor: Actor::System,
         text: format!("**受付からの指示**\n\n{text}"),
@@ -1382,11 +1435,15 @@ pub async fn ask(app: &Arc<App>, session: &str, job: &str, text: String) -> Resu
     }
 }
 
-pub fn answer(app: &App, session: &str, id: &str, text: String) -> Result<()> {
+pub fn answer(app: &App, session: &str, id: &str, text: String, exec_trusted: bool) -> Result<()> {
     ensure!(!text.trim().is_empty(), "質問への回答を指定する");
     let mut questions = app.delegates.questions.lock().unwrap();
     ensure!(questions.get(id).is_some_and(|q| q.session == session), "受付への質問は終了したか、別のスレッドにある");
     let question = questions.remove(id).unwrap();
+    drop(questions);
+    if !exec_trusted {
+        app.delegates.revoke_exec(&question.job);
+    }
     question.reply.send(text.clone()).map_err(|_| anyhow::anyhow!("受付への質問は終了した"))?;
     desk_message(app, session, &question.job, "受付からの回答", &text);
     Ok(())
@@ -2555,6 +2612,8 @@ async fn mcp_review_findings_respect_authenticated_worker_access() -> Result<()>
             started: true.into(),
             drain_notice: Default::default(),
             capture_scope: Default::default(),
+        exec: Default::default(),
+        exec_revoked: false.into(),
             workspace_read_scope: Default::default(),
             workspace_write_scope: Default::default(),
             approval_scope: Default::default(),
@@ -2667,6 +2726,8 @@ async fn mcp_reading_tools_respect_authenticated_worker_access() -> Result<()> {
             started: true.into(),
             drain_notice: Default::default(),
             capture_scope: Default::default(),
+        exec: Default::default(),
+        exec_revoked: false.into(),
             workspace_read_scope: Default::default(),
             workspace_write_scope: Default::default(),
             approval_scope: Default::default(),

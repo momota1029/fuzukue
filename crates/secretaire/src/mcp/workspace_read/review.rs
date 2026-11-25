@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-const TOOLS: [Tool; 4] = [Tool::Read, Tool::List, Tool::Search, Tool::GitShow];
+const TOOLS: [Tool; 5] = [Tool::Read, Tool::Jq, Tool::List, Tool::Search, Tool::GitShow];
 const PREFIX: &str = "workspace-review-";
 static ACTIVE: LazyLock<Mutex<HashMap<String, Entry>>> = LazyLock::new(Mutex::default);
 
@@ -40,7 +40,8 @@ impl ReviewLease {
             .append_pair("workspace", &app.id)
             .append_pair("session", session)
             .append_pair("job", &id);
-        let scope = ReadScope::new(&app.project_dir, &app.state_dir, None)?;
+        let scope = ReadScope::new(&app.project_dir, &app.state_dir, None)?
+            .with_results(crate::mcp::result_spill::Owner::review(session, &id));
         ACTIVE.lock().unwrap().insert(
             id.clone(),
             Entry {
@@ -137,7 +138,11 @@ pub(in crate::mcp) async fn dispatch(
                 None => Err(anyhow::anyhow!("Tool is not allowed for workspace review")),
             };
             match result {
-                Ok(data) => super::super::data_result(data, false),
+                Ok(data) => crate::mcp::result_spill::limit(
+                    &app.project_dir,
+                    crate::mcp::result_spill::Owner::review(session, job),
+                    super::super::data_result(data, false),
+                ).await,
                 Err(error) => super::super::text_result(format!("{error:#}"), true),
             }
         }

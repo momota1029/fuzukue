@@ -52,6 +52,8 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
         started: true.into(),
         drain_notice: Default::default(),
         capture_scope: Default::default(),
+        exec: Default::default(),
+        exec_revoked: false.into(),
         workspace_read_scope: Default::default(),
         approval_scope: Default::default(),
         workspace_write_scope: Mutex::new(Some(scope)),

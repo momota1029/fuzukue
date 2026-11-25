@@ -3,6 +3,7 @@
 pub(crate) mod git_read;
 mod history;
 mod ignores;
+pub(crate) mod jq;
 mod paths;
 mod plan_status;
 pub(super) mod range;
@@ -28,6 +29,10 @@ use std::time::{Duration, Instant};
 
 use self::range::{IntegerRange, optional_integer};
 
+pub(super) fn open_exec_directory(path: &Path) -> Result<std::fs::File> {
+    paths::open(path)
+}
+
 /// Open a checked source path without following links.
 pub(crate) fn open_regular_source(path: &Path) -> Result<std::fs::File> {
     let file = paths::open(path)?;
@@ -36,7 +41,7 @@ pub(crate) fn open_regular_source(path: &Path) -> Result<std::fs::File> {
 }
 
 const MAX_BYTES: usize = 64 * 1024;
-const READ_SCAN_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const READ_SCAN_BYTES: usize = 16 * 1024 * 1024;
 const LINE_WINDOW: usize = 400;
 const DEFAULT_START_LINE: usize = 1;
 const DEFAULT_DEPTH: usize = 1;
@@ -50,11 +55,12 @@ const LIST_RESULTS: IntegerRange = IntegerRange::new(1, DEFAULT_LIST_RESULTS);
 const DEADLINE: Duration = Duration::from_secs(5);
 const TRUNCATED: &str = "… [truncated]";
 
-pub(crate) const GUIDANCE: &str = "\n\nUse fuzukue fs_read (start_line/end_line or tail_lines), fs_list, fs_search, and git_show instead of head/tail/sed/cat, ls/find, rg/grep, and git show in the shell.";
+pub(crate) const GUIDANCE: &str = "\n\nUse fuzukue fs_read (start_line/end_line or tail_lines), fs_list, fs_search, and git_show instead of head/tail/sed/cat, ls/find, rg/grep, and git show in the shell. When available, use fuzukue jq to filter JSON and JSON Lines files.";
 
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
     Read,
+    Jq,
     List,
     Search,
     GitShow,
@@ -62,11 +68,12 @@ pub(crate) enum Tool {
 }
 
 impl Tool {
-    pub(crate) const ALL: [Self; 5] = [Self::Read, Self::List, Self::Search, Self::GitShow, Self::PlanStatus];
+    pub(crate) const ALL: [Self; 6] = [Self::Read, Self::Jq, Self::List, Self::Search, Self::GitShow, Self::PlanStatus];
 
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Read => "fs_read",
+            Self::Jq => "jq",
             Self::List => "fs_list",
             Self::Search => "fs_search",
             Self::GitShow => "git_show",
@@ -114,6 +121,7 @@ impl Tool {
                     &["path"],
                 )
             }
+            Self::Jq => jq::definition(scoped_path),
             Self::List => (
                 harness_text!(
                     "Use instead of ls, ls -R, or find. Lists paths, types, sizes in bytes, and mtimes in Unix seconds without following symlinks. Use recursive=true for up to 64 levels, or specify depth. Try path=\"src\", depth=2, glob=\"*.rs\" to find Rust files. Use max_results or its alias limit to cap returned entries.",
@@ -150,6 +158,7 @@ impl Tool {
                 let args = super::parse_args(args)?;
                 tokio::task::spawn_blocking(move || read(&scope, args)).await?
             }
+            Self::Jq => jq::query(scope, super::parse_args(args)?).await,
             Self::List => {
                 let args = parse_named_args(args)?;
                 tokio::task::spawn_blocking(move || list(&scope, args)).await?
@@ -191,6 +200,16 @@ struct ReadArgs {
     max_bytes: Option<i128>,
 }
 
+fn open_scoped_text(scope: &ReadScope, requested: &Path) -> Result<std::fs::File> {
+    let path = scope.resolve(requested)?;
+    paths::media(requested)?;
+    paths::media(&path)?;
+    let file = paths::open(&path)?;
+    ensure!(!file.metadata()?.is_dir(), "Use fs_list to list a directory");
+    paths::regular(&file)?;
+    Ok(file)
+}
+
 fn read(scope: &ReadScope, args: ReadArgs) -> Result<Value> {
     let from_end = args.tail_lines.is_some() || args.start_line.is_some_and(|start| start < 0);
     let max_bytes = READ_BYTES.resolve(args.max_bytes, MAX_BYTES);
@@ -198,12 +217,7 @@ fn read(scope: &ReadScope, args: ReadArgs) -> Result<Value> {
         args.tail_lines.is_none() || (args.start_line.is_none() && args.end_line.is_none()),
         "Use fs_read tail_lines on its own, or specify start_line and optionally end_line"
     );
-    let path = scope.resolve(&args.path)?;
-    paths::media(&args.path)?;
-    paths::media(&path)?;
-    let file = paths::open(&path)?;
-    ensure!(!file.metadata()?.is_dir(), "Use fs_list to list a directory");
-    paths::regular(&file)?;
+    let file = open_scoped_text(scope, &args.path)?;
     let mut bytes = Vec::new();
     file.take((READ_SCAN_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;

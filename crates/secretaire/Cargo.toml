@@ -15,6 +15,9 @@ fuzukue-proto = { path = "../fuzukue-proto" }
 fuzukue-i18n = { path = "../fuzukue-i18n" }
 serde.workspace = true
 serde_json.workspace = true
+jaq-core = "3.1.2"
+jaq-std = "3.0.4"
+jaq-json = "2.0.3"
 lsp-types = "0.97"
 anyhow.workspace = true
 tokio.workspace = true

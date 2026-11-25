@@ -2040,7 +2040,27 @@ pub(crate) fn desk_context(app: &Workspace, session: &str, resumed: bool) -> Opt
     if resumed && (paused || !state.jobs.is_empty() || plan.status != PlanStatus::Active) {
         return None;
     }
-    let instruction = match plan.status {
+    let instruction = desk_instruction(plan, paused);
+    Some(format!(
+        "{instruction}\n{}",
+        json!({
+            "goal": plan.goal, "done_condition": plan.done_condition, "status": plan.status,
+            "next": plan.next, "verification": plan.verification,
+        })
+    ))
+}
+
+pub(crate) fn desk_guidance(app: &Workspace, session: &str, plan: &Plan) -> Option<&'static str> {
+    if plan.paused_by_user {
+        return None;
+    }
+    let thread = app.plans.get(app, session).ok()?;
+    let paused = matches!(thread.state.lock().unwrap().progress(app, session), Some(GoalProgress::Paused { .. }));
+    Some(desk_instruction(plan, paused))
+}
+
+fn desk_instruction(plan: &Plan, paused: bool) -> &'static str {
+    match plan.status {
         PlanStatus::Done if plan.verification.is_some() => harness_text!("Summarize the completed work and what the user can verify.", "完了した作業と利用者が確認できる内容を伝える。"),
         PlanStatus::Done => "The completion criteria have been met. Tell the user the outcome.",
         PlanStatus::WaitingForUser => {
@@ -2055,14 +2075,7 @@ pub(crate) fn desk_context(app: &Workspace, session: &str, resumed: bool) -> Opt
                 "実行中の作業と重ならず、ブロックされていない手順を delegate で依頼する。plan_step: true を指定し、agent と task をそのまま agent と prompt に渡す。利用者の確認が必要な手順は block_step に渡して、残りの手順を進める。必要なら replan で独立した作業を探すか、作業が済んだ目標を完了する。"
             )
         }
-    };
-    Some(format!(
-        "{instruction}\n{}",
-        json!({
-            "goal": plan.goal, "done_condition": plan.done_condition, "status": plan.status,
-            "next": plan.next, "verification": plan.verification,
-        })
-    ))
+    }
 }
 
 #[cfg(test)]

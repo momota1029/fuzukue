@@ -184,7 +184,7 @@ impl Desk {
         let result = if status == StatusCode::OK {
             let doc: Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
-            doc["result"].clone()
+            super::unspill_tool_result(&self.app.project_dir, doc["result"].clone())?
         } else {
             Value::Null
         };

@@ -529,6 +529,28 @@ async fn mcp_request(app: &Arc<Workspace>, method: &str, params: Value) -> Value
 }
 
 async fn mcp_request_for(app: &Arc<Workspace>, session: &str, method: &str, params: Value) -> Value {
+    let result = mcp_request_raw_for(app, session, method, params).await;
+    unspill_tool_result(&app.project_dir, result).expect("decode saved MCP result")
+}
+
+fn unspill_tool_result(project: &Path, result: Value) -> Result<Value> {
+    let spill = &result["structuredContent"];
+    if spill["spilled"] != true {
+        return Ok(result);
+    }
+    let saved = fs::read(project.join(spill["path"].as_str().context("missing saved result path")?))?;
+    Ok(match spill["format"].as_str() {
+        Some("mcp_json") => serde_json::from_slice(&saved)?,
+        Some("json") => {
+            let data: Value = serde_json::from_slice(&saved)?;
+            json!({"isError":false,"content":[{"type":"text","text":data.to_string()}],"structuredContent":data})
+        }
+        Some("text") => json!({"isError":false,"content":[{"type":"text","text":String::from_utf8(saved)?}]}),
+        _ => anyhow::bail!("invalid saved result format"),
+    })
+}
+
+async fn mcp_request_raw_for(app: &Arc<Workspace>, session: &str, method: &str, params: Value) -> Value {
     let batch = method == "tools/call" && params["name"] == "build_papers";
     let response = mcp::handler(
         State(app.clone()),
@@ -1804,6 +1826,70 @@ async fn mcp_folder_grants_require_approval_and_audit_granted_reads() -> Result<
 }
 
 #[tokio::test]
+async fn mcp_exec_schema_respects_full_approval_and_external_turns() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let project = fixture.path().join("project");
+    let state = fixture.path().join("state");
+    fs::create_dir(&project)?;
+    fs::create_dir(&state)?;
+    let open = || Arc::new(Workspace::new(project.clone(), String::new(), state.clone(), Arc::new(crate::hub::Hub::new())));
+    let app = open();
+    let args = json!({"command": "exit 7"});
+    let list = |result: &Value| result["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == "exec").cloned();
+    assert!(list(&mcp_request(&app, "tools/list", json!({})).await).is_none());
+    let refused = mcp_call(&app, "exec", args.clone()).await;
+    assert_eq!(refused["isError"], true);
+    assert!(refused["content"][0]["text"].as_str().unwrap().contains("off or expired"));
+    app.hub.set_full_approval(
+        fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour },
+        &crate::remote::SettingsPrincipal::fixture(),
+    )?;
+    let tool = list(&mcp_request(&app, "tools/list", json!({})).await).expect("exec is listed");
+    assert_eq!(tool["inputSchema"]["required"], json!(["command"]));
+    assert_eq!(tool["inputSchema"]["properties"]["cwd"]["type"], "string");
+    assert_eq!(tool["inputSchema"]["properties"]["timeout_ms"]["type"], "integer");
+    app.issue_threads.test_start_automatic_turn("test", fuzukue_proto::GitHubPolicy::Allow);
+    let refused = mcp_call(&app, "exec", args.clone()).await;
+    assert!(refused["content"][0]["text"].as_str().unwrap().contains("external-input turns"));
+    drop(app);
+
+    let file = state.join("async-approvals.json");
+    let mut saved: Value = serde_json::from_slice(&fs::read(&file)?)?;
+    saved["full_mode"]["active"]["settings"]["expires_at"] = json!(1);
+    fs::write(file, serde_json::to_vec(&saved)?)?;
+    let app = open();
+    assert!(list(&mcp_request(&app, "tools/list", json!({})).await).is_none());
+    let refused = mcp_call(&app, "exec", args).await;
+    assert!(refused["content"][0]["text"].as_str().unwrap().contains("off or expired"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_large_result_keeps_pagination_and_can_be_read_by_its_session() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let project = fixture.path().canonicalize()?;
+    let input = (0..500).map(|_| format!("{}\n", "x".repeat(40))).collect::<String>();
+    fs::write(project.join("input"), input)?;
+    let app = Arc::new(Workspace::new(project.clone(), String::new(), project.join("state"), Arc::new(crate::hub::Hub::new())));
+    let reply = mcp_request_raw_for(&app, "test", "tools/call", json!({"name":"fs_read","arguments":{"path":"input"}})).await;
+    let data = mcp_data(&reply);
+    assert_eq!(data["spilled"], true);
+    assert_eq!(data["next_start_line"], 401);
+    assert_eq!(data["shape"]["type"], "object");
+    let path = data["path"].as_str().unwrap();
+    assert!(path.starts_with(".fuzukue/mcp-results/"));
+    let result = mcp_call(&app, "jq", json!({"path":path,"filter":".next_start_line"})).await;
+    assert_eq!(mcp_data(&result)["output"], "401\n");
+    let searched = mcp_call(&app, "fs_search", json!({"path":path,"pattern":"next_start_line"})).await;
+    assert_eq!(searched["isError"], false);
+    assert!(searched.to_string().contains("401"));
+    let denied = mcp_request_for(&app, "other", "tools/call", json!({"name":"fs_read","arguments":{"path":path}})).await;
+    assert_eq!(denied["isError"], true);
+    assert!(denied["structuredContent"].is_null());
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> {
     let project = TempProject::new()?;
     let app = mcp_app(&project);
@@ -1927,9 +2013,9 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             &["action"]),
         ("delegate", &[("prompt", "string"), ("title", "string"), ("label", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("folder_grants", "array"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
             ("isolation", "string"), ("backend", "string"), ("model", "string"), ("effort", "string"), ("artifacts", "array")], &["prompt"]),
-        ("plan", &[("goal", "string"), ("context", "string"), ("long_running", "boolean"), ("pace", "string"), ("tier", "string"), ("min_tier", "string")],
+        ("plan", &[("goal", "string"), ("context", "string"), ("long_running", "boolean"), ("pace", "string"), ("tier", "string"), ("min_tier", "string"), ("include_history", "boolean")],
             &["goal", "context"]),
-        ("replan", &[("reason", "string"), ("pace", "string")], &["reason"]),
+        ("replan", &[("reason", "string"), ("pace", "string"), ("include_history", "boolean")], &["reason"]),
         ("consult", &[("question", "string"), ("context", "string")], &["question"]),
         ("escalate_request", &[("scope", "string"), ("reason", "string"), ("context", "string")], &["scope", "reason"]),
         ("list_agents", &[], &[]),
@@ -1990,6 +2076,8 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             ("base_tip", "string"), ("cleanup", "boolean")], &["branch", "confirm"]),
         ("fs_read", &[("path", "string"), ("start_line", "integer"), ("end_line", "integer"),
             ("tail_lines", "integer"), ("max_bytes", "integer")], &["path"]),
+        ("jq", &[("path", "string"), ("filter", "string"), ("raw", "boolean"),
+            ("max_bytes", "integer")], &["path", "filter"]),
         ("fs_list", &[("path", "string"), ("depth", "integer"), ("recursive", "boolean"), ("glob", "string"),
             ("include_hidden", "boolean"), ("include_ignored", "boolean"), ("max_results", "integer"), ("limit", "integer")], &[]),
         ("fs_search", &[("pattern", "string"), ("patterns", "array"), ("path", "string"), ("paths", "array"), ("glob", "string"),
@@ -2157,7 +2245,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         assert_eq!(locate[key]["maximum"], 1);
     }
     assert_eq!(
-        mcp::claude_tool_names(false, false).collect::<Vec<_>>(),
+        mcp::claude_tool_names(false, false).filter(|name| name != "mcp__fuzukue__exec").collect::<Vec<_>>(),
         tools
             .iter()
             .filter(|tool| !matches!(
@@ -2169,6 +2257,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
     );
     let confirming_writes: Vec<_> = mcp::claude_tool_names(false, true).collect();
     assert!(confirming_writes.iter().any(|name| name == "mcp__fuzukue__list_review_findings"));
+    assert!(confirming_writes.iter().any(|name| name == "mcp__fuzukue__exec"));
     for tool in ["mcp__fuzukue__attach_thread", "mcp__fuzukue__rename_thread", "mcp__fuzukue__open_paper", "mcp__fuzukue__detach_thread",
         "mcp__fuzukue__card_edit", "mcp__fuzukue__import_latex_book", "mcp__fuzukue__add_memo", "mcp__fuzukue__self_update", "mcp__fuzukue__watch",
         "mcp__fuzukue__export_reading_page", "mcp__fuzukue__generate_reading_page",
@@ -4739,8 +4828,8 @@ printf '%s\n' '{"type":"result","is_error":false}'
     let listed = request(authorized.clone(), "tools/list", json!({})).await;
     let listed: Value = serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await?)?;
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), mcp::available_tool_names(true).len());
-    assert_eq!(mcp::claude_tool_names(true, false).count(), tools.len() - 3);
+    assert_eq!(tools.len() + 1, mcp::available_tool_names(true).len());
+    assert_eq!(mcp::claude_tool_names(true, false).count(), tools.len() - 2);
     assert!(tools.iter().all(|tool| tool["name"] != "send_mail"));
 
     let (_, mut events) = app.hub.subscribe(u64::MAX);
@@ -5390,6 +5479,61 @@ done
 }
 
 #[tokio::test]
+async fn mcp_exec_runs_and_audits_an_authenticated_codex_turn() -> Result<()> {
+    use fuzukue_proto::{AgentBackend, ChatSettings, FullApprovalChange, FullApprovalDuration};
+    use std::time::Duration;
+
+    let project = TempProject::new()?;
+    let app = mcp_app(&project);
+    let log = project.path().join("codex.jsonl");
+    let gate = project.path().join("turn-complete");
+    let cwd = project.path().join("exec-dir");
+    fs::create_dir(&cwd)?;
+    stub_codex(&app, &log, Some(&gate)).await?;
+    app.hub.set_full_approval(
+        FullApprovalChange::Full { duration: FullApprovalDuration::OneHour },
+        &crate::remote::SettingsPrincipal::fixture(),
+    )?;
+    let session = app.hub.edit_threads(|store| store.create(None))?;
+    handle(&app, ClientMsg::SetChatSettings {
+        session: session.clone(),
+        settings: ChatSettings { model: Some("gpt-6.2-sol".into()), ..Default::default() },
+    }).await?;
+    handle(&app, ClientMsg::Prompt { session: session.clone(), text: "Run a check".into() }).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fs::read_to_string(&log).unwrap_or_default().contains("turn/start") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await?;
+    let start: Value = fs::read_to_string(&log)?.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|entry| entry["method"] == "thread/start").context("missing Codex launch")?;
+    let server = &start["params"]["config"]["mcp_servers"]["fuzukue"];
+    assert_eq!(server["tools"]["exec"]["approval_mode"], "approve");
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(axum::http::header::AUTHORIZATION,
+        server["http_headers"]["Authorization"].as_str().context("missing Codex MCP key")?.parse()?);
+    let response = mcp::handler(
+        State(app.clone()),
+        Query(mcp::McpQuery { session, backend: Some(AgentBackend::Codex), workspace: None, job: None }),
+        headers,
+        Json(json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+            "name":"exec", "arguments":{"command":"pwd -P; exit 7","cwd":"exec-dir"}
+        }})),
+    ).await;
+    fs::write(gate, "")?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+    let data = mcp_data(&response["result"]);
+    assert_eq!(data["exit_code"], 7);
+    assert_eq!(data["stdout"]["text"], format!("{}\n", cwd.canonicalize()?.display()));
+    let settings = serde_json::to_value(app.hub.full_approval_settings(None)?)?;
+    assert!(settings["audit"].as_array().unwrap().iter()
+        .any(|event| event["action"]["tool"] == "exec" && event["granted_by"] == "full_mode"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn codex_partner_can_attach_and_open_a_paper() -> Result<()> {
     use fuzukue_proto::{ChatSettings, PermissionMode};
 
@@ -5568,7 +5712,7 @@ for line in sys.stdin:
         let session = app.hub.edit_threads(|threads| threads.create(None))?;
         if paced {
             let plan = thread_tool(&app, &session, "plan", json!({
-                "goal": "Verify the release", "context": "fixture steps", "long_running": true, "pace": "normal"
+                "goal": "Verify the release", "context": "fixture steps", "long_running": true, "pace": "normal", "include_history": true
             })).await;
             assert_eq!(plan["plan"]["pace"], "normal");
         }
@@ -7418,12 +7562,18 @@ async fn planner_retries_verification_once_and_preserves_the_saved_goal() -> Res
     let started = thread_tool(&app, &session, "plan", json!({
         "goal": "Verify the release", "context": "fixture steps",
     })).await;
-    assert_eq!(started["plan"]["goal"], "Verify the release");
-    assert!(started["plan"]["pace"].is_null());
+    assert_eq!(
+        started["plan"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+        ["next", "question"]
+    );
+    assert!(started["guidance"].is_string());
 
-    let revised = thread_tool(&app, &session, "replan", json!({"reason": "correct invalid step"})).await;
+    let revised = thread_tool(&app, &session, "replan", json!({
+        "reason": "correct invalid step", "include_history": true,
+    })).await;
     assert_eq!(revised["plan"]["goal"], "Verify the release");
     assert_eq!(revised["plan"]["next"][0]["tier"], "light");
+    assert!(revised["plan"]["done"].is_array() && revised["plan"]["rejected"].is_array());
 
     let rejected = mcp_request_for(&app, &session, "tools/call", json!({
         "name": "replan", "arguments": {"reason": "repeat invalid step"},

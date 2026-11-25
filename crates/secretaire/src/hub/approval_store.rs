@@ -761,7 +761,7 @@ pub(super) fn eligible_for_full(owner: &ApprovalOwner, unattended: ApprovalUnatt
     owner.requester != "front_desk"
         || (unattended != ApprovalUnattended::NeverUnattended
             && matches!(tool,
-                "folder_read" | "git_integrate_patch" | "github_comment" | "github_label"
+                "exec" | "folder_read" | "git_integrate_patch" | "github_comment" | "github_label"
                 | "github_issue_create" | "github_issue_close"
             ))
 }

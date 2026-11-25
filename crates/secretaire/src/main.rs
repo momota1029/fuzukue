@@ -508,6 +508,10 @@ fn canary_snapshot() -> fuzukue_proto::SelfUpdateStatus {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(not(test))]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(mcp::workspace_read::jq::CHILD_COMMAND)) {
+        return mcp::workspace_read::jq::child();
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("release")) {
         return secretaire::release::cli(std::env::args_os().skip(2));
     }
@@ -639,6 +643,7 @@ async fn run_server() -> anyhow::Result<()> {
             _ = server_stop => {}
             _ = server_swap => {}
         }
+        mcp::exec::shutdown();
     }.shared();
     for (listener, mode) in listeners {
         tracing::info!(?mode, "listening on {}", listener.local_addr()?);
@@ -814,6 +819,7 @@ async fn handle_shutdown_signals(
         tracing::error!(%error, "shutdown signal listener failed");
         return;
     }
+    mcp::exec::shutdown();
     if let Err(error) = update.request_shutdown(app, limit, true) {
         tracing::error!(%error, "could not start shutdown drain");
         update.shutdown_ready.send_replace(true);
@@ -3684,5 +3690,6 @@ fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     let root = root.canonicalize()?;
     let full = root.join(rel).canonicalize()?;
     anyhow::ensure!(full.starts_with(&root), "path escapes project: {rel}");
+    anyhow::ensure!(!mcp::result_spill::is_spill_path(&full), "Use the session-scoped MCP read tools for saved tool results");
     Ok(full)
 }

@@ -26,6 +26,8 @@ mod front_desk_light;
 pub(crate) mod git_write;
 mod harness_candidates;
 pub(crate) mod workspace_read;
+pub(crate) mod result_spill;
+pub(crate) mod exec;
 pub(crate) mod workspace_write;
 use workspace_read::git_read;
 
@@ -99,6 +101,7 @@ pub(crate) enum Tool {
     ClientScreenshot,
     ListScreenshotScenarios,
     CaptureScreenshot,
+    Exec,
     Recipe(crate::recipes::Tool),
     ListReviewSubmissions,
     ReadReviewPoint,
@@ -239,7 +242,7 @@ impl Tool {
             .chain(crate::recipes::Tool::ALL.map(Self::Recipe))
             .chain(harness_candidates::Tool::ALL.map(Self::HarnessCandidates))
             .chain(crate::graph::mcp::Tool::ALL.map(Self::Graph)).chain(Self::GIT)
-            .chain(workspace_read::Tool::ALL.map(Self::WorkspaceRead)).chain([Self::FolderGrants])
+            .chain(workspace_read::Tool::ALL.map(Self::WorkspaceRead)).chain([Self::FolderGrants, Self::Exec])
             .chain(crate::workshop::mcp::Tool::ALL.map(Self::Research))
             .chain(crate::issue_threads::Tool::ALL.map(Self::GitHub))
             .chain(crate::github_auth::mcp::Tool::ALL.map(Self::GitHubAuth))
@@ -312,6 +315,7 @@ impl Tool {
             Self::AddMemo => "add_memo",
             Self::ClientScreenshot => "client_screenshot",
             Self::ListScreenshotScenarios => crate::capture::LIST,
+            Self::Exec => exec::NAME,
             Self::CaptureScreenshot => crate::capture::CAPTURE,
             Self::Recipe(tool) => tool.name(),
             Self::ListReviewSubmissions => "list_review_submissions",
@@ -379,7 +383,7 @@ impl Tool {
             | Self::UpdateReviewPoint | Self::WriteReviewResponse | Self::SelfUpdate | Self::Watch
             | Self::ExportReadingPage | Self::GenerateReadingPage
             | Self::RecordReviewFinding | Self::UpdateReviewFinding | Self::CoursePlan | Self::CourseNext | Self::CourseCommit
-            | Self::SaveAttachment | Self::AddMemo | Self::DraftMail | Self::GitCommit | Self::GitCommitScoped | Self::GitIntegratePatch | Self::GitPush | Self::GitPull | Self::MergeBranch)
+            | Self::Exec | Self::SaveAttachment | Self::AddMemo | Self::DraftMail | Self::GitCommit | Self::GitCommitScoped | Self::GitIntegratePatch | Self::GitPush | Self::GitPull | Self::MergeBranch)
     }
 
     fn git_remote(self) -> Option<git::RemoteOperation> {
@@ -407,6 +411,7 @@ impl Tool {
                 harness_text!("List headless UI scenarios, their fixtures and screenshot names.", "ヘッドレス撮影のシナリオ、フィクスチャ、画像名を一覧で返す。"),
                 json!({}), &[],
             ),
+            Self::Exec => return exec::definition(),
             Self::CaptureScreenshot => (
                 harness_text!("Build the current checkout and run a headless UI scenario. Returns PNG images and their paths.", "現在の作業ツリーをビルドしてヘッドレス撮影を実行し、PNG の画像とパスを返す。"),
                 json!({
@@ -468,11 +473,13 @@ impl Tool {
             Self::Plan => (harness_text!("Set the goal, completion criteria, and next steps for work with several steps. Set long_running for an ongoing goal. Pass the same goal and an explicit pace to change its parallel setting.", "複数の手順を要する仕事の目標、完了条件、次の手順を決める。長く続ける目標は long_running を true にする。同じ目標と pace を渡すと並行数設定を変更できる。"),
                 json!({"goal":{"type":"string", "description": harness_text!("Goal shown in the user's thread details. Write it in the user's conversation language.", "スレッドの情報欄に表示する目標。利用者が会話で使っている言語で書く。")},
                     "context":{"type":"string"}, "long_running":{"type":"boolean"},
+                     "include_history":{"type":"boolean","default":false,"description":"Include completed work and rejected approaches."},
                     "tier": {"type": "string", "enum": ["light", "standard", "heavy"]},
                     "min_tier": {"type": "string", "enum": ["light", "standard", "heavy"]},
                     "pace":{"type":"string","enum":["full","normal","economy"]}}), &["goal","context"]),
             Self::Replan => (harness_text!("Revise the current plan to get next steps or a question for the user. Set pace to update only the parallel setting.", "今の方針を見直し、次の手順または利用者に確認する質問を得る。pace を指定すると並行数設定だけを更新する。"),
-                json!({"reason":{"type":"string"}, "pace":{"type":"string","enum":["full","normal","economy"]}}), &["reason"]),
+                json!({"reason":{"type":"string"}, "pace":{"type":"string","enum":["full","normal","economy"]},
+                     "include_history":{"type":"boolean","default":false,"description":"Include completed work and rejected approaches."}}), &["reason"]),
             Self::Consult => (harness_text!(
                 "Ask the planner a one-off, read-only question. The current plan and recent conversation are included automatically.",
                 "方針役に一度だけ相談して答えを受け取る。現在の方針と直近の会話は自動で渡す。"
@@ -990,7 +997,7 @@ pub(crate) fn claude_tool_names(mail: bool, confirm_writes: bool) -> impl Iterat
     Tool::available(mail)
         // These tools remain available via tools/list and go through CLI permission checks.
         .filter(move |tool| {
-            !(matches!(tool, Tool::FileInbox | Tool::CreateResearch | Tool::CreateWorkspace) || confirm_writes && tool.writes() && !matches!(tool, Tool::GitCommit | Tool::GitIntegratePatch | Tool::GitPush | Tool::GitPull | Tool::Desk(desk::Tool::CancelJob)))
+            !(matches!(tool, Tool::FileInbox | Tool::CreateResearch | Tool::CreateWorkspace) || confirm_writes && tool.writes() && !matches!(tool, Tool::GitCommit | Tool::GitIntegratePatch | Tool::GitPush | Tool::GitPull | Tool::Desk(desk::Tool::CancelJob) | Tool::Exec))
         })
         .map(Tool::claude_name)
 }
@@ -1005,7 +1012,7 @@ fn worker_tools() -> impl Iterator<Item = Tool> {
         | Tool::ListLedger | Tool::ReadLedgerAttempts | Tool::GitStatus | Tool::GitDiff | Tool::GitLog
         | Tool::ListTests | Tool::Lsp(_) | Tool::LeanDocCheck | Tool::ClientScreenshot
         | Tool::WorkspaceRead(_) | Tool::GitRead | Tool::GitHubRead(_) | Tool::HarnessCandidates(_) | Tool::BuildPaper
-        | Tool::ListScreenshotScenarios | Tool::CaptureScreenshot | Tool::Recipe(_)
+        | Tool::ListScreenshotScenarios | Tool::CaptureScreenshot | Tool::Recipe(_) | Tool::Exec
     )).chain([Tool::AskFrontDesk])
         .chain(workspace_write::Tool::ALL.map(Tool::WorkspaceWrite).into_iter().filter(|_| !crate::canary()))
         .chain((!crate::canary()).then_some(Tool::GitCommitScoped))
@@ -1053,7 +1060,7 @@ pub(crate) fn codex_tool_policy(allow: Option<&[String]>) -> Value {
         let permitted = match allow {
             Some(names) => !matches!(tool, Tool::Consult | Tool::EscalateRequest) && names.iter().any(|entry| entry == name),
             None => !matches!(tool, Tool::AskFrontDesk | Tool::Escalate
-                | Tool::ClientScreenshot | Tool::CaptureScreenshot) && !tool.writes(),
+                | Tool::ClientScreenshot | Tool::CaptureScreenshot) && (!tool.writes() || matches!(tool, Tool::Exec)),
         };
         if permitted {
             approved.insert(name.into(), json!({"approval_mode": "approve"}));
@@ -1140,6 +1147,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let spill_owner = result_spill::Owner::thread(&q.session);
     let method = req["method"].as_str().unwrap_or("");
     let params = &req["params"];
     if method == "tools/call" && !planner {
@@ -1165,6 +1173,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                 let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 Ok::<_, anyhow::Error>(data_result(crate::recipes::call(tool, caller, &app.project_dir, storage, args).await?, false))
             }.await.unwrap_or_else(|error| text_result(format!("{error:#}"), true));
+            let result = result_spill::limit(&app.project_dir, spill_owner, result).await;
             return Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response();
         }
     }
@@ -1189,6 +1198,32 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
         return crate::capture::respond(id, &headers, &params["_meta"]["progressToken"], prepare()).await;
     }
     let result = match method {
+        "tools/call" if params["name"] == exec::NAME => {
+            let result = Box::pin(async {
+                let lease = exec::lease(&app, &q.session)?;
+                ensure!(!planner, "exec is unavailable to planning and consultation roles");
+                let caller = if let Some((job, allow)) = &worker {
+                    ensure!(allow.iter().any(|name| name == exec::NAME), "exec is unavailable to this worker");
+                    let worker = app.delegates.exec_scope(job)?;
+                    exec::Caller {
+                        owner: fuzukue_proto::ApprovalOwner {
+                            thread: q.session.clone(), job: (*job).into(), requester: worker.backend.usage_key().into(),
+                        },
+                        turn: worker.turn.clone(),
+                        cancel: worker.cancel.clone(),
+                        worker: Some(worker),
+                    }
+                } else {
+                    let (turn, cancel) = exec_front_turn(&q.session, claude.as_deref(),
+                        codex.as_ref().map(|(codex, key)| (codex.as_ref(), *key))).await
+                        .context(exec::TRUST_REQUIRED)?;
+                    exec::Caller { owner: crate::full_approval::desk_owner(&q.session), turn, cancel, worker: None }
+                };
+                Ok::<_, anyhow::Error>(data_result(
+                    exec::call(&app, &q.session, &id, &params["arguments"], caller, lease).await?, false))
+            }).await;
+            Ok(result.unwrap_or_else(|error| text_result(format!("{error:#}"), true)))
+        }
         "initialize" => Ok(json!({
             "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": { "tools": { "listChanged": false }, "logging": {} },
@@ -1205,6 +1240,9 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                     .map(Tool::definition).collect(),
                 None => Tool::available(app.mail.is_some()).map(Tool::definition).collect::<Vec<_>>(),
             };
+            if exec::lease(&app, &q.session).is_err() {
+                list.retain(|tool| tool["name"] != exec::NAME);
+            }
             list.extend(crate::extensions::tools(app.clone()).await.into_iter().filter(|tool| {
                 worker.as_ref().is_none_or(|(_, allow)| allow.iter().any(|name| tool["name"] == *name))
             }));
@@ -1251,7 +1289,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                 }.await
             } else if let Some(tool) = workspace_read::Tool::named(name) {
                 async {
-                    let scope = app.delegates.workspace_read_scope(job)?;
+                    let scope = app.delegates.workspace_read_scope(job)?.with_results(spill_owner.clone());
                     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
                     Ok(data_result(call_read_tool(&app, &q.session, Some(job), tool, scope, &args).await?, false))
                 }.await
@@ -1278,6 +1316,10 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
             .await
             .unwrap_or_else(|e| text_result(format!("{e:#}"), true))),
         _ => Err(json!({ "code": -32601, "message": format!("method not found: {method}") })),
+    };
+    let result = match result {
+        Ok(result) if method == "tools/call" => Ok(result_spill::limit(&app.project_dir, spill_owner, result).await),
+        result => result,
     };
     if method == "tools/call" && params["name"] == Tool::BuildPapers.name() {
         if let Ok(result) = &result {
@@ -1415,6 +1457,8 @@ struct DelegateArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlanArgs {
+    #[serde(default)]
+    include_history: bool,
     tier: Option<fuzukue_proto::Tier>,
     min_tier: Option<fuzukue_proto::Tier>,
     goal: String,
@@ -1427,6 +1471,8 @@ struct PlanArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplanArgs {
+    #[serde(default)]
+    include_history: bool,
     reason: String,
     pace: Option<fuzukue_proto::GoalPace>,
 }
@@ -1606,6 +1652,16 @@ fn deck_path(project: &Path, deck: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn plan_result(app: &Workspace, session: &str, plan: &fuzukue_proto::Plan, include_history: bool) -> Value {
+    let guidance = crate::planner::desk_guidance(app, session, plan);
+    let plan = if include_history {
+        json!(plan)
+    } else {
+        json!({"next": plan.next, "question": plan.question})
+    };
+    json!({"plan": plan, "guidance": guidance})
+}
+
 fn text_result(text: String, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
@@ -1680,6 +1736,16 @@ enum FolderGrantAction {
     Request { path: PathBuf },
     List { audit_before: Option<u64> },
     Revoke { grant_id: String },
+}
+
+async fn exec_front_turn(
+    session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>,
+) -> Option<(String, Arc<crate::cancellation::Cancellation>)> {
+    if let Some(claude) = claude {
+        return claude.exec_turn().await;
+    }
+    let (codex, key) = codex?;
+    codex.exec_turn(session, key)
 }
 
 async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>, params: &Value) -> Result<Value> {
@@ -1811,6 +1877,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             let _: NoArgs = parse_args(args)?;
             crate::capture::list(project)?
         }
+        Tool::Exec => anyhow::bail!("exec requires an authenticated MCP request"),
         Tool::CaptureScreenshot => anyhow::bail!("capture_screenshot requires an MCP request"),
         Tool::Recipe(_) => anyhow::bail!("recipes require a caller-bound MCP request"),
         Tool::ClientScreenshot => {
@@ -1843,6 +1910,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         }
         Tool::WorkspaceRead(tool) => {
             let scope = workspace_read::ReadScope::new(project, &app.state_dir, None)?
+                .with_results(result_spill::Owner::thread(session))
                 .with_grants(crate::folder_grants::Access { hub: app.hub.clone(), session: session.into(), worker_grants: None });
             Box::pin(call_read_tool(app, session, None, tool, scope, args)).await?
         }
@@ -1918,8 +1986,9 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                     app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, number, routing, args.touches, args.folder_grants, selection,
                 )).await?
             } else {
+                let exec_trusted = exec::trusted_session(app, session) && exec_front_turn(session, claude, codex).await.is_some();
                 Box::pin(crate::delegate::start_with_grants(
-                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection,
+                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection, exec_trusted,
                 )).await?
             };
             if claude.is_some() || codex.is_some() {
@@ -1939,12 +2008,12 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         Tool::Plan => {
             let args: PlanArgs = parse_args(args)?;
             let plan = crate::planner::start_plan(app, session, args.goal, args.context, args.long_running, args.pace, fuzukue_proto::TierRequest { tier: args.tier, min_tier: args.min_tier }).await?;
-            json!({"plan": plan, "guidance": crate::planner::desk_context(app, session, false)})
+            plan_result(app, session, &plan, args.include_history)
         }
         Tool::Replan => {
             let args: ReplanArgs = parse_args(args)?;
             let plan = crate::planner::replan(app, session, args.reason, true, args.pace).await?;
-            json!({"plan": plan, "guidance": crate::planner::desk_context(app, session, false)})
+            plan_result(app, session, &plan, args.include_history)
         }
         Tool::Consult => {
             let args = parse_args(args)?;
@@ -1964,13 +2033,15 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         Tool::Escalate => anyhow::bail!("Escalate is available to the active job only"),
         Tool::MessageWorker => {
             let args: WorkerMessage = parse_args(args)?;
-            let job = crate::delegate::message_worker(app, &args.job, &args.text)?;
+            let exec_trusted = exec::trusted_session(app, session) && exec_front_turn(session, claude, codex).await.is_some();
+            let job = crate::delegate::message_worker(app, session, &args.job, &args.text, exec_trusted)?;
             json!({"job": job})
         }
         Tool::AnswerWorker => {
             ensure!(claude.is_some() || codex.is_some(), "受付のセッションが必要");
             let args: AnswerArgs = parse_args(args)?;
-            crate::delegate::answer(app, session, &args.question_id, args.answer)?;
+            let exec_trusted = exec::trusted_session(app, session) && exec_front_turn(session, claude, codex).await.is_some();
+            crate::delegate::answer(app, session, &args.question_id, args.answer, exec_trusted)?;
             json!({"question_id": args.question_id})
         }
         Tool::AskFrontDesk => unreachable!("handled by the worker MCP endpoint"),

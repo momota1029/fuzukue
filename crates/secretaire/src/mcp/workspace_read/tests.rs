@@ -62,6 +62,24 @@ impl Fixture {
 }
 
 #[test]
+fn worker_can_search_its_session_spill_outside_its_checkout() -> Result<()> {
+    let f = Fixture::new()?;
+    let owner = crate::mcp::result_spill::Owner::thread("owner");
+    let path = crate::mcp::result_spill::save(&f.project, &owner, "txt", b"saved result\n")?;
+    let scope = f.worker()?.with_results(owner);
+    let file = scope.resolve(&path)?;
+    scope.audit_read(&file)?;
+    assert!(f.worker()?.resolve(&path).is_err());
+    assert!(f.front_desk()?.resolve(&path.with_file_name(".gitignore")).is_err());
+    let git = |args: &[&str]| Command::new("git").current_dir(&f.project).args(args).output();
+    assert!(git(&["init", "-q"])?.status.success());
+    let status = git(&["status", "--short", "--untracked-files=all"])?;
+    assert!(status.status.success());
+    assert!(!String::from_utf8(status.stdout)?.contains("mcp-results"));
+    Ok(())
+}
+
+#[test]
 fn read_root_config_cannot_follow_a_protected_file() -> Result<()> {
     let f = Fixture::new()?;
     let config = fuzukue_proto::compat::workspace_config(&f.project);
@@ -117,6 +135,11 @@ async fn read_scope_applies_to_all_filesystem_tools() -> Result<()> {
             format!("{error:#}").contains(expected),
             "{path:?}: {error:#}"
         );
+        let error = Tool::Jq
+            .call(scope.clone(), &json!({"path": path, "filter": "."}))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{path:?}: {error:#}");
     }
     for path in [
         ".env",
@@ -171,6 +194,83 @@ async fn read_scope_applies_to_all_filesystem_tools() -> Result<()> {
             .await
             .is_err()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn jq_queries_json_and_json_lines_in_the_read_scope() -> Result<()> {
+    let f = Fixture::new()?;
+    fs::write(f.project.join("names.json"), "{\n\"names\": [\"雪\", \"Ada\"]\n}\n")?;
+    fs::write(
+        f.scratch.join("events.jsonl"),
+        "{\"level\":\"info\",\"message\":\"start\"}\n{\"level\":\"error\",\"message\":\"雪\"}",
+    )?;
+    let result = Tool::Jq.call(f.front_desk()?, &json!({
+        "path": "names.json", "filter": "def names: .names[]; names # comment",
+    })).await?;
+    assert_eq!(result, json!({"output": "\"雪\"\n\"Ada\"\n", "truncated": false}));
+    let result = Tool::Jq.call(f.worker()?, &json!({
+        "path": f.scratch.join("events.jsonl"), "filter": "select(.level == \"error\") | .message",
+        "raw": true,
+    })).await?;
+    assert_eq!(result, json!({"output": "雪\n", "truncated": false}));
+    let result = Tool::Jq.call(f.worker()?, &json!({
+        "path": f.scratch.join("events.jsonl"), "filter": "[., inputs] | length", "raw": true,
+    })).await?;
+    assert_eq!(result["output"], "2\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn jq_reports_invalid_input_and_keeps_filters_inside_the_read_scope() -> Result<()> {
+    let f = Fixture::new()?;
+    let oversized = fs::File::create(f.project.join("large.json"))?;
+    oversized.set_len((READ_SCAN_BYTES + 1) as u64)?;
+    let error = Tool::Jq.call(f.front_desk()?, &json!({
+        "path": "large.json", "filter": ".",
+    })).await.unwrap_err();
+    assert!(error.to_string().contains("input exceeds the 16 MiB limit"));
+    fs::write(f.project.join("valid.json"), "{}")?;
+    fs::write(f.project.join("invalid.jsonl"), "{}\nplain text\n")?;
+    fs::write(f.outside.join("data.json"), "\"outside\"")?;
+    fs::write(f.outside.join("fixture.jq"), "module {marker: \"outside\"};")?;
+    let scope = f.front_desk()?;
+    for (path, filter, expected) in [
+        ("invalid.jsonl", ".".to_owned(), "Invalid JSON or JSON Lines"),
+        ("valid.json", ".[,".into(), "syntax error"),
+        ("valid.json", "--help".into(), "error"),
+        ("valid.json", format!("import \"data\" as $data {{search: {}}}; $data",
+            json!(f.outside)), "module imports are disabled"),
+        ("valid.json", "\"fixture\" | modulemeta".into(), "compile error"),
+    ] {
+        let error = Tool::Jq.call(scope.clone(), &json!({"path": path, "filter": filter}))
+            .await.unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+    let result = Tool::Jq
+        .call(scope, &json!({"path": "valid.json", "filter": "$ENV"}))
+        .await?;
+    assert_eq!(result["output"], "{}\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn jq_truncates_output_at_the_byte_limit_and_deadline() -> Result<()> {
+    let f = Fixture::new()?;
+    fs::write(f.project.join("input.json"), "\"a雪\"")?;
+    let scope = f.front_desk()?;
+    let capped = Tool::Jq.call(scope.clone(), &json!({
+        "path": "input.json", "filter": ".", "raw": true, "max_bytes": 2,
+    })).await?;
+    assert_eq!(capped["output"], "a");
+    assert_eq!(capped["truncated"], true);
+    assert!(capped["note"].as_str().unwrap().contains("2-byte limit"));
+    let timed_out = Tool::Jq.call(scope, &json!({
+        "path": "input.json", "filter": "def spin: spin; ., spin", "raw": true,
+    })).await?;
+    assert_eq!(timed_out["output"], "a雪\n");
+    assert_eq!(timed_out["truncated"], true);
+    assert!(timed_out["note"].as_str().unwrap().contains("time limit"));
     Ok(())
 }
 
@@ -1029,6 +1129,7 @@ async fn git_history_supports_worktree_head_and_checks_revision_paths() -> Resul
 async fn read_tools_follow_allowlists_and_review_credentials() -> Result<()> {
     let f = Fixture::new()?;
     let worker = mcp::worker_tool_names(&[]);
+    assert_eq!(mcp::worker_tool_names(&["jq".into()]), ["jq", "escalate"]);
     let codex = mcp::codex_tool_policy(Some(&worker));
     let front_desk = mcp::codex_tool_policy(None);
     let restrictive = mcp::worker_tool_names(&["fs_read".into()]);
@@ -1062,6 +1163,7 @@ async fn read_tools_follow_allowlists_and_review_credentials() -> Result<()> {
     ));
     fs::write(f.project.join("notes"), "review text")?;
     let lease = ReviewLease::open(&app, "review-math")?.context("Expected review MCP")?;
+    assert!(is_review_launch(&lease.launch));
     let url = url::Url::parse(lease.launch.mcp_url.as_ref().unwrap())?;
     let job = url
         .query_pairs()
@@ -1106,7 +1208,9 @@ async fn read_tools_follow_allowlists_and_review_credentials() -> Result<()> {
     );
     let listed = request("review-math", Some(&key), "tools/list", json!({})).await;
     let listed: Value = serde_json::from_slice(&body::to_bytes(listed.into_body(), 16_384).await?)?;
-    assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 4);
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 5);
+    assert!(tools.iter().any(|tool| tool["name"] == "jq"));
     let read = request(
         "review-math",
         Some(&key),

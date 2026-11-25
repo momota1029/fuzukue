@@ -34,6 +34,7 @@ struct ThreadInfo {
     read_only: bool,
     worker_execution: Option<crate::worker_execution::Policy>,
     current_turn: Option<String>,
+    exec: Option<(String, Arc<crate::cancellation::Cancellation>)>,
     /// 最後の final_answer
     last_answer: String,
     acted_or_asked: bool,
@@ -484,6 +485,15 @@ impl Codex {
         })
     }
 
+    pub(crate) fn exec_turn(&self, session: &str, key: &str) -> Option<(String, Arc<crate::cancellation::Cancellation>)> {
+        let threads = self.threads.lock().unwrap();
+        let thread = threads.values().find(|thread| thread.session == session && thread.waiter.is_some()
+            && thread.partner.as_ref().is_some_and(|p| p.mcp_key == key && p.mode() != PermissionMode::Plan))?;
+        let exec = thread.exec.as_ref()?;
+        exec.1.check().ok()?;
+        Some(exec.clone())
+    }
+
     pub(crate) fn check_mcp(
         &self, session: &str, key: &str, writes: bool, always_confirm: bool,
     ) -> Result<Option<Actor>> {
@@ -860,6 +870,7 @@ impl Codex {
                 read_only,
                 worker_execution: None,
                 current_turn: None,
+                exec: None,
                 last_answer: String::new(),
                 acted_or_asked: false,
                 waiter: None,
@@ -916,6 +927,7 @@ impl Codex {
                 bail!("Codex は使用量の上限に近いので休んでいる（{reason}、再開できるのは Unix 時刻 {until}）。Codex に回さずに進めて。");
             }
         }
+        let exec = crate::mcp::exec::Turn::default();
         let (tx, mut rx) = oneshot::channel();
         let overrides = {
             let mut threads = self.threads.lock().unwrap();
@@ -925,6 +937,7 @@ impl Codex {
             }
             before_submit()?;
             t.waiter = Some(tx);
+            t.exec = kind.user_conversation().then(|| (exec.id.clone(), exec.cancel.clone()));
             t.last_answer.clear();
             t.acted_or_asked = false;
             t.streamed.clear();
@@ -1064,7 +1077,12 @@ impl Codex {
     }
 
     pub async fn interrupt(&self, thread_id: &str) -> Result<()> {
-        let turn = self.threads.lock().unwrap().get(thread_id).and_then(|t| t.current_turn.clone());
+        let turn = self.threads.lock().unwrap().get(thread_id).and_then(|t| {
+            if let Some((_, cancel)) = &t.exec {
+                cancel.cancel();
+            }
+            t.current_turn.clone()
+        });
         if let Some(turn) = turn {
             self.request("turn/interrupt", json!({ "threadId": thread_id, "turnId": turn })).await?;
         }
@@ -1615,6 +1633,7 @@ impl Codex {
                     let mut threads = self.threads.lock().unwrap();
                     threads.get_mut(thread_id).and_then(|t| {
                         t.current_turn = None;
+                        if let Some((_, cancel)) = t.exec.take() { cancel.cancel(); }
                         if t.stats.is_some() && t.waiter.is_some() {
                             self.session_stats.update(&self.hub, &session, "codex", |stats| {
                                 stats.turns = stats.turns.saturating_add(1);

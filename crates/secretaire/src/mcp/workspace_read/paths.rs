@@ -10,6 +10,7 @@ use crate::folder_grants::{self, Access, OutsideScope};
 use crate::worker_scope::{self, Scope};
 
 use super::ignores::Ignores;
+use crate::mcp::result_spill;
 
 pub(super) const SCAN_DEPTH: usize = 64;
 
@@ -22,6 +23,7 @@ pub(crate) struct ReadScope {
     protected: Vec<PathBuf>,
     sensitive_aliases: Vec<PathBuf>,
     access: Option<Access>,
+    results: Option<result_spill::Owner>,
 }
 
 impl ReadScope {
@@ -40,7 +42,17 @@ impl ReadScope {
             protected: worker_scope::protected_roots(state),
             sensitive_aliases: folder_grants::protected_aliases(),
             access: None,
+            results: None,
         })
+    }
+
+    pub(in crate::mcp) fn with_results(mut self, owner: result_spill::Owner) -> Self {
+        self.results = Some(owner);
+        self
+    }
+
+    fn allows_result(&self, path: &Path) -> bool {
+        self.results.as_ref().is_some_and(|owner| owner.allows(&self.workspace, path))
     }
 
     pub(crate) fn with_grants(mut self, access: Access) -> Self {
@@ -62,6 +74,10 @@ impl ReadScope {
     }
 
     fn check_protected(&self, path: &Path) -> Result<()> {
+        if result_spill::is_spill_path(path) {
+            ensure!(self.allows_result(path), "Use the exact MCP result path from this session's tool reply. The result may have expired.");
+            return Ok(());
+        }
         ensure!(
             !path
                 .components()
@@ -100,14 +116,14 @@ impl ReadScope {
 
     pub(super) fn check(&self, path: &Path) -> Result<()> {
         self.check_protected(path)?;
-        ensure!(self.in_scope(path) || self.granted(path, false)?, OutsideScope(path.into()));
+        ensure!(self.allows_result(path) || self.in_scope(path) || self.granted(path, false)?, OutsideScope(path.into()));
         Ok(())
     }
 
     /// Call immediately before traversing a directory or reading a file discovered by a scan.
     pub(super) fn audit_read(&self, path: &Path) -> Result<()> {
         self.check_protected(path)?;
-        ensure!(self.in_scope(path) || self.granted(path, true)?, "Folder access expired or was revoked");
+        ensure!(self.allows_result(path) || self.in_scope(path) || self.granted(path, true)?, "Folder access expired or was revoked");
         Ok(())
     }
 
@@ -120,8 +136,16 @@ impl ReadScope {
             !path.components().any(|part| part == Component::ParentDir),
             "Parent-directory components (..) are outside the workspace path policy"
         );
-        let absolute = self.cwd.join(path);
+        let absolute = if path.is_relative() && result_spill::is_spill_path(path) {
+            self.workspace.join(path)
+        } else {
+            self.cwd.join(path)
+        };
         self.check_protected(&absolute)?;
+        if result_spill::is_spill_path(&absolute) {
+            ensure!(absolute.canonicalize()? == absolute, "MCP result path contains an alias");
+            return Ok(absolute);
+        }
         if !self.in_scope(&absolute) && self.access.is_none() {
             return Err(OutsideScope(absolute).into());
         }
