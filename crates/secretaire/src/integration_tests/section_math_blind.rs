@@ -63,6 +63,10 @@ fn setup() -> Result<(TempProject, tempfile::TempDir)> {
         project.path().join("AGENTS.md"),
         "PRIVATE_WORKSPACE_INSTRUCTIONS",
     )?;
+    fs::write(
+        project.path().join("CLAUDE.md"),
+        "PRIVATE_CLAUDE_INSTRUCTIONS",
+    )?;
     fs::write(root.join("review-findings.toml"), "PRIVATE_FINDINGS_LEDGER")?;
     fs::write(root.join("private-memo.md"), "PRIVATE_PRIOR_REVIEW")?;
     Ok((project, state))
@@ -265,6 +269,37 @@ fn golden_version(premise: &str, statement: &str, proof: &str) -> Result<(String
         premise.len(),
     ));
     Ok((expected, version))
+}
+
+fn assert_recorded_packet(
+    state: &Path,
+    reviewed: &Value,
+    expected_message: &str,
+    acquired_excerpt: Option<&str>,
+) -> Result<()> {
+    let session = reviewed["session"].as_str().context("Missing session")?;
+    let saved = fs::read_to_string(state.join("section-reviews").join(format!("{session}.json")))?;
+    assert!(!saved.contains("fixture-provider-key"));
+    let receipt: Value = serde_json::from_str(&saved)?;
+    let packet = &receipt["blind"]["packet"];
+    assert_eq!(packet, &reviewed["receipt"]["blind"]["packet"]);
+    // The provider mock checks the serialized request against the same independently built text.
+    assert_eq!(packet["message"], expected_message);
+    assert_eq!(packet["skill"]["text"], CRITERIA);
+    let mut expected = vec![
+        format!("{STATEMENT}\r\n"),
+        format!("{PROOF}\n"),
+        format!("{COR_STATEMENT}\n"),
+        format!("{COR_PROOF}\n"),
+        PREMISE.to_owned(),
+    ];
+    expected.extend(acquired_excerpt.map(str::to_owned));
+    let excerpts = packet["excerpts"].as_array().context("Missing excerpts")?;
+    assert_eq!(excerpts.len(), expected.len());
+    for (excerpt, text) in excerpts.iter().zip(expected) {
+        assert_eq!(excerpt["text"], text);
+    }
+    Ok(())
 }
 
 fn install_mock(
@@ -541,6 +576,7 @@ async fn section_math_blind_review_workflow() -> Result<()> {
             let (status, _) = desk.raw_call("request_review", args.clone(), false).await?;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
             let reviewed = desk.review(args.clone()).await?;
+            assert_recorded_packet(state.path(), &reviewed, &message, None)?;
             let record = &reviewed["receipt"];
             assert_eq!(reviewed["stage"], "reviewed", "{reviewed}");
             assert_eq!(reviewed["complete"], true);
@@ -1345,7 +1381,7 @@ async fn section_math_blind_review_workflow_acquired_material() -> Result<()> {
         "\nExcerpt: {{\"bytes\":{},\"card\":null,\"label\":\"excerpt-6\",\"lines\":[2,2],\"part\":null,\"role\":\"material\"}}\n{selected}\n",
         selected.len(),
     ));
-    let calls = install_mock(&app, expected, version);
+    let calls = install_mock(&app, expected.clone(), version);
     let id = app.hub.edit_threads(|threads| threads.create(None))?;
     let desk = Desk::open(app, id, AgentBackend::Claude, false).await?;
     let mut args = arguments("private", AgentBackend::Claude, "fixture-material");
@@ -1365,6 +1401,7 @@ async fn section_math_blind_review_workflow_acquired_material() -> Result<()> {
     args["request_key"] = json!("permitted");
     let allowed = desk.review(args).await?;
     assert_eq!(allowed["complete"], true);
+    assert_recorded_packet(state.path(), &allowed, &expected, Some(selected))?;
     let excerpt = &allowed["receipt"]["blind"]["packet"]["excerpts"][5];
     assert_eq!(excerpt["file"], "references/fixture-source/data.txt");
     assert_eq!(excerpt["sha256"], hash(selected.as_bytes()));
@@ -1379,6 +1416,7 @@ async fn section_math_blind_review_workflow_acquired_material() -> Result<()> {
         .as_str()
         .unwrap()
         .contains("differs from its acquisition"));
+    assert_recorded_packet(state.path(), &stale, &expected, Some(selected))?;
     record(&changed, "CC0-1.0")?;
     let stale = desk
         .call("read_section_review", json!({"session": session}))
