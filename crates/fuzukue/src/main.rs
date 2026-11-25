@@ -1481,6 +1481,15 @@ impl Workbench {
                         event @ ServerEvent::ThreadJobDetails { .. } if self.transcripts.scoped && env.workspace.is_some() => {
                             self.finish_thread_job(event, cx);
                         }
+                        ServerEvent::ThreadJobs { session, through, first, jobs } if self.transcripts.scoped && env.workspace.is_some() => {
+                            self.update_thread_jobs(&session, through, first, jobs, cx);
+                        }
+                        ServerEvent::ThreadJobUpdated { session, through, summary } if self.transcripts.scoped && env.workspace.is_some() => {
+                            self.update_thread_job(&session, through, summary, cx);
+                        }
+                        ServerEvent::ThreadJobReport { session, job, request, result } if self.transcripts.scoped && env.workspace.is_some() => {
+                            self.finish_job_report(&session, &job, request, result, window, cx);
+                        }
                         ServerEvent::ThreadHistoryFailed { session, request, reason } if env.workspace.is_some() => {
                             self.thread_history_failed(&session, request, reason, cx);
                         }

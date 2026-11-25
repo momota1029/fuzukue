@@ -1075,12 +1075,31 @@ impl Hub {
         ServerEvent::ThreadJobDetails { session, job, request, through: inner.next_seq - 1, before, next_before, events }
     }
 
-    pub(crate) fn thread_job_tool_count(&self, session: &str, job: &str) -> Option<usize> {
+    pub(crate) fn thread_job_summary(&self, event: &ServerEvent) -> Option<(String, u64, fuzukue_proto::JobSummary)> {
         let mut inner = self.inner.lock().unwrap();
+        let through = inner.next_seq - 1;
         let threads = inner.threads.as_mut()?;
-        let count = threads.job_tool_count(session, job);
+        let summary = threads.job_summary_for_event(event);
+        summary.map(|(session, summary)| (session.into(), through, summary))
+    }
+
+    pub(crate) fn thread_jobs(&self, session: &str) -> (u64, Vec<fuzukue_proto::JobSummary>) {
+        let mut inner = self.inner.lock().unwrap();
+        let through = inner.next_seq - 1;
+        let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
+        let jobs = threads.job_summaries(session);
         threads.trim_transcripts();
-        count
+        (through, jobs)
+    }
+
+    pub(crate) fn thread_job_report(&self, session: String, job: String, request: u64) -> ServerEvent {
+        let mut inner = self.inner.lock().unwrap();
+        let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
+        let result = threads.delegate_record(&session, &job).and_then(|(_, ok, output)| {
+            Some((ok?, serde_json::from_str(output?).ok()?))
+        });
+        threads.trim_transcripts();
+        ServerEvent::ThreadJobReport { session, job, request, result }
     }
 
     pub(crate) fn subscribe_transcripts(
@@ -1529,6 +1548,85 @@ mod tests {
         }
         let (backlog, _) = hub.subscribe(1);
         assert_eq!(backlog.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn job_summary_updates_with_no_transcript_ranges_open() -> anyhow::Result<()> {
+        use fuzukue_proto::{Actor, JobStatus};
+
+        let project = crate::test_support::TestDir::new();
+        let state = project.path().join("state");
+        let hub = Hub::with_timeline(&state);
+        hub.load_threads(project.path(), &state);
+        let session = hub.edit_threads(|store| store.create(None))?;
+        let (initial, _) = hub.subscribe_transcripts(0, &TranscriptResume::default());
+        assert!(initial.iter().all(|env| env.event.transcript_session().is_none()));
+        let job = "delegate:wire";
+        let call = |started| ServerEvent::ToolCall {
+            session: session.clone(), item: job.into(), name: "delegate".into(), actor: Actor::System,
+            input: serde_json::json!({
+                "model":"gpt-5.5", "queued_at_ms":10, "started_at_ms":started,
+                "selection":{"backend":"codex","model":"gpt-5.5","effort":"high"},
+                "routing":{"tier":"heavy","reason":"test"},
+            }),
+        };
+        let mut previous = 0;
+        let mut publish = |event: ServerEvent| {
+            hub.publish(event.clone());
+            let (_, through, summary) = hub.thread_job_summary(&event).unwrap();
+            assert!(through > previous);
+            previous = through;
+            summary
+        };
+        let queued = publish(call(None));
+        assert_eq!(queued.status, JobStatus::Queued);
+        assert_eq!(queued.elapsed_at(50), Some(40));
+        let running = publish(call(Some(25)));
+        assert_eq!(running.status, JobStatus::Running);
+        assert_eq!(running.job.routing.unwrap().tier, fuzukue_proto::Tier::Heavy);
+        assert_eq!(running.job.selection.unwrap().effort.as_deref(), Some("high"));
+        for path in ["early.md", "last.md"] {
+            let summary = publish(ServerEvent::ToolCall {
+                session: session.clone(), item: "worker-call".into(), name: "Read".into(),
+                actor: Actor::Codex { thread_id: "worker".into(), parent_tool_use: Some(job.into()) },
+                input: serde_json::json!({"path":path}),
+            });
+            assert_eq!(summary.tools, 1);
+            assert_eq!(summary.last_tool, Some(format!("Read {path}")));
+        }
+        let finished = publish(ServerEvent::ToolResult {
+            session: session.clone(), item: job.into(), ok: true,
+            output: serde_json::json!({
+                "elapsed_ms":75, "text":"Job report", "files":{"source":"declared","changed_files":["notes.md"]},
+            }).to_string(),
+        });
+        assert_eq!(finished.status, JobStatus::Succeeded);
+        assert_eq!(finished.elapsed_at(999), Some(75));
+        assert_eq!(finished.changed_file_count, Some(1));
+        hub.rename_delegate(&session, job, "New name".into(), None, "user")?;
+        hub.dismiss_delegate(&session, job)?;
+        let (_, saved) = hub.thread_jobs(&session);
+        let [saved] = saved.as_slice() else { panic!("expected one job") };
+        assert!(saved.job.dismissed_from_panel);
+        assert_eq!(saved.job.display.label.as_deref(), Some("New name"));
+        let interrupted = "delegate:interrupted";
+        let ServerEvent::ToolCall { actor, name, input, .. } = call(Some(50)) else { unreachable!() };
+        hub.publish(ServerEvent::ToolCall { session: session.clone(), item: interrupted.into(), actor, name, input });
+        hub.publish(ServerEvent::ToolCall {
+            session: session.clone(), item: format!("{interrupted}:tool"), actor: Actor::Claude,
+            name: "Read".into(), input: serde_json::json!({"path":"README.md"}),
+        });
+        drop(hub);
+
+        let hub = Hub::with_timeline(&state);
+        hub.load_threads(project.path(), &state);
+        let (_, restored) = hub.thread_jobs(&session);
+        let [restored, interrupted] = restored.as_slice() else { panic!("expected two jobs") };
+        assert_eq!(serde_json::to_value(restored)?, serde_json::to_value(saved)?);
+        assert_eq!(interrupted.status, JobStatus::Interrupted);
+        assert_eq!(interrupted.tools, 1);
+        assert_eq!(interrupted.last_tool.as_deref(), Some("Read README.md"));
+        Ok(())
     }
 
     #[test]

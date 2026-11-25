@@ -45,6 +45,7 @@ sealed interface TimelineRow {
         val details: List<String>? = null,
         val nextDetail: ULong? = null,
         val loadingDetails: Boolean = false,
+        val wireSummary: JobSummary? = null,
     ) : TimelineRow
 }
 
@@ -59,6 +60,7 @@ data class Timeline(
     private val streamingSilencePrefixes: Set<String> = emptySet(),
     val composerNotice: String? = null,
     internal val olderPages: Int = 0,
+    val jobSummaries: JobSummaries = JobSummaries(),
 ) {
     internal val visibleRows: Map<String, TimelineRow>
         get() = rows.filterNot { (id, row) ->
@@ -102,7 +104,14 @@ data class Timeline(
                 if (info == null) this
                 else {
                     val previous = rows[event.item] as? TimelineRow.Job
-                    withRow(event.item, previous?.copy(info = info) ?: TimelineRow.Job(info))
+                    val summary = (event.input as? JsonObject)?.get("job_summary")?.let {
+                        runCatching { Protocol.json.decodeFromJsonElement<JobSummary>(it) }.getOrNull()
+                    }
+                    withRow(
+                        event.item,
+                        previous?.copy(info = info, wireSummary = summary ?: previous.wireSummary)
+                            ?: TimelineRow.Job(info, wireSummary = summary),
+                    )
                 }
             }
             childJob(event.item, event.actor) != null -> appendJobDetail(
@@ -241,6 +250,28 @@ data class Timeline(
         var key = "user/$id"
         while (key in rows) key += "/"
         return withRow(key, TimelineRow.Message(text, user = true, userItem = id, paths = paths))
+    }
+}
+
+data class JobSummaries(
+    val received: Boolean = false,
+    private val through: ULong = 0uL,
+    private val jobs: Map<String, Pair<ULong, JobSummary>> = emptyMap(),
+) {
+    operator fun get(id: String): JobSummary? = jobs[id]?.second
+
+    val active: List<JobSummary> get() = jobs.values.map { it.second }
+        .filter { it.status.active }.sortedBy { it.position }
+
+    internal fun update(revision: ULong, summary: JobSummary): JobSummaries =
+        if (revision < through || (jobs[summary.id]?.first ?: 0uL) > revision) this
+        else copy(jobs = jobs + (summary.id to (revision to summary)))
+
+    internal fun snapshot(revision: ULong, first: Boolean, summaries: List<JobSummary>): JobSummaries {
+        if (revision < through) return this
+        val base = if (first) copy(received = true, through = revision, jobs = jobs.filterValues { it.first > revision }) else this
+        val latest = summaries.filter { (base.jobs[it.id]?.first ?: 0uL) <= revision }
+        return base.copy(jobs = base.jobs + latest.associate { it.id to (revision to it) })
     }
 }
 

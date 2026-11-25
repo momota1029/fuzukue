@@ -2,11 +2,50 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fuzukue_proto::{CachedSession, ClientMsg, ServerEvent, ThreadHistoryFailure};
+use fuzukue_proto::{CachedSession, ClientMsg, JobSummary, ServerEvent, ThreadHistoryFailure};
 use gpui_kit::{Context, ListOffset};
 
 use super::{CHAT_LEADING_PADDING, Chat, Content, Row, RowKind, Workbench};
 use crate::ConnectionStatus;
+
+#[derive(Default)]
+pub(super) struct JobSummaries {
+    pub(super) requested: bool,
+    pub(super) received: bool,
+    pub(super) report_request: Option<(u64, String)>,
+    through: u64,
+    jobs: HashMap<String, (u64, JobSummary)>,
+}
+
+impl JobSummaries {
+    pub(super) fn update(&mut self, through: u64, summary: JobSummary) {
+        if through >= self.through && self.jobs.get(&summary.id).is_none_or(|(seq, _)| *seq <= through) {
+            self.jobs.insert(summary.id.clone(), (through, summary));
+        }
+    }
+
+    pub(super) fn snapshot(&mut self, through: u64, first: bool, jobs: Vec<JobSummary>) {
+        if through < self.through {
+            return;
+        }
+        if first {
+            self.jobs.retain(|_, (seq, _)| *seq > through);
+            self.through = through;
+            self.received = true;
+        }
+        for summary in jobs {
+            self.update(through, summary);
+        }
+    }
+
+    pub(super) fn get(&self, id: &str) -> Option<&JobSummary> {
+        self.jobs.get(id).map(|(_, summary)| summary)
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &JobSummary> {
+        self.jobs.values().map(|(_, summary)| summary)
+    }
+}
 
 #[derive(Default)]
 pub(super) struct History {
@@ -90,6 +129,26 @@ fn history_item(event: &ServerEvent) -> Option<Cow<'_, str>> {
 
 
 impl Workbench {
+    pub(crate) fn update_thread_job(&mut self, session: &str, through: u64, summary: JobSummary, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(session) else { return };
+        let row = chat.by_item.get(&summary.id).copied();
+        chat.jobs.update(through, summary);
+        if let Some(row) = row {
+            chat.remeasure(row, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn update_thread_jobs(&mut self, session: &str, through: u64, first: bool, jobs: Vec<JobSummary>, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(session) else { return };
+        let rows: Vec<_> = jobs.iter().filter_map(|job| chat.by_item.get(&job.id).copied()).collect();
+        chat.jobs.snapshot(through, first, jobs);
+        for row in rows {
+            chat.remeasure(row, cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn request_thread_tail(&mut self) {
         if !self.transcripts.scoped || self.receiving_backlog
             || !matches!(self.status, ConnectionStatus::Connected)
@@ -100,6 +159,9 @@ impl Workbench {
         }
         let session = self.active.clone();
         let Some(chat) = self.chats.get_mut(&session) else { return };
+        if self.protocol >= fuzukue_proto::JOB_SUMMARY_PROTOCOL && !chat.jobs.requested {
+            chat.jobs.requested = self.out.send(ClientMsg::GetThreadJobs { session: session.clone() }).is_ok();
+        }
         if let Some(generation) = chat.history.generation {
             match chat.history.jump {
                 Some(Jump::History(start)) => {
@@ -241,6 +303,7 @@ impl Workbench {
     pub(crate) fn reset_thread_history(&mut self, session: &str, cx: &mut Context<Self>) {
         self.out.cache_transcript(session, None);
         let Some(chat) = self.chats.get_mut(session) else { return };
+        chat.jobs = JobSummaries::default();
         if chat.history.generation.is_none() && chat.history.tail.is_none() {
             return;
         }
@@ -273,6 +336,8 @@ impl Workbench {
         self.transcripts.initial_threads = None;
         self.transcripts.initial_controls.clear();
         for chat in self.chats.values_mut() {
+            chat.jobs.requested = false;
+            chat.jobs.report_request = None;
             chat.history.tail = None;
             chat.history.forward = None;
             chat.cancel_history_prefetch(cx);
@@ -390,6 +455,11 @@ impl Workbench {
             self.apply_event(threads, true, cx);
         }
         let applied = self.out.transcript_through(workspace, &epoch);
+        if applied == 0 {
+            for chat in self.chats.values_mut() {
+                chat.jobs = JobSummaries::default();
+            }
+        }
         let mut reset_sessions: HashSet<_> = reset_sessions.into_iter().collect();
         if let Some(advertised) = self.transcripts.advertised.take() {
             let advertised: HashMap<_, _> = advertised.into_iter()
@@ -1048,6 +1118,16 @@ mod tests {
                 });
                 let request = view.chats[A].history.tail.as_ref().unwrap().request;
                 let job = "delegate:synthetic";
+                let summary: JobSummary = serde_json::from_value(serde_json::json!({
+                    "id":job, "position":20, "status":"running", "tools":500, "had_tool_error":false,
+                    "job":{"model":"fixture","started_at_ms":0}, "last_tool":"Read notes.md",
+                })).unwrap();
+                deliver(view, window, cx, 0, ServerEvent::ThreadJobs {
+                    session: A.into(), through: 10, first: true, jobs: vec![summary.clone()],
+                });
+                assert!(view.chats[A].rows.is_empty());
+                assert_eq!(view.chats[A].active_worker(), Some("fixture"));
+                assert_eq!(view.chats[A].jobs.get(job).unwrap().tools, 500);
                 let events = vec![
                     text(A, "latest", "Newest conversation reply"),
                     ServerEvent::ToolCall {
@@ -1132,6 +1212,8 @@ mod tests {
                 }
                 let chat = &view.chats[A];
                 assert!(!chat.by_item.contains_key("first"));
+                assert!(!chat.by_item.contains_key(job));
+                assert_eq!(chat.jobs.get(job).unwrap().tools, 500);
                 assert_eq!(chat.history.pages.len(), 4);
                 assert_eq!(chat.scroller.logical_scroll_top(), ListOffset {
                     item_ix: chat.by_item["page-2-10"], offset_in_item: gpui_kit::px(3.),
@@ -1149,6 +1231,10 @@ mod tests {
                 });
                 assert_eq!(body(view, A, "latest"), "Newest conversation reply + streamed");
                 assert!(view.chats[A].scroller.is_following_tail());
+                deliver(view, window, cx, 0, ServerEvent::ThreadJobUpdated {
+                    session: A.into(), through: 13, summary: JobSummary { tools: 501, ..summary },
+                });
+                assert_eq!(view.chats[A].jobs.get(job).unwrap().tools, 501);
             })).unwrap();
             cx.spawn(async move |cx| {
                 let _ = cx.update(|cx| cx.quit());

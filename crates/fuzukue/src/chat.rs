@@ -38,7 +38,7 @@ use fuzukue_proto::{
     Actor, AgentBackend, AgentSelection, ChatSettings, ClientMsg, CommentApplication, CommentApplicationState, MathMacro, PermissionMode, ServerEvent, ATTACHMENT_CHUNK_BYTES,
     BackgroundCommand, BackgroundCommandState,
     ChatWaitReason, ChatWaiting, DeckRoute, GoalTail, InboxProposal, ThreadView, CLAUDE_MODELS, DelegateJob, DelegateReport, DELEGATE_JOB, MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES,
-    WorkerApprovalPolicy,
+    JobStatus, JobSummary, WorkerApprovalPolicy,
 };
 use fuzukue_view::chat::{
     is_json_document, paper_batch_failure_summary, tool_result_summary, tool_summary, ChatGrouping,
@@ -120,6 +120,7 @@ pub(super) fn chat_column() -> gpui_kit::Div {
 pub(super) struct Chat {
     rows: Vec<Row>,
     history: chat_history::History,
+    jobs: chat_history::JobSummaries,
     by_item: HashMap<String, usize>,
     by_tool: HashMap<String, (usize, usize)>,
     by_approval: HashMap<String, (usize, usize)>,
@@ -384,6 +385,7 @@ struct DelegateBlock {
     id: String,
     job: DelegateJob,
     summary: Option<String>,
+    wire_summary: Option<JobSummary>,
     progress: Vec<DelegateEntry>,
     text_open: Option<bool>,
     tools_open: bool,
@@ -547,6 +549,7 @@ impl Chat {
         Self {
             rows: Vec::new(),
             history: Default::default(),
+            jobs: Default::default(),
             by_item: HashMap::new(),
             by_tool: HashMap::new(),
             by_approval: HashMap::new(),
@@ -933,13 +936,16 @@ impl Chat {
 
     #[cfg(all(target_os = "linux", feature = "headless-shot"))]
     pub(super) fn has_delegate_report(&self, model: &str) -> bool {
-        self.rows.iter().any(|row| matches!(&row.content, Content::Delegate(block)
+        self.jobs.iter().any(|summary| summary.job.model == model && summary.status == JobStatus::Succeeded)
+            || self.rows.iter().any(|row| matches!(&row.content, Content::Delegate(block)
             if block.job.model == model && block.report.as_ref().is_some_and(|(ok, report)| *ok && !report.text.is_empty())))
     }
 
     #[cfg(all(target_os = "linux", feature = "headless-shot"))]
     pub(super) fn has_live_delegate_text(&self, needle: &str) -> bool {
-        self.rows.iter().any(|row| matches!(&row.content, Content::Delegate(block)
+        self.jobs.iter().any(|summary| summary.status.active()
+            && summary.latest_message.as_ref().is_some_and(|text| text.contains(needle)))
+            || self.rows.iter().any(|row| matches!(&row.content, Content::Delegate(block)
             if block.report.is_none() && block.progress.iter().any(|entry|
                 matches!(entry, DelegateEntry::Text(text) if text.contains(needle)))))
     }
@@ -975,8 +981,12 @@ impl Chat {
 
     #[cfg(all(target_os = "linux", feature = "headless-shot"))]
     pub(super) fn has_live_delegate_summaries(&self, count: usize) -> bool {
-        self.rows.iter().filter(|row| matches!(&row.content, Content::Delegate(block)
-            if block.job.started_at_ms.is_some() && block.report.is_none() && block.summary.is_some())).count() >= count
+        let summaries = self.jobs.iter().filter(|summary|
+            summary.status == JobStatus::Running && summary.last_activity.is_some()).count();
+        let legacy = self.rows.iter().filter(|row| matches!(&row.content, Content::Delegate(block)
+            if self.jobs.get(&block.id).is_none() && block.job.started_at_ms.is_some()
+                && block.report.is_none() && block.summary.is_some())).count();
+        summaries + legacy >= count
     }
 
     fn delegate_entry(
@@ -1015,6 +1025,7 @@ impl Chat {
             if let Ok(mut job) = serde_json::from_value::<DelegateJob>(input.clone()) {
                 let compact = input["details_deferred"].as_bool() == Some(true);
                 let count = input["tool_count"].as_u64().unwrap_or(0) as usize;
+                let wire_summary = serde_json::from_value::<JobSummary>(input["job_summary"].clone()).ok();
                 if job.display.label.is_none() && job.display.card_id.is_none() {
                     job.display = fuzukue_proto::DelegateDisplay::from_title(job.title.as_deref(), None);
                 }
@@ -1030,6 +1041,7 @@ impl Chat {
                         block.job = job;
                         if compact {
                             block.deferred.get_or_insert_with(DeferredJob::default).tools = count;
+                            block.wire_summary = wire_summary;
                         }
                         self.remeasure(row, cx);
                     }
@@ -1047,6 +1059,7 @@ impl Chat {
                             id: item.clone(),
                             job,
                             summary: None,
+                            wire_summary,
                             progress: Vec::new(),
                             text_open: None,
                             tools_open: false,
@@ -1255,14 +1268,31 @@ impl Chat {
         }
     }
 
-    fn pending_jobs(&self) -> impl Iterator<Item = (usize, &DelegateJob)> {
-        self.pending_delegates.iter().filter_map(|item| {
+    fn delegate_block(&self, id: &str) -> Option<&DelegateBlock> {
+        match &self.rows[*self.by_item.get(id)?].content {
+            Content::Delegate(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    fn job_summary<'a>(&'a self, block: &'a DelegateBlock) -> Option<&'a JobSummary> {
+        self.jobs.get(&block.id).or(block.wire_summary.as_ref())
+    }
+
+    fn pending_jobs(&self) -> impl Iterator<Item = (usize, &str, &DelegateJob)> {
+        let summaries = self.jobs.iter().filter(|summary| summary.status.active())
+            .map(|summary| (summary.position, summary.id.as_str(), &summary.job));
+        let rows = self.pending_delegates.iter().filter_map(|item| {
+            if self.jobs.received || self.jobs.get(item).is_some() {
+                return None;
+            }
             let row = *self.by_item.get(item)?;
             match &self.rows[row].content {
-                Content::Delegate(block) => Some((row, &block.job)),
+                Content::Delegate(block) => Some((row, item.as_str(), &block.job)),
                 _ => None,
             }
-        })
+        });
+        summaries.chain(rows)
     }
 
     fn finished_panel_jobs(&self) -> impl Iterator<Item = (usize, &DelegateBlock)> {
@@ -1273,7 +1303,8 @@ impl Chat {
     }
 
     pub(super) fn active_worker(&self) -> Option<&str> {
-        self.pending_jobs().find_map(|(_, job)| job.started_at_ms.map(|_| job.model.as_str()))
+        self.pending_jobs().filter(|(_, _, job)| job.started_at_ms.is_some())
+            .min_by_key(|(position, _, _)| *position).map(|(_, _, job)| job.model.as_str())
     }
 
     pub(super) fn working(&self) -> bool {
@@ -1321,7 +1352,7 @@ impl Chat {
     #[cfg(all(target_os = "linux", feature = "headless-shot"))]
     pub(super) fn turn_status(&self) -> Option<String> {
         let turn = self.turn_activity()?;
-        let jobs: Vec<_> = self.pending_jobs().map(|(_, job)| job).collect();
+        let jobs: Vec<_> = self.pending_jobs().map(|(_, _, job)| job).collect();
         Some(status_speech(&activity_summary(Some(&turn), &jobs, None, unix_millis()).0))
     }
 
@@ -1790,6 +1821,16 @@ fn delegate_tools(block: &DelegateBlock) -> (usize, bool) {
 
 fn delegate_elapsed(job: &DelegateJob, now_ms: u64) -> Option<u64> {
     job.started_at_ms.map(|started| now_ms.saturating_sub(started.max(0) as u64) / 1000)
+}
+
+fn job_status_label(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Queued => tr!("chat-waiting"),
+        JobStatus::Running => tr!("chat-working"),
+        JobStatus::Succeeded => tr!("chat-done"),
+        JobStatus::Failed => tr!("chat-failed"),
+        JobStatus::Interrupted => tr!("agents-interrupted"),
+    }
 }
 
 fn turn_activity_detail(turn: &TurnActivity<'_>) -> String {
@@ -2316,7 +2357,12 @@ impl Workbench {
                         }));
                     }
                     Content::Delegate(block) => {
-                        let (status, elapsed) = match &block.report {
+                        let summary = chat.job_summary(block);
+                        let job = summary.map_or(&block.job, |summary| &summary.job);
+                        let status = summary.map(|summary| summary.status);
+                        let (status_label, elapsed) = if let Some(summary) = summary {
+                            (job_status_label(summary.status), summary.elapsed_at(unix_millis()))
+                        } else { match &block.report {
                             Some((ok, report)) => (
                                 if report.interrupted { tr!("agents-interrupted") }
                                 else if *ok { tr!("chat-done") } else { tr!("chat-failed") },
@@ -2326,24 +2372,29 @@ impl Workbench {
                                 Some(started) => (tr!("chat-working"), Some(unix_millis().saturating_sub(started.max(0) as u64))),
                                 None => (tr!("chat-waiting"), None),
                             },
-                        };
+                        }};
                         let elapsed = elapsed.map(|ms| elapsed_label(Duration::from_millis(ms)));
-                        let label = if block.report.is_some() {
-                            worker_heading(status, Some(delegate_activity_name(&block.job)), elapsed.as_deref())
+                        let finished = status.map_or(block.report.is_some(), |status| !status.active());
+                        let label = if finished {
+                            worker_heading(status_label, Some(delegate_activity_name(job)), elapsed.as_deref())
                         } else {
-                            delegate_activity_name(&block.job).to_owned()
+                            delegate_activity_name(job).to_owned()
                         };
                         if let Some(deferred) = &block.deferred {
-                            let calls = tr!("chat-tool-calls", calls = deferred.tools.max(delegate_tools(block).0));
-                            let label = [delegate_activity_name(&block.job), status, &block.job.model, &calls]
+                            let calls = tr!("chat-tool-calls", calls = summary.map_or(deferred.tools, |summary| summary.tools));
+                            let label = [delegate_activity_name(job), status_label, &job.model, elapsed.as_deref().unwrap_or(""), &calls]
                                 .into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(STATUS_SEPARATOR);
                             body = body.child(summary_toggle(
                                 format!("delegate-expand-{}", block.id).into(),
                                 Disclosure::DelegateDetails, deferred.open, label, theme.muted_foreground,
                             ));
+                            if let Some(activity) = summary.and_then(|summary| summary.last_activity.as_ref()) {
+                                body = body.child(div().truncate().text_xs().text_color(theme.muted_foreground).child(activity.clone()));
+                            }
                         }
                         if block.deferred.as_ref().is_none_or(|job| job.open) {
-                        let failed = matches!(&block.report, Some((false, _)));
+                        let failed = status.map_or(matches!(&block.report, Some((false, _))), |status|
+                            matches!(status, JobStatus::Failed | JobStatus::Interrupted));
                         let header = h_flex().flex_wrap().gap_2().items_center()
                             .line_height(UI_LINE_HEIGHT)
                             .child(status_row(&label, theme.muted_foreground).text_xs().text_color(if failed {
@@ -2351,14 +2402,14 @@ impl Workbench {
                             } else {
                                 theme.muted_foreground
                             }))
-                            .when_some(block.job.display.card_id.clone(), |row, id| row.child(div().text_xs().child(id)))
+                            .when_some(job.display.card_id.clone(), |row, id| row.child(div().text_xs().child(id)))
                             .when(this.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL, |row| {
-                                row.child(this.rename_job_button(&session, block, SharedString::from(format!("rename-{}", block.id))))
+                                row.child(this.rename_job_button(&session, &block.id, job, SharedString::from(format!("rename-{}", block.id))))
                             })
                             .child(job_details(format!("delegate-details-{}", block.id),
-                                delegate_details(&block.job, block.report.as_ref().map(|(_, report)| report))));
+                                delegate_details(job, block.report.as_ref().map(|(_, report)| report))));
                         body = body.child(header.id(SharedString::from(format!("delegate-block-{}", block.id))));
-                        if let Some(summary) = &block.summary {
+                        if let Some(summary) = block.summary.as_ref().filter(|_| block.wire_summary.is_none()) {
                             body = body.child(div().id(SharedString::from(format!("delegate-summary-{}", block.id)))
                                 .text_sm().text_color(theme.muted_foreground).child(summary.clone()));
                         }
@@ -2366,7 +2417,7 @@ impl Workbench {
                         if let Some(job) = block.deferred.as_ref().filter(|job| job.next_before.is_some()) {
                             body = body.child(summary_toggle(
                                 format!("delegate-more-{}", block.id).into(), Disclosure::MoreDelegateDetails,
-                                false, tr!("chat-earlier-worker-tools", calls = job.tools.saturating_sub(calls)),
+                                false, tr!("chat-earlier-worker-tools", calls = summary.map_or(job.tools, |summary| summary.tools).saturating_sub(calls)),
                                 theme.muted_foreground,
                             ));
                         }
@@ -2377,7 +2428,7 @@ impl Workbench {
                             let status = if block.job.started_at_ms.is_some() && block.report.is_none() {
                                 tr!("chat-tool-running")
                             } else {
-                                status
+                                status_label
                             };
                             let label = tr!("chat-worker-tools", worker = worker, calls = calls, status = status);
                             let label = if tool_failed && !failed {
@@ -2690,7 +2741,7 @@ impl Workbench {
                         });
                         let rewrite = message.item.as_ref().filter(|_| {
                             this.protocol >= fuzukue_proto::CLOSE_TRASH_PROTOCOL
-                                && !chat.busy && chat.pending_delegates.is_empty() && chat.latest_reply() == Some(ix)
+                                && !chat.busy && chat.pending_jobs().next().is_none() && chat.latest_reply() == Some(ix)
                         }).map(|item| {
                             let out = this.out.clone();
                             let command = ClientMsg::RewriteReply { session: session.clone(), item: item.clone() };
@@ -4270,13 +4321,9 @@ impl Workbench {
         let compacting = self.chat_waiting.reason(&self.active).is_some_and(|wait| wait.reason == ChatWaitReason::Compacting);
         let turn_running = compacting || (chat.busy && !self.thread_usage_paused(&self.active));
         let running_job = chat.pending_jobs()
-            .filter(|(_, job)| job.started_at_ms.is_some())
-            .filter_map(|(row, _)| match &chat.rows[row].content {
-                Content::Delegate(block) => Some((row, block)),
-                _ => None,
-            })
-            .min_by_key(|(row, block)| (chat.worker_target.as_ref() != Some(&block.id), *row))
-            .map(|(_, block)| (block.id.as_str(), delegate_activity_name(&block.job)))
+            .filter(|(_, _, job)| job.started_at_ms.is_some())
+            .min_by_key(|(row, id, _)| (chat.worker_target.as_deref() != Some(*id), *row))
+            .map(|(_, id, job)| (id, delegate_activity_name(job)))
             .or_else(|| self.scoped_worker(&self.active).map(|id| (id, id)));
         let draining = self.safe_close.update_draining().unwrap_or_else(|| {
             self.self_update.status.as_ref().is_some_and(|status| status.wait.is_some())

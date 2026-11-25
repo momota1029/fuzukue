@@ -313,6 +313,9 @@ internal class RemoteRepository(
         val session = current.selection ?: return
         if (!selectionScoped || replaying || !current.canSend || current.threads.none { it.id == session }) return
         val history = histories.getOrPut(session) { TranscriptHistory() }
+        if (serverProtocol >= JOB_SUMMARY_PROTOCOL && !history.jobsRequested) {
+            history.jobsRequested = sendToWorkspace(ClientMessage.GetThreadJobs(session))
+        }
         if (history.generation != null || history.tail != null) return
         val request = ++nextHistoryRequest
         if (sendToWorkspace(ClientMessage.GetThreadTail(session, request))) {
@@ -381,8 +384,12 @@ internal class RemoteRepository(
     }
 
     fun stopWorker(session: String, job: String) {
-        val worker = state.value.timelines[session]?.rows?.get(job) as? TimelineRow.Job
-        if (worker != null && worker.ok == null) sendToWorkspace(ClientMessage.StopWorker(session, job))
+        val timeline = state.value.timeline(session)
+        val worker = timeline.rows[job] as? TimelineRow.Job
+        val summary = timeline.jobSummaries[job] ?: worker?.wireSummary
+        if (summary?.status?.active ?: (worker != null && worker.ok == null)) {
+            sendToWorkspace(ClientMessage.StopWorker(session, job))
+        }
     }
 
     fun resolve(id: String, accept: Boolean) {
@@ -566,6 +573,7 @@ internal class RemoteRepository(
         selectionScoped = false
         clearTranscriptReplay()
         for (history in histories.values) {
+            history.jobsRequested = false
             history.tail = null
             history.interruptPage()
         }
@@ -868,6 +876,22 @@ internal class RemoteRepository(
                     )
                 })
             }
+            is ServerEvent.ThreadJobs -> {
+                if (!selectionScoped || frame.workspace == null || frame.workspace != current.workspace ||
+                    !histories.containsKey(event.session)) return
+                val timeline = current.timeline(event.session)
+                current.withTimeline(event.session, timeline.copy(
+                    jobSummaries = timeline.jobSummaries.snapshot(event.through, event.first, event.jobs),
+                ))
+            }
+            is ServerEvent.ThreadJobUpdated -> {
+                if (!selectionScoped || frame.workspace == null || frame.workspace != current.workspace ||
+                    !histories.containsKey(event.session)) return
+                val timeline = current.timeline(event.session)
+                current.withTimeline(event.session, timeline.copy(
+                    jobSummaries = timeline.jobSummaries.update(event.through, event.summary),
+                ))
+            }
             is ServerEvent.ThreadHistoryPage -> {
                 if (replaying || (selectionScoped && frame.workspace == null)) return
                 val history = histories[event.session] ?: return
@@ -1036,7 +1060,7 @@ internal class RemoteRepository(
 
     private fun invalidateHistory(current: RemoteState, session: String): RemoteState {
         histories.remove(session)
-        return current.withTimeline(session, current.timeline(session).clearHistory())
+        return current.withTimeline(session, current.timeline(session).clearHistory().copy(jobSummaries = JobSummaries()))
     }
 
     private fun acknowledgePrompt(

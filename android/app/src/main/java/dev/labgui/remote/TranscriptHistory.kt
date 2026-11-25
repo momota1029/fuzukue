@@ -28,6 +28,7 @@ internal fun savedTranscriptEvents(session: String, events: List<JsonObject>) =
         .filter { it.session == session && it.isSavedTranscriptEvent }
 
 internal class TranscriptHistory {
+    var jobsRequested = false
     var generation: ULong? = null
         private set
     private var tailThrough = 0uL

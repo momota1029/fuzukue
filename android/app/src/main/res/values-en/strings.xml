@@ -111,6 +111,7 @@
     <string name="job_done">Done</string>
     <string name="job_done_suffix">" · Done"</string>
     <string name="job_failed">Failed</string>
+    <string name="job_interrupted">Interrupted</string>
     <string name="job_failed_suffix">" · Failed"</string>
     <string name="job_queued">Waiting</string>
     <string name="job_running">Working</string>

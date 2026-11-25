@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{durable, state, workspace};
 
-use fuzukue_proto::{AgentSelection, ChatSettings, DelegateSettings};
+use fuzukue_proto::{AgentBackend, AgentSelection, ChatSettings, DelegateJob, DelegateReport, DelegateSettings, JobStatus, JobSummary};
 
 const ENTRY: &str = "<!-- labo-thread ";
 const TITLE_MESSAGE_LIMIT: usize = 2000;
@@ -193,8 +193,37 @@ struct Transcript {
     items: Vec<Entry>,
     index: HashMap<String, usize>,
     hidden_replies: HashSet<String>,
-    job_tools: HashMap<String, usize>,
+    job_facts: HashMap<String, JobFacts>,
     job_children: HashMap<String, Vec<usize>>,
+    job_roots: Vec<usize>,
+}
+
+#[derive(Default)]
+struct JobFacts {
+    tools: usize,
+    failed_tools: usize,
+    last_tool: Option<usize>,
+    latest_message: Option<usize>,
+}
+
+fn summary_preview(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
+impl JobFacts {
+    fn record(&mut self, position: usize, entry: &Entry) {
+        if let Some(tool) = &entry.meta.tool {
+            self.tools += 1;
+            self.failed_tools += usize::from(tool.ok == Some(false));
+            self.last_tool = Some(position);
+        } else if matches!(entry.meta.actor, Actor::Claude | Actor::Codex { .. }) && !entry.text.trim().is_empty() {
+            self.latest_message = self.latest_message.max(Some(position));
+        }
+    }
 }
 
 impl Transcript {
@@ -208,14 +237,86 @@ impl Transcript {
     }
 
     fn push(&mut self, entry: Entry) {
+        let position = self.items.len();
         if let Some(job) = fuzukue_proto::delegate_job_id(&entry.meta.item, &entry.meta.actor) {
-            self.job_children.entry(job.into()).or_default().push(self.items.len());
-            if entry.meta.tool.is_some() {
-                *self.job_tools.entry(job.into()).or_default() += 1;
-            }
+            self.job_children.entry(job.into()).or_default().push(position);
+            self.job_facts.entry(job.into()).or_default().record(position, &entry);
+        } else if entry.meta.item.starts_with(fuzukue_proto::DELEGATE_JOB)
+            && entry.meta.tool.as_ref().is_some_and(|tool| tool.name == "delegate")
+        {
+            self.job_roots.push(position);
         }
-        self.index.insert(entry.meta.item.clone(), self.items.len());
+        self.index.insert(entry.meta.item.clone(), position);
         self.items.push(entry);
+    }
+
+    fn rebuild_job_facts(&mut self) {
+        self.job_facts = self.job_children.iter().map(|(job, children)| {
+            let mut facts = JobFacts::default();
+            for &position in children {
+                facts.record(position, &self.items[position]);
+            }
+            (job.clone(), facts)
+        }).collect();
+    }
+
+    fn job_summary(&self, job: &str) -> Option<JobSummary> {
+        let &position = self.index.get(job)?;
+        let root = self.items[position].meta.tool.as_ref().filter(|tool| tool.name == "delegate")?;
+        let mut metadata: DelegateJob = serde_json::from_value(root.input.as_ref()?.clone()).ok()?;
+        metadata.touches = None;
+        let report = root.output.as_deref().and_then(|output| serde_json::from_str::<DelegateReport>(output).ok());
+        if let Some(attempt) = report.as_ref().and_then(|report| report.attempts.last()) {
+            metadata.selection = Some(attempt.selection.clone());
+            let reason = metadata.routing.take().map(|route| route.reason).unwrap_or_default();
+            metadata.routing = Some(fuzukue_proto::TierDecision { tier: attempt.tier, reason });
+        }
+        if metadata.selection.is_none() && !metadata.model.is_empty() {
+            let backend = if metadata.model.to_ascii_lowercase().starts_with("claude") {
+                AgentBackend::Claude
+            } else {
+                AgentBackend::for_model(Some(&metadata.model))
+            };
+            metadata.selection = Some(AgentSelection { backend, model: Some(metadata.model.clone()), effort: None });
+        }
+        if let Some(model) = metadata.selection.as_ref().and_then(|selection| selection.model.as_ref()) {
+            metadata.model.clone_from(model);
+        }
+        let interrupted = report.as_ref().is_some_and(|report| report.interrupted);
+        let status = match root.ok {
+            Some(_) if interrupted => JobStatus::Interrupted,
+            Some(true) => JobStatus::Succeeded,
+            Some(false) => JobStatus::Failed,
+            None if metadata.started_at_ms.is_some() => JobStatus::Running,
+            None => JobStatus::Queued,
+        };
+        let facts = self.job_facts.get(job);
+        let saved = report.as_ref().and_then(|report| report.tool_activity.as_ref());
+        let recorded_tools = facts.map_or(0, |facts| facts.tools);
+        let recent_tool = facts.and_then(|facts| facts.last_tool)
+            .and_then(|position| self.items[position].meta.tool.as_ref())
+            .map(|tool| fuzukue_view::chat::tool_summary(&tool.name, tool.input.as_ref().unwrap_or(&serde_json::Value::Null)));
+        let saved_tool = saved.and_then(|activity| activity.last_tool.as_deref()).map(|tool| summary_preview(tool, 160));
+        let last_tool = if saved.is_some_and(|activity| activity.count > recorded_tools) {
+            saved_tool.or(recent_tool)
+        } else {
+            recent_tool.or(saved_tool)
+        };
+        let latest_message = facts.and_then(|facts| facts.latest_message)
+            .map(|position| summary_preview(&self.items[position].text, 640));
+        Some(JobSummary {
+            id: job.into(), position, job: metadata, status,
+            elapsed_ms: report.as_ref().filter(|report| !report.interrupted).map(|report| report.elapsed_ms),
+            tools: recorded_tools.max(saved.map_or(0, |activity| activity.count)),
+            had_tool_error: facts.is_some_and(|facts| facts.failed_tools > 0),
+            last_activity: root.progress.as_deref().filter(|text| !text.trim().is_empty())
+                .map(|text| summary_preview(text, 280))
+                .or_else(|| last_tool.clone())
+                .or_else(|| latest_message.as_deref().and_then(|text| text.lines().next())
+                    .map(|line| summary_preview(line, 280))),
+            last_tool, latest_message,
+            changed_file_count: report.as_ref().and_then(|report| report.files.as_ref()?.changed_files.as_ref()).map(Vec::len),
+        })
     }
 
     fn observe(&mut self, event: &ServerEvent) {
@@ -263,7 +364,11 @@ impl Transcript {
                 item, actor, text, ..
             } => {
                 if let Some(&i) = self.index.get(item) {
-                    self.items[i].text.push_str(text);
+                    let entry = &mut self.items[i];
+                    entry.text.push_str(text);
+                    if let Some(job) = fuzukue_proto::delegate_job_id(item, actor).filter(|_| entry.meta.tool.is_none()) {
+                        self.job_facts.entry(job.into()).or_default().record(i, entry);
+                    }
                 } else {
                     self.push(Entry {
                         meta: EntryMeta {
@@ -323,6 +428,13 @@ impl Transcript {
                     tool.input = Some(input);
                 }
             }
+            ServerEvent::ToolCall { item, actor, input, .. }
+                if fuzukue_proto::delegate_job_id(item, actor).is_some() =>
+            {
+                if let Some(tool) = self.index.get(item).and_then(|&i| self.items[i].meta.tool.as_mut()) {
+                    tool.input = Some(input.clone());
+                }
+            }
             ServerEvent::DelegateRenamed { job, change, .. } => {
                 if let Some(input) = self.delegate_input_mut(job) {
                     record_delegate_name(input, change);
@@ -343,6 +455,12 @@ impl Transcript {
                     let meta = &mut self.items[index].meta;
                     let delegated = meta.is_delegated();
                     let Some(tool) = &mut meta.tool else { return };
+                    if let Some(job) = fuzukue_proto::delegate_job_id(item, &meta.actor) {
+                        if let Some(facts) = self.job_facts.get_mut(job) {
+                            facts.failed_tools = facts.failed_tools.saturating_sub(usize::from(tool.ok == Some(false)))
+                                + usize::from(!ok);
+                        }
+                    }
                     tool.ok = Some(*ok);
                     if delegated || *ok && crate::thread_artifacts::has_structured_result(&tool.name) {
                         tool.output = Some(output.clone());
@@ -462,25 +580,24 @@ impl Transcript {
     }
 
     fn merge(&mut self, recovered: Self) {
-        for mut entry in recovered.items {
+        for entry in recovered.items {
             if let Some(&i) = self.index.get(&entry.meta.item) {
                 let saved = &mut self.items[i];
                 if entry.text.starts_with(&saved.text) {
                     saved.text = entry.text;
                 }
-                if entry
-                    .meta
-                    .tool
-                    .as_ref()
-                    .is_some_and(|tool| tool.ok.is_some())
-                {
-                    if let (Some(saved), Some(recovered)) = (
-                        saved.meta.tool.as_ref().and_then(|tool| tool.input.as_ref()),
-                        entry.meta.tool.as_mut().and_then(|tool| tool.input.as_mut()),
-                    ) {
-                        preserve_delegate_metadata(saved, recovered);
+                if let Some(mut incoming) = entry.meta.tool {
+                    if let Some(tool) = &mut saved.meta.tool {
+                        if incoming.ok.is_some() || tool.ok.is_none() {
+                            if let (Some(previous), Some(input)) = (&tool.input, &mut incoming.input) {
+                                preserve_delegate_metadata(previous, input);
+                            }
+                            incoming.progress = incoming.progress.or_else(|| tool.progress.take());
+                            *tool = incoming;
+                        } else if incoming.progress.is_some() {
+                            tool.progress = incoming.progress;
+                        }
                     }
-                    saved.meta.tool = entry.meta.tool;
                 }
                 if entry.meta.application.as_ref().is_some_and(|application| {
                     !matches!(application.state, CommentApplicationState::Running)
@@ -736,7 +853,7 @@ impl Transcript {
         self.events(id, std::slice::from_ref(entry)).filter_map(|event| {
             let event = restore_tool(event);
             if compact {
-                compact_job_event(event, |job| self.job_tools.get(job).copied())
+                compact_job_event(event, |job| self.job_summary(job))
             } else {
                 Some(event)
             }
@@ -1011,6 +1128,18 @@ impl TranscriptSource {
         self.timeline.visit_session(&self.session, |env, bytes| {
             if env.seq > self.after {
                 weight = weight.saturating_add(bytes as usize);
+                // A journal tail may begin with an update to a checkpointed tool or job.
+                let existing = match &env.event {
+                    ServerEvent::ToolResult { item, .. } => Some(item),
+                    ServerEvent::DelegateProgress { job, .. } | ServerEvent::DelegateRenamed { job, .. }
+                    | ServerEvent::DelegateDismissed { job, .. } => Some(job),
+                    _ => None,
+                };
+                if let Some(item) = existing.filter(|item| !recovered.index.contains_key(*item)) {
+                    if let Some(&position) = transcript.index.get(item) {
+                        recovered.push(transcript.items[position].clone());
+                    }
+                }
                 recovered.observe(&env.event);
             }
         });
@@ -1023,6 +1152,7 @@ impl TranscriptSource {
                 }
             });
         }
+        transcript.rebuild_job_facts();
         transcript.hide_saved_blank_replies();
         Ok((transcript, weight))
     }
@@ -1327,20 +1457,26 @@ fn preserve_delegate_metadata(previous: &serde_json::Value, input: &mut serde_js
     if previous["dismissed_from_panel"].as_bool() == Some(true) {
         object.insert("dismissed_from_panel".into(), true.into());
     }
-    let Some(history) = previous["rename_history"].as_array() else { return };
-    if object.get("rename_history").and_then(serde_json::Value::as_array)
-        .is_some_and(|current| current.len() >= history.len())
-    {
-        return;
+    let Some(previous_history) = previous["rename_history"].as_array() else { return };
+    let mut history = previous_history.clone();
+    let last = previous_history.last().and_then(|change| change["at_ms"].as_i64());
+    if let Some(current) = object.get("rename_history").and_then(serde_json::Value::as_array) {
+        history.extend(current.iter().filter(|change| {
+            change["at_ms"].as_i64() >= last && !previous_history.contains(change)
+        }).cloned());
     }
-    object.insert("rename_history".into(), previous["rename_history"].clone());
-    object.insert("label".into(), previous["label"].clone());
-    object.insert("label_source".into(), previous["label_source"].clone());
+    if history.len() == previous_history.len() {
+        object.insert("label".into(), previous["label"].clone());
+        object.insert("label_source".into(), previous["label_source"].clone());
+    }
+    object.insert("rename_history".into(), history.into());
 }
 
 fn record_delegate_name(input: &mut serde_json::Value, change: &fuzukue_proto::DelegateNameChange) {
     let change_value = serde_json::json!(change);
-    if input["rename_history"].as_array().and_then(|history| history.last()) == Some(&change_value) {
+    if input["rename_history"].as_array().and_then(|history| history.last()).is_some_and(|last| {
+        last == &change_value || last["at_ms"].as_i64().is_some_and(|at| at > change.at_ms)
+    }) {
         return;
     }
     let mut history = input["rename_history"].as_array().cloned().unwrap_or_default();
@@ -1353,12 +1489,12 @@ fn record_delegate_name(input: &mut serde_json::Value, change: &fuzukue_proto::D
 /// Use the ordinary job row events with a small summary payload. Child events
 /// remain in the journal and are sent only to a connection that opens the job.
 pub(crate) fn compact_job_event(
-    mut event: ServerEvent, count: impl FnOnce(&str) -> Option<usize>,
+    mut event: ServerEvent, summary: impl FnOnce(&str) -> Option<JobSummary>,
 ) -> Option<ServerEvent> {
     if let Some((session, job)) = event.worker_child() {
         return match event {
-            ServerEvent::ToolCall { .. } => count(job).map(|tools| ServerEvent::ThreadJobActivity {
-                session: session.into(), job: job.into(), tools,
+            ServerEvent::ToolCall { .. } => summary(job).map(|summary| ServerEvent::ThreadJobActivity {
+                session: session.into(), job: job.into(), tools: summary.tools,
             }),
             _ => None,
         };
@@ -1370,9 +1506,12 @@ pub(crate) fn compact_job_event(
             if let Some(fields) = input.as_object_mut() {
                 fields.retain(|key, _| matches!(key.as_str(),
                     "agent" | "title" | "label" | "label_source" | "card_id" | "queued_at_ms"
-                    | "model" | "started_at_ms" | "dismissed_from_panel"));
+                    | "model" | "started_at_ms" | "dismissed_from_panel" | "selection" | "routing" | "waiting"));
                 fields.insert("details_deferred".into(), true.into());
-                fields.insert("tool_count".into(), count(item).unwrap_or(0).into());
+                if let Some(summary) = summary(item) {
+                    fields.insert("tool_count".into(), summary.tools.into());
+                    fields.insert("job_summary".into(), serde_json::json!(summary));
+                }
             }
         }
         ServerEvent::ToolResult { item, output, .. } if item.starts_with(fuzukue_proto::DELEGATE_JOB) => {
@@ -1460,6 +1599,12 @@ struct HistoryRevision {
     journal: SessionStamp,
     legacy: Option<SessionStamp>,
     after: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct JobCheckpoint {
+    revision: HistoryRevision,
+    jobs: Vec<JobSummary>,
 }
 
 impl Thread {
@@ -1629,6 +1774,7 @@ impl Store {
                     transcript.observe(&env.event);
                     transcript.restore_tool(env.event);
                 });
+                transcript.rebuild_job_facts();
                 transcript.hide_saved_blank_replies();
                 let updated = timestamp.saturating_sub(i64::try_from(last_seq.saturating_sub(last)).unwrap_or(i64::MAX));
                 let session_id = records.get(&session).and_then(|record| record.claude_session_id.clone());
@@ -1916,7 +2062,11 @@ impl Store {
     }
 
     fn checkpoint_path(&self, id: &str) -> PathBuf {
-        self.state_dir.join("thread-tails-v1").join(format!("{:x}.json", Sha256::digest(id.as_bytes())))
+        self.state_dir.join("thread-tails-v2").join(format!("{:x}.json", Sha256::digest(id.as_bytes())))
+    }
+
+    fn job_checkpoint_path(&self, id: &str) -> PathBuf {
+        self.state_dir.join("thread-jobs-v1").join(format!("{:x}.json", Sha256::digest(id.as_bytes())))
     }
 
     fn read_tail_checkpoint(&self, key: &PageKey, workers: &BTreeSet<String>) -> Option<HistoryPage> {
@@ -2044,8 +2194,64 @@ impl Store {
         })
     }
 
-    pub(crate) fn job_tool_count(&self, session: &str, job: &str) -> Option<usize> {
-        self.threads.get(session)?.transcript.job_tools.get(job).copied()
+    pub(crate) fn job_summary_for_event<'a>(&mut self, event: &'a ServerEvent) -> Option<(&'a str, JobSummary)> {
+        let (session, item) = match event {
+            ServerEvent::ToolCall { session, item, name, .. } if name == "delegate" => (session.as_str(), item.as_str()),
+            ServerEvent::ToolResult { session, item, .. } => (session.as_str(), item.as_str()),
+            ServerEvent::DelegateProgress { session, job, .. } | ServerEvent::DelegateRenamed { session, job, .. }
+            | ServerEvent::DelegateDismissed { session, job, .. } => (session.as_str(), job.as_str()),
+            ServerEvent::ToolCall { .. } | ServerEvent::TextDelta { .. } => event.worker_child()?,
+            _ => return None,
+        };
+        let transcript = &self.threads.get(session)?.transcript;
+        let cold = transcript.loaded.get().is_none();
+        let job = if matches!(event, ServerEvent::ToolResult { .. }) {
+            transcript.index.get(item)
+                .and_then(|&position| fuzukue_proto::delegate_job_id(item, &transcript.items[position].meta.actor))
+                .unwrap_or(item)
+        } else {
+            item
+        };
+        let summary = transcript.job_summary(job);
+        if cold {
+            self.trim_transcripts();
+        }
+        summary.map(|summary| (session, summary))
+    }
+
+    pub(crate) fn job_summaries(&self, session: &str) -> Vec<JobSummary> {
+        let Some(thread) = self.threads.get(session) else { return Vec::new() };
+        let revision = thread.history_revision();
+        let path = self.job_checkpoint_path(session);
+        if let Some(revision) = &revision {
+            if let Ok(file) = File::open(&path) {
+                let checkpoint: Result<JobCheckpoint, _> = serde_json::from_reader(file.take(CACHE_PAGE_BYTES as u64));
+                if let Ok(checkpoint) = checkpoint {
+                    if &checkpoint.revision == revision {
+                        return checkpoint.jobs;
+                    }
+                }
+            }
+        }
+        if thread.transcript.check().is_err() {
+            return Vec::new();
+        }
+        let transcript = &thread.transcript;
+        let jobs: Vec<_> = transcript.job_roots.iter().filter_map(|&position| {
+            transcript.job_summary(&transcript.items[position].meta.item)
+        }).collect();
+        if let Some(revision) = revision {
+            let checkpoint = JobCheckpoint { revision, jobs };
+            if let Ok(encoded) = serde_json::to_vec(&checkpoint) {
+                if encoded.len() < CACHE_PAGE_BYTES {
+                    if let Err(error) = durable::write(&path, |output| Ok(output.write_all(&encoded)?)) {
+                        tracing::debug!(%error, session, "could not cache job summaries");
+                    }
+                }
+            }
+            return checkpoint.jobs;
+        }
+        jobs
     }
 
     pub(crate) fn delegate_target(&self, query: &str, session: Option<&str>) -> Result<(String, String)> {
@@ -2925,6 +3131,7 @@ impl Store {
         self.threads.remove(id);
         self.pages.borrow_mut().retain(|(key, _)| key.session != id);
         let _ = std::fs::remove_file(self.checkpoint_path(id));
+        let _ = std::fs::remove_file(self.job_checkpoint_path(id));
         self.restored_generations.remove(id);
         Ok(())
     }
@@ -3085,9 +3292,11 @@ impl Store {
         thread.transcript.check()?;
         if matches!(event,
             ServerEvent::ToolResult { .. } | ServerEvent::DelegateRenamed { .. }
-            | ServerEvent::DelegateDismissed { .. } | ServerEvent::CommentApplication { .. }
+            | ServerEvent::DelegateDismissed { .. } | ServerEvent::DelegateProgress { .. } | ServerEvent::CommentApplication { .. }
             | ServerEvent::MessageDetails { .. } | ServerEvent::ReplySuperseded { .. }
-        ) || matches!(event, ServerEvent::ToolCall { name, .. } if name == "delegate" || event.worker_child().is_some()) {
+        ) || matches!(event, ServerEvent::ToolCall { name, .. } if name == "delegate" || event.worker_child().is_some())
+            || matches!(event, ServerEvent::TextDelta { .. } if event.worker_child().is_some())
+        {
             thread.page_revision = thread.page_revision.wrapping_add(1);
         }
         if matches!(event, ServerEvent::TurnEnded { actor, .. } if crate::routing::is_partner(actor)) {
@@ -3429,6 +3638,65 @@ mod archive_tests {
     }
 
     #[test]
+    fn job_summary_recovers_from_a_checkpoint_and_a_journal_tail() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let records = Default::default();
+        let mut store = Store::load(project.path(), state.path(), &records);
+        let session = store.create(None)?;
+        let job = "delegate:checkpoint";
+        let child = "worker-tool";
+        let tool_call = ServerEvent::ToolCall {
+            session: session.clone(), item: child.into(), name: "Read".into(),
+            actor: Actor::Codex { thread_id: "worker".into(), parent_tool_use: Some(job.into()) },
+            input: serde_json::json!({"path":"notes.md"}),
+        };
+        let thread = store.threads.get_mut(&session).unwrap();
+        thread.transcript.observe(&ServerEvent::ToolCall {
+            session: session.clone(), item: job.into(), actor: Actor::System, name: "delegate".into(),
+            input: serde_json::json!({"title":"Before", "model":"gpt-5.5", "started_at_ms":20}),
+        });
+        thread.transcript.observe(&tool_call);
+        thread.save()?;
+        assert_eq!(store.job_summaries(&session)[0].last_activity.as_deref(), Some("Read notes.md"));
+        store.history_tail(&session, &BTreeSet::from([job.into()]), true, bound_history_tool).unwrap();
+        drop(store);
+
+        let mut writer = state::TimelineWriter::open(state.path())?;
+        let events = [
+            ServerEvent::ToolResult { session: session.clone(), item: child.into(), ok: false, output: "error".into() },
+            ServerEvent::DelegateProgress { session: session.clone(), job: job.into(), summary: "Checking notes".into() },
+            ServerEvent::DelegateRenamed {
+                session: session.clone(), job: job.into(), change: fuzukue_proto::DelegateNameChange {
+                    at_ms: 30, source: "user".into(), previous_label: Some("Before".into()),
+                    label: "Renamed".into(), label_source: None,
+                },
+            },
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            writer.append(&fuzukue_proto::Envelope { workspace: None, seq: index as u64 + 1, event });
+        }
+        drop(writer);
+        let store = Store::load(project.path(), state.path(), &records);
+        assert!(store.threads[&session].transcript.loaded.get().is_none());
+        let summaries = store.job_summaries(&session);
+        let [summary] = summaries.as_slice() else { panic!("expected one job") };
+        assert_eq!(summary.tools, 1);
+        assert!(summary.had_tool_error);
+        assert_eq!(summary.status, JobStatus::Running);
+        assert_eq!(summary.elapsed_at(123), Some(103));
+        assert_eq!(summary.job.selection.as_ref().unwrap().backend, fuzukue_proto::AgentBackend::Codex);
+        assert_eq!(summary.job.display.label.as_deref(), Some("Renamed"));
+        assert_eq!(summary.last_tool.as_deref(), Some("Read notes.md"));
+        assert_eq!(summary.last_activity.as_deref(), Some("Checking notes"));
+        let reopened = Store::load(project.path(), state.path(), &records);
+        let restored = reopened.job_summaries(&session);
+        assert_eq!(serde_json::to_value(restored)?, serde_json::to_value(summaries)?);
+        assert!(reopened.threads[&session].transcript.loaded.get().is_none(), "current job checkpoint should serve the snapshot");
+        Ok(())
+    }
+
+    #[test]
     fn transcript_nul_is_detected_on_first_open() -> anyhow::Result<()> {
         use super::*;
         let project = tempfile::tempdir()?;
@@ -3442,6 +3710,34 @@ mod archive_tests {
         assert!(threads.history_tail(&id, &Default::default(), true, |event| event).is_none());
         assert!(matches!(threads.thread_damage(&id), Some(ServerEvent::Error { message })
             if message.contains("Synthetic thread") && message.contains("NUL")));
+        Ok(())
+    }
+
+    #[test]
+    fn job_summary_size_is_independent_of_worker_history() -> anyhow::Result<()> {
+        let size = |tools: usize| -> anyhow::Result<usize> {
+            let session = "thread-scale";
+            let job = "delegate:scale";
+            let mut transcript = Transcript::default();
+            transcript.observe(&ServerEvent::ToolCall {
+                session: session.into(), item: job.into(), actor: Actor::System, name: "delegate".into(),
+                input: serde_json::json!({"model":"gpt-5.5","started_at_ms":20}),
+            });
+            for i in 0..tools {
+                transcript.observe(&ServerEvent::ToolCall {
+                    session: session.into(), item: format!("{job}:{i}"), actor: Actor::System, name: "Read".into(),
+                    input: serde_json::json!({"path":"notes.md"}),
+                });
+            }
+            let summary = transcript.job_summary(job).unwrap();
+            assert_eq!(summary.tools, tools);
+            assert_eq!(summary.last_tool.as_deref(), Some("Read notes.md"));
+            let compact = transcript.page_events(session, &transcript.items[0], true, &bound_history_tool);
+            assert!(matches!(compact.as_slice(), [ServerEvent::ToolCall { input, .. }]
+                if input["job_summary"]["tools"] == tools));
+            Ok(serde_json::to_vec(&compact)?.len())
+        };
+        assert!(size(512)?.abs_diff(size(5120)?) <= 2);
         Ok(())
     }
 

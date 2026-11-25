@@ -57,6 +57,24 @@ class ProtocolTest {
         assertEquals(2uL, details.nextBefore)
     }
 
+    @Test fun jobSummarySurvivesWindowChangesAndOverlappingSnapshots() {
+        val snapshot = decodeEvent(
+            """{"type":"thread_jobs","session":"s","through":10,"first":true,"jobs":[{"id":"delegate:j","position":20,"job":{"model":"gpt-5.5","started_at_ms":1000,"selection":{"backend":"codex","effort":"high"},"routing":{"tier":"heavy"}},"status":"running","tools":500,"last_tool":"Read README.md"}]}""",
+        ) as ServerEvent.ThreadJobs
+        val before = snapshot.jobs.single()
+        val live = before.copy(tools = 501, lastActivity = "Reviewing notes")
+        val timeline = Timeline(jobSummaries = JobSummaries().update(11uL, live)
+            .snapshot(snapshot.through, snapshot.first, snapshot.jobs)).clearHistory()
+        assertTrue(timeline.rows.isEmpty())
+        assertEquals(listOf(live), timeline.jobSummaries.active)
+        assertEquals("high", timeline.jobSummaries["delegate:j"]?.job?.selection?.effort)
+        assertEquals("heavy", timeline.jobSummaries["delegate:j"]?.job?.routing?.tier)
+        assertEquals("Read README.md", timeline.jobSummaries["delegate:j"]?.lastTool)
+        assertEquals("Reviewing notes", timeline.jobSummaries["delegate:j"]?.lastActivity)
+        assertTrue(timeline.jobSummaries.update(12uL, live.copy(status = JobStatus.Succeeded)).active.isEmpty())
+        assertMessage("""{"type":"get_thread_jobs","session":"s"}""", ClientMessage.GetThreadJobs("s"))
+    }
+
     @Test fun decodesNotificationRoutingAndTerminalUpdateStatus() {
         val notice = Protocol.decode(
             """{"seq":0,"workspace":"lab","event":{"type":"notify","session":"s","kind":"question","future_field":true}}""",

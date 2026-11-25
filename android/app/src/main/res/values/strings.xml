@@ -111,6 +111,7 @@
     <string name="job_done">完了</string>
     <string name="job_done_suffix">" · 完了"</string>
     <string name="job_failed">失敗</string>
+    <string name="job_interrupted">中断</string>
     <string name="job_failed_suffix">" · 失敗"</string>
     <string name="job_queued">待機中</string>
     <string name="job_running">作業中</string>

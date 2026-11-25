@@ -72,7 +72,8 @@ pub const LARGE_LEGACY_FRAME_PROTOCOL: u32 = 70;
 pub const LAZY_DECK_PROTOCOL: u32 = 71;
 pub const WORKSPACE_REQUEST_RECOVERY_PROTOCOL: u32 = 72;
 pub const THREAD_WINDOW_PROTOCOL: u32 = 73;
-pub const PROTOCOL_VERSION: u32 = THREAD_WINDOW_PROTOCOL;
+pub const JOB_SUMMARY_PROTOCOL: u32 = 74;
+pub const PROTOCOL_VERSION: u32 = JOB_SUMMARY_PROTOCOL;
 pub const DECK_PAGE_BYTES: usize = 1024 * 1024;
 pub const CARD_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -449,6 +450,50 @@ pub struct DelegateJob {
     /// Hide this job from the activity panel once it has a report.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dismissed_from_panel: bool,
+}
+
+/// The lifecycle state of a delegated job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Interrupted,
+}
+
+impl JobStatus {
+    pub fn active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+}
+
+/// Server-owned metadata and activity for a job, regardless of loaded transcript ranges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSummary {
+    pub id: String,
+    pub position: usize,
+    pub job: DelegateJob,
+    pub status: JobStatus,
+    pub elapsed_ms: Option<u64>,
+    pub tools: usize,
+    pub had_tool_error: bool,
+    pub last_tool: Option<String>,
+    pub last_activity: Option<String>,
+    pub latest_message: Option<String>,
+    pub changed_file_count: Option<usize>,
+}
+
+impl JobSummary {
+    pub fn elapsed_at(&self, now_ms: u64) -> Option<u64> {
+        if self.status.active() {
+            self.job.started_at_ms.or(self.job.queued_at_ms)
+                .map(|at| now_ms.saturating_sub(at.max(0) as u64))
+        } else {
+            self.elapsed_ms
+        }
+    }
 }
 
 pub use job_labels::{DelegateDisplay, DelegateNameChange, JOB_LABEL_COLUMNS};
@@ -1204,6 +1249,9 @@ pub enum ClientMsg {
     GetThreadArtifacts { session: String },
     /// Fetch whole transcript entries strictly before the supplied cursor.
     GetThreadTail { session: String, request: u64 },
+    /// Request chat-wide job summaries independently of transcript pagination.
+    GetThreadJobs { session: String },
+    GetThreadJobReport { session: String, job: String, request: u64 },
     /// Fetch whole transcript entries starting at this inclusive ordinal.
     GetThreadHistoryFrom { session: String, request: u64, start: u64, generation: u64 },
     /// Subscribe to a worker while its details are expanded, or unsubscribe on collapse.
@@ -2416,6 +2464,11 @@ pub enum ServerEvent {
         events: Vec<ServerEvent>,
     },
     ThreadJobActivity { session: String, job: String, tools: usize },
+    /// A job list snapshot at the same journal position for every row.
+    ThreadJobs { session: String, through: u64, first: bool, jobs: Vec<JobSummary> },
+    /// A replacement summary, even if the worker's activity range is closed.
+    ThreadJobUpdated { session: String, through: u64, summary: JobSummary },
+    ThreadJobReport { session: String, job: String, request: u64, result: Option<(bool, DelegateReport)> },
     ThreadHistoryFailed {
         session: String,
         request: u64,
@@ -2801,6 +2854,7 @@ impl ServerEvent {
             | Self::FolderGrants { .. } | Self::FolderGrantsChanged { .. }
             | Self::ThreadHistoryStart { .. } | Self::ThreadHistoryPage { .. }
             | Self::ThreadJobDetails { .. } | Self::ThreadJobActivity { .. }
+            | Self::ThreadJobs { .. } | Self::ThreadJobUpdated { .. } | Self::ThreadJobReport { .. }
             | Self::ThreadHistoryFrom { .. } | Self::ThreadHistoryFailed { .. } | Self::ThreadTail { .. } | Self::ThreadSync { .. })
             || matches!(self, Self::LocalNotice { item, .. } if item == COMPOSER_NOTICE_ITEM)
     }

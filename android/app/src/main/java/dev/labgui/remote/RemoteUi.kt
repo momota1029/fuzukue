@@ -709,7 +709,9 @@ private fun Conversation(
                         items(visibleRows, key = { "event/${it.key}" }) { entry ->
                             when (val row = entry.value) {
                                 is TimelineRow.Message -> MessageBubble(row, target, attachmentView.sent)
-                                is TimelineRow.Job -> JobPanel(row) { older -> onRequestJob(session, entry.key, older) }
+                                is TimelineRow.Job -> JobPanel(row, timeline.jobSummaries[entry.key] ?: row.wireSummary) { older ->
+                                    onRequestJob(session, entry.key, older)
+                                }
                                 is TimelineRow.ApprovalOutcome -> ApprovalOutcomeRow(row)
                                 is TimelineRow.Note -> Text(row.text, color = colors.onSurfaceVariant,
                                     style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 8.dp))
@@ -743,7 +745,8 @@ private fun Conversation(
                 }
                 ApprovalDock(
                     queuedApprovals, state.approvalDock.decisions[session], state.canSend, maxDockHeight, openApprovalDock,
-                    jobTitle = { (timeline.rows[it] as? TimelineRow.Job)?.info?.displayTitle ?: it },
+                    jobTitle = { timeline.jobSummaries[it]?.job?.displayTitle
+                        ?: (timeline.rows[it] as? TimelineRow.Job)?.info?.displayTitle ?: it },
                     onDecide = onDecideQueuedApprovals,
                     onDismissResult = onDismissQueuedDecision,
                     loadError = state.approvalDock.loadError,
@@ -856,16 +859,20 @@ private fun ActivityLine(
     state: RemoteState, session: String, timeline: Timeline, approvalPending: Boolean,
     firstPendingAt: Long?, onStopWorker: (String, String) -> Unit,
 ) {
-    val jobs = remember(timeline.rows) {
-        timeline.rows.mapNotNull { (item, row) ->
-            if (row is TimelineRow.Job && row.ok == null) item to row else null
+    val jobs = remember(timeline.jobSummaries, timeline.rows) {
+        val summaries = timeline.jobSummaries.active.map { Triple(it.id, it.job, it) }
+        if (timeline.jobSummaries.received) summaries else summaries + timeline.rows.mapNotNull { (item, row) ->
+            if (row is TimelineRow.Job && row.ok == null && timeline.jobSummaries[item] == null &&
+                row.wireSummary?.status?.active != false) {
+                Triple(item, row.wireSummary?.job ?: row.info, row.wireSummary)
+            } else null
         }
     }
     val wait = state.waiting.reason(session)
     val drain = state.drain?.takeIf { it.holdingInput }
     val turnRunning = state.isTurnRunning(session)
     val working = (turnRunning && !approvalPending && timeline.pauseReason == null) ||
-        jobs.any { (_, job) -> job.info.startedAt != null }
+        jobs.any { (_, job) -> job.startedAt != null }
     val detail = when {
         approvalPending -> stringResource(R.string.approval_pending)
         timeline.pauseReason != null -> stringResource(R.string.reply_paused, timeline.pauseReason)
@@ -879,7 +886,7 @@ private fun ActivityLine(
     if (!turnRunning && jobs.isEmpty() && detail == null) return
 
     val startedAt = if (working) {
-        (jobs.mapNotNull { (_, job) -> job.info.startedAt } + listOfNotNull(timeline.runningSince)).minOrNull()
+        (jobs.mapNotNull { (_, job) -> job.startedAt } + listOfNotNull(timeline.runningSince)).minOrNull()
     } else if (approvalPending || timeline.pauseReason != null) {
         null
     } else drain?.startedAt ?: firstPendingAt
@@ -907,11 +914,16 @@ private fun ActivityLine(
                     if (turnRunning && detail == null) {
                         Text(stringResource(R.string.activity_front_desk), style = MaterialTheme.typography.bodyMedium)
                     }
-                    jobs.forEach { (item, job) ->
+                    jobs.forEach { (item, job, summary) ->
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f).padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(job.info.displayTitle, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                if (job.info.model.isNotBlank()) StatusLabel(job.info.model)
+                                Text(job.displayTitle, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                val status = jobStatusLabel(summary?.status ?: if (job.startedAt == null) JobStatus.Queued else JobStatus.Running)
+                                val age = (job.startedAt ?: job.queuedAt)?.let { at ->
+                                    elapsedLabel((since + elapsed - at.coerceAtLeast(0)).coerceAtLeast(0))
+                                }
+                                Text(listOfNotNull(status, age).joinToString(" · "), style = MaterialTheme.typography.labelMedium)
+                                JobMetadata(job, summary)
                             }
                             TextButton(onClick = { onStopWorker(session, item) }, enabled = state.canSend) {
                                 Text(stringResource(R.string.stop))
@@ -974,30 +986,61 @@ private fun MessageBubble(
 }
 
 @Composable
-private fun JobPanel(job: TimelineRow.Job, onRequest: (older: Boolean) -> Unit) {
-    val status = when (job.ok) {
-        true -> stringResource(R.string.job_done)
-        false -> stringResource(R.string.job_failed)
-        null -> if (job.info.startedAt == null) stringResource(R.string.job_queued) else stringResource(R.string.job_running)
+private fun JobMetadata(info: JobInfo, summary: JobSummary?) {
+    val backend = when (info.selection?.backend) {
+        "claude" -> "Claude"
+        "codex" -> "Codex"
+        else -> info.selection?.backend
     }
-    val startedAt = job.info.startedAt
+    val metadata = listOfNotNull(info.model.takeIf { it.isNotBlank() }, info.selection?.effort, info.routing?.tier, backend)
+    if (metadata.isNotEmpty()) StatusLabel(metadata.joinToString(" · "))
+    if (summary != null) {
+        Text(
+            listOfNotNull(stringResource(R.string.job_tool_count, summary.tools), summary.lastActivity ?: summary.lastTool)
+                .joinToString(" · "),
+            maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium,
+        )
+    }
+}
+
+@Composable
+private fun jobStatusLabel(status: JobStatus) = stringResource(when (status) {
+    JobStatus.Succeeded -> R.string.job_done
+    JobStatus.Failed -> R.string.job_failed
+    JobStatus.Interrupted -> R.string.job_interrupted
+    JobStatus.Queued -> R.string.job_queued
+    JobStatus.Running -> R.string.job_running
+})
+
+@Composable
+private fun JobPanel(job: TimelineRow.Job, summary: JobSummary?, onRequest: (older: Boolean) -> Unit) {
+    val info = summary?.job ?: job.info
+    val state = summary?.status ?: when (job.ok) {
+        true -> JobStatus.Succeeded
+        false -> JobStatus.Failed
+        null -> if (info.startedAt == null) JobStatus.Queued else JobStatus.Running
+    }
+    val status = jobStatusLabel(state)
+    val startedAt = info.startedAt ?: info.queuedAt
     var elapsed by remember(startedAt) { mutableLongStateOf(elapsedSince(startedAt)) }
-    LaunchedEffect(startedAt, job.ok) {
-        while (startedAt != null && job.ok == null) {
+    LaunchedEffect(startedAt, state) {
+        while (startedAt != null && state.active) {
             elapsed = elapsedSince(startedAt)
             delay(1_000)
         }
     }
-    val time = job.report?.elapsed ?: elapsed.takeIf { startedAt != null && job.ok == null }
+    val time = if (state.active) elapsed.takeIf { startedAt != null }
+        else if (summary != null) summary.elapsed else job.report?.elapsed
     if (job.info.detailsDeferred) {
         Panel(color = MaterialTheme.colorScheme.surfaceContainer) {
             TextButton(onClick = { onRequest(false) }) {
                 Text(
-                    listOf(job.info.displayTitle, status, job.info.model,
-                        stringResource(R.string.job_tool_count, job.info.toolCount)).joinToString(" · "),
+                    listOfNotNull(info.displayTitle, status, time?.let { elapsedLabel(it) },
+                        stringResource(R.string.job_tool_count, job.info.toolCount).takeIf { summary == null }).joinToString(" · "),
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
             }
+            JobMetadata(info, summary)
             if (job.nextDetail != null) {
                 TextButton(onClick = { onRequest(true) }, enabled = !job.loadingDetails) {
                     Text(stringResource(R.string.job_earlier_activity))
@@ -1010,7 +1053,7 @@ private fun JobPanel(job: TimelineRow.Job, onRequest: (older: Boolean) -> Unit) 
     val detail = if (job.ok != null) job.report?.text?.takeIf { it.isNotBlank() } ?: job.summary else job.summary
     Panel(color = MaterialTheme.colorScheme.surfaceContainer) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(job.info.displayTitle, Modifier.weight(1f),
+            Text(info.displayTitle, Modifier.weight(1f),
                 style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
             if (time != null) Text(elapsedLabel(time), style = MaterialTheme.typography.labelMedium)
             StatusLabel(status)

@@ -10,7 +10,8 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.decodeFromJsonElement
 
-const val PROTOCOL_VERSION = 73
+internal const val JOB_SUMMARY_PROTOCOL = 74
+const val PROTOCOL_VERSION = JOB_SUMMARY_PROTOCOL
 internal const val MIN_PROTOCOL_VERSION = 18
 internal const val THREAD_HISTORY_PROTOCOL = 62
 internal const val FOLDER_ACCESS_REQUEST = "folder-access-"
@@ -33,6 +34,9 @@ sealed interface ClientMessage {
 
     @Serializable @SerialName("get_thread_tail")
     data class GetThreadTail(val session: String, val request: ULong) : ClientMessage
+
+    @Serializable @SerialName("get_thread_jobs")
+    data class GetThreadJobs(val session: String) : ClientMessage
 
     @Serializable @SerialName("get_thread_job")
     data class GetThreadJob(
@@ -139,9 +143,38 @@ data class JobInfo(
     @SerialName("card_id") val cardId: String? = null,
     @SerialName("details_deferred") val detailsDeferred: Boolean = false,
     @SerialName("tool_count") val toolCount: Int = 0,
+    @SerialName("queued_at_ms") val queuedAt: Long? = null,
+    val selection: JobSelection? = null,
+    val routing: JobRouting? = null,
+    @SerialName("dismissed_from_panel") val dismissedFromPanel: Boolean = false,
 ) {
     val displayTitle: String get() = label ?: title?.takeIf { it.isNotBlank() && it != cardId } ?: agent ?: model
 }
+
+@Serializable
+data class JobSelection(val backend: String, val model: String? = null, val effort: String? = null)
+
+@Serializable
+data class JobRouting(val tier: String)
+
+@Serializable
+enum class JobStatus {
+    @SerialName("queued") Queued,
+    @SerialName("running") Running,
+    @SerialName("succeeded") Succeeded,
+    @SerialName("failed") Failed,
+    @SerialName("interrupted") Interrupted;
+
+    val active: Boolean get() = this == Queued || this == Running
+}
+
+@Serializable
+data class JobSummary(
+    val id: String, val position: Int, val job: JobInfo, val status: JobStatus, val tools: Int,
+    @SerialName("elapsed_ms") val elapsed: Long? = null,
+    @SerialName("last_activity") val lastActivity: String? = null,
+    @SerialName("last_tool") val lastTool: String? = null,
+)
 
 @Serializable
 data class JobNameChange(val label: String)
@@ -308,6 +341,12 @@ sealed interface ServerEvent {
     @Serializable data class ThreadJobActivity(
         override val session: String, val job: String, val tools: Int,
     ) : InThread
+    @Serializable data class ThreadJobs(
+        val session: String, val through: ULong, val first: Boolean, val jobs: List<JobSummary>,
+    ) : ServerEvent
+    @Serializable data class ThreadJobUpdated(
+        val session: String, val through: ULong, val summary: JobSummary,
+    ) : ServerEvent
     @Serializable data class ThreadHistoryFailed(val session: String, val request: ULong, val reason: String? = null) : ServerEvent
     @Serializable data class ThreadHistoryInvalidated(val session: String) : ServerEvent
     @Serializable data class ThreadRestored(val session: String, val events: List<JsonObject>) : ServerEvent
@@ -401,6 +440,8 @@ object Protocol {
             "thread_tail" -> json.decodeFromJsonElement<ServerEvent.ThreadTail>(event)
             "thread_job_details" -> json.decodeFromJsonElement<ServerEvent.ThreadJobDetails>(event)
             "thread_job_activity" -> json.decodeFromJsonElement<ServerEvent.ThreadJobActivity>(event)
+            "thread_jobs" -> json.decodeFromJsonElement<ServerEvent.ThreadJobs>(event)
+            "thread_job_updated" -> json.decodeFromJsonElement<ServerEvent.ThreadJobUpdated>(event)
             "thread_history_page" -> json.decodeFromJsonElement<ServerEvent.ThreadHistoryPage>(event)
             "thread_history_failed" -> json.decodeFromJsonElement<ServerEvent.ThreadHistoryFailed>(event)
             "thread_history_invalidated" -> json.decodeFromJsonElement<ServerEvent.ThreadHistoryInvalidated>(event)

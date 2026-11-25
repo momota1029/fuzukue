@@ -69,8 +69,25 @@ struct WorkerActivityDetails<'a> {
 }
 
 impl<'a> WorkerActivity<'a> {
+    fn from_summary(summary: &'a JobSummary, expanded: bool, now_ms: u64) -> Self {
+        Self {
+            title: delegate_activity_name(&summary.job),
+            elapsed: summary.elapsed_at(now_ms).map(|ms| activity_time(ms / 1000)),
+            calls: summary.tools,
+            last_tool: summary.last_tool.as_deref(),
+            selection: summary.job.selection.as_ref(),
+            tier: summary.job.routing.as_ref().map(|route| route.tier),
+            failed: summary.had_tool_error || matches!(summary.status, JobStatus::Failed | JobStatus::Interrupted),
+            details: expanded.then(|| WorkerActivityDetails {
+                last_activity: summary.last_activity.as_deref(),
+                latest_message: summary.latest_message.as_deref(),
+            }),
+        }
+    }
+
     fn new(block: &'a DelegateBlock, expanded: bool, now_ms: u64) -> Self {
-        let (calls, failed) = delegate_tools(block);
+        let (loaded_calls, failed) = delegate_tools(block);
+        let calls = block.deferred.as_ref().map_or(loaded_calls, |deferred| deferred.tools.max(loaded_calls));
         let saved_activity = block.report.as_ref().and_then(|(_, report)| report.tool_activity.as_ref());
         let calls = saved_activity.map_or(calls, |activity| activity.count.max(calls));
         let last_tool = block.progress.iter().rev().find_map(|entry| match entry {
@@ -111,10 +128,10 @@ fn job_chip(id: SharedString, text: &str, cx: &gpui_kit::App) -> Stateful<Div> {
         .bg(theme.muted).text_color(theme.muted_foreground).text_xs().truncate().child(text)
 }
 
-fn job_metadata(block: &DelegateBlock, worker: &WorkerActivity<'_>, index: usize, cx: &gpui_kit::App) -> Div {
+fn job_metadata(job: &DelegateJob, worker: &WorkerActivity<'_>, index: usize, cx: &gpui_kit::App) -> Div {
     let selection = worker.selection;
     let model = selection.and_then(|selection| selection.model.as_deref())
-        .or_else(|| (!block.job.model.is_empty()).then_some(block.job.model.as_str()));
+        .or_else(|| (!job.model.is_empty()).then_some(job.model.as_str()));
     let backend = selection.map(|selection| selection.backend)
         .or_else(|| model.map(|model| AgentBackend::for_model(Some(model))));
     let effort = selection.and_then(|selection| selection.effort.as_deref());
@@ -161,11 +178,50 @@ fn command_state(state: BackgroundCommandState) -> &'static str {
 }
 
 impl Workbench {
-    pub(super) fn rename_job_button(&self, session: &str, block: &DelegateBlock, id: SharedString) -> Button {
+    fn show_job_report(
+        view: WeakEntity<Self>, session: String, name: String, ok: bool, report: DelegateReport,
+        window: &mut Window, cx: &mut gpui_kit::App,
+    ) {
+        let title = if ok { tr!("chat-final-report") } else { tr!("chat-failure-details") };
+        let text = if report.interrupted { tr!("chat-worker-recovery").to_owned() } else { report.text };
+        let changes = report.changes;
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let Some(view) = view.upgrade() else { return dialog };
+            let this = view.read(cx);
+            let Some(chat) = this.chats.get(&session) else { return dialog };
+            dialog.title(title).w(px(620.))
+                .child(v_flex().id("job-report-dialog").gap_2()
+                    .child(div().font_bold().child(name.clone()))
+                    .child(this.chat_markdown("job-report-text".into(), fuzukue_view::link_card_refs(&text), chat, cx))
+                    .children((!changes.is_empty()).then(|| div().whitespace_normal().child(changes.clone()))))
+        });
+    }
+
+    pub(crate) fn finish_job_report(
+        &mut self, session: &str, job: &str, request: u64, result: Option<(bool, DelegateReport)>,
+        window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        let Some(chat) = self.chats.get_mut(session) else { return };
+        if chat.jobs.report_request.as_ref().is_none_or(|(id, item)| *id != request || item != job) {
+            return;
+        }
+        chat.jobs.report_request = None;
+        if self.active != session {
+            return;
+        }
+        if let Some((ok, report)) = result {
+            let name = chat.jobs.get(job).map(|summary| delegate_activity_name(&summary.job))
+                .or_else(|| chat.delegate_block(job).map(|block| delegate_activity_name(&block.job)))
+                .unwrap_or(job).to_owned();
+            Self::show_job_report(cx.weak_entity(), session.into(), name, ok, report, window, cx);
+        }
+    }
+
+    pub(super) fn rename_job_button(&self, session: &str, job_id: &str, metadata: &DelegateJob, id: SharedString) -> Button {
         let session = session.to_owned();
-        let job = block.id.clone();
-        let name = block.job.display.label_source.as_deref()
-            .unwrap_or_else(|| delegate_activity_name(&block.job)).to_owned();
+        let job = job_id.to_owned();
+        let name = metadata.display.label_source.as_deref()
+            .unwrap_or_else(|| delegate_activity_name(metadata)).to_owned();
         let out = self.out.clone();
         inline_button(id).label(tr!("chat-job-rename")).tab_stop(true)
             .on_click(move |_, window, cx| {
@@ -229,7 +285,7 @@ impl Workbench {
         }
         let turn = chat.turn_activity();
         let static_goal = self.chat_waiting.static_goal_status(session, chat);
-        let jobs: Vec<_> = chat.pending_jobs().map(|(_, job)| job).collect();
+        let jobs: Vec<_> = chat.pending_jobs().map(|(_, _, job)| job).collect();
         let (label, metadata) = if compacting {
             (Some(tr!("chat-wait-compacting").to_owned()), None)
         } else if let Some(goal) = static_goal {
@@ -367,19 +423,31 @@ impl Workbench {
         let commands = self.chat_waiting.background_commands(session);
         let goal = self.chat_waiting.static_goal_status(session, chat);
         let theme = cx.theme();
-        let mut jobs: Vec<_> = chat.pending_jobs()
-            .filter_map(|(row, _)| match &chat.rows[row].content {
-                Content::Delegate(block) => Some((row, block)),
-                _ => None,
-            }).collect();
-        jobs.sort_unstable_by_key(|(row, _)| *row);
-        if self.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL {
-            jobs.extend(chat.finished_panel_jobs());
+        let mut jobs: Vec<_> = chat.jobs.iter()
+            .filter(|summary| summary.status.active() || !summary.job.dismissed_from_panel)
+            .map(|summary| (summary.position, summary.id.as_str(), Some(summary), chat.delegate_block(&summary.id)))
+            .collect();
+        if !chat.jobs.received {
+            jobs.extend(chat.pending_jobs().filter_map(|(position, id, _)| {
+                let block = chat.delegate_block(id)?;
+                chat.jobs.get(id).is_none().then_some((position, id, block.wire_summary.as_ref(), Some(block)))
+            }));
+            if self.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL {
+                jobs.extend(chat.finished_panel_jobs().filter(|(_, block)| chat.jobs.get(&block.id).is_none())
+                    .map(|(position, block)| (position, block.id.as_str(), block.wire_summary.as_ref(), Some(block))));
+            }
         }
+        jobs.sort_unstable_by_key(|(position, _, summary, block)| {
+            if summary.map_or_else(|| block.is_some_and(|block| block.report.is_none()), |summary| summary.status.active()) {
+                (false, *position)
+            } else {
+                (true, usize::MAX - *position)
+            }
+        });
         let state = panel.read(cx);
         let selected = jobs
             .iter()
-            .position(|(_, job)| Some(job.id.as_str()) == state.selected.as_deref())
+            .position(|(_, id, _, _)| Some(*id) == state.selected.as_deref())
             .unwrap_or(0);
         let scroll = state.scroll.clone();
         let inset = window.client_inset().unwrap_or_default();
@@ -425,11 +493,17 @@ impl Workbench {
                     .child(status_sep(theme.muted_foreground))
                     .child(div().flex_none().text_color(theme.muted_foreground).child(elapsed))
             }));
-        for (index, &(_, block)) in jobs.iter().enumerate() {
-            let expanded = state.expanded.as_deref() == Some(block.id.as_str());
-            let worker = WorkerActivity::new(block, expanded, now_ms);
+        let pending_jobs = chat.pending_jobs().count();
+        for (index, &(_, id, summary, block)) in jobs.iter().enumerate() {
+            let expanded = state.expanded.as_deref() == Some(id);
+            let report = block.and_then(|block| block.report.as_ref());
+            let job = summary.map_or_else(|| &block.unwrap().job, |summary| &summary.job);
+            let worker = match summary {
+                Some(summary) => WorkerActivity::from_summary(summary, expanded, now_ms),
+                None => WorkerActivity::new(block.unwrap(), expanded, now_ms),
+            };
             let toggle = {
-                let job = block.id.clone();
+                let job = id.to_owned();
                 let panel = panel.clone();
                 move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut gpui_kit::App| {
                     panel.update(cx, |state, _| {
@@ -439,7 +513,7 @@ impl Workbench {
                     window.refresh();
                 }
             };
-            let running = block.report.is_none();
+            let running = summary.map_or(report.is_none(), |summary| summary.status.active());
             let mut actions = h_flex().flex_none().flex_wrap().gap_1().child(
                 inline_button(activity_id(&format!("job-details-{index}")))
                     .tab_stop(true).label(tr!("chat-activity-details"))
@@ -447,17 +521,17 @@ impl Workbench {
                     .on_click(toggle),
             );
             if running && self.protocol >= 14 {
-                let (target_session, target_job) = (session.to_owned(), block.id.clone());
+                let (target_session, target_job) = (session.to_owned(), id.to_owned());
                 let view = view.clone();
-                let chosen = chat.worker_target.as_deref() == Some(&block.id);
-                let target_id = if chat.pending_delegates.len() == 1 {
+                let chosen = chat.worker_target.as_deref() == Some(id);
+                let target_id = if pending_jobs == 1 {
                     "chat-role-target".into()
                 } else {
-                    SharedString::from(format!("worker-target-{}", block.id))
+                    SharedString::from(format!("worker-target-{id}"))
                 };
                 let command = ClientMsg::StopWorker {
                     session: session.to_owned(),
-                    job: block.id.clone(),
+                    job: id.to_owned(),
                 };
                 let out = self.out.clone();
                 actions = actions
@@ -473,7 +547,7 @@ impl Workbench {
                             .on_click(move |_, _, cx| {
                                 let _ = view.update(cx, |this, cx| {
                                     if let Some(chat) = this.chats.get_mut(&target_session) {
-                                        if chat.pending_delegates.contains(&target_job) {
+                                        if chat.pending_jobs().any(|(_, id, _)| id == target_job) {
                                             chat.worker_target =
                                                 (!chosen).then(|| target_job.clone());
                                             cx.notify();
@@ -483,7 +557,7 @@ impl Workbench {
                             }),
                     )
                     .child(
-                        inline_button(SharedString::from(format!("stop-worker-{}", block.id)))
+                        inline_button(SharedString::from(format!("stop-worker-{id}")))
                             .tab_stop(true).label(tr!("chat-stop"))
                             .on_click(move |_, _, _| {
                                 let _ = out.send(command.clone());
@@ -491,42 +565,45 @@ impl Workbench {
                     );
             }
             if running && self.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL {
-                actions = actions.child(self.rename_job_button(session, block, activity_id(&format!("job-rename-{index}"))));
+                actions = actions.child(self.rename_job_button(session, id, job, activity_id(&format!("job-rename-{index}"))));
             }
-            let job_id = block.id.clone();
+            let job_id = id.to_owned();
             actions = actions.child(
                 inline_button(activity_id(&format!("job-copy-{index}"))).tab_stop(true)
                     .label(tr!("chat-job-copy-id"))
                     .on_click(move |_, _, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(job_id.clone()))),
             );
-            if let Some((ok, report)) = &block.report {
-                let title = if *ok { tr!("chat-final-report") } else { tr!("chat-failure-details") };
+            let has_report = summary.is_some_and(|summary|
+                summary.elapsed_ms.is_some() || summary.status == JobStatus::Interrupted);
+            if !running && (report.is_some() || has_report) {
                 let name = worker.title.to_owned();
-                let text = if report.interrupted { tr!("chat-worker-recovery").to_owned() } else { report.text.clone() };
-                let changes = report.changes.clone();
+                let report = report.filter(|(_, report)| summary.is_none() || report.interrupted || !report.text.is_empty()).cloned();
                 let (view, card, session) = (view.clone(), card.clone(), session.to_owned());
+                let job_id = id.to_owned();
                 actions = actions.child(
                     inline_button(activity_id(&format!("job-report-{index}"))).tab_stop(true)
                         .label(tr!("chat-job-open-report"))
                         .on_click(move |_, window, cx| {
                             let _ = card.update(cx, |card, cx| card.dismiss(window, cx));
-                            let (view, session, name, text, changes) =
-                                (view.clone(), session.clone(), name.clone(), text.clone(), changes.clone());
-                            window.open_dialog(cx, move |dialog, _, cx| {
-                                let Some(view) = view.upgrade() else { return dialog };
-                                let this = view.read(cx);
-                                let Some(chat) = this.chats.get(&session) else { return dialog };
-                                dialog.title(title).w(px(620.))
-                                    .child(v_flex().id("job-report-dialog").gap_2()
-                                        .child(div().font_bold().child(name.clone()))
-                                        .child(this.chat_markdown("job-report-text".into(), fuzukue_view::link_card_refs(&text), chat, cx))
-                                        .children((!changes.is_empty()).then(|| div().whitespace_normal().child(changes.clone()))))
-                            });
+                            if let Some((ok, report)) = &report {
+                                Self::show_job_report(view.clone(), session.clone(), name.clone(), *ok, report.clone(), window, cx);
+                            } else {
+                                let _ = view.update(cx, |this, _| {
+                                    let request = chat_history::next_request();
+                                    if let Some(chat) = this.chats.get_mut(&session) {
+                                        if this.out.send(ClientMsg::GetThreadJobReport {
+                                            session: session.clone(), job: job_id.clone(), request,
+                                        }).is_ok() {
+                                            chat.jobs.report_request = Some((request, job_id.clone()));
+                                        }
+                                    }
+                                });
+                            }
                         }),
                 );
             }
             if !running && self.protocol >= fuzukue_proto::JOB_DISMISS_PROTOCOL {
-                let command = ClientMsg::DismissJob { session: session.to_owned(), job: block.id.clone() };
+                let command = ClientMsg::DismissJob { session: session.to_owned(), job: id.to_owned() };
                 let out = self.out.clone();
                 actions = actions.child(
                     inline_button(activity_id(&format!("job-dismiss-{index}"))).tab_stop(true)
@@ -536,14 +613,17 @@ impl Workbench {
                         }),
                 );
             }
-            let accessible_status = match &block.report {
-                Some((_, report)) if report.interrupted => tr!("agents-interrupted"),
-                Some((true, _)) => tr!("chat-done"),
-                Some((false, _)) => tr!("chat-failed"),
-                None if block.job.started_at_ms.is_some() => tr!("chat-activity-working"),
-                None => tr!("chat-activity-waiting"),
+            let accessible_status = match (summary.map(|summary| summary.status), report) {
+                (Some(JobStatus::Running), _) => tr!("chat-activity-working"),
+                (Some(JobStatus::Queued), _) => tr!("chat-activity-waiting"),
+                (Some(status), _) => job_status_label(status),
+                (None, Some((_, report))) if report.interrupted => tr!("agents-interrupted"),
+                (None, Some((true, _))) => tr!("chat-done"),
+                (None, Some((false, _))) => tr!("chat-failed"),
+                (None, None) if job.started_at_ms.is_some() => tr!("chat-activity-working"),
+                (None, None) => tr!("chat-activity-waiting"),
             };
-            let wait_status = block.job.waiting.as_ref().map(|reason| {
+            let wait_status = job.waiting.as_ref().map(|reason| {
                 format!("{}: {reason}", tr!("chat-waiting"))
             });
             let accessible_label = worker_heading(
@@ -556,8 +636,8 @@ impl Workbench {
             } else {
                 accessible_label
             };
-            let title_tip = block.job.title.clone()
-                .or_else(|| block.job.display.label_source.clone()).unwrap_or_else(|| worker.title.to_owned());
+            let title_tip = job.title.clone()
+                .or_else(|| job.display.label_source.clone()).unwrap_or_else(|| worker.title.to_owned());
             let heading = h_flex()
                 .id(activity_id(&format!("job-heading-{index}")))
                 .role(Role::Group)
@@ -565,13 +645,13 @@ impl Workbench {
                 .min_w_0()
                 .items_center()
                 .gap_1()
-                .when(running && block.job.started_at_ms.is_some(), |heading| {
+                .when(running && job.started_at_ms.is_some(), |heading| {
                     heading.child(activity_spinner(
                         activity_id(&format!("job-icon-{index}")),
                         theme.ring,
                     ))
                 })
-                .when(running && block.job.started_at_ms.is_none(), |heading| {
+                .when(running && job.started_at_ms.is_none(), |heading| {
                     heading.child(
                         div()
                             .size(px(14.))
@@ -591,7 +671,7 @@ impl Workbench {
                         .bg(theme.danger)
                 }))
                 .when(!running, |row| row.child(job_chip(activity_id(&format!("job-state-{index}")), accessible_status, cx)))
-                .children(block.job.display.card_id.as_ref().map(|id| {
+                .children(job.display.card_id.as_ref().map(|id| {
                     job_chip(activity_id(&format!("job-card-{index}")), id, cx)
                 }))
                 .child(
@@ -618,10 +698,10 @@ impl Workbench {
                 .rounded_md()
                 .when(pinned && selected == index, |item| item.bg(theme.accent))
                 .child(heading)
-                .child(job_metadata(block, &worker, index, cx))
+                .child(job_metadata(job, &worker, index, cx))
                 .child(h_flex().min_w_0().gap_2().text_color(theme.muted_foreground)
                     .child(div().flex_none().child(tr!("chat-job-tool-count", count = worker.calls)))
-                    .children(worker.last_tool.map(|tool| {
+                    .children(worker.last_tool.or_else(|| summary.and_then(|summary| summary.last_activity.as_deref())).map(|tool| {
                         let tool = tool.to_owned();
                         div().id(activity_id(&format!("job-last-tool-{index}"))).min_w_0().truncate()
                             .child(tool.clone())
@@ -649,7 +729,7 @@ impl Workbench {
                     label
                 };
                 item = item
-                    .children(delegate_details(&block.job, block.report.as_ref().map(|(_, report)| report))
+                    .children(delegate_details(job, report.map(|(_, report)| report))
                         .into_iter().map(|line| div().whitespace_normal().child(line)))
                     .child(
                         status_row(&label, theme.muted_foreground)
@@ -675,7 +755,7 @@ impl Workbench {
                         .min_w_0();
                     let preview = if fuzukue_view::markdown_code::has_code(message) {
                         preview.bg(theme.background).child(self.chat_markdown(
-                            activity_id(&format!("job-preview-markdown-{}", block.id)),
+                            activity_id(&format!("job-preview-markdown-{id}")),
                             fuzukue_view::link_card_refs(message),
                             chat,
                             cx,
@@ -687,23 +767,25 @@ impl Workbench {
                         view.clone(),
                         card.clone(),
                         session.to_owned(),
-                        block.id.clone(),
+                        id.to_owned(),
                     );
                     item = item
                         .child(preview)
-                        .child(
+                        .when(block.is_some(), |item| item.child(
                             inline_button(activity_id(&format!("job-full-{index}")))
                                 .self_start()
                                 .tab_stop(true).label(tr!("chat-activity-full-message"))
                                 .on_click(move |_, window, cx| {
                                     let _ = card.update(cx, |card, cx| card.dismiss(window, cx));
                                     let _ = view.update(cx, |this, cx| {
-                                        let Some(chat) = this.chats.get_mut(&session) else {
-                                            return;
-                                        };
-                                        let Some(&row) = chat.by_item.get(&job) else {
-                                            return;
-                                        };
+                                        let Some(chat) = this.chats.get(&session) else { return };
+                                        let Some(&row) = chat.by_item.get(&job) else { return };
+                                        if chat.delegate_block(&job).and_then(|block| block.deferred.as_ref())
+                                            .is_some_and(|deferred| !deferred.open)
+                                        {
+                                            this.toggle_thread_job(&session, row, cx);
+                                        }
+                                        let chat = this.chats.get_mut(&session).unwrap();
                                         if let Some(Row {
                                             content: Content::Delegate(block),
                                             ..
@@ -716,7 +798,7 @@ impl Workbench {
                                         }
                                     });
                                 }),
-                        );
+                        ));
                 }
             }
             rows = rows.child(item);
@@ -757,7 +839,7 @@ impl Workbench {
         }
         let jobs: Vec<_> = jobs
             .into_iter()
-            .map(|(_, block)| block.id.clone())
+            .map(|(_, id, _, _)| id.to_owned())
             .collect();
         let panel = panel.clone();
         div()
@@ -812,6 +894,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_activity_reads_job_summary_without_a_transcript_row() {
+        let summary: JobSummary = serde_json::from_value(serde_json::json!({
+            "id":"delegate:test", "position":20, "status":"running",
+            "job":{
+                "title":"Check references", "model":"gpt-5.5", "started_at_ms":1000,
+                "selection":{"backend":"codex","model":"gpt-5.5","effort":"high"},
+                "routing":{"tier":"heavy","reason":"test"},
+            },
+            "tools":512, "had_tool_error":true, "last_tool":"Read README.md",
+            "last_activity":"Reviewing notes", "latest_message":"The links resolve.",
+        })).unwrap();
+        let mut jobs = chat_history::JobSummaries::default();
+        jobs.update(11, summary.clone());
+        jobs.snapshot(10, true, vec![JobSummary { tools: 0, ..summary }]);
+        let worker = WorkerActivity::from_summary(jobs.get("delegate:test").unwrap(), true, 226_000);
+        assert_eq!(worker.calls, 512);
+        assert_eq!(worker.elapsed.as_deref(), Some("3:45"));
+        assert_eq!(worker.tier, Some(fuzukue_proto::Tier::Heavy));
+        assert_eq!(worker.selection.unwrap().effort.as_deref(), Some("high"));
+        assert_eq!(worker.last_tool, Some("Read README.md"));
+        assert_eq!(worker.details.unwrap().last_activity, Some("Reviewing notes"));
+    }
+
+    #[test]
     fn worker_activity_keeps_the_error_visible_when_details_are_collapsed() {
         let mut tool = ToolCall::new("Read", "Read README.md".into(), Value::Null);
         tool.result = Some(ToolResult {
@@ -834,6 +940,7 @@ mod tests {
                 dismissed_from_panel: false,
             },
             summary: None,
+            wire_summary: None,
             progress: vec![
                 DelegateEntry::Text("Earlier draft".into()),
                 DelegateEntry::Text("I checked the README.".into()),
