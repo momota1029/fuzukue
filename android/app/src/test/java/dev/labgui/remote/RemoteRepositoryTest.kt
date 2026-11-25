@@ -53,6 +53,9 @@ class RemoteRepositoryTest {
         assertTrue(state.updateRequired)
         assertNotNull(state.error)
         assertFalse(repository.wantsConnection)
+        assertEquals(UpdateProtocol(PROTOCOL_VERSION + 1, PROTOCOL_VERSION + 1), repository.updateProtocol)
+        assertFalse(repository.canApplyAppUpdate(allowProtocolMismatch = false))
+        assertTrue(repository.canApplyAppUpdate(allowProtocolMismatch = true))
 
         assertTrue(repository.connect("ws://server.example", ""))
         finishConnect()
@@ -106,16 +109,19 @@ class RemoteRepositoryTest {
 
     @Test fun approvalQueueIsFetchedOnlyWhenAdvertisedAndRefetchedAfterReconnectAndWorkspaceSwitch() {
         val socket = finishConnect(approvalQueue = true)
+        assertFalse(repository.canApplyAppUpdate(allowProtocolMismatch = false))
         assertCommands(socket, """{"type":"in_workspace","id":"lab","request":{"type":"list_pending_approvals","request":1}}""")
         val original = queuedApprovalFixture("original")
         socket.queueSnapshot(99, original)
         assertTrue(state.approvalDock.pending.isEmpty())
         socket.queueSnapshot(1, original)
         assertEquals(setOf(original.id), state.approvalDock.pending.keys)
+        assertFalse(repository.canApplyAppUpdate(allowProtocolMismatch = false))
 
         repository.selectThread("s")
         repository.decideQueuedApprovals(ConversationTarget("lab", "s"), listOf(original), true)
         socket.fail()
+        assertFalse(repository.canApplyAppUpdate(allowProtocolMismatch = false))
         assertTrue(state.approvalDock.pending.isEmpty())
         val interrupted = state.approvalDock.decisions.getValue("s")
         assertFalse(interrupted.isSending)

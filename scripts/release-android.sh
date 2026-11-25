@@ -3,6 +3,7 @@ set -euo pipefail
 
 usage() {
     printf 'Usage: FUZUKUE_ANDROID_RELEASE_REPO=OWNER/REPO %s [--dry-run] [release-notes.md]\n' "$0"
+    printf '       %s [--dry-run] --server <stable|beta|dev> <project> [release-notes.md]\n' "$0"
 }
 
 fail() {
@@ -15,7 +16,15 @@ case ${1:-} in
     --help|-h) usage; exit 0 ;;
     --dry-run) dry_run=true; shift ;;
 esac
-if [[ $# -gt 1 || ($dry_run == false && $# -ne 1) ]]; then
+channel=
+if [[ ${1:-} == --server ]]; then
+    [[ $# -ge 3 ]] || fail 'Specify an Android channel and the running server project.'
+    channel=$2
+    case $channel in stable|beta|dev) ;; *) fail 'Unknown Android channel.' ;; esac
+    project=$(realpath -- "$3")
+    shift 3
+fi
+if [[ $# -gt 1 || ($dry_run == false && -z $channel && $# -ne 1) ]]; then
     usage >&2
     exit 2
 fi
@@ -23,11 +32,15 @@ if [[ $# -eq 1 && (! -f $1 || ! -r $1) ]]; then
     fail "Cannot read release notes: $1"
 fi
 
-release_repo=${FUZUKUE_ANDROID_RELEASE_REPO:-}
-[[ $release_repo =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ && ${release_repo#*/} != . && ${release_repo#*/} != .. ]] \
-    || fail 'Set FUZUKUE_ANDROID_RELEASE_REPO to the intended GitHub OWNER/REPO.'
+if [[ -z $channel ]]; then
+    release_repo=${FUZUKUE_ANDROID_RELEASE_REPO:-}
+    [[ $release_repo =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ && ${release_repo#*/} != . && ${release_repo#*/} != .. ]] \
+        || fail 'Set FUZUKUE_ANDROID_RELEASE_REPO to the intended GitHub OWNER/REPO.'
+fi
 
-notes=$(realpath -m -- "${1:-release-notes.md}")
+default_notes=release-notes.md
+if [[ -n $channel ]]; then default_notes=/dev/null; fi
+notes=$(realpath -m -- "${1:-$default_notes}")
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 "$root/scripts/check-android-protocol.sh"
 "$root/scripts/check-android-notices.sh"
@@ -36,8 +49,10 @@ version=$(sed -nE 's/^versionName[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:spac
 version_code=$(sed -nE 's/^versionCode[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' "$android/version.properties")
 minimum_protocol=$(sed -nE 's/^internal const val MIN_PROTOCOL_VERSION = ([0-9]+)$/\1/p' \
     "$android/app/src/main/java/dev/labgui/remote/Protocol.kt")
-[[ $version =~ ^[0-9][A-Za-z0-9._+\-]*$ && $version_code =~ ^[1-9][0-9]*$ && $minimum_protocol =~ ^[1-9][0-9]*$ ]] \
-    || fail 'Invalid Android release version or minimum protocol.'
+maximum_protocol=$(sed -nE 's/^const val PROTOCOL_VERSION = ([0-9]+)$/\1/p' \
+    "$android/app/src/main/java/dev/labgui/remote/Protocol.kt")
+[[ $version =~ ^[0-9][A-Za-z0-9._+\-]*$ && $version_code =~ ^[1-9][0-9]*$ && $minimum_protocol =~ ^[1-9][0-9]*$ && $maximum_protocol =~ ^[1-9][0-9]*$ ]] \
+    || fail 'Invalid Android release version or protocol range.'
 
 output="$android/build/releases/$version"
 apk="fuzukue-android-$version.apk"
@@ -63,9 +78,15 @@ release_command() {
 
 if $dry_run; then
     printf 'Would run :app:assembleRelease in %s and verify its signature with apksigner.\n' "$android"
-    printf 'Would write %s, %s and android-latest.json to %s (versionCode %s, minimum protocol %s).\n' \
-        "$apk" "$apk.sha256" "$output" "$version_code" "$minimum_protocol"
-    release_command
+    if [[ -n $channel ]]; then
+        printf 'Would register versionCode %s (protocol %s–%s) for %s in %s.\n' \
+            "$version_code" "$minimum_protocol" "$maximum_protocol" "$channel" "$project"
+        printf 'Feed: /android/%s/android-latest.json\nFirst install: /android/%s/download.apk\n' "$channel" "$channel"
+    else
+        printf 'Would write %s, %s and android-latest.json to %s (versionCode %s, minimum protocol %s).\n' \
+            "$apk" "$apk.sha256" "$output" "$version_code" "$minimum_protocol"
+        release_command
+    fi
     exit 0
 fi
 
@@ -85,6 +106,15 @@ if [[ -z $apksigner ]]; then
     fi
 fi
 [[ -n $apksigner ]] || fail 'Install Android SDK Build Tools or put apksigner on PATH.'
+if [[ -n $channel ]]; then
+    aapt="$(dirname -- "$apksigner")/aapt"
+    if [[ ! -x $aapt ]]; then
+        aapt=$(command -v aapt || true)
+    fi
+    [[ -n $aapt ]] || fail 'Install Android SDK Build Tools or put aapt on PATH.'
+    secretaire=${FUZUKUE_SECRETAIRE:-secretaire}
+    command -v "$secretaire" >/dev/null || fail 'Set FUZUKUE_SECRETAIRE to the new secretaire binary.'
+fi
 
 mkdir -p -- "$android/build/releases"
 exec {release_lock}>"$android/build/releases/.release.lock"
@@ -94,7 +124,7 @@ flock "$release_lock"
 source_apk="$android/app/build/outputs/apk/release"
 staging=$(mktemp -d "$android/build/releases/.staging.XXXXXXXX")
 trap 'rm -rf -- "$staging"' EXIT
-python3 - "$source_apk" "$staging" "$apk" "$version" "$version_code" "$minimum_protocol" "$notes" <<'PY'
+python3 - "$source_apk" "$staging" "$apk" "$version" "$version_code" "$minimum_protocol" "$maximum_protocol" "$notes" <<'PY'
 import hashlib
 import json
 import shutil
@@ -102,7 +132,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-source, staging, apk, version, version_code, minimum_protocol, notes = sys.argv[1:]
+source, staging, apk, version, version_code, minimum_protocol, maximum_protocol, notes = sys.argv[1:]
 source, staging = Path(source), Path(staging)
 metadata = json.loads((source / "output-metadata.json").read_text(encoding="utf-8"))
 application_id = metadata.get("applicationId")
@@ -129,6 +159,7 @@ manifest = json.dumps({
     "sha256": sha256,
     "apk": apk,
     "minimum_protocol": int(minimum_protocol),
+    "maximum_protocol": int(maximum_protocol),
     "release_notes_first_line": first_line,
     "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
 }, ensure_ascii=False, indent=2) + "\n"
@@ -137,6 +168,10 @@ if len(manifest.encode("utf-8")) > 32_768:
 (staging / f"{apk}.sha256").write_text(f"{sha256}  {apk}\n", encoding="ascii")
 (staging / "android-latest.json").write_text(manifest, encoding="utf-8")
 PY
+if [[ -n $channel ]]; then
+    "$secretaire" publish-android "$channel" "$project" "$staging/android-latest.json" "$staging/$apk" "$apksigner" "$aapt"
+    exit 0
+fi
 "$apksigner" verify "$staging/$apk" >&2
 mkdir -p -- "$output"
 mv -f -- "$staging/$apk" "$staging/$apk.sha256" "$staging/android-latest.json" "$output/"

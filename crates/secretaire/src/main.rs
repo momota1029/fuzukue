@@ -61,6 +61,7 @@ mod references;
 mod remote;
 mod device_tokens;
 mod distribution;
+mod android_distribution;
 mod reviewers;
 mod course;
 mod review_findings;
@@ -569,6 +570,9 @@ async fn run_server() -> anyhow::Result<()> {
     if first.as_deref() == Some("publish-client") {
         return distribution::cli(args);
     }
+    if first.as_deref() == Some("publish-android") {
+        return android_distribution::cli(args);
+    }
 
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
     tracing_subscriber::registry()
@@ -732,6 +736,7 @@ fn router(app: Arc<App>, access: Arc<remote::Access>) -> Router {
         .route("/client/{platform}/manifest", get(distribution::manifest))
         .route("/client/{platform}", get(distribution::binary))
         .route("/client/notify", post(distribution::notify))
+        .route("/android/{channel}/{asset}", get(android_distribution::asset))
         .route("/file/{*path}", get(file_handler))
         .route("/file", get(file_browser::download))
         .route("/exploration", get(exploration::tree))

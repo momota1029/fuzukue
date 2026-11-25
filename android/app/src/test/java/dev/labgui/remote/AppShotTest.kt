@@ -219,7 +219,7 @@ class AppShotTest {
                         assertEquals(url, it)
                         updates.value = UpdateState(url, UpdateStatus.Available(UpdateRelease(
                             version = "0.2.0",
-                            versionCode = 3,
+                            versionCode = BuildConfig.VERSION_CODE + 1,
                             packageName = BuildConfig.APPLICATION_ID,
                             sha256 = "a".repeat(64),
                             apk = "fuzukue-android-0.2.0.apk",
@@ -236,10 +236,52 @@ class AppShotTest {
         compose.onNodeWithText("更新を確認").performScrollTo().performClick()
         compose.onNodeWithText("新しい版 v0.2.0 があります（接続を改善）").performScrollTo().assertIsDisplayed()
         compose.runOnIdle { assertEquals(0, downloads) }
-        val download = compose.onNodeWithText("APK をダウンロードしてインストール").performScrollTo()
+        val download = compose.onNodeWithText("APK をダウンロード").performScrollTo()
         compose.onRoot().captureRoboImage("build/shots/update-available.png")
         download.performClick()
         compose.runOnIdle { assertEquals(1, downloads) }
+    }
+
+    @Test fun updatePermissionGuideDeferralAndSystemConfirmationAreExplicit() {
+        val release = UpdateRelease("0.2.0", BuildConfig.VERSION_CODE + 1, BuildConfig.APPLICATION_ID,
+            "a".repeat(64), "app.apk", 18, "", "2026-11-22T08:00:00Z", 73)
+        val ready = UpdateStatus.Ready(release, java.io.File("app.apk"))
+        val updates = mutableStateOf(UpdateState(status = ready))
+        var permissionOpened = 0
+        var confirmed = 0
+        var cancelled = 0
+        compose.setContent {
+            RemoteTheme {
+                RemoteApp(RemoteState(), updates = updates.value,
+                    onAllowUpdate = { permissionOpened++ }, onInstallUpdate = { confirmed++ },
+                    onCancelUpdate = { cancelled++ },
+                    onAutoUpdate = { updates.value = updates.value.copy(auto = it) },
+                    onUpdateChannel = { updates.value = updates.value.copy(channel = it) },
+                )
+            }
+        }
+        compose.onNodeWithContentDescription("アプリの自動更新").performScrollTo().performClick()
+        compose.onNodeWithText("stable").performScrollTo().performClick()
+        compose.runOnIdle {
+            assertTrue(updates.value.auto)
+            assertEquals(UpdateChannel.Stable, updates.value.channel)
+        }
+        val permission = compose.onNodeWithText("提供元の設定を開く").performScrollTo()
+        compose.onRoot().captureRoboImage("build/shots/update-permission.png")
+        permission.performClick()
+        compose.runOnIdle {
+            assertEquals(1, permissionOpened)
+            assertEquals(0, confirmed)
+            updates.value = updates.value.copy(canInstallFromSource = true, applyBlocked = true)
+        }
+        compose.onNodeWithText("インストール").performScrollTo().assertIsNotEnabled()
+        compose.runOnIdle { updates.value = updates.value.copy(status = UpdateStatus.Confirmation(release), applyBlocked = false) }
+        compose.onNodeWithText("Android の確認画面を開く").performScrollTo().performClick()
+        compose.onNodeWithText("更新をキャンセル").performScrollTo().performClick()
+        compose.runOnIdle {
+            assertEquals(1, confirmed)
+            assertEquals(1, cancelled)
+        }
     }
 
     @Test fun draftSurvivesReconnectAndStopMovesAboveThePillWhileSending() {

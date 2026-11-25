@@ -129,6 +129,8 @@ internal class RemoteRepository(
     private var serviceRunning = false
     private var welcomed = false
     private var serverProtocol = 0
+    var updateProtocol: UpdateProtocol? = null
+        private set
     private var sentLocale: String? = null
     private var replaying = true
     private var selectionScoped = false
@@ -156,6 +158,28 @@ internal class RemoteRepository(
     private val resolved = mutableSetOf<String>()
     val attachments by lazy {
         Attachments(context, canUpload = ::canUpload, awaitUpload = ::awaitUpload, send = ::sendToWorkspace)
+    }
+
+    fun canApplyAppUpdate(allowProtocolMismatch: Boolean): Boolean {
+        val current = state.value
+        if (current.creatingThread || current.changingWorkspace || current.approvals.isNotEmpty() ||
+            current.resolving.isNotEmpty() || current.approvalDock.pending.isNotEmpty() ||
+            current.approvalDock.decisions.values.any { it.isSending } || current.outboxes.isNotEmpty() ||
+            current.drain?.holdingInput == true || current.heldConversations.isNotEmpty()
+        ) return false
+        val attachments = attachments.view.value
+        if (attachments.share != null || attachments.drafts.values.any {
+                it.items.isNotEmpty() || it.sharedText != null
+            }
+        ) return false
+        val selected = current.selection
+        val timeline = selected?.let(current::timeline)
+        if (timeline != null && (timeline.running || timeline.rows.values.any { it is TimelineRow.Job && it.ok == null })) {
+            return false
+        }
+        if (allowProtocolMismatch && current.updateRequired && updateProtocol != null) return true
+        return current.canSend && !replaying && (!approvalQueueSupported || approvalQueueReady) &&
+            (!selectionScoped || selected == null || histories[selected]?.generation != null)
     }
 
     private fun canUpload(target: ConversationTarget): Boolean {
@@ -528,6 +552,7 @@ internal class RemoteRepository(
         handler.removeCallbacks(retry)
         handler.removeCallbacks(helloTimeout)
         serverProtocol = 0
+        updateProtocol = null
         approvalQueueSupported = false
         approvalSnapshotRequest = null
         approvalQueueReady = false
@@ -552,8 +577,12 @@ internal class RemoteRepository(
         socket = null
     }
 
-    private fun connectionLost(message: String, fatal: Boolean = false, updateRequired: Boolean = false) {
+    private fun connectionLost(
+        message: String, fatal: Boolean = false, updateRequired: Boolean = false,
+        protocol: UpdateProtocol? = null,
+    ) {
         closeSocket()
+        updateProtocol = protocol
         if (fatal) request = null
         val retrying = wantsConnection && (visible || serviceRunning)
         mutableState.value = state.value.copy(
@@ -629,11 +658,13 @@ internal class RemoteRepository(
             handler.removeCallbacks(helloTimeout)
             val agreed = minOf(PROTOCOL_VERSION, event.protocol)
             val required = event.minimumProtocol ?: agreed
+            val updateRange = UpdateProtocol(event.minimumProtocol ?: 1, maxOf(event.protocol, required))
             if (agreed < MIN_PROTOCOL_VERSION || required > agreed) {
                 connectionLost(
                     context.getString(R.string.error_protocol_version, PROTOCOL_VERSION, maxOf(agreed, required)),
                     fatal = true,
                     updateRequired = required > PROTOCOL_VERSION,
+                    protocol = updateRange,
                 )
             } else {
                 selectionScoped = agreed >= THREAD_HISTORY_PROTOCOL && event.selectionScoped
@@ -645,6 +676,7 @@ internal class RemoteRepository(
                     return
                 }
                 serverProtocol = agreed
+                updateProtocol = updateRange
                 approvalQueueSupported = event.approvalQueue
                 welcomed = true
                 receivedDrainStatus = false
@@ -656,8 +688,10 @@ internal class RemoteRepository(
         }
         if (!welcomed) {
             if (event is ServerEvent.Error) {
-                if ((event.minimumProtocol ?: 0) > PROTOCOL_VERSION) {
-                    connectionLost(event.message, fatal = true, updateRequired = true)
+                val minimum = event.minimumProtocol ?: 0
+                if (minimum > PROTOCOL_VERSION) {
+                    connectionLost(event.message, fatal = true, updateRequired = true,
+                        protocol = UpdateProtocol(minimum, minimum))
                 } else mutableState.value = state.value.copy(error = event.message)
             }
             return

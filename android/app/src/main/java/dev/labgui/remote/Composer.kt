@@ -51,6 +51,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.flow.collect
 import java.io.File
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -63,8 +64,19 @@ internal fun Composer(
     attachmentDraft: AttachmentDraft,
     onSend: (String, String) -> Boolean,
     onStop: (String) -> Unit,
+    drafts: ConversationDrafts? = null,
 ) {
-    val draft = rememberTextFieldState()
+    val draftKey = drafts?.key(target)
+    val draft = rememberTextFieldState(initialText = if (drafts != null && draftKey != null) drafts.read(draftKey) else "")
+    if (drafts != null && draftKey != null) {
+        DisposableEffect(drafts, draftKey, draft) {
+            drafts.show(draftKey, draft)
+            onDispose { drafts.hide(draftKey, draft) }
+        }
+        LaunchedEffect(drafts, draftKey, draft) {
+            snapshotFlow { draft.text.toString() }.collect { drafts.write(draftKey, it) }
+        }
+    }
     LaunchedEffect(attachmentDraft.sharedText) {
         val shared = attachments?.takeSharedText(target) ?: return@LaunchedEffect
         draft.edit {

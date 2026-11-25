@@ -186,9 +186,19 @@ pub async fn binary(
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(StatusCode::NOT_FOUND);
     }
-    let mut file = tokio::fs::File::open(app.distribution.root.join(platform).join(&sha))
+    let file = tokio::fs::File::open(app.distribution.root.join(platform).join(&sha))
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
+    serve_file(file, &sha, method, &headers, "application/octet-stream").await
+}
+
+pub(crate) async fn serve_file(
+    mut file: tokio::fs::File,
+    sha: &str,
+    method: Method,
+    headers: &HeaderMap,
+    content_type: &str,
+) -> Result<Response, StatusCode> {
     let size = file
         .metadata()
         .await
@@ -237,7 +247,7 @@ pub async fn binary(
         status,
         common,
         [
-            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_TYPE, content_type.to_owned()),
             (header::CONTENT_LENGTH, length.to_string()),
         ],
         Body::from_stream(stream),

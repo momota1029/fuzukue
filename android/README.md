@@ -26,15 +26,53 @@ Android 10 以降のスマホとタブレット向けの指示出しクライア
 
 ## 配布と更新
 
-初回は GitHub Releases から `fuzukue-android-<version>.apk` をダウンロードし、Android のインストーラーで開く。手元でビルドしたデバッグ版がすでに入っている場合は、署名が異なるため、デバッグ版をアンインストールしてからリリース版を入れる。アンインストールすると保存した接続設定が消える。
+自前サーバーから初回インストールするには、スマートフォンを許可リストに入っている Tailscale アカウントで tailnet に参加させ、ブラウザーで `https://<サーバーの MagicDNS 名>/android/beta/download.apk` を開く。Tailscale Serve が HTTPS を提供し、secretaire が接続元の Tailscale ログインを許可リストと照合する。URL にトークンは付けない。別のチャネルを配布した場合は `beta` を置き換える。ダウンロードした APK を開き、Android が求めたらブラウザーまたはファイル管理アプリからのインストールを許可する。既存の方法として GitHub Releases の署名済み APK も利用できる。
+
+tailnet 外の HTTPS プロキシではフィードと APK の両方に `Authorization: Bearer` の端末トークンが必要となる。通常のブラウザーのダウンロードリンクではこのヘッダーを付けられない。tailnet 経由で取得するか、端末トークンを扱える HTTP クライアントで取得した署名済み APK をスマートフォンに移す。
+
+手元でビルドしたデバッグ版がすでに入っている場合は、署名が異なるため、デバッグ版をアンインストールしてからリリース版を入れる。アンインストールすると保存した接続設定が消える。
 
 アプリ ID は `dev.fuzukue.android`。旧 ID `dev.labgui.remote` のインストールは Android では別アプリとして扱われる。新しい APK を手動でインストールし、接続設定を入力し直す。旧アプリはアンインストールできる。
 
-更新は「接続設定」→「更新を確認」。更新 JSON の `package` が実行中のアプリ ID と一致し、新版があればバージョンとリリースノートの先頭行を表示する。「APK をダウンロードしてインストール」を押すと、アプリが SHA-256、APK のパッケージ名と実行中のアプリ ID、APK と更新 JSON のバージョンコードを照合し、Android の確認画面を開く。Android の設定が開いた場合は、このアプリからのインストールを許可して戻り、「インストール」を押す。ダウンロード中に画面を離れた場合も、戻って「インストール」を押せる。サーバーがアプリの対応範囲より新しいプロトコルを要求した場合も、接続設定に更新の案内が出る。
+「接続設定」で Tailscale Serve または HTTPS プロキシの `wss://<サーバー>/ws` を接続先に設定する。「更新を確認」はそのサーバーの選択チャネルを使う。新規設定の既定は `beta` で、自動更新はオフ。配布先は `stable`、`beta`、`dev` から選べる。以前入力した HTTPS URL は `beta` に引き継ぐ。`stable` と `beta` は同じチャネルの指定 URL へ切り替えられる。サーバーを選んでいて接続できない場合、サーバーの対応プロトコルが既知なら、設定済みの同じチャネルの URL を確認する。認証拒否や互換版なしの場合は理由を表示する。`dev` は接続先のサーバーを使う。
 
-更新先は初期状態では空欄。自前で配布するときは、生成した `android-latest.json` と、その `apk` 欄にある名前の APK を同じディレクトリに置く。「更新情報の URL」に JSON の HTTPS URL（例 `https://updates.example.org/android/android-latest.json`）を入力して「更新を確認」を押すと、その URL を保存して使う。配布先が変わった場合も同じ欄で切り替える。JSON と APK の取得先は、リダイレクトを含めて HTTPS が必要。
+自動更新をオンにすると、起動時とアプリを開いている間に新版を確認する。通常は約 1 時間、通信エラー後は約 15 分の間隔を空ける。APK のハッシュ、署名証明書、アプリ ID、増加する `versionCode`、サーバーとの互換性を確かめてから、操作が落ち着いたタイミングで適用する。作業や承認が表示されている間、送信・添付・編集・再接続中は適用を待つ。切断したダウンロードは、強い ETag と取得対象が同じ場合に再開する。
+
+初回の更新では「提供元の設定を開く」から、fuzukue の「この提供元のアプリを許可」をオンにする。戻ると許可を再確認する。Android 12 以降では条件がそろうと自動でインストールする。Android 10 / 11 や、Android が確認を求める場合は、更新欄の「Android の確認画面を開く」から進む。キャンセル後は同じ更新を手動で試せる。
 
 同梱ライブラリのライセンスとソースの案内は「接続設定」→「ライセンス」で確認できる。
+
+### 自前サーバーに配布する
+
+サービスと同じユーザー・状態ディレクトリ設定で実行する。下のプロジェクトパスは secretaire の起動時と同じものを指定する。Android SDK Build Tools、JDK 21 と署名設定はビルドするホストに用意する。
+
+```sh
+cargo build --release -p secretaire
+(cd android && ./gradlew :app:testDebugUnitTest)
+FUZUKUE_SECRETAIRE="$PWD/target/release/secretaire" \
+  scripts/release-android.sh --dry-run --server beta /path/to/project
+FUZUKUE_SECRETAIRE="$PWD/target/release/secretaire" \
+  scripts/release-android.sh --server beta /path/to/project
+```
+
+最後にリリースノートのファイルを渡すと、その先頭行がアプリに表示される。コマンドは署名済み APK をビルドし、`apksigner`、`aapt`、SHA-256 で検証する。同じアプリ ID と署名証明書を使い、版を更新するときは全チャネルで別の APK に同じ `versionCode` を割り当てない。検証した APK を版とハッシュで固定した URL に登録してから、チャネルの JSON を原子的に切り替える。直前の URL も引き続き取得できる。稼働中のサーバーは、互換な版を配信する。
+
+APK の登録はこのコマンドで明示的に行う。secretaire の自己更新は既存のフィードを引き継ぎ、稼働版との互換性を再評価する。現行 APK が互換でなく、直前の版が互換なら直前の版を提示する。自己更新に Android SDK や署名鍵は必要ない。端末に入れた APK を修正版に入れ替えるときは、問題版より大きい `versionCode` と同じ署名鍵で復旧版を配布する。
+
+初回インストール用の HTTPS は、`server.toml` の既存の `[remote]` に次を追加し、更新した secretaire を再起動してから Tailscale Serve で設定する。
+
+```toml
+[remote]
+tailscale_serve_listen = "127.0.0.1:7880"
+allowed_logins = ["user@example.com"]
+```
+
+```sh
+tailscale serve --bg http://127.0.0.1:7880
+tailscale serve status
+```
+
+`7880` はこのマシンの Tailscale Serve 専用にし、汎用プロキシの転送先には別のポートを使う。Serve の HTTPS ホスト名と、スマートフォンを所有する実際の Tailscale ログインを使う。tailnet 外へ公開する Funnel ではなく、tailnet 内の Serve を使う。[Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) · [端末トークンと HTTPS プロキシ](../docs/remote.md#tailscale-なしで公開する)
 
 ### 署名キーの作り方
 
@@ -90,5 +128,5 @@ export JAVA_HOME=$HOME/opt/jdk-21.0.13.1+2
 - APK は `app/build/outputs/apk/debug/app-debug.apk` に出る。
 - JVM テストでは fuzukue-proto の JSON を読み、差分から会話と作業カードの状態を更新できることを確認する。
 - 再接続テストでは、作業の詳細ダイアログ内で作業名と「閉じる」を検索し、入力欄の送信と停止を個別のテストタグで指定する。
-- Roborazzi は設定、一覧、進捗付き会話、承認、タブレットの画面をライト・ダークで `app/build/shots/` に出す。更新のテストはサーバーとのプロトコル不一致から新版を確認できることを検証し、`app/build/shots/update-available.png` に撮影する。Robolectric では Android 用ネイティブライブラリをロードできないため、数式は TeX ソースで写る。
+- Roborazzi は設定、一覧、進捗付き会話、承認、タブレットの画面をライト・ダークで `app/build/shots/` に出す。更新のテストではプロトコル不一致からの確認、提供元の設定、適用の保留と Android の確認操作を検証する。画像は `app/build/shots/update-available.png` と `app/build/shots/update-permission.png` に出る。Robolectric では Android 用ネイティブライブラリをロードできないため、数式は TeX ソースで写る。
 - 実機では Tailscale / LAN での接続、日本語 IME、通知許可とバックグラウンドでの通知、RaTeX による数式描画を確認する。

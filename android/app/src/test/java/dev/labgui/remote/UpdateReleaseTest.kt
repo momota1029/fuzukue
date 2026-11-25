@@ -23,6 +23,37 @@ class UpdateReleaseTest {
         assertFalse(release.isNewerThan(13))
     }
 
+    @Test fun matchesServerProtocolRangesAndTreatsTheLegacyMinimumAsAKnownPoint() {
+        val legacy = UpdateRelease.parse(manifest, applicationId)
+        assertTrue(legacy.supports(UpdateProtocol(1, 48)))
+        assertFalse(legacy.supports(UpdateProtocol(19, 48)))
+        val release = UpdateRelease.parse(manifest.replace("\"extra\": true", "\"maximum_protocol\": 73"), applicationId)
+        assertTrue(release.supports(UpdateProtocol(70, 75)))
+        assertFalse(release.supports(UpdateProtocol(74, 75)))
+        assertFalse(release.supports(UpdateProtocol(1, 17)))
+        assertThrows(IllegalArgumentException::class.java) {
+            UpdateRelease.parse(manifest.replace("\"extra\": true", "\"maximum_protocol\": 17"), applicationId)
+        }
+    }
+
+    @Test fun derivesTheFeedFromTheSecureConnectionAndSelectedChannel() {
+        assertEquals("https://host.example:8443/app/android/stable/android-latest.json",
+            serverUpdateSource("wss://host.example:8443/app/ws", UpdateChannel.Stable)?.feed.toString())
+        assertEquals("https://host.example/android/dev/android-latest.json",
+            serverUpdateSource("https://host.example", UpdateChannel.Dev)?.feed.toString())
+        assertNull(serverUpdateSource("ws://host.example/ws", UpdateChannel.Beta))
+        assertNull(serverUpdateSource("wss://host.example/ws?token=secret", UpdateChannel.Beta))
+    }
+
+    @Test fun onlyAppendsACompleteRangeWithTheExpectedStartAndLength() {
+        assertEquals(10L, resumedLength("bytes 4-9/10", 4, 6))
+        assertNull(resumedLength("bytes 3-9/10", 4, 7))
+        assertNull(resumedLength("bytes 4-8/10", 4, 5))
+        assertNull(resumedLength("bytes 4-9/10", 4, 4))
+        assertEquals("\"revision\"", strongEtag("\"revision\""))
+        assertNull(strongEtag("W/\"revision\""))
+    }
+
     @Test fun parsesManifestAndResolvesTheApkNextToTheFeed() {
         val release = UpdateRelease.parse(manifest, applicationId)
         assertEquals("0.1.12", release.version)

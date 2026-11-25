@@ -25,8 +25,11 @@ internal data class UpdateRelease(
     @SerialName("minimum_protocol") val minimumProtocol: Int,
     @SerialName("release_notes_first_line") val releaseNotesFirstLine: String,
     @SerialName("built_at") val builtAt: String,
+    @SerialName("maximum_protocol") val maximumProtocol: Int? = null,
 ) {
     fun isNewerThan(installedVersionCode: Int): Boolean = versionCode > installedVersionCode
+    fun supports(server: UpdateProtocol): Boolean =
+        minimumProtocol <= server.maximum && (maximumProtocol ?: minimumProtocol) >= server.minimum
 
     // Use the configured feed's directory so a GitHub asset redirect doesn't set the APK URL.
     fun apkUrl(feed: HttpUrl): HttpUrl = feed.newBuilder().removePathSegment(feed.pathSize - 1)
@@ -38,11 +41,31 @@ internal data class UpdateRelease(
                 require(it.packageName == installedPackageName)
                 require(it.version.isNotBlank() && it.version.lineSequence().count() == 1)
                 require(it.versionCode > 0 && it.minimumProtocol > 0)
+                require(it.maximumProtocol == null || it.maximumProtocol >= it.minimumProtocol)
                 require(sha256Hex.matches(it.sha256) && apkFileName.matches(it.apk))
                 require(it.releaseNotesFirstLine.lineSequence().count() == 1)
                 require(runCatching { Instant.parse(it.builtAt) }.isSuccess)
             }
     }
+}
+
+internal data class UpdateProtocol(val minimum: Int, val maximum: Int)
+
+internal enum class UpdateChannel { Stable, Beta, Dev;
+    val path get() = name.lowercase()
+}
+
+internal enum class UpdateOrigin { Server, Custom }
+
+internal data class UpdateSource(val feed: HttpUrl, val origin: UpdateOrigin, val channel: UpdateChannel) {
+    val key: String get() = "$origin:${channel.path}:$feed"
+}
+
+internal fun serverUpdateSource(connection: String, channel: UpdateChannel): UpdateSource? {
+    val endpoint = socketUrl(connection)?.let(::httpsUpdateUrl) ?: return null
+    val feed = endpoint.newBuilder().removePathSegment(endpoint.pathSize - 1)
+        .addPathSegment("android").addPathSegment(channel.path).addPathSegment("android-latest.json").build()
+    return UpdateSource(feed, UpdateOrigin.Server, channel)
 }
 
 internal fun httpsUpdateUrl(value: String): HttpUrl? {

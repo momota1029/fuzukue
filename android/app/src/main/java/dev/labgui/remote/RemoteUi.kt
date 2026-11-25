@@ -86,6 +86,11 @@ internal fun RemoteApp(
     onCheckUpdate: (String) -> Unit = {},
     onDownloadUpdate: () -> Unit = {},
     onInstallUpdate: () -> Unit = {},
+    onAllowUpdate: () -> Unit = {},
+    onCancelUpdate: () -> Unit = {},
+    onAutoUpdate: (Boolean) -> Unit = {},
+    onUpdateChannel: (UpdateChannel) -> Unit = {},
+    onUpdateOrigin: (UpdateOrigin) -> Unit = {},
     onBackground: (Boolean) -> Unit = {},
     onWorkerNotices: (Boolean) -> Unit = {},
     onShowPlanAboveConversation: (Boolean) -> Unit = {},
@@ -107,14 +112,15 @@ internal fun RemoteApp(
     onRevokeShellApproval: (String) -> Unit = {},
     onWorkerApprovalPolicy: (WorkerApprovalPolicy) -> Unit = {},
     attachments: Attachments? = null,
+    drafts: ConversationDrafts? = null,
 ) {
     var settings by rememberSaveable { mutableStateOf(showSettingsInitially) }
     var licenses by rememberSaveable { mutableStateOf(false) }
     var connecting by rememberSaveable { mutableStateOf(false) }
     var url by rememberSaveable { mutableStateOf(initialUrl) }
     var token by remember { mutableStateOf(initialToken) }
-    var updateUrl by rememberSaveable { mutableStateOf(updates.url) }
-    val drafts = rememberSaveableStateHolder()
+    var updateUrl by rememberSaveable(updates.channel) { mutableStateOf(updates.url) }
+    val conversationState = rememberSaveableStateHolder()
     val selected = state.selection
     val attachmentView = attachments?.view?.collectAsState()?.value ?: AttachmentView()
     val shareTarget = state.workspace?.let { workspace ->
@@ -167,7 +173,8 @@ internal fun RemoteApp(
                         onRevokeShellApproval = onRevokeShellApproval,
                         updates = {
                             UpdatePanel(updateUrl, { updateUrl = it }, updates, installError,
-                                { onCheckUpdate(updateUrl) }, onDownloadUpdate, onInstallUpdate)
+                                { onCheckUpdate(updateUrl) }, onDownloadUpdate, onInstallUpdate, onAllowUpdate,
+                                onCancelUpdate, onAutoUpdate, onUpdateChannel, onUpdateOrigin)
                         },
                     )
                 } else {
@@ -203,7 +210,7 @@ internal fun RemoteApp(
                         }
                         if (wide) VerticalDivider()
                         if (selected != null) {
-                            drafts.SaveableStateProvider("${state.workspace.orEmpty()}/$selected") {
+                            conversationState.SaveableStateProvider("${initialUrl}/${state.workspace.orEmpty()}/$selected") {
                                 val target = ConversationTarget(state.workspace.orEmpty(), selected)
                                 Conversation(
                                     state, selected, onSend, onStopTurn, onStopWorker, onResolve, onRememberShellApproval,
@@ -212,6 +219,7 @@ internal fun RemoteApp(
                                     onDecideQueuedApprovals = { requests, accept -> onDecideQueuedApprovals(target, requests, accept) },
                                     onDismissQueuedDecision = { onDismissQueuedDecision(target) },
                                     onRetryApprovalQueue = { onRetryApprovalQueue(target) },
+                                    drafts = drafts,
                                 )
                             }
                         } else if (wide) {
@@ -393,44 +401,112 @@ private fun WorkspaceApprovals(
 private fun UpdatePanel(
     url: String, onUrl: (String) -> Unit, state: UpdateState, installError: String?,
     onCheck: () -> Unit, onDownload: () -> Unit, onInstall: () -> Unit,
+    onAllow: () -> Unit, onCancel: () -> Unit, onAuto: (Boolean) -> Unit,
+    onChannel: (UpdateChannel) -> Unit, onOrigin: (UpdateOrigin) -> Unit,
 ) {
     Panel {
-        OutlinedTextField(
-            value = url, onValueChange = onUrl, enabled = !state.busy, singleLine = true,
-            label = { Text(stringResource(R.string.update_url)) },
-            supportingText = if (url.isBlank()) {
-                { Text(stringResource(R.string.update_url_missing)) }
-            } else null,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-            modifier = Modifier.fillMaxWidth(),
-        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            val label = stringResource(R.string.update_auto)
+            Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            Switch(checked = state.auto, onCheckedChange = onAuto,
+                modifier = Modifier.semantics { contentDescription = label })
+        }
+        Text(stringResource(R.string.update_channel), style = MaterialTheme.typography.titleSmall)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (channel in UpdateChannel.entries) {
+                FilterChip(state.channel == channel, { onChannel(channel) },
+                    label = { Text(channel.path) }, enabled = !state.installing)
+            }
+        }
+        var choosingSource by remember { mutableStateOf(false) }
+        Box {
+            val label = stringResource(if (state.origin == UpdateOrigin.Server) R.string.update_source_server
+                else R.string.update_source_custom)
+            OutlinedButton(onClick = { choosingSource = true },
+                enabled = !state.installing && state.channel != UpdateChannel.Dev, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.update_source, label))
+            }
+            DropdownMenu(choosingSource, { choosingSource = false }) {
+                for (origin in UpdateOrigin.entries) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(if (origin == UpdateOrigin.Server) R.string.update_source_server
+                            else R.string.update_source_custom)) },
+                        onClick = { choosingSource = false; onOrigin(origin) },
+                    )
+                }
+            }
+        }
+        if (state.origin == UpdateOrigin.Custom) {
+            OutlinedTextField(
+                value = url, onValueChange = onUrl, enabled = !state.busy, singleLine = true,
+                label = { Text(stringResource(R.string.update_url)) },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        if (state.feedOrigin == UpdateOrigin.Custom && state.origin == UpdateOrigin.Server) {
+            Text(stringResource(R.string.update_source_fallback), style = MaterialTheme.typography.bodySmall)
+        }
         OutlinedButton(onClick = onCheck, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
             Text(stringResource(R.string.update_check))
         }
-        when (val status = state.status.takeIf { url.trim() == state.url } ?: UpdateStatus.Idle) {
+        when (val status = state.status.takeIf {
+            state.origin == UpdateOrigin.Server || url.trim() == state.url
+        } ?: UpdateStatus.Idle) {
             UpdateStatus.Idle -> Unit
             UpdateStatus.Checking -> Text(stringResource(R.string.update_checking))
             UpdateStatus.Current -> Text(stringResource(R.string.update_current))
-            UpdateStatus.Downloading -> Text(stringResource(R.string.update_downloading))
+            is UpdateStatus.Downloading -> {
+                ReleaseSummary(status.release)
+                Text(stringResource(R.string.update_downloading))
+                val total = status.total
+                if (total == null || total == 0L) LinearProgressIndicator(Modifier.fillMaxWidth())
+                else LinearProgressIndicator(progress = { status.bytes.toFloat() / total },
+                    modifier = Modifier.fillMaxWidth())
+            }
             is UpdateStatus.Available -> {
-                val release = status.release
-                Text(if (release.releaseNotesFirstLine.isBlank()) stringResource(R.string.update_available, release.version)
-                    else stringResource(R.string.update_available_notes, release.version, release.releaseNotesFirstLine))
+                ReleaseSummary(status.release)
                 status.error?.let { ErrorText(stringResource(it)) }
                 Button(onClick = onDownload, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.update_download))
                 }
             }
             is UpdateStatus.Ready -> {
+                ReleaseSummary(status.release)
                 Text(stringResource(R.string.update_install_help))
-                Button(onClick = onInstall, modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.update_install))
-                }
-                installError?.let { ErrorText(it) }
+                status.error?.let { ErrorText(stringResource(it)) }
+                UpdateInstallControls(state, R.string.update_install, onInstall, onAllow)
             }
-            is UpdateStatus.Failed -> {
-                if (status.error != R.string.update_url_missing) ErrorText(stringResource(status.error))
+            is UpdateStatus.Installing -> Text(stringResource(R.string.update_installing))
+            is UpdateStatus.Confirmation -> {
+                ReleaseSummary(status.release)
+                Text(stringResource(R.string.update_confirmation_help))
+                UpdateInstallControls(state, R.string.update_confirmation_open, onInstall, onAllow)
+                TextButton(onClick = onCancel) { Text(stringResource(R.string.update_confirmation_cancel)) }
             }
+            is UpdateStatus.Failed -> ErrorText(stringResource(status.error))
+        }
+        installError?.let { ErrorText(it) }
+    }
+}
+
+@Composable
+private fun ReleaseSummary(release: UpdateRelease) {
+    Text(if (release.releaseNotesFirstLine.isBlank()) stringResource(R.string.update_available, release.version)
+        else stringResource(R.string.update_available_notes, release.version, release.releaseNotesFirstLine))
+}
+
+@Composable
+private fun UpdateInstallControls(state: UpdateState, action: Int, onInstall: () -> Unit, onAllow: () -> Unit) {
+    if (!state.canInstallFromSource) {
+        Text(stringResource(R.string.update_permission_help))
+        OutlinedButton(onClick = onAllow, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(R.string.update_permission_open))
+        }
+    } else {
+        if (state.applyBlocked) Text(stringResource(R.string.update_deferred))
+        Button(onClick = onInstall, enabled = !state.applyBlocked, modifier = Modifier.fillMaxWidth()) {
+            Text(stringResource(action))
         }
     }
 }
@@ -539,6 +615,7 @@ private fun Conversation(
     openApprovalDock: Int?,
     onDecideQueuedApprovals: (List<QueuedApproval>, Boolean) -> Unit, onDismissQueuedDecision: () -> Unit,
     onRetryApprovalQueue: () -> Unit,
+    drafts: ConversationDrafts?,
 ) {
     val thread = state.threads.find { it.id == session }
     val timeline = state.timeline(session)
@@ -663,7 +740,7 @@ private fun Conversation(
         }
         if (thread != null) {
             Composer(target, state.isTurnRunning(session), state.canSend, attachments,
-                attachmentView.drafts[target] ?: AttachmentDraft(), onSend, onStopTurn)
+                attachmentView.drafts[target] ?: AttachmentDraft(), onSend, onStopTurn, drafts)
         }
     }
 }

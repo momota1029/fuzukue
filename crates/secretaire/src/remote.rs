@@ -52,6 +52,7 @@ struct RemoteConfig {
     allow_shared_token: bool,
     trusted_proxy: HashSet<IpAddr>,
     local_listen: Option<SocketAddr>,
+    tailscale_serve_listen: Option<SocketAddr>,
 }
 
 impl Default for RemoteConfig {
@@ -62,6 +63,7 @@ impl Default for RemoteConfig {
             allow_shared_token: true,
             trusted_proxy: HashSet::new(),
             local_listen: None,
+            tailscale_serve_listen: None,
         }
     }
 }
@@ -91,6 +93,7 @@ pub struct Config {
     allow_shared_token: bool,
     trusted_proxy: HashSet<IpAddr>,
     local_listen: Option<SocketAddr>,
+    tailscale_serve_listen: Option<SocketAddr>,
     pub shutdown_drain_seconds: u64,
     pub(crate) delegate: crate::delegate::admission::Overrides,
 }
@@ -149,6 +152,7 @@ impl Config {
                 .map(|ip| ip.to_canonical())
                 .collect(),
             local_listen: config.remote.local_listen,
+            tailscale_serve_listen: config.remote.tailscale_serve_listen,
             delegate: config.delegate,
         })
     }
@@ -211,6 +215,13 @@ impl Config {
                 addresses: vec![(addr, ListenMode::Direct)],
             });
         }
+        if let Some(addr) = self.tailscale_serve_listen.filter(|_| !canary) {
+            ensure!(is_loopback(addr.ip()), "[remote].tailscale_serve_listen must be loopback");
+            listeners.push(Listener {
+                name: addr.to_string(),
+                addresses: vec![(addr, ListenMode::TailscaleServe)],
+            });
+        }
         Ok(listeners)
     }
 }
@@ -238,6 +249,7 @@ impl Listener {
 pub enum ListenMode {
     Direct,
     Proxy,
+    TailscaleServe,
 }
 
 fn listen_mode(addr: SocketAddr, trusted_proxy: &HashSet<IpAddr>) -> Result<ListenMode> {
@@ -670,9 +682,14 @@ pub async fn enforce(State(access): State<Arc<Access>>, mut req: Request, next: 
     // In-process protocol tests can exercise token auth without a transport.
     // Real listeners always enforce the transport policy.
     let check_transport = mode.is_some() || !cfg!(test);
-    let proxy = mode == Some(ListenMode::Proxy);
+    let tailscale_serve = mode == Some(ListenMode::TailscaleServe);
+    let proxy = mode == Some(ListenMode::Proxy) || tailscale_serve;
     let peer_ip = peer.ip().to_canonical();
     let local = !proxy && peer_ip.is_loopback();
+    let android = req.uri().path().starts_with("/android/");
+    if android && !proxy && !local {
+        return deny(Some(peer), Some(peer_ip), StatusCode::FORBIDDEN, "https_required");
+    }
     if req.uri().path() == "/mcp" && !local {
         return deny(
             Some(peer),
@@ -766,7 +783,7 @@ pub async fn enforce(State(access): State<Arc<Access>>, mut req: Request, next: 
     DefaultBodyLimit::max(MAX_REQUEST_BODY).apply(&mut req);
 
     let client = if proxy {
-        if !access.trusted_proxy.contains(&peer_ip) {
+        if !(if tailscale_serve { peer_ip.is_loopback() } else { access.trusted_proxy.contains(&peer_ip) }) {
             return deny(Some(peer), None, StatusCode::FORBIDDEN, "untrusted_proxy");
         }
         let Some(client) = forwarded_client(req.headers()) else {
@@ -816,9 +833,13 @@ pub async fn enforce(State(access): State<Arc<Access>>, mut req: Request, next: 
         .map(std::borrow::Cow::into_owned)
         .collect();
     let identity = match access.token_identity(tokens).await {
-        Ok(Some(identity)) => Some(identity),
+        Ok(Some(identity)) if !android || matches!(identity, Identity::Device(_)) => Some(identity),
         token => {
-            let tailnet = if proxy {
+            // Only the dedicated Tailscale Serve listener trusts its proxy's identity header.
+            let tailnet = if tailscale_serve {
+                Ok(is_tailscale_ip(client) && single_header(req.headers(), "tailscale-user-login")
+                    .is_some_and(|login| access.allowed_logins.contains(login)))
+            } else if proxy {
                 Ok(false)
             } else {
                 access.allowed_tailnet_peer(client).await
@@ -1028,6 +1049,7 @@ allowed_logins = ["owner@example.com"]"#,
             allow_shared_token: true,
             trusted_proxy: HashSet::new(),
             local_listen: None,
+            tailscale_serve_listen: None,
             shutdown_drain_seconds: DEFAULT_DRAIN_SECONDS,
             delegate: Default::default(),
         };
@@ -1374,6 +1396,66 @@ trusted_proxy = ["127.0.0.1"]"#,
         Request::builder().uri(path).extension(ConnectInfo(
             "[::ffff:127.0.0.1]:1234".parse::<SocketAddr>().unwrap(),
         ))
+    }
+
+    #[tokio::test]
+    async fn android_download_requires_https_and_the_configured_remote_identity() -> Result<()> {
+        use tower::ServiceExt;
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || LogWriter(writer.clone())).finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        let dir = tempfile::tempdir()?;
+        let access = Arc::new(Access::with_whois(
+            dir.path(),
+            HashSet::from(["owner@example.com".into()]),
+            true,
+            HashSet::from(["127.0.0.1".parse()?]),
+            Box::new(|_| panic!("a proxy must not fall back to direct Tailscale whois")),
+        )?);
+        let device = Store::new(dir.path()).add("phone", None, chrono::Utc::now().timestamp())?;
+        let shared = ensure_token(dir.path(), false)?;
+        let router = axum::Router::new()
+            .route("/android/beta/{asset}", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(access, enforce));
+        for path in ["/android/beta/android-latest.json", "/android/beta/download.apk"] {
+            let request = async |mode, login: Option<&str>, token: Option<&str>, https| {
+                let mut builder = proxy_request(path).extension(mode)
+                    .header("x-forwarded-for", "100.64.0.21")
+                    .header("x-forwarded-proto", if https { "https" } else { "http" });
+                if let Some(login) = login {
+                    builder = builder.header("tailscale-user-login", login);
+                }
+                if let Some(token) = token {
+                    builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                router.clone().oneshot(builder.body(axum::body::Body::empty()).unwrap()).await.unwrap().status()
+            };
+            assert_eq!(request(ListenMode::Proxy, Some("owner@example.com"), None, true).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(request(ListenMode::Proxy, None, Some(&shared), true).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(request(ListenMode::Proxy, None, Some(&device), false).await, StatusCode::FORBIDDEN);
+            assert_eq!(request(ListenMode::Proxy, None, Some(&device), true).await, StatusCode::OK);
+            assert_eq!(request(ListenMode::TailscaleServe, Some("owner@example.com"), None, true).await, StatusCode::OK);
+            assert_eq!(request(ListenMode::TailscaleServe, Some("other@example.com"), None, true).await, StatusCode::UNAUTHORIZED);
+            let direct = Request::builder().uri(path)
+                .extension(ListenMode::Direct)
+                .extension(ConnectInfo("100.64.0.21:1234".parse::<SocketAddr>()?))
+                .header(header::AUTHORIZATION, format!("Bearer {device}"))
+                .body(axum::body::Body::empty())?;
+            assert_eq!(router.clone().oneshot(direct).await?.status(), StatusCode::FORBIDDEN);
+        }
+        let logs = String::from_utf8(logs.lock().unwrap().clone())?;
+        assert!(logs.contains("remote access"));
+        assert!(!logs.contains(&shared) && !logs.contains(&device));
+        Ok(())
     }
 
     fn ws_upgrade(builder: axum::http::request::Builder) -> axum::http::request::Builder {

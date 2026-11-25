@@ -45,6 +45,20 @@ internal class ConnectionSettings(context: Context) {
         editor.apply()
     }
 
+    fun saveUpdateResume(version: Int, workspace: String?, selection: String?): Boolean = prefs.edit()
+        .putInt("resume_after_update", version).putString("resume_url", url)
+        .putString("resume_workspace", workspace).putString("resume_selection", selection).commit()
+
+    fun takeUpdateResume(): Pair<String?, String?>? {
+        val version = prefs.getInt("resume_after_update", 0)
+        if (version <= 0 || BuildConfig.VERSION_CODE < version) return null
+        val target = prefs.getString("resume_workspace", null) to prefs.getString("resume_selection", null)
+        val sameConnection = url == prefs.getString("resume_url", null)
+        prefs.edit().remove("resume_after_update").remove("resume_url")
+            .remove("resume_workspace").remove("resume_selection").apply()
+        return target.takeIf { sameConnection }
+    }
+
     private fun key(): SecretKey {
         // Keep the existing Keystore alias so saved tokens survive a rename.
         val alias = "lab-gui-remote-token"

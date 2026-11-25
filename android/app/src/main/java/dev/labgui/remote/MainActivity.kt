@@ -2,13 +2,15 @@ package dev.labgui.remote
 
 import android.Manifest
 import android.content.ActivityNotFoundException
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
+import android.view.KeyEvent
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -17,10 +19,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.core.content.FileProvider
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
-
-internal fun updateAuthority(context: Context) = "${context.packageName}.updates"
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     private val app get() = application as RemoteApplication
@@ -35,7 +37,10 @@ class MainActivity : ComponentActivity() {
     private var pendingApprovalDock = false
     private val openApprovalDock = mutableStateOf<Pair<ConversationTarget, Int>?>(null)
     private var requestedNoticeWorkspace: String? = null
-    private var openInstallerAfterDownload = false
+    private val resumed = mutableStateOf(false)
+    private var lastInteraction = 0L
+    private var restoreWorkspace: String? = null
+    private var resumingAfterUpdate = false
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         serviceError.value = if (granted) null else getString(R.string.error_notification_permission)
     }
@@ -47,10 +52,26 @@ class MainActivity : ComponentActivity() {
         workerNotices.value = app.settings.workerNotices
         showPlanAboveConversation.value = app.settings.showPlanAboveConversation
         val loadedToken = runCatching { app.settings.token() }
-        if (savedInstanceState == null) openIncoming(intent) else openNotice(intent)
+        if (savedInstanceState == null) {
+            app.settings.takeUpdateResume()?.let { (workspace, selection) ->
+                resumingAfterUpdate = true
+                if (workspace != null && selection != null) pendingNotice.value = ConversationTarget(workspace, selection)
+                else restoreWorkspace = workspace
+                connectFromIntent()
+            }
+            openIncoming(intent)
+        } else openNotice(intent)
         setContent {
             val state by remote.state.collectAsState()
             val updates by app.updater.state.collectAsState()
+            LaunchedEffect(state.canSend, state.workspace, state.changingWorkspace) {
+                if (!state.canSend || !resumingAfterUpdate) return@LaunchedEffect
+                resumingAfterUpdate = false
+                val workspace = restoreWorkspace
+                restoreWorkspace = null
+                if (workspace != null && state.workspace != workspace) remote.switchWorkspace(workspace)
+                if (pendingNotice.value == null) openConversation.value++
+            }
             LaunchedEffect(
                 pendingNotice.value, state.phase, state.workspace, state.threads, state.changingWorkspace,
                 state.approvalDock.isLoading, state.approvalDock.pending,
@@ -76,12 +97,16 @@ class MainActivity : ComponentActivity() {
                     pendingNotice.value = null
                 }
             }
-            LaunchedEffect(updates.status) {
-                if (openInstallerAfterDownload && updates.status != UpdateStatus.Downloading) {
-                    openInstallerAfterDownload = false
-                    if (updates.status is UpdateStatus.Ready && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-                        installUpdate()
+            LaunchedEffect(resumed.value, state.phase, updates.status, updates.auto, updates.channel, updates.origin) {
+                while (resumed.value) {
+                    val release = when (val status = updates.status) {
+                        is UpdateStatus.Ready -> status.release
+                        is UpdateStatus.Confirmation -> status.release
+                        else -> null
                     }
+                    app.updater.refreshInstallState(release != null && !mayApply(release, manual = true))
+                    app.updater.autoTick(remote.updateProtocol, { mayApply(it, manual = false) }, ::checkpointUpdate)
+                    delay(if (updates.status is UpdateStatus.Ready || updates.status is UpdateStatus.Confirmation) 2_000 else 30_000)
                 }
             }
             RemoteTheme {
@@ -98,16 +123,19 @@ class MainActivity : ComponentActivity() {
                     openConversation = openConversation.value,
                     openApprovalDock = openApprovalDock.value,
                     updates = updates,
+                    drafts = app.drafts,
                     installError = installError.value,
                     onCheckUpdate = {
                         installError.value = null
-                        app.updater.check(it)
+                        app.updater.check(it, remote.updateProtocol)
                     },
-                    onDownloadUpdate = {
-                        openInstallerAfterDownload = true
-                        app.updater.download()
-                    },
+                    onDownloadUpdate = app.updater::download,
                     onInstallUpdate = ::installUpdate,
+                    onAllowUpdate = ::openUpdatePermission,
+                    onCancelUpdate = app.updater::cancelConfirmation,
+                    onAutoUpdate = app.updater::setAuto,
+                    onUpdateChannel = app.updater::setChannel,
+                    onUpdateOrigin = app.updater::setOrigin,
                     onBackground = { checked ->
                         app.settings.background = checked
                         background.value = checked
@@ -125,6 +153,7 @@ class MainActivity : ComponentActivity() {
                     },
                     onConnect = { url, token ->
                         if (remote.connect(url, token)) {
+                            app.updater.connectionChanged()
                             syncService()
                             if (background.value) requestNotifications()
                         }
@@ -158,13 +187,33 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         remote.setVisible(true)
         if (background.value && remote.wantsConnection &&
-            (pendingNotice.value != null || remote.attachments.view.value.share != null)
+            (resumingAfterUpdate || pendingNotice.value != null || remote.attachments.view.value.share != null)
         ) syncService()
     }
 
     override fun onStop() {
         remote.setVisible(false)
         super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed.value = true
+    }
+
+    override fun onPause() {
+        resumed.value = false
+        super.onPause()
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        lastInteraction = SystemClock.elapsedRealtime()
+        return super.dispatchTouchEvent(event)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        lastInteraction = SystemClock.elapsedRealtime()
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -219,17 +268,42 @@ class MainActivity : ComponentActivity() {
         ) permission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
-    @Suppress("DEPRECATION") // Android's installer activity prompts the user for confirmation.
+    private fun canApplyUpdate(manual: Boolean): Boolean =
+        resumed.value && hasWindowFocus() && pendingNotice.value == null && restoreWorkspace == null &&
+            !app.drafts.editing && remote.canApplyAppUpdate(allowProtocolMismatch = manual) &&
+            (manual || (SystemClock.elapsedRealtime() - lastInteraction >= 2_000 &&
+                ViewCompat.getRootWindowInsets(window.decorView)?.isVisible(WindowInsetsCompat.Type.ime()) != true))
+
+    private fun mayApply(release: UpdateRelease, manual: Boolean): Boolean =
+        canApplyUpdate(manual) &&
+            remote.updateProtocol?.let { app.updater.supportsConnectedServer(release, it) } == true
+
+    private fun checkpointUpdate(release: UpdateRelease): Boolean {
+        val state = remote.state.value
+        return app.drafts.flush() && app.settings.saveUpdateResume(release.versionCode, state.workspace, state.selection)
+    }
+
     private fun installUpdate() {
         installError.value = null
-        val apk = app.updater.apkForInstall() ?: return
-        try {
-            if (!packageManager.canRequestPackageInstalls()) {
-                startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.fromParts("package", packageName, null)))
-                return
+        val mayApply: (UpdateRelease) -> Boolean = { mayApply(it, manual = true) }
+        when (val status = app.updater.state.value.status) {
+            is UpdateStatus.Confirmation -> app.updater.confirm(mayApply) { intent ->
+                if (checkpointUpdate(status.release)) launchInstaller(intent)
+                else installError.value = getString(R.string.update_install_failed)
             }
-            val uri = FileProvider.getUriForFile(this, updateAuthority(this), apk)
-            startActivity(Intent(Intent.ACTION_INSTALL_PACKAGE, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+            is UpdateStatus.Ready -> app.updater.install(mayApply = mayApply, checkpoint = ::checkpointUpdate)
+            else -> Unit
+        }
+    }
+
+    private fun openUpdatePermission() {
+        installError.value = null
+        launchInstaller(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.fromParts("package", packageName, null)))
+    }
+
+    private fun launchInstaller(intent: Intent) {
+        try {
+            startActivity(intent)
         } catch (_: ActivityNotFoundException) {
             installError.value = getString(R.string.update_installer_unavailable)
         } catch (_: SecurityException) {
