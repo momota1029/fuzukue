@@ -1241,8 +1241,15 @@ async fn serve_workspace(
         .then(|| app.hub.register_question_client());
     let scoped = transcripts.is_some();
     let approval_queue = github_report_client && !canary() && protocol >= 11;
-    let workspace_request_client = workspace_requests::may_preview(protocol, client_version.0, github_report_client);
-    let request_operator = workspace_request_client && settings.is_some_and(remote::SettingsPrincipal::paired_device);
+    use workspace_requests::ClientSupport;
+    let request_support = ClientSupport::from_connection(
+        protocol, client_version.0, github_report_client,
+        settings.is_some_and(remote::SettingsPrincipal::paired_device),
+    );
+    let request_operator = request_support.can_review();
+    let workspace_request_client = request_operator || request_support == ClientSupport::UnpairedDesktop;
+    let request_recovery = request_support == ClientSupport::Desktop;
+    let request_connection = registry.workspace_requests.connect(&app.id, request_support);
     let mut request_changes = request_operator.then(|| registry.workspace_requests.subscribe());
     let (initial, mut live) = app.session_stats.subscribe(
         &app.hub, resume_from, protocol >= 2, protocol >= 4, transcripts,
@@ -1302,6 +1309,12 @@ async fn serve_workspace(
             tx.send(wire_event(&snapshot(event), protocol, None, locale_for_wire())).await.ok()?;
         }
     }
+    let send = |env: &Envelope| wire_event(env, protocol, Some(&app.id), locale_for_wire());
+    if request_recovery {
+        for event in registry.workspace_requests.draft_events(registry, &app.id) {
+            tx.send(send(&snapshot(event))).await.ok()?;
+        }
+    }
     if protocol >= fuzukue_proto::EXTENSIONS_PROTOCOL {
         for event in extensions::snapshot(app.clone(), locale_for_wire()).await {
             tx.send(wire_event(&snapshot(event), protocol, Some(&app.id), locale_for_wire())).await.ok()?;
@@ -1315,7 +1328,6 @@ async fn serve_workspace(
     if supports_chat {
         app.hub.refresh_model_defaults();
     }
-    let send = |env: &Envelope| wire_event(env, protocol, Some(&app.id), locale_for_wire());
     // v1 クライアントは未知のイベントを受けると切断する。
     let supports = move |env: &Envelope| {
         if !supports_question_events(&env.event, question_protocol) {
@@ -1324,6 +1336,7 @@ async fn serve_workspace(
         match env.event {
             ServerEvent::DeckCardsChanged { .. } | ServerEvent::Cards { .. } | ServerEvent::Document { .. } => desktop_cards,
             ServerEvent::WorkspaceRequests { view: Some(_) } => request_operator,
+            ServerEvent::WorkspaceRequestDrafts { .. } => request_recovery,
             ServerEvent::WorkspaceRequests { view: None } | ServerEvent::WorkspaceRequestError { .. } => workspace_request_client,
             ServerEvent::FolderGrants { .. } | ServerEvent::FolderGrantsChanged { .. } =>
                 github_report_client && protocol >= fuzukue_proto::FOLDER_GRANTS_PROTOCOL,
@@ -1573,7 +1586,7 @@ async fn serve_workspace(
     let (stop_writer, mut stop) = tokio::sync::oneshot::channel::<()>();
     let writer = async {
         if workspace_request_client {
-            let event = registry.workspace_requests.event(&app.id, request_operator);
+            let event = registry.workspace_requests.event(&app.id, request_operator, !request_recovery);
             if tx.send(send(&snapshot(event))).await.is_err() { return; }
         }
         let mut background_commands = (protocol >= fuzukue_proto::BACKGROUND_COMMANDS_PROTOCOL)
@@ -1599,7 +1612,12 @@ async fn serve_workspace(
                 }
                 _ = &mut stop => break,
                 Ok(()) = async { request_changes.as_mut().unwrap().changed().await }, if request_changes.is_some() => {
-                    let event = registry.workspace_requests.event(&app.id, true);
+                    if request_recovery {
+                        for event in registry.workspace_requests.draft_events(registry, &app.id) {
+                            if tx.send(send(&snapshot(event))).await.is_err() { break 'write; }
+                        }
+                    }
+                    let event = registry.workspace_requests.event(&app.id, true, !request_recovery);
                     if tx.send(send(&snapshot(event))).await.is_err() { break; }
                     continue;
                 }
@@ -1799,6 +1817,16 @@ async fn serve_workspace(
                 other => other,
             };
             match msg {
+                Ok(ClientMsg::WorkspaceRequestSurface { session, inbox_revision })
+                    if request_recovery && workspace_request =>
+                {
+                    // The report is advisory. It never authorizes a decision.
+                    if session.as_ref().is_none_or(|session| session.len() <= 1024)
+                        && inbox_revision.as_ref().is_none_or(|revision| revision.len() <= 64)
+                    {
+                        request_connection.report(session, inbox_revision);
+                    }
+                }
                 Ok(ClientMsg::WorkspaceRequest { action }) if workspace_request_client && workspace_request => {
                     let result = workspace_requests::client_action(registry, &app, settings, action);
                     if let Err(error) = result {
@@ -3370,7 +3398,7 @@ async fn handle_from_client(
     app: &Arc<Workspace>, msg: ClientMsg, client: Option<&screenshots::Connection<'_>>,
 ) -> anyhow::Result<()> {
     match msg {
-        ClientMsg::ListPendingApprovals { .. } | ClientMsg::DecideApproval { .. } | ClientMsg::WorkspaceRequest { .. } => {}
+        ClientMsg::ListPendingApprovals { .. } | ClientMsg::DecideApproval { .. } | ClientMsg::WorkspaceRequest { .. } | ClientMsg::WorkspaceRequestSurface { .. } => {}
         ClientMsg::SaveScreenshot { .. } | ClientMsg::ClientScreenshotResponse { .. }
         | ClientMsg::Trash { .. } | ClientMsg::RemoveWorkspace { .. } | ClientMsg::RewriteReply { .. }
         | ClientMsg::SelfUpdateStatus | ClientMsg::StartSelfUpdate | ClientMsg::RollbackServer

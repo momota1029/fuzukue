@@ -24,6 +24,7 @@ pub(super) struct WorkspaceState {
     pub active: Option<String>,
     pub entries: Vec<WorkspaceInfo>,
     pub pending: bool,
+    pending_draft_inbox: Option<String>,
     last_thread: HashMap<String, String>,
     replay_positions: HashMap<String, TranscriptPosition>,
     browser: Option<Browser>,
@@ -116,6 +117,9 @@ impl Workbench {
         {
             self.open_workshop_target(target, cx);
         }
+        if self.workspaces.pending_draft_inbox.take().as_ref() == Some(&id) {
+            self.show_workspace_request_inbox(cx);
+        }
         if first && self.auto_prompt.is_some() {
             let _ = self.out.send(ClientMsg::NewThread);
         }
@@ -131,6 +135,7 @@ impl Workbench {
 
     pub(super) fn workspace_error(&mut self, message: String) {
         self.workshop.pending_navigation = None;
+        self.workspaces.pending_draft_inbox = None;
         self.workspaces.pending = false;
         self.workspaces.error = Some(message.into());
     }
@@ -138,6 +143,15 @@ impl Workbench {
     pub(super) fn switch_workspace(&mut self, id: String, cx: &mut Context<Self>) {
         if self.workspaces.active.as_ref() != Some(&id) && !self.workspaces.pending {
             self.request_workspace(ClientMsg::SwitchWorkspace { id }, cx);
+        }
+    }
+
+    pub(super) fn open_other_workspace_request_inbox(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.workspaces.pending {
+            self.switch_workspace(id.clone(), cx);
+            if self.workspaces.pending {
+                self.workspaces.pending_draft_inbox = Some(id);
+            }
         }
     }
 

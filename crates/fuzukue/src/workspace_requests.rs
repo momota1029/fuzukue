@@ -1,6 +1,7 @@
 use fuzukue_proto::{
     ClientMsg, WorkspaceRequestAction as Action, WorkspaceRequestDestination as Destination,
-    WorkspaceRequestReply as Reply, WorkspaceRequestUpdateKind as Update,
+    WorkspaceRequestDraft as Draft, WorkspaceRequestDraftLocation, WorkspaceRequestReply as Reply,
+    WorkspaceRequestUpdateKind as Update,
     WorkspaceRequestsView as View,
 };
 use gpui_kit::{
@@ -18,30 +19,143 @@ use gpui_kit::{
     px,
 };
 
-use crate::Workbench;
+use crate::{ConnectionStatus, RightPane, Workbench};
+
+#[derive(Default)]
+struct DraftFeed {
+    drafts: Vec<Draft>,
+    other_workspaces: Vec<WorkspaceRequestDraftLocation>,
+}
+
+#[derive(Clone, PartialEq)]
+struct Surface {
+    session: Option<String>,
+    inbox_revision: Option<String>,
+}
 
 #[derive(Default)]
 pub(super) struct WorkspaceRequests {
     pub(super) available: bool,
     pub(super) view: Option<View>,
+    pub(super) error: Option<String>,
+    draft_feed: Option<DraftFeed>,
+    incoming: DraftFeed,
+    reported_surface: Option<Surface>,
     selected_inbox: Option<String>,
+    selected_draft: Option<String>,
     show_updates: bool,
 }
 
+impl WorkspaceRequests {
+    fn drafts(&self) -> &[Draft] {
+        if let Some(feed) = &self.draft_feed {
+            &feed.drafts
+        } else {
+            self.view.as_ref().map_or(&[], |view| view.drafts.as_slice())
+        }
+    }
+
+    fn other_workspaces(&self) -> &[WorkspaceRequestDraftLocation] {
+        self.draft_feed.as_ref().map_or(&[], |feed| feed.other_workspaces.as_slice())
+    }
+
+    pub(super) fn receive_drafts(
+        &mut self, drafts: Vec<Draft>, other_workspaces: Vec<WorkspaceRequestDraftLocation>, complete: bool,
+    ) {
+        self.incoming.drafts.extend(drafts);
+        self.incoming.other_workspaces.extend(other_workspaces);
+        if complete {
+            self.draft_feed = Some(std::mem::take(&mut self.incoming));
+            if self.selected_draft.as_ref().is_some_and(|revision| {
+                !self.drafts().iter().any(|draft| &draft.revision == revision)
+            }) {
+                self.selected_draft = None;
+            }
+        }
+    }
+}
+
 impl Workbench {
+    pub(super) fn report_workspace_request_surface(&mut self, chat_visible: bool, uncovered: bool) {
+        let requests = &mut self.workspace_requests;
+        if requests.draft_feed.is_none() || self.workspaces.active.is_none()
+            || !matches!(self.status, ConnectionStatus::Connected)
+        {
+            return;
+        }
+        let open = uncovered && !self.workspaces.pending;
+        let surface = Surface {
+            session: (open && chat_visible && !self.active.is_empty()).then(|| self.active.clone()),
+            inbox_revision: if open && !self.settings_open && self.right == RightPane::Inbox {
+                requests.selected_draft.clone()
+            } else {
+                None
+            },
+        };
+        if requests.reported_surface.as_ref() != Some(&surface)
+            && self.out.send(ClientMsg::WorkspaceRequestSurface {
+                session: surface.session.clone(),
+                inbox_revision: surface.inbox_revision.clone(),
+            }).is_ok()
+        {
+            requests.reported_surface = Some(surface);
+        }
+    }
+
+    pub(super) fn show_workspace_request_inbox(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.right = RightPane::Inbox;
+        cx.notify();
+    }
+
+    pub(super) fn render_workspace_request_notice(
+        &self, chat_visible: bool, cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let requests = &self.workspace_requests;
+        let elsewhere = !requests.other_workspaces().is_empty();
+        let local = requests.drafts().iter().any(|draft| !chat_visible || draft.session != self.active);
+        let link = (local || elsewhere) && (self.settings_open || self.right != RightPane::Inbox);
+        if !link && requests.error.is_none() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        Some(h_flex()
+            .id("workspace-request-notice")
+            .flex_none()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .children(link.then(|| {
+                Button::new("workspace-request-open-inbox")
+                    .secondary().xsmall()
+                    .label(tr!("workspace-request-review-inbox"))
+                    .on_click(cx.listener(|this, _, _, cx| this.show_workspace_request_inbox(cx)))
+            }))
+            .children(requests.error.as_ref().map(|error| {
+                h_flex().gap_2().text_sm().text_color(theme.danger)
+                    .child(plain(error.clone()))
+                    .child(Button::new("workspace-request-dismiss-error")
+                        .ghost().xsmall().label(tr!("workspace-request-dismiss"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.workspace_requests.error = None;
+                            cx.notify();
+                        })))
+            }))
+            .into_any_element())
+    }
+
     pub(super) fn render_workspace_request_chat(
         &self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let requests = &self.workspace_requests;
-        let view = requests.view.as_ref()?;
-        let updates: Vec<_> = view
-            .updates
-            .iter()
+        let updates: Vec<_> = requests.view.iter()
+            .flat_map(|view| &view.updates)
             .filter(|update| update.session == self.active)
             .collect();
-        let draft = view
-            .drafts
+        let draft = requests.drafts()
             .iter()
             .find(|draft| draft.session == self.active);
         if updates.is_empty() && draft.is_none() {
@@ -117,69 +231,7 @@ impl Workbench {
             );
         }
         if let Some(draft) = draft {
-            let Destination::Workspace { id, title } = &draft.destination;
-            let revision = draft.revision.clone();
-            let label = match draft.reply {
-                None => tr!("workspace-request-preview"),
-                Some(Reply::Question) => tr!("workspace-request-preview-question"),
-                Some(Reply::Answer) => tr!("workspace-request-preview-answer"),
-                Some(Reply::Result) => tr!("workspace-request-preview-result"),
-            };
-            section = section.child(
-                v_flex()
-                    .id("workspace-request-preview")
-                    .flex_none()
-                    .min_w_0()
-                    .gap_2()
-                    .p_3()
-                    .border_1()
-                    .rounded_md()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .child(div().font_semibold().text_sm().child(label))
-                    .child(
-                        v_flex()
-                            .id("workspace-request-preview-scroll")
-                            .max_h(px(205.))
-                            .overflow_y_scrollbar()
-                            .min_w_0()
-                            .gap_1()
-                            .text_sm()
-                            .child(
-                                plain(tr!(
-                                    "workspace-request-destination",
-                                    title = title.as_str(),
-                                    id = id.as_str()
-                                ))
-                                .id("workspace-request-to"),
-                            )
-                            .child(
-                                plain(draft.title.clone())
-                                    .id("workspace-request-title")
-                                    .font_semibold(),
-                            )
-                            .child(plain(draft.body.clone()).id("workspace-request-body"))
-                            .child(
-                                div()
-                                    .id("workspace-request-no-attachments")
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(tr!("workspace-request-no-attachments")),
-                            ),
-                    )
-                    .child(crate::chat::approval_decision_buttons(
-                        "workspace-request",
-                        tr!("workspace-request-cancel"),
-                        tr!("workspace-request-send"),
-                        &cx.entity(),
-                        move |send| ClientMsg::WorkspaceRequest {
-                            action: Action::Decide {
-                                revision: revision.clone(),
-                                send,
-                            },
-                        },
-                    )),
-            );
+            section = section.child(review_card(draft, false, cx));
         }
         Some(section.into_any_element())
     }
@@ -189,7 +241,7 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let requests = &self.workspace_requests;
-        if !requests.available {
+        if !requests.available && requests.draft_feed.is_none() {
             return None;
         }
         let theme = cx.theme().clone();
@@ -198,7 +250,7 @@ impl Workbench {
             .min_w_0()
             .gap_2()
             .pb_3();
-        let Some(view) = &requests.view else {
+        if requests.view.is_none() && requests.draft_feed.is_none() {
             return Some(
                 section
                     .child(
@@ -208,6 +260,10 @@ impl Workbench {
                     )
                     .into_any_element(),
             );
+        }
+        section = section.children(self.render_workspace_request_drafts(cx));
+        let Some(view) = &requests.view else {
+            return Some(section.into_any_element());
         };
         let auto_start = view.auto_start;
         let out = self.out.clone();
@@ -332,6 +388,117 @@ impl Workbench {
         }
         Some(section.into_any_element())
     }
+
+    fn render_workspace_request_drafts(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let requests = &self.workspace_requests;
+        let drafts = requests.drafts();
+        let elsewhere = requests.other_workspaces();
+        if drafts.is_empty() && elsewhere.is_empty() {
+            return None;
+        }
+        let mut section = v_flex()
+            .id("workspace-request-pending-drafts")
+            .min_w_0()
+            .gap_2()
+            .child(div().font_semibold().text_sm().child(tr!("workspace-request-pending-title")));
+        for (index, draft) in drafts.iter().rev().enumerate() {
+            let revision = draft.revision.clone();
+            let expanded = requests.selected_draft.as_ref() == Some(&revision);
+            let title = draft.title.clone();
+            section = section.child(
+                Button::new(SharedString::from(format!("workspace-request-pending-{index}")))
+                    .secondary().small().max_w_full()
+                    .accessibility_label(title.clone())
+                    .child(div().min_w_0().truncate().child(title))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let selected = &mut this.workspace_requests.selected_draft;
+                        *selected = (selected.as_ref() != Some(&revision)).then(|| revision.clone());
+                        cx.notify();
+                    })),
+            );
+            if expanded {
+                section = section.child(review_card(draft, true, cx));
+                if self.threads.iter().any(|thread| thread.id == draft.session) {
+                    let session = draft.session.clone();
+                    section = section.child(
+                        Button::new("workspace-request-open-source-thread")
+                            .ghost().xsmall().label(tr!("workspace-request-open-source-thread"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.symbols.clear();
+                                this.close_right_pane(cx);
+                                this.select_thread(session.clone(), cx);
+                            })),
+                    );
+                }
+            }
+        }
+        for (index, entry) in elsewhere.iter().enumerate() {
+            let id = entry.id.clone();
+            section = section.child(
+                Button::new(SharedString::from(format!("workspace-request-other-workspace-{index}")))
+                    .secondary().small().max_w_full()
+                    .label(tr!("workspace-request-open-other-inbox", title = entry.title.as_str()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_other_workspace_request_inbox(id.clone(), cx);
+                    })),
+            );
+        }
+        Some(section.into_any_element())
+    }
+}
+
+fn review_card(draft: &Draft, inbox: bool, cx: &Context<Workbench>) -> impl IntoElement {
+    let theme = cx.theme();
+    let prefix = if inbox { "workspace-request-inbox-draft" } else { "workspace-request" };
+    let element = |name: &str| SharedString::from(format!("{prefix}-{name}"));
+    let Destination::Workspace { id, title } = &draft.destination;
+    let revision = draft.revision.clone();
+    let label = match draft.reply {
+        None => tr!("workspace-request-preview"),
+        Some(Reply::Question) => tr!("workspace-request-preview-question"),
+        Some(Reply::Answer) => tr!("workspace-request-preview-answer"),
+        Some(Reply::Result) => tr!("workspace-request-preview-result"),
+    };
+    v_flex()
+        .id(element("preview"))
+        .flex_none()
+        .min_w_0()
+        .gap_2()
+        .p_3()
+        .border_1()
+        .rounded_md()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .child(div().font_semibold().text_sm().child(label))
+        .child(
+            v_flex()
+                .id(element("preview-scroll"))
+                .max_h(px(205.))
+                .overflow_y_scrollbar()
+                .min_w_0()
+                .gap_1()
+                .text_sm()
+                .child(
+                    plain(tr!("workspace-request-destination", title = title.as_str(), id = id.as_str()))
+                        .id(element("to")),
+                )
+                .child(plain(draft.title.clone()).id(element("title")).font_semibold())
+                .child(plain(draft.body.clone()).id(element("body")))
+                .child(
+                    div().id(element("no-attachments")).text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(tr!("workspace-request-no-attachments")),
+                ),
+        )
+        .child(crate::chat::approval_decision_buttons(
+            prefix,
+            tr!("workspace-request-cancel"),
+            tr!("workspace-request-send"),
+            &cx.entity(),
+            move |send| ClientMsg::WorkspaceRequest {
+                action: Action::Decide { revision: revision.clone(), send },
+            },
+        ))
 }
 
 fn plain(text: impl Into<SharedString>) -> Div {

@@ -977,6 +977,7 @@ impl Worker {
         let mut approvals_armed = false;
         let mut approval_snapshot = None;
         let mut approval_workspace_seen = false;
+        let mut request_feed_received = false;
         let mut scoped = false;
         let mut synced = false;
         loop {
@@ -1005,7 +1006,15 @@ impl Worker {
                             }
                             ClientMsg::ListPendingApprovals { .. } => continue,
                             ClientMsg::DecideApproval { .. } if !approvals_armed || !selected_workspace => continue,
+                            ClientMsg::WorkspaceRequestSurface { .. }
+                                if !request_feed_received || !selected_workspace => continue,
                             _ => {}
+                        }
+                        #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+                        if _target.shot_read_only == Some(true)
+                            && matches!(request, ClientMsg::WorkspaceRequestSurface { .. })
+                        {
+                            continue;
                         }
                         if matches!(request, ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { generation: Some(_), .. })
                             && !synced
@@ -1065,6 +1074,9 @@ impl Worker {
                             approvals_armed = true;
                         }
                         ServerEvent::ThreadSync { .. } => synced = scoped,
+                        ServerEvent::WorkspaceRequestDrafts { complete: true, .. } => {
+                            request_feed_received = env.workspace.as_ref() == cursor.workspace.as_ref();
+                        }
                         ServerEvent::ServerSwapNotice => {
                             crate::updater::server_restarting();
                             if welcomed {
@@ -1083,6 +1095,7 @@ impl Worker {
                         if !approval_workspace_seen || cursor.workspace.as_ref() != Some(id) {
                             approvals_armed = false;
                             approval_snapshot = None;
+                            request_feed_received = false;
                         }
                         approval_workspace_seen = true;
                         if *replay || cursor.workspace.as_deref() != Some(id) {

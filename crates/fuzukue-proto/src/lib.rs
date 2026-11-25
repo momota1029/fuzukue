@@ -70,7 +70,8 @@ pub const JOB_DISMISS_PROTOCOL: u32 = 68;
 pub const WORKSPACE_REQUESTS_PROTOCOL: u32 = 69;
 pub const LARGE_LEGACY_FRAME_PROTOCOL: u32 = 70;
 pub const LAZY_DECK_PROTOCOL: u32 = 71;
-pub const PROTOCOL_VERSION: u32 = LAZY_DECK_PROTOCOL;
+pub const WORKSPACE_REQUEST_RECOVERY_PROTOCOL: u32 = 72;
+pub const PROTOCOL_VERSION: u32 = WORKSPACE_REQUEST_RECOVERY_PROTOCOL;
 pub const DECK_PAGE_BYTES: usize = 1024 * 1024;
 pub const CARD_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -937,6 +938,8 @@ pub struct MarkdownComponentCapability {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     WorkspaceRequest { action: WorkspaceRequestAction },
+    /// Draft review surfaces currently open on the desktop.
+    WorkspaceRequestSurface { session: Option<String>, inbox_revision: Option<String> },
     SelfUpdateStatus,
     RequestDrain { reason: DrainReason },
     CancelDrain { started_at: i64 },
@@ -1976,6 +1979,12 @@ pub struct WorkspaceRequestDraft {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRequestDraftLocation {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceRequestItem {
     pub id: String,
     pub title: String,
@@ -2279,6 +2288,12 @@ pub enum ClientCommand {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
     WorkspaceRequests { view: Option<WorkspaceRequestsView> },
+    /// Consecutive chunks of the paired desktop's pending drafts, ending at `complete`.
+    WorkspaceRequestDrafts {
+        drafts: Vec<WorkspaceRequestDraft>,
+        other_workspaces: Vec<WorkspaceRequestDraftLocation>,
+        complete: bool,
+    },
     WorkspaceRequestError { message: LocalizedMessage },
     GitHubReportResult { request: u64, result: Result<GitHubReportUpdate, GitHubReportError> },
     GitHubAccountChanged { state: GitHubConnectState },

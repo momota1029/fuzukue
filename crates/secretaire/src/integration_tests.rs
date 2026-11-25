@@ -2533,7 +2533,7 @@ async fn review_entry_points_start_in_background_and_report_preparation_errors()
 }
 
 // Keep the real HTTP upgrade and WebSocket frames without binding a socket.
-struct MemoryListener(tokio::sync::mpsc::Receiver<tokio::io::DuplexStream>);
+pub(super) struct MemoryListener(pub(super) tokio::sync::mpsc::Receiver<tokio::io::DuplexStream>);
 
 impl axum::serve::Listener for MemoryListener {
     type Io = tokio::io::DuplexStream;

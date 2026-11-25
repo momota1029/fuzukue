@@ -2230,10 +2230,12 @@ impl Workbench {
                 self.workspace_requests.available = true;
                 self.workspace_requests.view = view;
             }
+            ServerEvent::WorkspaceRequestDrafts { drafts, other_workspaces, complete } => {
+                self.workspace_requests.receive_drafts(drafts, other_workspaces, complete);
+            }
             ServerEvent::WorkspaceRequestError { message } => {
-                let session = self.active.clone();
                 let text = i18n::Message { fallback: message.key.clone(), localized: Some(message) };
-                self.chat(&session, cx).push_error(text.text().into_owned(), cx);
+                self.workspace_requests.error = Some(text.text().into_owned());
             }
             ServerEvent::ResponseTooLarge { message } => self.notice = Some(message.into()),
             ServerEvent::Error { message } => {
@@ -2273,7 +2275,9 @@ impl Render for Workbench {
             .children(self.handoff_thread_button(cx))
             .children((!self.settings_open).then(|| self.render_model_setup(false, cx)).flatten())
             .children((!self.settings_open && !self.thread_info_visible()).then(|| self.render_update_notice(cx)).flatten());
-        let chat_col = if let Some(panel) = self.render_symbol_panel(cx).filter(|_| !self.settings_open) {
+        let symbols = self.render_symbol_panel(cx).filter(|_| !self.settings_open);
+        let chat_visible = symbols.is_none() && !paper_info;
+        let chat_col = if let Some(panel) = symbols {
             let panel = if self.pane_close_id() == Some("symbol-close") {
                 self.render_pane_notice(panel.into_any_element(), cx)
             } else {
@@ -2301,6 +2305,9 @@ impl Render for Workbench {
                         .child(self.render_composer(window, cx))
                 )
         };
+        let uncovered = !self.workspace_browser_open() && self.palette.is_none()
+            && !window.has_active_dialog(cx);
+        self.report_workspace_request_surface(chat_visible, uncovered);
         let root = self.render_workbench_layout(chat_col, window, cx);
         div()
             .id("workbench")
@@ -2351,6 +2358,7 @@ impl Render for Workbench {
             .child(
                 v_flex().size_full()
                     .child(self.render_menu_bar(window, cx))
+                    .children(self.render_workspace_request_notice(chat_visible, cx))
                     .child(div().flex_1().min_h_0().w_full().child(root)),
             )
             .children(self.render_pdf_popup(window, cx))

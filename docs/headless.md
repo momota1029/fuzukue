@@ -197,7 +197,7 @@ scripts/shot.sh --url ws://127.0.0.1:7878/ws /tmp/read-only.json /tmp/lab-shots/
 scripts/shot.sh --workspace examples/code-pilot examples/lab tests/shots/workspaces.json
 ```
 
-`workspace-requests.json` は同じ二つのフィクスチャと一時端末トークンを使います。通常の会話で依頼を下書きし、完全承認モードで送る操作、受信側の Inbox からの着手、質問・回答・結果の往復を通します。出力は `workspace-request-preview.png`、`workspace-request-inbox.png`、`workspace-request-question.png`、`workspace-request-result.png` です。
+`workspace-requests.json` は同じ二つのフィクスチャと一時端末トークンを使います。通常の会話で依頼を下書きし、別のワークスペースに移動してから送り元の Inbox で確認・送信します。受信側の Inbox からの着手と、質問・回答・結果の往復も通します。出力は `workspace-request-preview.png`、`workspace-request-pending-inbox.png`、`workspace-request-inbox.png`、`workspace-request-question.png`、`workspace-request-result.png` です。
 
 ```sh
 scripts/shot.sh --workspace examples/code-pilot examples/lab tests/shots/workspace-requests.json
