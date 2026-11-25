@@ -174,7 +174,7 @@ fn restore_file(
             } else {
                 stamp.4 & !0o111
             };
-            unix::fchmod(&file, Mode::from_bits_truncate(mode & 0o777))?;
+            unix::fchmod(&file, Mode::from_bits_truncate((mode & 0o777) as _))?;
         }
         file.sync_all()?;
         unchanged(root, parent_path, &parent, name, stamp.as_ref())?;

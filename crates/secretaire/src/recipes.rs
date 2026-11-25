@@ -576,7 +576,7 @@ impl Broker {
                 &self.paths,
                 &self.config.recipe_runner,
             );
-            anyhow::bail!("recipe execution requires Linux")
+            Err(anyhow::anyhow!("recipe execution requires Linux"))
         };
         if let Err(error) = result {
             record.finish(State::Refused, Some(format!("{error:#}")));

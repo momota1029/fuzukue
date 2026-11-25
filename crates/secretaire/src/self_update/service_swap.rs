@@ -2,6 +2,7 @@
 
 use std::fs::{self, File};
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -320,6 +321,12 @@ fn wait_healthy(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn older_binary_healthy(_: &impl SystemctlRunner, _: &Path, _: SocketAddr, _: HealthCheck) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn older_binary_healthy(
     runner: &impl SystemctlRunner,
     binary: &Path,

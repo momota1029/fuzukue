@@ -101,6 +101,12 @@ fn write_history(project: &Path, state: &Path) -> Result<u64> {
     Ok(fs::metadata(path)?.len())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn rss_kib() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn rss_kib() -> Option<u64> {
     fs::read_to_string("/proc/self/status")
         .ok()?

@@ -70,8 +70,11 @@ static CAPABILITY: tokio::sync::OnceCell<Capability> = tokio::sync::OnceCell::co
 
 pub(crate) async fn capability() -> &'static Capability {
     CAPABILITY.get_or_init(|| async {
+        #[cfg(target_os = "linux")]
         let bwrap = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
             .into_iter().map(PathBuf::from).find(|path| path.is_file());
+        #[cfg(not(target_os = "linux"))]
+        let bwrap = None;
         probe(bwrap).await
     }).await
 }
@@ -95,6 +98,7 @@ async fn probe(bwrap: Option<PathBuf>) -> Capability {
         error: None,
         network_error: None,
     };
+    #[cfg(target_os = "linux")]
     if Path::new("/usr/bin/unshare").is_file() {
         let mut unshare = Command::new("/usr/bin/unshare");
         unshare.args(["--user", "--map-root-user", "--", "/bin/true"]);

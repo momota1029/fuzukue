@@ -10,7 +10,9 @@ mod supervisor;
 pub(crate) mod wait_route;
 
 use std::fs::{self, File};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -1274,6 +1276,12 @@ impl Update {
         .then_some(previous)
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn snapshot_current(&self) -> Result<PathBuf> {
+        bail!("実行中のサーバーの保存には Linux の procfs が必要だよ");
+    }
+
+    #[cfg(target_os = "linux")]
     fn snapshot_current(&self) -> Result<PathBuf> {
         let running = Path::new("/proc/self/exe");
         if fs::canonicalize(&self.root).is_ok_and(|root| self.exe.starts_with(root)) {
@@ -1618,6 +1626,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn failing_test_kills_prebuild_group_without_registering() -> Result<()> {
         let dir = tempfile::tempdir()?;

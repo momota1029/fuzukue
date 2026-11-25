@@ -6,20 +6,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{ensure, Context, Result};
 use rustix::fd::{AsFd, OwnedFd};
-use rustix::fs::{self as at, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags};
+use rustix::fs::{self as at, AtFlags, Dir, FileType};
+#[cfg(all(target_os = "linux", not(all(test, feature = "portable-fs-tests"))))]
+use rustix::fs::OFlags;
 use rustix::io::Errno;
+
+use crate::confined_fs::{open_beneath, open_root, DIR_FLAGS};
 
 const DEBUG: &str = "target/debug";
 const DEPS: &str = "target/debug/deps";
 const INCREMENTAL: &str = "target/debug/incremental";
 const SOURCE_MAX_AGE: Duration = Duration::from_secs(3600);
 const CANARY_MAX_AGE: Duration = Duration::from_secs(7200);
-const DIR_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::CLOEXEC);
-const INSIDE_ROOT: ResolveFlags = ResolveFlags::BENEATH
-    .union(ResolveFlags::NO_SYMLINKS)
-    .union(ResolveFlags::NO_XDEV);
 
 struct Entry {
     path: PathBuf,
@@ -102,14 +100,7 @@ pub(super) fn run(root: &Path, current: &Path, previous: &Path, mut log: impl Fn
 }
 
 fn prune(root: &Path, binaries: [&Path; 2], log: &mut impl FnMut(&str)) -> Result<()> {
-    let dir = at::openat2(
-        at::CWD,
-        root,
-        DIR_FLAGS,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS,
-    )
-    .context("open server-builds")?;
+    let dir = open_root(root).context("open server-builds")?;
     let mut keep = Vec::new();
     // The supervisor passes the two targets just published by record_versions.
     // A target reached through a symlink would make the lexical keep list unsafe.
@@ -128,14 +119,8 @@ fn prune(root: &Path, binaries: [&Path; 2], log: &mut impl FnMut(&str)) -> Resul
             "invalid version target {}",
             binary.display()
         );
-        at::openat2(
-            &dir,
-            relative,
-            OFlags::PATH | OFlags::CLOEXEC,
-            Mode::empty(),
-            INSIDE_ROOT,
-        )
-        .with_context(|| format!("protect version target {}", binary.display()))?;
+        protect_version(&dir, relative)
+            .with_context(|| format!("protect version target {}", binary.display()))?;
         keep.push(Path::new(
             relative
                 .components()
@@ -159,11 +144,7 @@ fn prune(root: &Path, binaries: [&Path; 2], log: &mut impl FnMut(&str)) -> Resul
     let mut removed = 0;
     let mut bytes = 0;
     for path in plan_prune(&entries, SystemTime::now(), &keep) {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let result = open_dir(&dir, parent).and_then(|parent| {
+        let result = open_dir(&dir, parent_path(&path)).and_then(|parent| {
             let name = path.file_name().expect("prune plan contains a filename");
             let stat = at::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
             let kind = FileType::from_raw_mode(stat.st_mode);
@@ -175,7 +156,7 @@ fn prune(root: &Path, binaries: [&Path; 2], log: &mut impl FnMut(&str)) -> Resul
             if kind != expected {
                 return Err(Errno::INVAL);
             }
-            remove(&parent, name, &stat, &mut bytes)
+            remove(&dir, &parent, &path, &stat, &mut bytes)
         });
         match result {
             Ok(()) => removed += 1,
@@ -193,7 +174,36 @@ fn prune(root: &Path, binaries: [&Path; 2], log: &mut impl FnMut(&str)) -> Resul
 }
 
 fn open_dir(parent: impl AsFd, path: &Path) -> rustix::io::Result<OwnedFd> {
-    at::openat2(parent, path, DIR_FLAGS, Mode::empty(), INSIDE_ROOT)
+    open_beneath(parent, path, DIR_FLAGS, true)
+}
+
+#[cfg(all(target_os = "linux", not(all(test, feature = "portable-fs-tests"))))]
+fn protect_version(root: &OwnedFd, path: &Path) -> rustix::io::Result<()> {
+    open_beneath(root, path, OFlags::PATH | OFlags::CLOEXEC, true)?;
+    Ok(())
+}
+
+#[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+fn protect_version(root: &OwnedFd, path: &Path) -> rustix::io::Result<()> {
+    // Inspect the final component without opening it. A version target should
+    // be a regular file, so a symlink, device or FIFO cannot stand in for it.
+    let parent = parent_path(path);
+    let dir = open_dir(root, parent)?;
+    let name = path.file_name().ok_or(Errno::INVAL)?;
+    let stat = at::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(Errno::INVAL);
+    }
+    if stat.st_dev != at::fstat(root)?.st_dev {
+        return Err(Errno::XDEV);
+    }
+    crate::confined_fs::verify_dir(root, parent, &dir, true)
+}
+
+fn parent_path(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 fn file_name(name: &CStr) -> Option<&OsStr> {
@@ -226,35 +236,56 @@ fn scan(root: &OwnedFd, path: &Path) -> rustix::io::Result<Vec<Entry>> {
             },
             kind: FileType::from_raw_mode(stat.st_mode),
             executable: stat.st_mode & 0o111 != 0,
-            modified: base + Duration::from_nanos(stat.st_mtime_nsec.into()),
+            modified: base + Duration::from_nanos(stat.st_mtime_nsec as u64),
         });
     }
     Ok(entries)
 }
 
 fn remove(
+    root: &OwnedFd,
     parent: &OwnedFd,
-    name: &OsStr,
+    path: &Path,
     stat: &at::Stat,
     bytes: &mut u64,
 ) -> rustix::io::Result<()> {
+    let name = path.file_name().ok_or(Errno::INVAL)?;
     let kind = FileType::from_raw_mode(stat.st_mode);
+    #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+    if stat.st_dev != at::fstat(root)?.st_dev {
+        return Err(Errno::XDEV);
+    }
     if kind == FileType::Directory {
+        #[cfg(all(target_os = "linux", not(all(test, feature = "portable-fs-tests"))))]
         let dir = open_dir(parent, Path::new(name))?;
+        #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+        let dir = {
+            let dir = open_dir(root, path)?;
+            crate::confined_fs::require_same_entry(stat, &at::fstat(&dir)?)?;
+            dir
+        };
         for item in Dir::read_from(&dir)? {
             let item = item?;
             let Some(child) = file_name(item.file_name()) else {
                 continue;
             };
             let stat = at::statat(&dir, child, AtFlags::SYMLINK_NOFOLLOW)?;
-            remove(&dir, child, &stat, bytes)?;
+            remove(root, &dir, &path.join(child), &stat, bytes)?;
         }
-        at::unlinkat(parent, name, AtFlags::REMOVEDIR)?;
+    }
+    #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+    {
+        crate::confined_fs::verify_entry(parent, name, stat)?;
+        crate::confined_fs::verify_dir(root, parent_path(path), parent, true)?;
+    }
+    let flags = if kind == FileType::Directory {
+        AtFlags::REMOVEDIR
     } else {
-        at::unlinkat(parent, name, AtFlags::empty())?;
-        if kind == FileType::RegularFile {
-            *bytes += stat.st_size.max(0) as u64;
-        }
+        AtFlags::empty()
+    };
+    at::unlinkat(parent, name, flags)?;
+    if kind == FileType::RegularFile {
+        *bytes += stat.st_size.max(0) as u64;
     }
     Ok(())
 }
@@ -264,6 +295,33 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[cfg(all(test, feature = "portable-fs-tests"))]
+    #[test]
+    fn portable_remove_refuses_a_parent_moved_outside_the_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let temp = temp.path().canonicalize()?;
+        let root_path = temp.join("server-builds");
+        let old_parent = root_path.join("old");
+        let outside = temp.join("outside");
+        fs::create_dir_all(&old_parent)?;
+        fs::write(old_parent.join("keep"), b"outside")?;
+        let root = open_root(&root_path)?;
+        let parent = open_dir(&root, Path::new("old"))?;
+        let stat = at::statat(&parent, "keep", AtFlags::SYMLINK_NOFOLLOW)?;
+
+        fs::rename(&old_parent, &outside)?;
+        fs::create_dir(&old_parent)?;
+
+        let mut bytes = 0;
+        assert_eq!(
+            remove(&root, &parent, Path::new("old/keep"), &stat, &mut bytes),
+            Err(Errno::STALE)
+        );
+        assert_eq!(bytes, 0);
+        assert_eq!(fs::read(outside.join("keep"))?, b"outside");
+        Ok(())
+    }
 
     #[test]
     fn plans_versions_and_old_sources() {
@@ -377,7 +435,7 @@ mod tests {
     #[test]
     fn executor_preserves_symlink_targets_and_reports_removals() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let root = temp.path().join("server-builds");
+        let root = temp.path().canonicalize()?.join("server-builds");
         let outside = temp.path().join("outside");
         let current = root.join("a".repeat(40)).join("secretaire");
         let previous = root.join("b".repeat(40)).join("secretaire");

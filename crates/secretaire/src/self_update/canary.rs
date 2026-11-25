@@ -79,8 +79,10 @@ impl Update {
             self.config.canary_minutes > 0,
             "canary_minutes には正の分数を指定してねぇ"
         );
-        #[cfg(not(target_os = "linux"))]
-        bail!("試運転のファイル隔離には Linux が必要だよ");
+        ensure!(
+            cfg!(target_os = "linux"),
+            "試運転のファイル隔離には Linux が必要だよ"
+        );
 
         self.end_canary(false).await?;
         let run = self
@@ -542,8 +544,8 @@ impl Runtime {
     }
 
     async fn stop(&mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
         if let Some(pid) = self.group.0 {
-            #[cfg(target_os = "linux")]
             isolation::stop_session(pid)?;
             self.group.0 = None;
         }

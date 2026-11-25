@@ -111,13 +111,13 @@ struct Headroom {
 }
 
 impl Headroom {
-    #[cfg(test)]
+    #[cfg(any(test, not(target_os = "linux")))]
     fn read() -> Self {
-        // Test runners share host resources. Load thresholds use explicit samples in tests.
+        // Test runners use explicit samples. The production sampler requires Linux procfs.
         Self::default()
     }
 
-    #[cfg(not(test))]
+    #[cfg(all(not(test), target_os = "linux"))]
     fn read() -> Self {
         let load = std::fs::read_to_string("/proc/loadavg")
             .ok()

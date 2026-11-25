@@ -27,6 +27,7 @@ mod agents;
 mod agent_usage;
 mod delegate;
 mod extensions;
+mod confined_fs;
 mod exploration;
 mod git;
 mod github;
@@ -727,6 +728,43 @@ fn router(app: Arc<App>, access: Arc<remote::Access>) -> Router {
         .layer(axum::middleware::from_fn_with_state(access, remote::enforce))
 }
 
+#[cfg(all(target_os = "linux", not(all(test, feature = "portable-fs-tests"))))]
+fn shutdown_pipe() -> rustix::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use rustix::pipe::{pipe_with, PipeFlags};
+    pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)
+}
+
+#[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+fn shutdown_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+
+    let (rx, tx) = std::io::pipe()?;
+    let (rx, tx) = (rx.into(), tx.into());
+    for fd in [&rx, &tx] {
+        fcntl_setfl(fd, fcntl_getfl(fd)? | OFlags::NONBLOCK)?;
+    }
+    Ok((rx, tx))
+}
+
+#[cfg(test)]
+#[test]
+fn shutdown_pipe_uses_cloexec_and_nonblocking() -> anyhow::Result<()> {
+    use rustix::fs::{fcntl_getfl, OFlags};
+    use rustix::io::{fcntl_getfd, Errno, FdFlags};
+
+    let (rx, tx) = shutdown_pipe()?;
+    for fd in [&rx, &tx] {
+        assert!(fcntl_getfd(fd)?.contains(FdFlags::CLOEXEC));
+        assert!(fcntl_getfl(fd)?.contains(OFlags::NONBLOCK));
+    }
+    let mut signal = [0];
+    assert_eq!(rustix::io::read(&rx, &mut signal), Err(Errno::AGAIN));
+    assert_eq!(rustix::io::write(&tx, &[1])?, 1);
+    assert_eq!(rustix::io::read(&rx, &mut signal)?, 1);
+    assert_eq!(signal, [1]);
+    Ok(())
+}
+
 struct ShutdownSignals {
     pipe: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
     handlers: Vec<signal_hook_registry::SigId>,
@@ -734,8 +772,8 @@ struct ShutdownSignals {
 
 impl ShutdownSignals {
     fn new() -> anyhow::Result<Self> {
-        use rustix::{pipe::{pipe_with, PipeFlags}, process::Signal};
-        let (rx, tx) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK)?;
+        use rustix::process::Signal;
+        let (rx, tx) = shutdown_pipe()?;
         let tx = Arc::new(tx);
         // The AsyncFd owns the pipe's read descriptor until deregistration.
         let pipe = unsafe { tokio::io::unix::AsyncFd::register_with_interest(rx, tokio::io::Interest::READABLE) }

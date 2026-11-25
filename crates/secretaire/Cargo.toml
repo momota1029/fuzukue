@@ -4,6 +4,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+portable-fs-tests = []
+
 [dependencies]
 wasmtime = { version = "48", default-features = false, features = ["anyhow", "runtime", "cranelift", "component-model", "std", "parallel-compilation", "cache"] }
 wasmtime-wasi = "48"

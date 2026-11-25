@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use glob::{MatchOptions, Pattern};
 use fuzukue_proto::ExtensionPermissions;
-use rustix::fs::{self as at, Mode, OFlags, ResolveFlags};
+use rustix::fs::{self as at, Mode, OFlags};
+
+use crate::confined_fs::{open_beneath, DIR_FLAGS};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -25,7 +27,6 @@ use fuzukue::extension::types::File as GuestFile;
 const TICK: Duration = Duration::from_millis(10);
 const CALL_TICKS: u64 = 100;
 const MAX_IO: usize = 4 * 1024 * 1024;
-const RESOLVE: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS);
 const MATCH: MatchOptions = MatchOptions {
     case_sensitive: true,
     require_literal_separator: true,
@@ -251,21 +252,16 @@ fn allowed_url(input: &str, hosts: &[String]) -> Result<url::Url> {
     Ok(url)
 }
 
-fn dir_flags() -> OFlags {
-    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC
-}
-
 fn project_dir(path: &Path) -> Result<File> {
-    Ok(at::open(path, dir_flags() | OFlags::NOFOLLOW, Mode::empty())?.into())
+    Ok(at::open(path, DIR_FLAGS | OFlags::NOFOLLOW, Mode::empty())?.into())
 }
 
 fn read_file(root: &File, path: &Path, budget: usize) -> Result<Vec<u8>> {
-    let fd = at::openat2(
+    let fd = open_beneath(
         root,
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-        RESOLVE,
+        false,
     )?;
     let file = File::from(fd);
     ensure!(file.metadata()?.is_file(), "expected a regular file");
@@ -293,6 +289,55 @@ fn permitted(scopes: &[Pattern], path: &str) -> bool {
         scope.matches_with(path, MATCH)
             || other.as_ref().is_some_and(|other| scope.matches_with(other, MATCH))
     })
+}
+
+#[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+fn parent_path(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+#[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+fn walk_files(
+    root: &File,
+    prefix: PathBuf,
+    start: rustix::fd::OwnedFd,
+    deadline: Instant,
+    mut visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut stack = vec![(prefix, at::Dir::new(start)?)];
+    let mut visited = 0;
+    while let Some((path, dir)) = stack.last_mut() {
+        let Some(item) = dir.next() else {
+            stack.pop();
+            continue;
+        };
+        let item = item?;
+        let name = item.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        visited += 1;
+        ensure!(
+            visited <= 50_000 && Instant::now() < deadline,
+            "extension read scan limit exceeded"
+        );
+        let name = std::ffi::OsStr::from_bytes(name);
+        let stat = at::statat(dir.fd()?, name, at::AtFlags::SYMLINK_NOFOLLOW)?;
+        let path = path.join(name);
+        match at::FileType::from_raw_mode(stat.st_mode) {
+            at::FileType::RegularFile => visit(&path)?,
+            at::FileType::Directory if stack.len() < 64 => {
+                let dir = open_beneath(root, &path, DIR_FLAGS, false)?;
+                stack.push((path, at::Dir::new(dir)?));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 impl Host {
@@ -341,37 +386,21 @@ impl Host {
             .split('/')
             .take_while(|part| !part.contains(['*', '?', '[']))
             .collect::<PathBuf>();
-        let start = self.project.join(&literal_prefix);
-        if !literal_prefix.as_os_str().is_empty() {
-            match at::openat2(&root, &literal_prefix, dir_flags(), Mode::empty(), RESOLVE) {
-                Ok(_) => {}
-                Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
-            }
-        }
+        let start = if literal_prefix.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &literal_prefix
+        };
+        let start_dir = match open_beneath(&root, start, DIR_FLAGS, false) {
+            Ok(dir) => dir,
+            Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
         let mut files = Vec::new();
         let mut budget = MAX_IO;
-        for (index, entry) in walkdir::WalkDir::new(&start)
-            .min_depth(1)
-            .follow_links(false)
-            .follow_root_links(false)
-            .max_depth(64)
-            .into_iter()
-            .enumerate()
-        {
-            ensure!(
-                index < 50_000 && Instant::now() < self.deadline,
-                "extension read scan limit exceeded"
-            );
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path().strip_prefix(&self.project)?;
-            let Some(text) = path.to_str() else { continue };
-            if requested.matches_with(text, MATCH)
-                && permitted(&self.read, text)
-            {
+        let read_matching_file = |path: &Path| -> Result<()> {
+            let Some(text) = path.to_str() else { return Ok(()) };
+            if requested.matches_with(text, MATCH) && permitted(&self.read, text) {
                 ensure!(files.len() < 4096, "extension read file limit exceeded");
                 let contents = read_file(&root, path, budget)?;
                 budget -= contents.len();
@@ -380,7 +409,35 @@ impl Host {
                     contents,
                 });
             }
+            Ok(())
+        };
+
+        #[cfg(all(target_os = "linux", not(all(test, feature = "portable-fs-tests"))))]
+        {
+            drop(start_dir);
+            let mut read_matching_file = read_matching_file;
+            for (index, entry) in walkdir::WalkDir::new(self.project.join(&literal_prefix))
+                .min_depth(1)
+                .follow_links(false)
+                .follow_root_links(false)
+                .max_depth(64)
+                .into_iter()
+                .enumerate()
+            {
+                ensure!(
+                    index < 50_000 && Instant::now() < self.deadline,
+                    "extension read scan limit exceeded"
+                );
+                let entry = entry?;
+                if entry.file_type().is_file() {
+                    read_matching_file(entry.path().strip_prefix(&self.project)?)?;
+                }
+            }
         }
+
+        #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+        walk_files(&root, literal_prefix, start_dir, self.deadline, read_matching_file)?;
+
         files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         Ok(files)
     }
@@ -405,14 +462,16 @@ impl Host {
         let mut parent = root.try_clone()?;
         for segment in path.parent().context("missing parent")?.components() {
             prefix.push(segment.as_os_str());
-            parent = match at::openat2(&root, &prefix, dir_flags(), Mode::empty(), RESOLVE) {
+            parent = match open_beneath(&root, &prefix, DIR_FLAGS, false) {
                 Ok(fd) => fd.into(),
                 Err(rustix::io::Errno::NOENT) => {
+                    #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+                    crate::confined_fs::verify_dir(&root, parent_path(&prefix), &parent, false)?;
                     match at::mkdirat(&parent, segment.as_os_str(), Mode::from_raw_mode(0o700)) {
                         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                         Err(error) => return Err(error.into()),
                     }
-                    at::openat2(&root, &prefix, dir_flags(), Mode::empty(), RESOLVE)?.into()
+                    open_beneath(&root, &prefix, DIR_FLAGS, false)?.into()
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -427,16 +486,28 @@ impl Host {
             Err(error) => return Err(error.into()),
         }
         let tmp = format!(".fuzukue-write-{:032x}", rand::random::<u128>());
+        #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+        crate::confined_fs::verify_dir(&root, parent_path(path), &parent, false)?;
         let fd = at::openat(
             &parent,
             tmp.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )?;
+        let mut file = File::from(fd);
+        #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+        let tmp_stat = at::fstat(&file)?;
         let outcome = (|| {
-            File::from(fd).write_all(contents)?;
+            file.write_all(contents)?;
             ensure!(Instant::now() < self.deadline, "extension write timed out");
-            let rename = || at::renameat(&parent, tmp.as_str(), &parent, name);
+            let rename = || {
+                #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+                {
+                    crate::confined_fs::verify_entry(&parent, tmp.as_ref(), &tmp_stat)?;
+                    crate::confined_fs::verify_dir(&root, parent_path(path), &parent, false)?;
+                }
+                at::renameat(&parent, tmp.as_str(), &parent, name)
+            };
             match &self.history {
                 Some(history) => history.write(format!("extension:{}", self.name), &self.project.join(path), rename)?,
                 None => rename()?,
@@ -444,7 +515,14 @@ impl Host {
             Ok(())
         })();
         if outcome.is_err() {
-            let _ = at::unlinkat(&parent, tmp.as_str(), at::AtFlags::empty());
+            let _ = (|| {
+                #[cfg(any(not(target_os = "linux"), all(test, feature = "portable-fs-tests")))]
+                {
+                    crate::confined_fs::verify_entry(&parent, tmp.as_ref(), &tmp_stat)?;
+                    crate::confined_fs::verify_dir(&root, parent_path(path), &parent, false)?;
+                }
+                at::unlinkat(&parent, tmp.as_str(), at::AtFlags::empty())
+            })();
         }
         outcome
     }

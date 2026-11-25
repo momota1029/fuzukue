@@ -494,7 +494,7 @@ pub(super) fn replace(
     let result = (|| {
         file.write_all(content.as_bytes())?;
         if let Some(before) = before {
-            unix::fchmod(&file, Mode::from_bits_truncate(before.mode & 0o777))?;
+            unix::fchmod(&file, Mode::from_bits_truncate((before.mode & 0o777) as _))?;
         }
         file.sync_all()?;
         check_cancelled()?;
