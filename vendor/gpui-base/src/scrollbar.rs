@@ -72,6 +72,11 @@ pub trait ScrollbarHandle: 'static {
     fn offset(&self) -> Point<Pixels>;
     /// Set the offset of the scroll handle.
     fn set_offset(&self, offset: Point<Pixels>);
+
+    /// Set the live offset from wheel input.
+    fn set_wheel_offset(&self, offset: Point<Pixels>) {
+        self.set_offset(offset);
+    }
     /// The full size of the content, including padding.
     fn content_size(&self) -> Size<Pixels>;
     /// Called when start dragging the scrollbar thumb.
@@ -128,6 +133,10 @@ impl ScrollbarHandle for ListState {
 
     fn set_offset(&self, offset: Point<Pixels>) {
         self.set_offset_from_scrollbar(offset);
+    }
+
+    fn set_wheel_offset(&self, offset: Point<Pixels>) {
+        self.set_offset_from_wheel(offset);
     }
 
     fn content_size(&self) -> Size<Pixels> {

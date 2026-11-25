@@ -42,6 +42,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
@@ -632,7 +633,9 @@ private fun Conversation(
 ) {
     val thread = state.threads.find { it.id == session }
     val timeline = state.timeline(session)
-    val visibleRows = remember(timeline) { timeline.visibleRows.entries.toList().asReversed() }
+    val visibleRows = remember(timeline.rows, timeline.streamingSilencePrefixes) {
+        timeline.visibleRows.entries.toList().asReversed()
+    }
     val approvals = state.approvals.values.filter {
         it.session == session && it.requestId !in state.approvalDock.pending
     }
@@ -649,14 +652,14 @@ private fun Conversation(
     val topScroll = remember(listState) {
         object : NestedScrollConnection {
             override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                if (source == NestedScrollSource.UserInput && consumed.y + available.y > 0 &&
-                    !listState.canScrollForward
-                ) requestOlder()
+                // Momentum also dispatches post-scroll, even when the last packet
+                // lands exactly on the edge with no leftover velocity.
+                if (consumed.y + available.y > 0 && !listState.canScrollForward) requestOlder()
                 return Offset.Zero
             }
 
             override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
-                if (available.y > 0 && !listState.canScrollForward) requestOlder()
+                if (consumed.y + available.y > 0 && !listState.canScrollForward) requestOlder()
                 return Velocity.Zero
             }
         }
@@ -727,6 +730,17 @@ private fun Conversation(
                                 modifier = Modifier.padding(8.dp), color = colors.onSurfaceVariant,
                                 style = MaterialTheme.typography.bodySmall)
                         }
+                        if (timeline.historyEdge == HistoryEdge.Start) item(key = "history/start") {
+                            Text(stringResource(R.string.conversation_start),
+                                modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center,
+                                style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
+                        }
+                    }
+                    if (state.canSend && timeline.historyEdge == HistoryEdge.Loading) {
+                        Text(stringResource(R.string.conversation_loading_older),
+                            modifier = Modifier.background(colors.surface, RoundedCornerShape(8.dp))
+                                .padding(horizontal = 8.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
                     }
                 }
                 if (thread != null) {

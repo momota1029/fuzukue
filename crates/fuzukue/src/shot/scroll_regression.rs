@@ -96,7 +96,7 @@ impl Runner {
             push(ServerEvent::TurnActivity { session: A.into(), running: true });
             push(message(B, 1, "Complete short tail".into()));
             let threads = [A, B].into_iter().map(|id| serde_json::from_value(serde_json::json!({
-                "id": id, "title": id, "updated": 1
+                "id": id, "title": id, "updated": 1, "archived": id == A
             })).unwrap()).collect();
             push(ServerEvent::Threads { threads });
             view.select_thread(B.into(), cx);
@@ -117,17 +117,22 @@ impl Runner {
 
         self.update(cx, |view, _, cx| view.select_thread(A.into(), cx))?;
         self.frame(cx)?;
-        self.dispatch_transcript_wheel(cx, -10_000.)?;
+        self.dispatch_transcript_scroll(cx, gpui_kit::ScrollDelta::Pixels(point(px(0.), px(20.))), gpui_kit::TouchPhase::Started)?;
+        self.dispatch_transcript_scroll(cx, gpui_kit::ScrollDelta::Pixels(point(px(0.), px(0.))), gpui_kit::TouchPhase::Ended)?;
+        self.dispatch_transcript_scroll(cx, gpui_kit::ScrollDelta::Pixels(point(px(0.), px(10_000.))), gpui_kit::TouchPhase::Moved)?;
         self.frame(cx)?;
         let header_y = |cx: &mut AsyncApp| self.update(cx, |_, window, _| {
             window.shot_element_bounds(&format!("delegate-block-{WORKER}")).map(|bounds| bounds.top())
         })?.context("anchor worker is not visible");
         let y = header_y(cx)?;
-        for _ in 0..4 {
-            self.dispatch_transcript_wheel(cx, -30.)?;
-        }
-        let [first] = requests().try_into().map_err(|requests: Vec<_>| anyhow!("expected one pending request, got {requests:?}"))?;
+        let [first] = requests().try_into().map_err(|requests: Vec<_>| anyhow!("momentum at the archived top should request one page, got {requests:?}"))?;
         ensure!((first.0.as_str(), first.1.as_str(), first.3) == (WORKSPACE, A, 900), "wrong first request: {first:?}");
+        ensure!(self.update(cx, |_, window, _| window.shot_element_bounds("chat-loading-older").is_some())?,
+            "missing older-history loading row");
+        for _ in 0..4 {
+            self.dispatch_transcript_scroll(cx, gpui_kit::ScrollDelta::Lines(point(0., 2.)), gpui_kit::TouchPhase::Moved)?;
+        }
+        ensure!(requests().is_empty(), "wheel packets at offset zero duplicated the request");
 
         let reply = |workspace, session: &str, request, events, next_before, cx: &mut AsyncApp| {
             self.update(cx, |view, window, cx| replay_event(view, window, cx, Some(workspace),
@@ -139,20 +144,24 @@ impl Runner {
         self.dispatch_transcript_wheel(cx, -30.)?;
         ensure!(requests().is_empty(), "unmatched reply cleared the pending request");
         reply(WORKSPACE, A, first.2, vec![], Some(600), cx)?;
-        self.dispatch_transcript_wheel(cx, -30.)?;
         let [second] = requests().try_into().map_err(|requests: Vec<_>| anyhow!("empty page did not advance: {requests:?}"))?;
         ensure!(second.2 != first.2 && second.3 == 600, "empty page did not advance: {second:?}");
+        reply(WORKSPACE, A, second.2, vec![ServerEvent::DelegateProgress {
+            session: A.into(), job: WORKER.into(), summary: "Collapsed worker progress".into(),
+        }], Some(300), cx)?;
+        let [third] = requests().try_into().map_err(|requests: Vec<_>| anyhow!("zero-height sparse-worker page stalled: {requests:?}"))?;
+        ensure!(third.3 == 300, "sparse-worker page did not advance: {third:?}");
 
         self.update(cx, |view, _, cx| view.select_thread(B.into(), cx))?;
         self.frame(cx)?;
         let page = vec![
             message(A, 7, "Early short message".into()),
-            message(A, 8, format!("Earlier long message\n\n{}", "Variable height **Markdown**. ".repeat(26))),
+            message(A, 8, format!("Earlier long message\n\n$$\\frac{{x^2}}{{y}}$$\n\n{}", "Variable height **Markdown**. ".repeat(26))),
             worker(),
             message(A, 9, "Immediately before the attached tail".into()),
             ServerEvent::TurnEnded { session: A.into(), actor: Actor::Claude },
         ];
-        reply(WORKSPACE, A, second.2, page, None, cx)?;
+        reply(WORKSPACE, A, third.2, page, None, cx)?;
         self.update(cx, |view, _, cx| {
             ensure!(view.active == B && view.chats[B].scroller.item_count() == 1, "A's reply changed B");
             ensure!(view.chats[A].scroller.item_count() == 44 && view.chats[A].busy
@@ -175,6 +184,8 @@ impl Runner {
             self.frame(cx)?;
         }
         ensure!(requests().is_empty(), "exhausted cursor requested another page");
+        ensure!(self.update(cx, |_, window, _| window.shot_element_bounds("chat-start-of-thread").is_some())?,
+            "the start of an exhausted thread is not marked");
         self.update(cx, |view, _, _| {
             let list = &view.chats[A].scroller;
             let short = list.bounds_for_item(0).context("missing short older row")?;
@@ -208,6 +219,150 @@ impl Runner {
         ensure!(requests().is_empty(), "rejected cursor requested another page");
         self.update(cx, |view, _, cx| view.select_thread(A.into(), cx))?;
         self.frame(cx)
+    }
+
+    #[cfg(test)]
+    fn assert_scoped_wheel_paging(&self, cx: &mut AsyncApp) -> Result<()> {
+        const WORKSPACE: &str = "scoped-wheel-history";
+        const THREAD: &str = "windowed-thread";
+        const OTHER: &str = "another-thread";
+        let (out, sent) = std::sync::mpsc::channel();
+        let workspace_event = |view: &mut Workbench, window: &mut Window, cx: &mut Context<Workbench>, event| {
+            replay_event(view, window, cx, Some(WORKSPACE), event);
+        };
+        let sync = || ServerEvent::ThreadSync { epoch: "wheel-fixture".into(), through: 10, reset_sessions: vec![] };
+        let message = |item: String, text: String| ServerEvent::TextDelta {
+            session: THREAD.into(), item, actor: Actor::Claude, text,
+        };
+        self.update(cx, |view, window, cx| {
+            view.out = out.into();
+            view.on_conn(ConnEvent::Connected, window, cx);
+            replay_event(view, window, cx, None, ServerEvent::Welcome {
+                protocol: fuzukue_proto::PROTOCOL_VERSION, server: "fixture".into(),
+                client_manifest: None, server_tailnet_url: None, selection_scoped_transcripts: true,
+            });
+            replay_event(view, window, cx, None, ServerEvent::WorkspaceSelected { id: WORKSPACE.into(), replay: true });
+            let threads = [THREAD, OTHER].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                "id": id, "title": id, "updated": 1
+            })).unwrap()).collect();
+            workspace_event(view, window, cx, ServerEvent::Threads { threads });
+            workspace_event(view, window, cx, sync());
+            view.select_thread(THREAD.into(), cx);
+        })?;
+        let requests = || sent.try_iter().filter_map(|msg| match msg {
+            ClientMsg::InWorkspace { request, .. } => Some(*request),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let tail = requests().into_iter().find_map(|msg| match msg {
+            ClientMsg::GetThreadTail { session, request } if session == THREAD => Some(request),
+            _ => None,
+        }).context("missing tail request")?;
+        let rows = |page| (0..48).map(|row| message(
+            format!("reply-{page}-{row}"),
+            format!("Page {page}, message {row}\n\n{}\n\n$$\\frac{{x^2 + 1}}{{y}}$$",
+                "Long **markdown** paragraph with a [link](https://example.test). ".repeat(row % 8)),
+        )).collect::<Vec<_>>();
+        self.update(cx, |view, window, cx| workspace_event(view, window, cx, ServerEvent::ThreadTail {
+            session: THREAD.into(), request: tail, generation: 2, through: 10,
+            events: rows(7), workers: vec![], next_before: Some(700),
+        }))?;
+        self.frame(cx)?;
+
+        let older_request = |cursor| -> Result<u64> {
+            let [request] = requests().into_iter().filter_map(|msg| match msg {
+                ClientMsg::GetThreadHistory { session, request, before, generation: Some(2) } if session == THREAD => {
+                    Some((request, before))
+                }
+                _ => None,
+            }).collect::<Vec<_>>().try_into().map_err(|requests: Vec<_>| anyhow!("older cursor {cursor}, got {requests:?}"))?;
+            ensure!(request.1 == cursor, "wrong older cursor {request:?}");
+            Ok(request.0)
+        };
+        let reply = |cx: &mut AsyncApp, request, next_before, events| {
+            self.update(cx, |view, window, cx| workspace_event(view, window, cx, ServerEvent::ThreadHistoryPage {
+                session: THREAD.into(), request, generation: Some(2), through: Some(10), next_before, events,
+            }))
+        };
+        self.step_scroll_fixture(cx, -100_000.)?;
+        let interrupted = older_request(700)?;
+        self.update(cx, |view, window, cx| {
+            view.on_conn(ConnEvent::Disconnected("fixture disconnect".into()), window, cx);
+            view.on_conn(ConnEvent::Connected, window, cx);
+            workspace_event(view, window, cx, sync());
+        })?;
+        let retried = older_request(700)?;
+        ensure!(retried != interrupted, "reconnect reused a stale request");
+        self.update(cx, |view, _, cx| view.select_thread(OTHER.into(), cx))?;
+        reply(cx, retried, Some(600), vec![message("hidden".into(), " ".into())])?;
+        ensure!(!requests().into_iter().any(|msg| matches!(msg, ClientMsg::GetThreadHistory { .. })),
+            "inactive thread continued paging");
+        self.update(cx, |view, _, cx| view.select_thread(THREAD.into(), cx))?;
+        let mut request = older_request(600)?;
+        self.frame(cx)?;
+        let list = self.update(cx, |view, _, _| view.chats[THREAD].scroller.clone())?;
+        for page in (0..6).rev() {
+            let before = list.logical_scroll_top();
+            let y = list.bounds_for_item(before.item_ix).context("page anchor")?.top();
+            reply(cx, request, (page != 0).then_some(page * 100), rows(page))?;
+            self.frame(cx)?;
+            let after = list.logical_scroll_top();
+            let shifted = list.bounds_for_item(after.item_ix).context("shifted page anchor")?.top();
+            // At the former top, the leading inset moves to the new first row.
+            ensure!((shifted - y - px(16.)).abs() <= px(1.),
+                "prepend moved the anchor content: {before:?} -> {after:?}");
+            self.step_scroll_fixture(cx, -100_000.)?;
+            if page != 0 {
+                request = older_request(page * 100)?;
+            }
+        }
+        ensure!(requests().is_empty(), "issued a request past the true start");
+        ensure!(self.update(cx, |_, window, _| window.shot_element_bounds("chat-start-of-thread").is_some())?,
+            "scoped history did not mark the true start");
+
+        let forward_request = |start| -> Result<u64> {
+            let [request] = requests().into_iter().filter_map(|msg| match msg {
+                ClientMsg::GetThreadHistoryFrom { session, request, start, generation: 2 } if session == THREAD =>
+                    Some((request, start)),
+                _ => None,
+            }).collect::<Vec<_>>().try_into().map_err(|requests: Vec<_>| anyhow!("newer cursor {start}, got {requests:?}"))?;
+            ensure!(request.1 == start, "wrong forward cursor {request:?}");
+            Ok(request.0)
+        };
+        let forward = |cx: &mut AsyncApp, start, request, next_after, events| {
+            self.update(cx, |view, window, cx| workspace_event(view, window, cx, ServerEvent::ThreadHistoryFrom {
+                session: THREAD.into(), request, start, generation: 2, through: 10, next_after, events,
+            }))
+        };
+        cx.update_window(self.handle, |_, window, cx| {
+            window.blur(cx);
+            window.dispatch_keystroke(gpui_kit::Keystroke::parse("home").unwrap(), cx);
+        })?;
+        forward(cx, 0, forward_request(0)?, Some(100), vec![message("first".into(), "First message".into())])?;
+        self.frame(cx)?;
+        self.dispatch_transcript_wheel(cx, 24.)?;
+        forward(cx, 100, forward_request(100)?, Some(200), vec![message("hidden2".into(), " ".into())])?;
+        forward(cx, 200, forward_request(200)?, Some(300), rows(2))?;
+        self.frame(cx)?;
+        self.step_scroll_fixture(cx, 1800.)?;
+        let anchor = list.logical_scroll_top();
+        ensure!(anchor.item_ix > 0, "the first message should be above the viewport");
+        let anchor_y = list.bounds_for_item(anchor.item_ix).context("anchor before late layout")?.top();
+        let extent = list.max_offset_for_scrollbar().y;
+        self.update(cx, |view, window, cx| workspace_event(view, window, cx, message(
+            "first".into(), "\n\n$$\\frac{x^2}{1+x^2}$$\n\nA new **paragraph**.".repeat(24),
+        )))?;
+        self.frame(cx)?;
+        ensure!(list.max_offset_for_scrollbar().y > extent, "late Markdown did not change the height estimate");
+        ensure!(list.logical_scroll_top() == anchor
+            && (list.bounds_for_item(anchor.item_ix).context("anchor after late layout")?.top() - anchor_y).abs() <= px(1.),
+            "late Markdown above the viewport moved its anchor");
+        self.step_scroll_fixture(cx, 100_000.)?;
+        ensure!(list.logical_scroll_top().item_ix > anchor.item_ix, "wheel did not advance after Home");
+        forward(cx, 300, forward_request(300)?, None, rows(3))?;
+        self.frame(cx)?;
+        self.step_scroll_fixture(cx, 100_000.)?;
+        ensure!(requests().is_empty(), "issued a request past the latest page");
+        Ok(())
     }
 
     pub(super) fn assert_chat_replay_load(&self, cx: &mut AsyncApp) -> Result<()> {
@@ -550,12 +705,107 @@ impl Runner {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn assert_wheel_frame_work(&self, cx: &mut AsyncApp) -> Result<()> {
+        self.update(cx, |view, _, cx| {
+            view.switch_session(SESSION.into(), cx);
+            append_messages(view, 0..REPLAY_ROWS, cx);
+        })?;
+        self.frame(cx)?;
+        let list = self.update(cx, |view, _, _| view.chats[SESSION].scroller.clone())?;
+        let extent = list.max_offset_for_scrollbar().y;
+        // Two trackpad packets can land before the next paint. Reversing at
+        // the bottom must consume the second packet from the visible tail.
+        self.dispatch_transcript_wheel(cx, -(1. / 2.))?;
+        self.dispatch_transcript_wheel(cx, -(1. / 2.))?;
+        let before_paint = extent + list.scroll_px_offset_for_scrollbar().y;
+        self.frame(cx)?;
+        let reversal = list.frame_stats();
+        let after_paint = list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y;
+        let mut layouts = 0;
+        let mut paints = 0;
+        for delta in [-12., -18., -24., -31., -40., -50., -63., -79., -98., -110., -60., -25.] {
+            self.step_scroll_fixture(cx, delta)?;
+            let stats = list.frame_stats();
+            layouts += stats.laid_out;
+            paints += stats.painted;
+        }
+        eprintln!("wheel frames: reverse moved {before_paint:?}; reverse layout/paint={}/{}; scrolling layout/paint={layouts}/{paints}",
+            reversal.laid_out, reversal.painted);
+        ensure!((before_paint - px(1.)).abs() < px(0.05), "fractional reverse packets were lost");
+        ensure!((after_paint - px(1.)).abs() < px(0.05), "painting snapped back to the tail");
+        ensure!(layouts < 100 && paints < 100, "work exceeded the viewport budget");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn assert_prepending_preserves_height_cache(&self, cx: &mut AsyncApp) -> Result<()> {
+        const WORKSPACE: &str = "height-cache";
+        let (out, sent) = std::sync::mpsc::channel();
+        let message = |number: usize| ServerEvent::TextDelta {
+            session: SESSION.into(), item: format!("assistant-{number}"), actor: Actor::Claude,
+            text: format!("Reply {number}\n\n{}", "Markdown with `code` and $x^2$. ".repeat(number % 4)),
+        };
+        self.update(cx, |view, window, cx| {
+            view.out = out.into();
+            view.protocol = fuzukue_proto::THREAD_HISTORY_PROTOCOL;
+            view.on_conn(ConnEvent::Connected, window, cx);
+            replay_event(view, window, cx, None, ServerEvent::WorkspaceSelected { id: WORKSPACE.into(), replay: true });
+            replay_event(view, window, cx, Some(WORKSPACE), ServerEvent::ThreadHistoryStart {
+                session: SESSION.into(), before: 20, workers: vec![],
+            });
+            for row in 20..180 {
+                replay_event(view, window, cx, Some(WORKSPACE), message(row));
+            }
+            replay_event(view, window, cx, Some(WORKSPACE), ServerEvent::Threads {
+                threads: vec![serde_json::from_value(serde_json::json!({
+                    "id": SESSION, "title": SESSION, "updated": 1
+                })).unwrap()],
+            });
+            view.select_thread(SESSION.into(), cx);
+        })?;
+        self.frame(cx)?;
+        let list = self.update(cx, |view, _, _| view.chats[SESSION].scroller.clone())?;
+        for _ in 0..80 {
+            self.step_scroll_fixture(cx, -280.)?;
+            if list.scroll_px_offset_for_scrollbar().y >= -px(0.1) {
+                break;
+            }
+        }
+        let request = sent.try_iter().find_map(|msg| match msg {
+            ClientMsg::InWorkspace { request, .. } => match *request {
+                ClientMsg::GetThreadHistory { request, before: 20, .. } => Some(request),
+                _ => None,
+            },
+            _ => None,
+        }).context("no older request while scrolling through the group")?;
+        let before = list.frame_stats().measured;
+        self.update(cx, |view, window, cx| replay_event(view, window, cx, Some(WORKSPACE),
+            ServerEvent::ThreadHistoryPage {
+                session: SESSION.into(), request, events: (0..20).map(message).collect(),
+                next_before: None, generation: None, through: None,
+            }))?;
+        self.frame(cx)?;
+        let after = list.frame_stats();
+        eprintln!("older page: measured rows before/after={before}/{}; layout/paint={}/{}",
+            after.measured, after.laid_out, after.painted);
+        ensure!(before > 100 && after.measured >= before, "prepending invalidated measured rows away from the splice");
+        Ok(())
+    }
+
     fn step_scroll_fixture(&self, cx: &mut AsyncApp, pixels: f32) -> Result<()> {
         self.dispatch_transcript_wheel(cx, pixels)?;
         self.frame(cx)
     }
 
     fn dispatch_transcript_wheel(&self, cx: &mut AsyncApp, pixels: f32) -> Result<()> {
+        self.dispatch_transcript_scroll(cx,
+            gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-pixels))), gpui_kit::TouchPhase::Moved)
+    }
+
+    fn dispatch_transcript_scroll(
+        &self, cx: &mut AsyncApp, delta: gpui_kit::ScrollDelta, touch_phase: gpui_kit::TouchPhase,
+    ) -> Result<()> {
         let position = self.update(cx, |view, _, _| {
             view.chats[&view.active].scroller.viewport_bounds().center()
         })?;
@@ -569,8 +819,7 @@ impl Runner {
             );
             window.dispatch_event(
                 PlatformInput::Scroll(gpui_kit::ScrollEvent {
-                    position,
-                    delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-pixels))),
+                    position, delta, touch_phase,
                     ..Default::default()
                 }),
                 cx,
@@ -721,6 +970,21 @@ mod tests {
     }
 
     #[test]
+    fn fractional_wheel_packets_keep_viewport_work_bounded_when_reversing_at_the_tail() {
+        run_fixture(|runner, cx| runner.assert_wheel_frame_work(cx));
+    }
+
+    #[test]
+    fn scoped_wheel_prefetch_handles_reconnect_cached_return_and_home() {
+        run_fixture(|runner, cx| runner.assert_scoped_wheel_paging(cx));
+    }
+
+    #[test]
+    fn prepending_history_retains_measurements_away_from_the_splice() {
+        run_fixture(|runner, cx| runner.assert_prepending_preserves_height_cache(cx));
+    }
+
+    #[test]
     fn transcript_replay_paints_only_at_the_restored_position() {
         let scenario: Scenario = serde_json::from_str(include_str!(
             "../../../../tests/shots/chat-replay-load.json"
@@ -759,6 +1023,24 @@ mod tests {
                 })
                 .detach();
             });
+        completed.recv().unwrap().unwrap();
+    }
+
+    fn run_fixture(check: impl FnOnce(Runner, &mut AsyncApp) -> Result<()> + 'static) {
+        let (result, completed) = std::sync::mpsc::channel();
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+            math::init(cx);
+            let (handle, view) = open_workbench_at_size(cx, 820., 750.).unwrap();
+            cx.spawn(async move |cx| {
+                let runner = Runner {
+                    handle, view, target: None, output: PathBuf::new(), read_only: false, seen: HashMap::new(),
+                };
+                result.send(check(runner, cx)).unwrap();
+                cx.update(|cx| cx.quit());
+            }).detach();
+        });
         completed.recv().unwrap().unwrap();
     }
 }

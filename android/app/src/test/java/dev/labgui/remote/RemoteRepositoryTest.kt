@@ -503,6 +503,29 @@ class RemoteRepositoryTest {
         assertEquals(listOf("user/old", "user/new"), rowIds())
     }
 
+    @Test fun pageWithOnlyASparseWorkerContinuesAfterReturningToTheThread() {
+        val socket = beginScoped()
+        socket.sync(10)
+        repository.selectThread("s")
+        socket.tail(1, 10, worker(), delta("latest", "tail"), before = 40, workers = """["delegate:sparse"]""")
+        repository.requestOlderHistory(historyTarget)
+        assertEquals(HistoryEdge.Loading, state.timeline("s").historyEdge)
+
+        repository.selectThread(null)
+        socket.page(2, 10, worker(), before = 20)
+        assertEquals(2, socket.historyRequests().size)
+        assertEquals(HistoryEdge.More, state.timeline("s").historyEdge)
+
+        repository.selectThread("s")
+        assertEquals("20", socket.historyRequests().last()["before"]?.jsonPrimitive?.content)
+        assertEquals(HistoryEdge.Loading, state.timeline("s").historyEdge)
+        socket.page(3, 10, """{"type":"future_history_item"}""", before = 1)
+        assertEquals("1", socket.historyRequests().last()["before"]?.jsonPrimitive?.content)
+        socket.page(4, 10, echo("user:first", "first"))
+        assertEquals(HistoryEdge.Start, state.timeline("s").historyEdge)
+        assertEquals(listOf("user/user:first", "delegate:sparse", "latest"), rowIds())
+    }
+
     @Test fun reconnectResumesCachedRowsAndRetriesAnInterruptedPageWithANewRequest() {
         val first = beginScoped()
         first.sync(5)

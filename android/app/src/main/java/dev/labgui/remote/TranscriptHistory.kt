@@ -41,10 +41,18 @@ internal class TranscriptHistory {
     var page: PendingPage? = null
     var pageInterrupted = false
         private set
+    var continueOlder = false
     private val pageUpdates = mutableListOf<TranscriptUpdate>()
 
     class Pending(val request: ULong, val updates: MutableList<TranscriptUpdate> = mutableListOf())
     class PendingPage(val request: ULong, val before: ULong, val generation: ULong?)
+
+    val edge: HistoryEdge
+        get() = when {
+            page != null -> HistoryEdge.Loading
+            before != null -> HistoryEdge.More
+            else -> HistoryEdge.Start
+        }
 
     fun startLegacy(event: ServerEvent.ThreadHistoryStart) {
         before = event.before

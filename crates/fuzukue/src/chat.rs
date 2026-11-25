@@ -2212,6 +2212,7 @@ impl Workbench {
                     groups: assistant_groups(kinds.iter().zip(&chat.rows).map(|(&kind, row)| (kind, row.at_ms))),
                     kinds,
                     latest_message,
+                    latest_reply: chat.latest_reply(),
                     show_worker_messages,
                 }));
             }
@@ -2243,7 +2244,7 @@ impl Workbench {
                 });
                 let hovered_chat = entity.downgrade();
                 let hovered_session = session.clone();
-                let list_row = div().id(("chat-row", ix)).w_full().group("chat-message-row")
+                let list_row = div().id(("chat-row", row.id)).w_full().group("chat-message-row")
                     .on_hover(move |&hovered, _, cx| {
                         let _ = hovered_chat.update(cx, |this, cx| {
                             let Some(chat) = this.chats.get_mut(&hovered_session) else { return };
@@ -2809,7 +2810,7 @@ impl Workbench {
                         });
                         let rewrite = message.item.as_ref().filter(|_| {
                             this.protocol >= fuzukue_proto::CLOSE_TRASH_PROTOCOL
-                                && !chat.busy && chat.pending_jobs().next().is_none() && chat.latest_reply() == Some(ix)
+                                && !chat.busy && chat.pending_jobs().next().is_none() && geometry.latest_reply == Some(ix)
                         }).map(|item| {
                             let out = this.out.clone();
                             let command = ClientMsg::RewriteReply { session: session.clone(), item: item.clone() };
@@ -2833,7 +2834,7 @@ impl Workbench {
                             && (copy.is_some() || memo.is_some() || history.is_some() || rewrite.is_some() || runtime.is_some())
                         {
                             let actions = message_actions().h(message_action_height).items_center()
-                                .id(SharedString::from(if chat.latest_reply() == Some(ix) {
+                                .id(SharedString::from(if geometry.latest_reply == Some(ix) {
                                     "chat-partner-reply".into()
                                 } else {
                                     format!("chat-message-actions-{ix}")
@@ -2923,20 +2924,21 @@ impl Workbench {
         .size_full()
         .min_h_0();
         let at_bottom = chat_at_bottom(&scroller);
+        let at_top = scroller.scroll_px_offset_for_scrollbar().y >= -px(1.);
+        let start = chat.history.at_true_start(thread.is_some() && !self.transcripts.scoped
+            && self.threads_loaded && !self.receiving_backlog);
+        let loading_older = chat.history.pending.is_some();
+        let loading_newer = chat.history.loading_newer();
         let workbench = cx.weak_entity();
         let layout_scroller = scroller.clone();
         let layout_workbench = workbench.clone();
         let quote_workbench = workbench.clone();
         let scroll_workbench = workbench.clone();
-        let bounce = ScrollBounce::new("bounce", &scroller, rows).on_scroll(move |_, cx| {
-            let _ = scroll_workbench.update(cx, |view, cx| {
-                view.history_scrolled(cx);
-                cx.notify();
-            });
-        });
-        let bounce = if chat.history.before.is_some() && thread.is_none_or(|thread| !thread.archived) {
-            bounce.on_top_wheel(move |_, cx| {
-                let _ = workbench.update(cx, |view, cx| view.history_scrolled_older(cx));
+        let bounce = ScrollBounce::new("bounce", &scroller, rows);
+        let bounce = if chat.history.before.is_some() || chat.history.next_after.is_some() || chat.history.needs_trim() {
+            let session = self.active.clone();
+            bounce.on_vertical_wheel(move |delta, _, cx| {
+                let _ = scroll_workbench.update(cx, |view, cx| view.history_wheel(&session, delta, cx));
             })
         } else {
             bounce
@@ -2946,7 +2948,9 @@ impl Workbench {
         div()
             .child(cancel_disclosure_drag(disclosure_press))
             .on_children_prepainted(move |_, window, cx| {
-                if chat_at_bottom(&layout_scroller) != at_bottom {
+                if chat_at_bottom(&layout_scroller) != at_bottom
+                    || start && (layout_scroller.scroll_px_offset_for_scrollbar().y >= -px(1.)) != at_top
+                {
                     let workbench = layout_workbench.clone();
                     window.defer(cx, move |_, cx| {
                         let _ = workbench.update(cx, |_, cx| cx.notify());
@@ -2967,6 +2971,22 @@ impl Workbench {
             }))
             .role(gpui_kit::Role::Log)
             .child(bounce)
+            .when(loading_older || loading_newer || start && at_top, |pane| {
+                let (id, label) = if loading_older {
+                    ("chat-loading-older", tr!("chat-loading-older"))
+                } else if loading_newer {
+                    ("chat-loading-newer", tr!("chat-loading-newer"))
+                } else {
+                    ("chat-start-of-thread", tr!("chat-start-of-thread"))
+                };
+                let label = div().id(id).absolute().left_0().w_full().flex().justify_center()
+                    .when(loading_newer, |row| row.bottom(CHAT_BOTTOM_FADE))
+                    .when(!loading_newer, |row| row.top_0())
+                    .child(div().px_2().rounded_md().bg(background)
+                        .text_xs().line_height(CHAT_LEADING_PADDING)
+                        .text_color(cx.theme().muted_foreground).child(label));
+                pane.child(label)
+            })
             .child(div().id("chat-bottom-fade").absolute().left_0().bottom_0().w_full().h(CHAT_BOTTOM_FADE)
                 .child(canvas(|_, _, _| (), move |bounds, _, window, _| {
                     // GPUI gradients take two stops, so paint one quad per segment.

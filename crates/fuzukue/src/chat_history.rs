@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fuzukue_proto::{CachedSession, ClientMsg, JobSummary, ServerEvent, ThreadHistoryFailure};
-use gpui_kit::{Context, ListOffset};
+use gpui_kit::{Context, ListOffset, Pixels, Task, px};
 
 use super::{CHAT_LEADING_PADDING, Chat, Content, Row, RowKind, Workbench};
 use crate::ConnectionStatus;
+
+const KEPT_PAGES: usize = 4;
 
 #[derive(Default)]
 pub(super) struct JobSummaries {
@@ -64,7 +66,23 @@ pub(super) struct History {
     pages: VecDeque<LoadedPage>,
     last_scroll: Option<ListOffset>,
     direction: Option<Direction>,
+    trim_direction: Option<Direction>,
+    trim_task: Option<Task<()>>,
+    legacy_unavailable: bool,
+}
 
+impl History {
+    pub(super) fn loading_newer(&self) -> bool {
+        self.forward.as_ref().is_some_and(|pending| !pending.jump)
+    }
+
+    pub(super) fn at_true_start(&self, legacy_ready: bool) -> bool {
+        self.before.is_none() && (self.generation.is_some() || legacy_ready && !self.legacy_unavailable)
+    }
+
+    pub(super) fn needs_trim(&self) -> bool {
+        self.pages.len() > KEPT_PAGES && self.trim_direction.is_some()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -224,35 +242,95 @@ impl Workbench {
         self.prefetch_history(direction, false, cx);
     }
 
-    pub(super) fn history_scrolled_older(&mut self, cx: &mut Context<Self>) {
-        self.prefetch_history(Direction::Older, true, cx);
-    }
-
-    fn prefetch_history(&mut self, direction: Direction, at_edge: bool, cx: &mut Context<Self>) {
-        const PREFETCH_ROWS: usize = 32;
-
-        if !matches!(self.status, ConnectionStatus::Connected) || self.receiving_backlog {
+    pub(super) fn history_wheel(&mut self, session: &str, delta: Pixels, cx: &mut Context<Self>) {
+        if session != self.active {
             return;
         }
+        let chat = self.chats.get_mut(session).unwrap();
+        chat.history.last_scroll = Some(chat.scroller.logical_scroll_top());
+        let direction = if delta > px(0.) { Direction::Older } else { Direction::Newer };
+        self.prefetch_history(direction, false, cx);
+    }
+
+    pub(crate) fn resume_history_prefetch(&mut self, cx: &mut Context<Self>) {
+        if let Some(direction) = self.chats.get(&self.active).and_then(|chat| chat.history.direction) {
+            self.prefetch_history(direction, false, cx);
+        }
+    }
+
+    fn prefetch_history(&mut self, direction: Direction, empty_page: bool, cx: &mut Context<Self>) {
         let session = self.active.clone();
         let Some(chat) = self.chats.get_mut(&session) else { return };
         if chat.history.jump.is_some() {
             return;
         }
-        if chat.history.direction.replace(direction) != Some(direction) {
-            chat.cancel_history_prefetch(cx);
+        chat.history.direction = Some(direction);
+        self.schedule_history_trim(&session, cx);
+        let chat = &self.chats[&session];
+        if !matches!(self.status, ConnectionStatus::Connected) || self.receiving_backlog
+            || self.workspaces.active.is_none() || chat.history.pending.is_some() || chat.history.forward.is_some()
+        {
+            return;
         }
-        let top = chat.scroller.logical_scroll_top().item_ix;
-        let remaining = chat.scroller.max_offset_for_scrollbar().y + chat.scroller.scroll_px_offset_for_scrollbar().y;
+        let offset = -chat.scroller.scroll_px_offset_for_scrollbar().y;
+        let extent = chat.scroller.max_offset_for_scrollbar().y;
+        let margin = chat.scroller.viewport_bounds().size.height.max(px(48.));
         match direction {
-            Direction::Older if at_edge || top <= PREFETCH_ROWS => self.request_older_history(&session),
-            Direction::Newer if remaining <= chat.scroller.viewport_bounds().size.height.max(gpui_kit::px(48.)) => {
+            Direction::Older if empty_page || offset <= margin => self.request_older_history(&session),
+            Direction::Newer if empty_page || extent - offset <= margin => {
                 if let (Some(start), Some(generation)) = (chat.history.next_after, chat.history.generation) {
                     self.request_history_from(&session, start, generation, false);
                 }
             }
             _ => {}
         }
+        let history = &self.chats[&session].history;
+        if history.pending.is_some() || history.forward.is_some() {
+            cx.notify();
+        }
+    }
+
+    fn continue_history(&mut self, session: &str, loaded: Direction, empty_page: bool, cx: &mut Context<Self>) {
+        if session == self.active && let Some(direction) = self.chats[session].history.direction {
+            self.prefetch_history(direction, empty_page && direction == loaded, cx);
+        } else {
+            self.schedule_history_trim(session, cx);
+        }
+        cx.notify();
+    }
+
+    fn schedule_history_trim(&mut self, session: &str, cx: &mut Context<Self>) {
+        let history = &mut self.chats.get_mut(session).unwrap().history;
+        if !history.needs_trim() {
+            return;
+        }
+        let session = session.to_owned();
+        // Restart the delay as wheel/momentum packets arrive. Changing the
+        // scrollbar range while the pointer is holding its thumb also waits.
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(160)).await;
+                let done = this.update(cx, |view, cx| {
+                    let Some(chat) = view.chats.get_mut(&session) else { return true };
+                    if chat.scroller.is_scrollbar_dragging() {
+                        return false;
+                    }
+                    // Both cursors describe the current window. A response
+                    // must be merged before eviction can move either cursor.
+                    if chat.history.pending.is_some() || chat.history.forward.is_some() {
+                        return true;
+                    }
+                    if chat.trim_history_window() {
+                        cx.notify();
+                    }
+                    true
+                }).unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        });
+        history.trim_task = Some(task);
     }
 
     pub(crate) fn finish_thread_tail(
@@ -297,6 +375,7 @@ impl Workbench {
         if session == self.active {
             self.github_view();
             self.request_thread_tail();
+            self.resume_history_prefetch(cx);
         }
     }
 
@@ -538,10 +617,6 @@ impl Workbench {
             || self.receiving_backlog
             || session != self.active
             || self.workspaces.active.is_none()
-            || self
-                .threads
-                .iter()
-                .any(|thread| thread.id == session && thread.archived)
         {
             return;
         }
@@ -607,13 +682,13 @@ impl Workbench {
             HashSet::new()
         };
         let deferred = std::mem::take(&mut chat.history.deferred_page_events);
-        chat.prepend_history(events, false, cx);
+        let added_visible_rows = chat.prepend_history(events, false, cx);
         if !chat.history.pages.is_empty() && chat.history.before != previous_before {
             chat.history.pages.push_front(LoadedPage {
                 start: chat.history.before.unwrap_or(0),
                 rows: chat.rows.len() - rows + sparse.saturating_sub(chat.sparse_history_rows()),
             });
-            chat.trim_history_window(Direction::Older);
+            chat.history.trim_direction = Some(Direction::Older);
         }
         if let Some(through) = through {
             chat.history.page_through.extend(items.iter().map(|item| (item.clone(), through)));
@@ -623,6 +698,7 @@ impl Workbench {
             }), cx);
         }
         chat.history.last_scroll = Some(chat.scroller.logical_scroll_top());
+        self.continue_history(&session, Direction::Older, !added_visible_rows, cx);
     }
 
     pub(crate) fn finish_thread_history_from(&mut self, event: ServerEvent, cx: &mut Context<Self>) {
@@ -648,27 +724,24 @@ impl Workbench {
         chat.grouping = Default::default();
         chat.delegate_anchor = None;
         chat.replay_updates(events.into_iter(), cx);
+        let added_visible_rows = chat.rows[rows.min(chat.rows.len())..].iter().any(|row| {
+            row.kind(self.appearance.settings.show_worker_messages) != RowKind::Hidden
+        });
         chat.history.pages.push_back(LoadedPage { start, rows: chat.rows.len().saturating_sub(rows) });
         if chat.history.next_after.is_none() {
             chat.history.through = through;
             chat.replay_updates(pending.events.into_iter().filter_map(|(seq, event)| (seq > through).then_some(event)), cx);
         }
         if pending.jump {
-            if chat.rows.is_empty() && chat.history.next_after.is_some() {
-                chat.history.jump = chat.history.next_after.map(Jump::History);
-                if self.active == session {
-                    self.request_thread_tail();
-                }
-                return;
-            }
             chat.history.jump = None;
+            chat.history.direction = (!added_visible_rows).then_some(Direction::Newer);
             if let Some(position) = chat.history.reset_position.take() {
                 chat.restore_transcript_position(position);
             } else {
                 chat.scroller.scroll_to(ListOffset::default());
             }
         } else {
-            chat.trim_history_window(Direction::Newer);
+            chat.history.trim_direction = Some(Direction::Newer);
         }
         if chat.history.next_after.is_none() {
             let anchor = chat.scroller.logical_scroll_top();
@@ -679,7 +752,7 @@ impl Workbench {
         if pending.jump {
             self.restore_approval_notices(&session, cx);
         }
-        cx.notify();
+        self.continue_history(&session, Direction::Newer, !added_visible_rows, cx);
     }
 
     pub(crate) fn thread_history_failed(
@@ -708,8 +781,12 @@ impl Workbench {
                 }
                 chat.cancel_history_prefetch(cx);
             }
-            None => chat.history.before = None,
+            None => {
+                chat.history.before = None;
+                chat.history.legacy_unavailable = true;
+            }
         }
+        cx.notify();
     }
 }
 
@@ -723,21 +800,29 @@ impl Chat {
         self.replay_updates(deferred.into_iter().map(|(_, event)| event), cx);
     }
 
-    fn trim_history_window(&mut self, direction: Direction) {
-        const KEPT_PAGES: usize = 4;
-        if self.history.pages.len() <= KEPT_PAGES {
-            return;
+    fn trim_history_window(&mut self) -> bool {
+        let Some(direction) = self.history.trim_direction.take() else { return false };
+        let mut trimmed = false;
+        while self.history.pages.len() > KEPT_PAGES && self.trim_history_page(direction) {
+            trimmed = true;
         }
+        if self.history.pages.len() > KEPT_PAGES {
+            self.history.trim_direction = Some(direction);
+        }
+        trimmed
+    }
 
+    fn trim_history_page(&mut self, direction: Direction) -> bool {
         let anchor = self.scroller.logical_scroll_top();
+        let visible = self.scroller.visible_item_range();
         let sparse = self.sparse_history_rows();
         let range = match direction {
             Direction::Older => {
                 let newest = self.history.pages.back().unwrap();
                 let offset = sparse + self.history.pages.iter().take(self.history.pages.len() - 1)
                     .map(|page| page.rows).sum::<usize>();
-                if anchor.item_ix.saturating_add(32) >= offset || self.scroller.is_following_tail() {
-                    return;
+                if visible.end.saturating_add(1) >= offset || self.scroller.is_following_tail() {
+                    return false;
                 }
                 self.history.next_after = Some(newest.start);
                 self.history.pages.pop_back();
@@ -748,7 +833,7 @@ impl Chat {
                 let oldest = self.history.pages.front().unwrap();
                 let end = sparse + oldest.rows;
                 if anchor.item_ix <= end {
-                    return;
+                    return false;
                 }
                 self.history.pages.pop_front();
                 self.history.before = self.history.pages.front().map(|page| page.start);
@@ -756,9 +841,13 @@ impl Chat {
             }
         };
         self.remove_history_rows(range);
+        self.history.last_scroll = Some(self.scroller.logical_scroll_top());
+        true
     }
 
     fn remove_history_rows(&mut self, range: std::ops::Range<usize>) {
+        let removed_tail = range.end == self.rows.len();
+        let boundary = range.start;
         let shift = |row: &mut usize| {
             if range.contains(row) {
                 return false;
@@ -780,6 +869,17 @@ impl Chat {
         self.scroller.splice(range, 0);
         self.transcript.forget_rows(&removed);
         self.clear_transcript_hover();
+        let show_worker_messages = self.transcript.current_style().is_some_and(|style| style.show_worker_messages);
+        let visible = |row: &Row| row.kind(show_worker_messages) != RowKind::Hidden;
+        let edge = if removed_tail {
+            self.rows.iter().rposition(visible)
+        } else {
+            self.rows[..boundary].iter().rposition(visible)
+                .or_else(|| self.rows[boundary..].iter().position(visible).map(|index| boundary + index))
+        };
+        if let Some(row) = edge {
+            self.scroller.remeasure_items(row..row + 1);
+        }
     }
 
     fn sparse_history_rows(&self) -> usize {
@@ -792,16 +892,12 @@ impl Chat {
             || self.delegate_items.contains_key(item)
     }
 
-    fn prepend_history(&mut self, events: Vec<ServerEvent>, initial: bool, cx: &mut Context<Workbench>) {
+    fn prepend_history(&mut self, events: Vec<ServerEvent>, initial: bool, cx: &mut Context<Workbench>) -> bool {
         if events.is_empty() {
-            return;
+            return false;
         }
-        let leading = self
-            .transcript
-            .rows
-            .borrow()
-            .as_ref()
-            .and_then(|rows| rows.first_visible);
+        let show_worker_messages = self.transcript.current_style().is_some_and(|style| style.show_worker_messages);
+        let leading = self.rows.iter().position(|row| row.kind(show_worker_messages) != RowKind::Hidden);
         // Replay into an independent row builder so old turn endings and tool
         // results cannot change the live turn or replace a running worker.
         let mut page = Chat::new(cx);
@@ -900,7 +996,7 @@ impl Chat {
             }
         }
         if batches.is_empty() {
-            return;
+            return false;
         }
         if !initial && self.scroller.is_following_tail()
             && self.scroller.scroll_px_offset_for_scrollbar().y.as_f32() == 0.
@@ -908,22 +1004,18 @@ impl Chat {
             self.scroller.scroll_to(ListOffset::default());
         }
         let mut preserve_leading_padding = false;
+        let mut added_visible_rows = false;
         let preserve_leading_row = !self.scroller.is_following_tail()
             && leading == Some(self.scroller.logical_scroll_top().item_ix);
-        let show_worker_messages = self
-            .transcript
-            .current_style()
-            .is_some_and(|style| style.show_worker_messages);
         let mut destinations = vec![0; page.scroller.item_count()];
         let mut inserted = 0;
         for (before, batch) in batches {
             let start = before + inserted;
             let count = batch.len();
-            preserve_leading_padding |= preserve_leading_row
-                && start <= self.scroller.logical_scroll_top().item_ix
-                && batch
-                    .iter()
-                    .any(|(_, row)| row.kind(show_worker_messages) != RowKind::Hidden);
+            let visible = batch.iter().any(|(_, row)| row.kind(show_worker_messages) != RowKind::Hidden);
+            added_visible_rows |= visible;
+            preserve_leading_padding |= visible && preserve_leading_row
+                && start <= self.scroller.logical_scroll_top().item_ix;
             let rows = batch
                 .into_iter()
                 .rev()
@@ -963,6 +1055,7 @@ impl Chat {
         }
         self.clear_transcript_hover();
         cx.notify();
+        added_visible_rows
     }
 
     pub(super) fn prepend_job_details(&mut self, job: &str, events: Vec<ServerEvent>, cx: &mut Context<Workbench>) {
@@ -1058,10 +1151,15 @@ impl Chat {
             .collect::<Vec<_>>();
         self.scroller
             .splice_with_height_estimates(start..start, heights);
-        if end < self.rows.len() {
-            self.remeasure_group_near(end);
-        } else {
-            self.transcript.rows.borrow_mut().take();
+        self.transcript.rows.borrow_mut().take();
+        // A splice can transfer the leading inset or end-of-group padding
+        // at its boundaries. Keep exact heights for the surviving interior.
+        let show_worker_messages = self.transcript.current_style().is_some_and(|style| style.show_worker_messages);
+        let visible = |row: &Row| row.kind(show_worker_messages) != RowKind::Hidden;
+        if let Some(previous) = self.rows[..start].iter().rposition(visible) {
+            self.scroller.remeasure_items(previous..previous + 1);
+        } else if let Some(next) = self.rows[end..].iter().position(visible).map(|next| end + next) {
+            self.scroller.remeasure_items(next..next + 1);
         }
     }
 }
@@ -1167,15 +1265,15 @@ mod tests {
                 let Content::Delegate(block) = &view.chats[A].rows[job_row].content else { panic!("missing job") };
                 assert_eq!(block.progress.len(), 1);
 
-                view.history_scrolled_older(cx);
+                view.prefetch_history(Direction::Older, true, cx);
                 let older = view.chats[A].history.pending.unwrap();
                 view.prefetch_history(Direction::Newer, false, cx);
-                assert!(view.chats[A].history.pending.is_none());
+                assert_eq!(view.chats[A].history.pending, Some(older));
                 deliver(view, window, cx, 0, ServerEvent::ThreadHistoryPage {
-                    session: A.into(), request: older, events: vec![text(A, "ignored", "Cancelled page")],
+                    session: A.into(), request: older, events: vec![text(A, "previous", "Earlier page in flight")],
                     next_before: Some(300), generation: Some(0), through: Some(10),
                 });
-                assert!(!view.chats[A].by_item.contains_key("ignored"));
+                assert_eq!(body(view, A, "previous"), "Earlier page in flight");
                 summary
             })).unwrap();
 
@@ -1212,7 +1310,9 @@ mod tests {
                         events: (0..32).map(|item| text(A, &format!("page-{start}-{item}"), "Synthetic message")).collect(),
                     });
                 }
-                let chat = &view.chats[A];
+                let chat = view.chats.get_mut(A).unwrap();
+                assert_eq!(chat.history.pages.len(), 5, "scrolling defers eviction");
+                assert!(chat.trim_history_window());
                 assert!(!chat.by_item.contains_key("first"));
                 assert!(!chat.by_item.contains_key(job));
                 assert_eq!(chat.jobs.get(job).unwrap().tools, 500);

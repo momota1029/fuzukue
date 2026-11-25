@@ -2114,7 +2114,7 @@ impl Store {
         if self.history_generation(id) != generation {
             return Err(Stale);
         }
-        if thread.front.archived || !thread.path.is_file() {
+        if !thread.path.is_file() {
             return Err(Unavailable);
         }
         self.history_page_mode(id, before, compact).ok_or(Stale)
@@ -2125,7 +2125,7 @@ impl Store {
     }
 
     fn history_page_mode(&self, id: &str, before: u64, compact: bool) -> Option<(Vec<ServerEvent>, Option<u64>)> {
-        let thread = self.threads.get(id).filter(|thread| !thread.front.archived && thread.path.is_file())?;
+        let thread = self.threads.get(id).filter(|thread| thread.path.is_file())?;
         let key = compact.then(|| self.completed_page_key(id, thread, PagePosition::Before(before)));
         if let Some(page) = key.as_ref().and_then(|key| self.cached_page(key)) {
             return Some((page.events, page.next));
@@ -3942,6 +3942,45 @@ mod archive_tests {
         assert_eq!(thread.updated, updated);
         store.set_pinned(&id, false)?;
         assert!(!load().threads[&id].front.pinned);
+        Ok(())
+    }
+
+    #[test]
+    fn archived_transcript_pages_to_the_start_without_a_checkpoint() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let mut store = Store::load(project.path(), state.path(), &BTreeMap::new());
+        let id = store.create(None)?;
+        let count = INITIAL_HISTORY_ENTRIES * 7;
+        let thread = store.threads.get_mut(&id).unwrap();
+        for index in 0..count {
+            thread.transcript.observe(&ServerEvent::TextDelta {
+                session: id.clone(), item: format!("message-{index}"), actor: Actor::Claude,
+                text: format!("Synthetic message {index}"),
+            });
+        }
+        thread.save()?;
+        store.set_archived(&id, true)?;
+        drop(store);
+        let store = Store::load(project.path(), state.path(), &BTreeMap::new());
+        assert!(!store.checkpoint_path(&id).exists());
+        let generation = store.history_generation(&id);
+        for scoped in [false, true] {
+            let mut cursor = Some(count as u64);
+            let mut remaining = count;
+            while let Some(before) = cursor {
+                let (events, next) = if scoped {
+                    store.scoped_history_page(&id, before, generation, true).expect("archived scoped page")
+                } else {
+                    store.history_page(&id, before).expect("archived legacy page")
+                };
+                assert!(!events.is_empty());
+                remaining -= events.len();
+                assert_eq!(next.unwrap_or(0), remaining as u64);
+                cursor = next;
+            }
+            assert_eq!(remaining, 0);
+        }
         Ok(())
     }
 

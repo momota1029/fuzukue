@@ -317,9 +317,20 @@ async fn large_thread_history_wire() -> Result<()> {
                     socket.send(Message::Text(serde_json::to_string(&request)?.into())).await?;
                     loop {
                         let env: Envelope = serde_json::from_str(socket.next().await.unwrap()?.to_text()?)?;
-                        if let ServerEvent::ThreadHistoryFailed { session: failed, request, .. } = env.event {
-                            assert_eq!((failed.as_str(), request, env.seq), (session, 91, 0));
-                            break;
+                        match env.event {
+                            ServerEvent::ThreadHistoryFailed { session: failed, request, .. } => {
+                                assert_eq!((failed.as_str(), request, env.seq), ("thread-missing", 91, 0));
+                                assert_eq!(session, "thread-missing", "archived history must remain readable");
+                                break;
+                            }
+                            ServerEvent::ThreadHistoryPage { session: owner, request, events, next_before, .. } => {
+                                assert_eq!((owner.as_str(), request, env.seq), (THREAD, 91, 0));
+                                assert_eq!(session, THREAD);
+                                assert!(!events.is_empty());
+                                assert!(next_before.is_some_and(|next| next < before));
+                                break;
+                            }
+                            _ => {}
                         }
                     }
                 }

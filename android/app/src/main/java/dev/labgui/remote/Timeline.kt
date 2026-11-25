@@ -49,6 +49,8 @@ sealed interface TimelineRow {
     ) : TimelineRow
 }
 
+enum class HistoryEdge { Unknown, More, Loading, Start }
+
 data class Timeline(
     val rows: Map<String, TimelineRow> = emptyMap(),
     val running: Boolean = false,
@@ -57,10 +59,11 @@ data class Timeline(
     val pauseReason: String? = null,
     val runningSince: Long? = null,
     val planAttention: PlanAttention = PlanAttention(),
-    private val streamingSilencePrefixes: Set<String> = emptySet(),
+    internal val streamingSilencePrefixes: Set<String> = emptySet(),
     val composerNotice: String? = null,
     internal val olderPages: Int = 0,
     val jobSummaries: JobSummaries = JobSummaries(),
+    val historyEdge: HistoryEdge = HistoryEdge.Unknown,
 ) {
     internal val visibleRows: Map<String, TimelineRow>
         get() = rows.filterNot { (id, row) ->
@@ -204,6 +207,7 @@ data class Timeline(
     internal fun clearHistory() = copy(
         rows = rows.filterValues { it is TimelineRow.ApprovalOutcome },
         streamingSilencePrefixes = emptySet(),
+        historyEdge = HistoryEdge.Unknown,
     )
 
     internal fun prependHistory(page: Timeline, sparseWorkers: List<String>): Timeline {

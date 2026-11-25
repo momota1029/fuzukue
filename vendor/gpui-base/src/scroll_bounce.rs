@@ -149,7 +149,7 @@ pub struct ScrollBounce {
     scroll_wheel: bool,
     motion: ScrollBounceMotion,
     on_scroll: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
-    on_top_wheel: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    on_vertical_wheel: Option<Rc<dyn Fn(Pixels, &mut Window, &mut App)>>,
 }
 
 impl ScrollBounce {
@@ -166,7 +166,7 @@ impl ScrollBounce {
             scroll_wheel: true,
             motion: ScrollBounceMotion::default(),
             on_scroll: None,
-            on_top_wheel: None,
+            on_vertical_wheel: None,
         }
     }
 
@@ -212,10 +212,10 @@ impl ScrollBounce {
         self
     }
 
-    /// Observe a wheel packet directed above the logical top, even if the
-    /// child fits in its viewport. Applies when this element owns the wheel.
-    pub fn on_top_wheel(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
-        self.on_top_wheel = Some(Rc::new(handler));
+    /// Observe vertical wheel input after moving the child, including packets
+    /// clamped at an edge and packets over content that fits the viewport.
+    pub fn on_vertical_wheel(mut self, handler: impl Fn(Pixels, &mut Window, &mut App) + 'static) -> Self {
+        self.on_vertical_wheel = Some(Rc::new(handler));
         self
     }
 }
@@ -396,13 +396,13 @@ impl Element for ScrollBounce {
         if self.scroll_wheel {
             let hitbox = prepaint.hitbox.id;
             let handle = self.handle.clone();
-            let observes_top = self.on_top_wheel.is_some();
+            let observes_wheel = self.on_vertical_wheel.is_some();
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture
                     && hitbox.should_handle_scroll(window)
-                    && (max_scroll_extent(handle.as_ref()) > px(0.) || (observes_top && {
+                    && (max_scroll_extent(handle.as_ref()) > px(0.) || (observes_wheel && {
                         let delta = event.delta.pixel_delta_in(window.line_height(), bounds.size);
-                        delta.y > px(0.) && delta.y >= delta.x.abs()
+                        delta.y != px(0.) && delta.y.abs() >= delta.x.abs()
                     }))
                 {
                     claim_scroll(hitbox, cx);
@@ -569,7 +569,7 @@ impl Element for ScrollBounce {
             let handle = self.handle.clone();
             let view = window.current_view();
             let on_scroll = self.on_scroll.clone();
-            let on_top_wheel = self.on_top_wheel.clone();
+            let on_vertical_wheel = self.on_vertical_wheel.clone();
             window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase != DispatchPhase::Capture
                     || !hitbox.should_handle_scroll(window)
@@ -583,14 +583,14 @@ impl Element for ScrollBounce {
                     .ongoing_scroll
                     .lock_axis(&mut delta, event.touch_phase);
                 let before = handle.offset();
-                let at_top = delta.y > px(0.) && delta.y >= delta.x.abs() && before.y.as_f32() >= 0.;
+                let vertical = delta.y != px(0.) && delta.y.abs() >= delta.x.abs();
                 let max = max_scroll_extent(handle.as_ref());
                 if max <= px(0.) {
                     state.overscroll.reset();
                     drop(state);
-                    if at_top && let Some(handler) = &on_top_wheel {
+                    if vertical && let Some(handler) = &on_vertical_wheel {
                         cx.stop_propagation();
-                        handler(window, cx);
+                        handler(delta.y, window, cx);
                     }
                     return;
                 }
@@ -605,7 +605,7 @@ impl Element for ScrollBounce {
                     state.overscroll.reset();
                     let mut offset = before;
                     offset.y = (before.y + delta.y).clamp(-max, px(0.));
-                    handle.set_offset(offset);
+                    handle.set_wheel_offset(offset);
                     displaced
                 } else {
                     state.overscroll.packet(
@@ -618,7 +618,7 @@ impl Element for ScrollBounce {
                             let mut offset = before;
                             let requested = before.y + px(dy);
                             offset.y = requested.clamp(-max, px(0.));
-                            handle.set_offset(offset);
+                            handle.set_wheel_offset(offset);
                             // Only clamping leaves unused input; subtraction
                             // can leave a rounding residue inside the list.
                             if offset.y == requested {
@@ -635,8 +635,8 @@ impl Element for ScrollBounce {
                 if changed || scrolled {
                     cx.notify(view);
                 }
-                if at_top && let Some(handler) = &on_top_wheel {
-                    handler(window, cx);
+                if vertical && let Some(handler) = &on_vertical_wheel {
+                    handler(delta.y, window, cx);
                 }
                 if scrolled && let Some(handler) = &on_scroll {
                     handler(window, cx);

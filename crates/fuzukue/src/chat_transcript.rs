@@ -100,6 +100,7 @@ pub(super) struct TranscriptRows {
     pub first_visible: Option<usize>,
     pub last_visible: Option<usize>,
     pub latest_message: Option<usize>,
+    pub latest_reply: Option<usize>,
     pub groups: Vec<AssistantGroup>,
     pub show_worker_messages: bool,
 }

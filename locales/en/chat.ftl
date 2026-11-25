@@ -161,6 +161,9 @@ chat-worker-tools = { $worker }: { $calls ->
     [one] { $calls } tool call
    *[other] { $calls } tool calls
     }{ STATUS_SEPARATOR() }{ $status }
+chat-loading-older = Loading earlier messages…
+chat-loading-newer = Loading newer messages…
+chat-start-of-thread = Start of thread
 chat-earlier-worker-tools = { $calls ->
     [one] { $calls } earlier tool call
    *[other] { $calls } earlier tool calls

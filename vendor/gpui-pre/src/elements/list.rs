@@ -135,6 +135,7 @@ struct ScrollAnchor {
 enum PendingScroll {
     Absolute(Pixels),
     Proportional(f32),
+    FromEnd(Pixels),
 }
 
 enum ScrollAnchorMode {
@@ -900,6 +901,51 @@ impl ListState {
         self.0.borrow_mut().set_offset_from_scrollbar(point);
     }
 
+    /// Scroll from wheel input in live content coordinates.
+    pub fn set_offset_from_wheel(&self, point: Point<Pixels>) {
+        let mut state = self.0.borrow_mut();
+        let max = state.scroll_extent(state.items.summary().height);
+        let target = (-point.y).clamp(px(0.), max);
+        let current = state.live_scroll_offset();
+        if target == current {
+            return;
+        }
+        if target < current {
+            state.follow_state.stop_following();
+        } else if target == max {
+            state.follow_state.start_following();
+            if state.follow_state.is_following() {
+                let item_ix = state.items.summary().count;
+                state.set_scroll_anchor(Some(ListOffset { item_ix, offset_in_item: px(0.) }));
+                return;
+            }
+        }
+        let previous = state.scroll_anchor;
+        let anchor = if state.alignment == ListAlignment::Bottom && target == max {
+            None
+        } else {
+            Some(state.offset_for_pixels(target))
+        };
+        state.set_scroll_anchor(anchor);
+        // When moving backward into an estimated row, the part adjacent to
+        // the current viewport is its end. Keep the distance traveled into
+        // that end when the real height becomes available.
+        if target > px(0.)
+            && let (Some(anchor), Some(previous)) = (anchor, previous)
+            && (target < current && anchor.item_ix < previous.position.item_ix
+                || anchor.item_ix == previous.position.item_ix
+                    && matches!(previous.pending, Some(PendingScroll::FromEnd(_))))
+        {
+            let mut cursor = state.items.cursor::<Count>(());
+            cursor.seek(&Count(anchor.item_ix), Bias::Right);
+            let distance = cursor.item().filter(|item| item.size().is_none())
+                .and_then(|item| item.size_hint())
+                .map(|hint| (hint.height - anchor.offset_in_item).max(px(0.)));
+            drop(cursor);
+            state.scroll_anchor.as_mut().unwrap().pending = distance.map(PendingScroll::FromEnd);
+        }
+    }
+
     /// Returns the maximum scroll offset according to the items we have measured.
     /// This value remains constant while dragging to prevent the scrollbar from moving away unexpectedly.
     pub fn max_offset_for_scrollbar(&self) -> Point<Pixels> {
@@ -1008,10 +1054,11 @@ impl StateInner {
     }
 
     fn live_scroll_offset(&self) -> Pixels {
-        if self.scroll_anchor.is_none() && self.alignment == ListAlignment::Bottom {
+        let anchor = self.logical_scroll_top();
+        if anchor.item_ix == self.items.summary().count {
             self.scroll_extent(self.items.summary().height)
         } else {
-            self.scroll_top(&self.logical_scroll_top())
+            self.scroll_top(&anchor)
         }
     }
 
@@ -1144,6 +1191,7 @@ impl StateInner {
                             )
                         })
                 }
+                (PendingScroll::FromEnd(_), false) => None,
             });
         self.scroll_anchor = Some(ScrollAnchor {
             position,
@@ -1261,6 +1309,7 @@ impl StateInner {
                         scroll_top.offset_in_item = match pending {
                             PendingScroll::Absolute(offset) => offset.min(element_size.height),
                             PendingScroll::Proportional(fraction) => element_size.height * fraction,
+                            PendingScroll::FromEnd(distance) => (element_size.height - distance).max(px(0.)),
                         };
                         anchor.position = scroll_top;
                     } else if self.estimate_revision.is_some() && item.size().is_none() {
@@ -1406,7 +1455,7 @@ impl StateInner {
             let padding = self.last_padding.unwrap_or_default();
             let total_height = self.items.summary().height + padding.top + padding.bottom;
             let scroll_offset = self.scroll_top(&scroll_top);
-            if scroll_offset + available_height >= total_height - px(1.0) {
+            if scroll_offset + available_height >= total_height - px(0.01) {
                 self.follow_state.start_following();
             }
         }

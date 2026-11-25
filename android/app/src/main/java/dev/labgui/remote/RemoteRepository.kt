@@ -264,6 +264,7 @@ internal class RemoteRepository(
         selectionToRestore = id
         mutableState.value = state.value.copy(selection = id)
         requestSelectionTail()
+        resumeOlderHistory()
     }
 
     fun requestThreadJob(session: String, job: String, older: Boolean) {
@@ -305,6 +306,19 @@ internal class RemoteRepository(
         val generation = history.generation
         if (sendToWorkspace(ClientMessage.GetThreadHistory(session, request, before, generation))) {
             history.page = TranscriptHistory.PendingPage(request, before, generation)
+            history.continueOlder = false
+            val current = state.value
+            mutableState.value = current.withTimeline(session, current.timeline(session).copy(historyEdge = history.edge))
+        }
+    }
+
+    private fun resumeOlderHistory() {
+        val current = state.value
+        val session = current.selection ?: return
+        val workspace = current.workspace ?: return
+        val history = histories[session] ?: return
+        if (history.pageInterrupted || history.continueOlder) {
+            requestOlderHistory(ConversationTarget(workspace, session))
         }
     }
 
@@ -841,8 +855,9 @@ internal class RemoteRepository(
             }
             is ServerEvent.ThreadHistoryStart -> {
                 if (selectionScoped || serverProtocol < THREAD_HISTORY_PROTOCOL) return
-                histories.getOrPut(event.session) { TranscriptHistory() }.startLegacy(event)
-                return
+                val history = histories.getOrPut(event.session) { TranscriptHistory() }
+                history.startLegacy(event)
+                current.withTimeline(event.session, current.timeline(event.session).copy(historyEdge = history.edge))
             }
             is ServerEvent.ThreadTail -> {
                 if (!selectionScoped || replaying || frame.workspace != current.workspace || frame.workspace == null) return
@@ -851,7 +866,7 @@ internal class RemoteRepository(
                 val events = savedTranscriptEvents(event.session, event.events)
                 val loaded = history.applyTail(event, current.timeline(event.session), pending, events)
                 // A prompt echoed across the disconnect may be present only in the new tail.
-                events.fold(current.withTimeline(event.session, loaded)) { next, echo ->
+                events.fold(current.withTimeline(event.session, loaded.copy(historyEdge = history.edge))) { next, echo ->
                     acknowledgePrompt(next, echo, reconnectPromptLimit)
                 }
             }
@@ -897,16 +912,10 @@ internal class RemoteRepository(
                 val history = histories[event.session] ?: return
                 val before = current.timeline(event.session)
                 val merged = history.applyPage(event, before) ?: return
-                val next = current.withTimeline(event.session, merged)
-                if (current.selection == event.session && history.before != null &&
+                // Hidden rows and updates to a sparse worker can leave the same visible extent.
+                history.continueOlder = history.before != null &&
                     merged.visibleRows.keys.all(before.visibleRows.keys::contains)
-                ) {
-                    // A page can contain only hidden entries or a worker already on screen.
-                    mutableState.value = next
-                    current.workspace?.let { requestOlderHistory(ConversationTarget(it, event.session)) }
-                    return
-                }
-                next
+                current.withTimeline(event.session, merged.copy(historyEdge = history.edge))
             }
             is ServerEvent.ThreadHistoryFailed -> {
                 if (replaying || (selectionScoped && frame.workspace == null)) return
@@ -920,7 +929,8 @@ internal class RemoteRepository(
                     "stale", "not_found" -> invalidateHistory(current, event.session)
                     else -> current.withTimeline(
                         event.session,
-                        history.finishPage(current.timeline(event.session), endOfHistory = event.reason == null),
+                        history.finishPage(current.timeline(event.session), endOfHistory = event.reason == null)
+                            .copy(historyEdge = if (event.reason == null) HistoryEdge.Unknown else history.edge),
                     )
                 }
             }
@@ -995,10 +1005,8 @@ internal class RemoteRepository(
         }
         when (event) {
             is ServerEvent.ThreadSync -> {
-                for ((session, history) in histories) {
-                    if (history.pageInterrupted) requestHistoryPage(session, history)
-                }
                 requestSelectionTail()
+                resumeOlderHistory()
             }
             is ServerEvent.WorkspaceSelected -> {
                 if (!approvalQueueReady && approvalSnapshotRequest == null) requestApprovalQueue(event.id)
@@ -1007,6 +1015,7 @@ internal class RemoteRepository(
             is ServerEvent.Threads, is ServerEvent.ThreadCreated, is ServerEvent.ThreadHistoryInvalidated,
             is ServerEvent.Error -> requestSelectionTail()
             is ServerEvent.ThreadHistoryFailed -> if (event.reason == "stale") requestSelectionTail()
+            is ServerEvent.ThreadHistoryPage -> resumeOlderHistory()
             else -> Unit
         }
     }

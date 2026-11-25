@@ -1376,6 +1376,7 @@ impl Workbench {
         }
         self.active = session;
         self.request_thread_tail();
+        self.resume_history_prefetch(cx);
         self.github_view();
         self.request_thread_artifacts();
         cx.notify();
@@ -1510,6 +1511,7 @@ impl Workbench {
                                 self.receiving_backlog = false;
                                 self.finish_notification_route(cx);
                                 self.request_thread_tail();
+                                self.resume_history_prefetch(cx);
                             }
                         }
                         ServerEvent::ThreadHistoryInvalidated { session } if self.transcripts.scoped && env.workspace.is_some() => {
@@ -1580,6 +1582,7 @@ impl Workbench {
                                 self.on_event(event, cx);
                                 self.restore_replay_positions();
                                 self.finish_notification_route(cx);
+                                self.resume_history_prefetch(cx);
                             } else if self.scoped_event(env.seq, &event, cx).is_some() {
                                 let selection_was_listed = self.threads.iter().any(|thread| thread.id == self.active);
                                 self.on_event(event, cx);
