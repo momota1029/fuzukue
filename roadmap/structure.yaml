@@ -81,6 +81,9 @@ sections:
   - R-70
   - R-72
   - R-73
+  - R-91
+  - R-92
+  - R-93
 - title: 技術的負債
   items:
   - R-38
