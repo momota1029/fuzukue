@@ -97,7 +97,7 @@ class MainActivity : ComponentActivity() {
                     pendingNotice.value = null
                 }
             }
-            LaunchedEffect(resumed.value, state.phase, updates.status, updates.auto, updates.channel, updates.origin) {
+            LaunchedEffect(resumed.value, state.phase, updates.status, updates.auto, updates.channel, updates.preference, updates.url) {
                 while (resumed.value) {
                     val release = when (val status = updates.status) {
                         is UpdateStatus.Ready -> status.release
