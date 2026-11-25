@@ -922,6 +922,15 @@ impl ListState {
         self.0.borrow().last_layout_bounds.unwrap_or_default()
     }
 
+    /// Rows intersecting the last laid out viewport, including provisional measurements.
+    pub fn visible_item_range(&self) -> Range<usize> {
+        let state = self.0.borrow();
+        let Some(bounds) = state.last_layout_bounds else { return 0..0 };
+        let mut range = StateInner::visible_range(&state.items, bounds.size.height, &state.logical_scroll_top());
+        range.end = range.end.min(state.items.summary().count);
+        range
+    }
+
     /// Returns whether the item is entirely above the viewport, or `None` if
     /// the list has not measured enough layout to know.
     ///

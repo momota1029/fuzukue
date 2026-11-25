@@ -78,20 +78,23 @@ pub fn referenced_decls(project: &Path) -> BTreeSet<String> {
 /// `#print axioms` の出力を、宣言 → 状態 に読む。
 pub fn parse_axioms(output: &str, decls: &[String]) -> BTreeMap<String, String> {
     let mut status: BTreeMap<String, String> = decls.iter().map(|d| (d.clone(), "missing".to_string())).collect();
+    let definitions: BTreeSet<_> = output.lines()
+        .filter_map(|line| line.strip_prefix("fuzukue definition: ")).collect();
     for line in output.lines() {
         let Some(rest) = line.strip_prefix('\'') else { continue };
-        let Some((name, tail)) = rest.split_once('\'') else { continue };
+        let Some((name, tail)) = rest.split_once("' ") else { continue };
         if !status.contains_key(name) {
             continue;
         }
+        let checked = if definitions.contains(name) { "defined" } else { "proved" };
         let state = if tail.contains("does not depend on any axioms") {
-            "proved".to_string()
+            checked.to_string()
         } else if let Some(list) = tail.split_once('[').and_then(|(_, r)| r.split_once(']')).map(|(l, _)| l) {
             let axioms: Vec<&str> = list.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
             if axioms.contains(&"sorryAx") {
                 "sorry".to_string()
             } else if axioms.iter().all(|a| STANDARD.contains(a)) {
-                "proved".to_string()
+                checked.to_string()
             } else {
                 format!("axioms: {}", axioms.join(", "))
             }
@@ -169,13 +172,23 @@ async fn check_project(project: &Path, reading: bool) -> Result<BTreeMap<String,
             }
             continue;
         }
-        let mut src = String::new();
+        let mut src = String::from("import Lean\n");
         for module in imports.into_iter().filter(|name| lean_name(name)) {
             src.push_str(&format!("import {module}\n"));
         }
         for d in &decls {
             src.push_str(&format!("#print axioms {d}\n"));
         }
+        // Read declaration kinds from the elaborated environment. A definition
+        // with an unchecked axiom dependency still keeps its warning status.
+        src.push_str("run_cmd do\n  let env ← Lean.getEnv\n  for decl in [");
+        src.push_str(&decls.iter().map(|name| format!("\"{name}\"")).collect::<Vec<_>>().join(", "));
+        src.push_str(concat!(
+            "] do\n    match env.find? decl.toName with\n",
+            "    | some (.defnInfo _) | some (.inductInfo _) | some (.ctorInfo _)\n",
+            "    | some (.recInfo _) | some (.opaqueInfo _) => Lean.logInfo (\"fuzukue definition: \" ++ decl)\n",
+            "    | _ => pure ()\n",
+        ));
         let mut audit = Command::new("lake")
             .args(["env", "lean", "--stdin"])
             .current_dir(&dir)
@@ -261,13 +274,47 @@ imports = ["Init", "PilotProofs"]
     #[test]
     fn reads_axiom_lines() {
         let out = "'P.a' depends on axioms: [propext, Quot.sound]\n'P.b' depends on axioms: [propext, sorryAx]\n\
-                   'P.c' does not depend on any axioms\n'P.d' depends on axioms: [propext, myAxiom]\nx.lean:5:14: error: Unknown constant `P.e`";
+                   'P.c' does not depend on any axioms\n'P.d' depends on axioms: [propext, myAxiom]\nx.lean:5:14: error: Unknown constant `P.e`\n\
+                   fuzukue definition: P.b\nfuzukue definition: P.c";
         let decls: Vec<String> = ["P.a", "P.b", "P.c", "P.d", "P.e"].iter().map(|s| s.to_string()).collect();
         let s = parse_axioms(out, &decls);
         assert_eq!(s["P.a"], "proved");
         assert_eq!(s["P.b"], "sorry");
-        assert_eq!(s["P.c"], "proved");
+        assert_eq!(s["P.c"], "defined");
         assert_eq!(s["P.d"], "axioms: propext, myAxiom");
         assert_eq!(s["P.e"], "missing");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the installed Lean and Lake toolchain"]
+    async fn audit_distinguishes_definitions_from_theorems() {
+        let project = TestDir::new();
+        project.write("deck.toml", "title = 'Synthetic deck'\n");
+        project.write("cards/example.md", "---\nid: example\nkind: definition\nlean: [Synthetic.Item, Synthetic.value, Synthetic.other, Synthetic.result, Synthetic.missing]\n---\n");
+        project.write("lean/Synthetic/lakefile.toml", "name = 'Synthetic'\ndefaultTargets = ['Synthetic']\n[[lean_lib]]\nname = 'Synthetic'\n");
+        project.write("lean/Synthetic/Synthetic.lean", r#"
+namespace Synthetic
+
+/-- A structure with one sample field. -/
+structure Item where
+  number : Nat
+
+/-- A sample natural number. -/
+def value : Nat := 7
+
+/-- A sample value with an unproved body. -/
+def other : Nat := sorry
+
+/-- The sample value is seven. -/
+theorem result : value = 7 := rfl
+
+end Synthetic
+"#);
+        let statuses = check(project.path()).await.unwrap();
+        assert_eq!(statuses["Synthetic.Item"], "defined");
+        assert_eq!(statuses["Synthetic.value"], "defined");
+        assert_eq!(statuses["Synthetic.other"], "sorry");
+        assert_eq!(statuses["Synthetic.result"], "proved");
+        assert_eq!(statuses["Synthetic.missing"], "missing");
     }
 }

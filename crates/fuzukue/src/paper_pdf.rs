@@ -277,6 +277,7 @@ impl Workbench {
             .min_by(|a, b| (a.rect[2] * a.rect[3]).total_cmp(&(b.rect[2] * b.rect[3])))
             .map(|region| (region.card.clone(), region.proof));
         if let Some((card, proof)) = hit {
+            self.load_card_content(card.clone(), cx);
             self.paper_pdf.popup = Some(PdfPopup {
                 card,
                 proof,
@@ -390,7 +391,7 @@ impl Workbench {
             SharedString::from(format!("pdf-card-heading-{id}")),
             self.display_card_tex(&title).markdown,
         )
-        .markdown_extensions(super::math::extensions())
+        .markdown_extensions(super::math::extensions_with_macros(&self.doc_math_macros))
         .selectable(false);
         let edit_proof = proof && card.edit_proof.is_some();
         let editor = self.card_editor(id, edit_proof);
@@ -412,6 +413,7 @@ impl Workbench {
                     preview.child(self.render_card_editor(editor, &entity, editor_height, cx))
                 } else {
                     preview.children(self.render_read_text(id, proof, &entity, cx))
+                        .children(self.card_body_status(id, &entity, cx))
                 }
             });
         let actions = h_flex().gap_1().flex_wrap()

@@ -21,6 +21,8 @@ paper-edit-proof = 証明を編集
 paper-expand-all = すべて開く
 paper-findings = 指摘 { $count } 件
 paper-lean-proved = Lean { $ok }/{ $n } 証明済み
+paper-lean-checked = Lean { $ok }/{ $n } 件の宣言を確認済み
+paper-math-unknown-macros = 未定義の TeX マクロ: { $names }
 paper-lean-review = Lean 査読
 paper-math-review = 数学査読
 paper-output-review = 出力査読
@@ -47,6 +49,8 @@ paper-kind-definition = 定義
 paper-kind-remark = 注意
 paper-kind-example = 例
 paper-kind-question = 問い
+paper-kind-axiom = 公理
+paper-kind-proof = 証明
 paper-dismiss-review = 査読を閉じる
 
 paper-audit-title = PDF の点検

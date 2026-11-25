@@ -51,10 +51,53 @@ type Key = (SharedString, Macros, u32, [u32; 4], bool);
 
 #[derive(Default)]
 struct FormulaCache {
-    formulas: RefCell<HashMap<Key, Option<Rc<Formula>>>>,
+    formulas: RefCell<HashMap<Key, FormulaRender>>,
     fonts: RefCell<GlyphFonts>,
 }
 impl Global for FormulaCache {}
+
+#[derive(Clone)]
+struct FormulaRender {
+    formula: Option<Rc<Formula>>,
+    unknown_macros: Vec<String>,
+}
+
+fn set_macro(parser: &mut Parser<'_>, name: String, body: &str, num_args: usize) {
+    let body = aliases(body);
+    let mut tokens: Vec<_> = Parser::new(&body).gullet.lexer.collect();
+    tokens.reverse();
+    parser.gullet.set_macro(name, MacroDefinition::Tokens { tokens, num_args });
+}
+
+fn parse_formula(
+    latex: &str,
+    macros: &[MathMacro],
+) -> (Option<Vec<ratex_parser::ParseNode>>, Vec<String>) {
+    let latex = aliases(latex);
+    let mut unknown = Vec::<String>::new();
+    loop {
+        let mut parser = Parser::new(&latex);
+        for definition in macros {
+            set_macro(&mut parser, format!("\\{}", definition.name), &definition.body, definition.arguments.into());
+        }
+        for name in &unknown {
+            set_macro(&mut parser, name.clone(), r"\text{?}", 0);
+        }
+        match parser.parse() {
+            Ok(nodes) => return (Some(nodes), unknown),
+            Err(error) => {
+                let Some(name) = error.message.strip_prefix("Undefined control sequence: ") else {
+                    return (None, unknown);
+                };
+                // Retry with a placeholder so the surrounding formula remains legible.
+                if unknown.len() == 16 || unknown.iter().any(|seen| seen == name) {
+                    return (None, unknown);
+                }
+                unknown.push(name.to_owned());
+            }
+        }
+    }
+}
 
 fn rendered(
     latex: &SharedString,
@@ -64,7 +107,7 @@ fn rendered(
     display: bool,
     window: &Window,
     cx: &mut App,
-) -> Option<Rc<Formula>> {
+) -> FormulaRender {
     init(cx);
     let rgba: Rgba = color.into();
     let key = (
@@ -80,34 +123,12 @@ fn rendered(
         .borrow_mut()
         .entry(key)
         .or_insert_with(|| {
-            let latex = aliases(latex);
-            let nodes = if macros.is_empty() {
-                ratex_parser::parse(&latex).ok()?
-            } else {
-                let mut parser = Parser::new(&latex);
-                for definition in macros.iter() {
-                    let body = aliases(&definition.body);
-                    let mut tokens: Vec<_> = Parser::new(&body).gullet.lexer.collect();
-                    tokens.reverse();
-                    parser.gullet.set_macro(
-                        format!("\\{}", definition.name),
-                        MacroDefinition::Tokens {
-                            tokens,
-                            num_args: usize::from(definition.arguments),
-                        },
-                    );
-                }
-                parser.parse().ok()?
-            };
-            Formula::new(
-                &nodes,
-                font_size,
-                rgba,
-                display,
-                window,
-                &mut cache.fonts.borrow_mut(),
-            )
-            .map(Rc::new)
+            let (nodes, unknown_macros) = parse_formula(latex, macros);
+            let formula = nodes.and_then(|nodes| {
+                Formula::new(&nodes, font_size, rgba, display, window, &mut cache.fonts.borrow_mut())
+                    .map(Rc::new)
+            });
+            FormulaRender { formula, unknown_macros }
         })
         .clone()
 }
@@ -170,10 +191,20 @@ impl MathNode {
             .max_w_full()
             .whitespace_normal()
             .font(crate::appearance::code_font(cx))
-            .text_color(cx.theme().danger)
+            .text_color(cx.theme().muted_foreground)
             .child(self.source.clone())
             .into_any_element()
     }
+}
+
+fn macro_error(names: &[String], cx: &App) -> Option<AnyElement> {
+    (!names.is_empty()).then(|| {
+        let error = div().min_w_0().max_w_full().whitespace_normal().text_xs().text_color(cx.theme().danger)
+            .child(tr!("paper-math-unknown-macros", names = names.join(", ")));
+        #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+        let error = error.id(format!("math-unknown:{}", names.join(",")));
+        error.into_any_element()
+    })
 }
 
 const INLINE_MATH: &str = "fuzukue-inline-math";
@@ -208,8 +239,7 @@ impl MarkdownPlugin for InlineMath {
     ) -> Option<InlineElement> {
         let math = node.data::<MathNode>()?;
         let size = scaled_size(context.font_size().into(), cx);
-        Some(
-            match rendered(
+        let result = rendered(
                 &math.latex,
                 &self.0,
                 size,
@@ -217,12 +247,21 @@ impl MarkdownPlugin for InlineMath {
                 false,
                 window,
                 cx,
-            ) {
+            );
+        let error = macro_error(&result.unknown_macros, cx);
+        Some(
+            match result.formula {
                 Some(formula) => {
                     let baseline = formula.baseline;
-                    InlineElement::new(math.element(formula)).with_baseline(baseline)
+                    let element = math.element(formula);
+                    if let Some(error) = error {
+                        InlineElement::new(div().flex().items_center().gap_1()
+                            .child(element).child(error)).with_baseline(baseline)
+                    } else {
+                        InlineElement::new(element).with_baseline(baseline)
+                    }
                 }
-                None => InlineElement::new(math.fallback(cx)),
+                None => InlineElement::new(div().child(math.fallback(cx)).children(error)),
             },
         )
     }
@@ -254,9 +293,11 @@ impl MarkdownPlugin for BlockMath {
     fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let math = node.data::<MathNode>().expect("block math plugin node");
         let size = scaled_size(text_size(window) * (17.0 / 16.0), cx);
-        let Some(formula) = rendered(&math.latex, &self.0, size, cx.theme().foreground, true, window, cx)
+        let result = rendered(&math.latex, &self.0, size, cx.theme().foreground, true, window, cx);
+        let error = macro_error(&result.unknown_macros, cx);
+        let Some(formula) = result.formula
         else {
-            return div().w_full().min_w_0().py_1().child(math.fallback(cx));
+            return div().w_full().min_w_0().py_1().child(math.fallback(cx)).children(error);
         };
         let scroll = window
             .use_keyed_state(("display-math-scroll", math.offset), cx, |_, _| {
@@ -306,7 +347,7 @@ impl MarkdownPlugin for BlockMath {
                             cx.stop_propagation();
                         }),
                 ),
-        )
+        ).children(error)
     }
 }
 

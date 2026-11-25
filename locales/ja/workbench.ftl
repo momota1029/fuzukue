@@ -57,6 +57,7 @@ workbench-plan = 計画
 workbench-source-card-missing = { $file }:{ $line } はカード { $id } だが、今のデッキにない
 workbench-press-ctrl-enter-to-send = Ctrl+Enter で送信
 workbench-proved = 証明済み
+workbench-declaration-checked = 宣言を確認済み
 workbench-read = 読む
 workbench-read-through-deck = 通して読む · { $title }
 workbench-reconnecting = 再接続中 ({ $e })

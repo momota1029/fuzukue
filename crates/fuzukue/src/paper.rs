@@ -18,18 +18,51 @@ use gpui_kit::component::{
     v_flex, ActiveTheme as _, Sizable as _,
 };
 use gpui_kit::{div, prelude::*, px, rems, StyleRefinement};
-use fuzukue_proto::{DocItem, PdfAuditStatus};
+use fuzukue_proto::{DocItem, MathMacro, PdfAuditStatus};
 use fuzukue_view::{card_section_ranges, theorem_heading_with_label, truncate, TexMarkdown};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub(super) fn paper_list() -> gpui_kit::ListState {
     // Measure the full document for the thumb, but only paint visible cards.
-    gpui_kit::ListState::new(0, gpui_kit::ListAlignment::Top, px(300.)).measure_all()
+    gpui_kit::ListState::new(1, gpui_kit::ListAlignment::Top, px(300.)).measure_all()
 }
 
-fn paper_extensions() -> MarkdownExtensions {
-    math::extensions()
+fn reconcile_read_rows(list: &gpui_kit::ListState, old: &[ReadRow], new: &[ReadRow]) {
+    if old == new {
+        return;
+    }
+    let offset = list.logical_scroll_top();
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b).count();
+    let old_end = old.len() - suffix;
+    let new_end = new.len() - suffix;
+    let anchor = if (prefix..old_end).contains(&offset.item_ix) {
+        let position = |row: &ReadRow| new.iter().position(|candidate| candidate == row);
+        position(&old[offset.item_ix]).map(|index| (index, offset.offset_in_item))
+            .or_else(|| {
+                if offset.item_ix == 0 {
+                    return Some((0, px(0.)));
+                }
+                old[offset.item_ix + 1..].iter().chain(old[..offset.item_ix].iter().rev())
+                    .find_map(position).map(|index| (index, px(0.)))
+            })
+    } else {
+        None
+    };
+    list.splice(prefix..old_end, new_end - prefix);
+    if old.is_empty() || new.is_empty() {
+        list.scroll_to(gpui_kit::ListOffset::default());
+    } else if let Some((item_ix, offset_in_item)) = anchor {
+        list.scroll_to(gpui_kit::ListOffset { item_ix, offset_in_item });
+        list.remeasure_items(item_ix..item_ix + 1);
+    }
+    list.remeasure_items(prefix..new_end);
+}
+
+fn paper_extensions(macros: &[MathMacro]) -> MarkdownExtensions {
+    math::extensions_with_macros(macros)
         .plugin(ItemLabel)
         .block_surface("fuzukue-quote", |window, cx| {
             div()
@@ -55,11 +88,15 @@ fn comment_quote(id: impl Into<SharedString>, quote: &str) -> TextView {
 pub(super) const STATEMENT_HEADINGS: &[&str] = &["", "Statement", "主張"];
 
 pub(super) fn paper_text(view: TextView, cx: &App) -> TextView {
+    paper_text_with_macros(view, &[], cx)
+}
+
+pub(super) fn paper_text_with_macros(view: TextView, macros: &[MathMacro], cx: &App) -> TextView {
     // List rows measure their children twice. Give the fit-content TextView
     // the column width in both passes, including when a list has a wide item.
     view.w_full()
         .min_w_0()
-        .markdown_extensions(paper_extensions())
+        .markdown_extensions(paper_extensions(macros))
         .blockquote_style(
             StyleRefinement::default()
                 .border_l_0()
@@ -192,18 +229,25 @@ pub(super) fn theorem_heading(
     title: &str,
     refs: Option<&fuzukue_proto::DocReferences>,
 ) -> Option<String> {
-    let label = match kind {
-        "theorem" | "introthm" => tr!("paper-kind-theorem"),
-        "lemma" => tr!("paper-kind-lemma"),
-        "proposition" => tr!("paper-kind-proposition"),
-        "corollary" => tr!("paper-kind-corollary"),
-        "definition" | "introdef" => tr!("paper-kind-definition"),
-        "remark" => tr!("paper-kind-remark"),
-        "example" => tr!("paper-kind-example"),
-        "question" => tr!("paper-kind-question"),
+    let label = theorem_kind_label(kind, crate::i18n::current())?;
+    Some(theorem_heading_with_label(label, id, title, refs))
+}
+
+fn theorem_kind_label(kind: &str, locale: fuzukue_i18n::Locale) -> Option<&'static str> {
+    let key = match kind {
+        "theorem" | "introthm" => "paper-kind-theorem",
+        "lemma" => "paper-kind-lemma",
+        "proposition" => "paper-kind-proposition",
+        "corollary" => "paper-kind-corollary",
+        "definition" | "introdef" => "paper-kind-definition",
+        "remark" => "paper-kind-remark",
+        "example" => "paper-kind-example",
+        "question" => "paper-kind-question",
+        "axiom" => "paper-kind-axiom",
+        "proof" => "paper-kind-proof",
         _ => return None,
     };
-    Some(theorem_heading_with_label(label, id, title, refs))
+    Some(locale.text(key))
 }
 
 fn paper_job_name(kind: Option<&str>) -> &'static str {
@@ -215,6 +259,32 @@ fn paper_job_name(kind: Option<&str>) -> &'static str {
         Some(_) => tr!("paper-writing-review"),
         None => tr!("paper-pdf-build"),
     }
+}
+
+pub(super) fn lean_card_progress(
+    card: &fuzukue_proto::CardView,
+    statuses: &HashMap<String, String>,
+) -> Option<(String, bool)> {
+    let total = card.lean.len();
+    if total == 0 {
+        return None;
+    }
+    let mut proved = 0;
+    let mut defined = 0;
+    for decl in &card.lean {
+        match statuses.get(decl).map(String::as_str) {
+            Some("proved") => proved += 1,
+            Some("defined") => defined += 1,
+            _ => {}
+        }
+    }
+    let checked = proved + defined;
+    let label = if defined > 0 || matches!(card.kind.as_str(), "definition" | "introdef") {
+        tr!("paper-lean-checked", ok = checked.to_string(), n = total.to_string())
+    } else {
+        tr!("paper-lean-proved", ok = proved.to_string(), n = total.to_string())
+    };
+    Some((label, checked == total))
 }
 
 fn unique_quote(text: &str, quote: &str) -> Option<std::ops::Range<usize>> {
@@ -250,15 +320,15 @@ impl Workbench {
 
 
     /// 通して読む画面の行とカード本文を更新する。
-    pub(super) fn rebuild_read(&mut self, cards_changed: bool, cx: &mut Context<Self>) {
-        self.rebuild_read_views(cards_changed, None, cx);
+    pub(super) fn rebuild_read(&mut self, presentation_changed: bool, cx: &mut Context<Self>) {
+        self.rebuild_read_views(presentation_changed, None, cx);
     }
 
     pub(super) fn rebuild_read_card(&mut self, id: &str, cx: &mut Context<Self>) {
         self.rebuild_read_views(false, Some(id), cx);
     }
 
-    fn rebuild_read_views(&mut self, cards_changed: bool, only: Option<&str>, cx: &mut Context<Self>) {
+    fn rebuild_read_views(&mut self, presentation_changed: bool, only: Option<&str>, cx: &mut Context<Self>) {
         let mut rows = vec![ReadRow::Title(self.doc_title.clone())];
         for sec in &self.doc_sections {
             rows.push(ReadRow::Section(sec.title.clone()));
@@ -284,6 +354,19 @@ impl Workbench {
             .filter(|card| ids.contains(card.id.as_str()) && only.is_none_or(|id| id == card.id))
         {
             let uses_tex = super::card_reading::uses_tex(card);
+            if !presentation_changed {
+                let parts = [false, true].map(|proof| ReadPart { card: card.id.clone(), proof });
+                if parts.iter().any(|part| self.read_md.get(part).is_some_and(|text| {
+                    text.uses_tex == uses_tex && text.body.as_ref() == card.body
+                })) {
+                    for part in parts {
+                        if let Some(text) = self.read_md.remove(&part) {
+                            views.insert(part, text);
+                        }
+                    }
+                    continue;
+                }
+            }
             let parts = if uses_tex {
                 let sections = card_section_ranges(&card.body);
                 [STATEMENT_HEADINGS, &["Proof", "証明"][..]].map(|headings| {
@@ -361,25 +444,16 @@ impl Workbench {
         if let Some(id) = only {
             views.extend(self.read_md.drain().filter(|(part, _)| part.card != id));
         }
-        if rows == self.read_rows {
-            if cards_changed {
-                self.read_list.remeasure_items(0..rows.len());
-            } else {
-                for card in &changed {
-                    self.remeasure_card(card);
-                }
-            }
-        } else {
-            let mut anchor = self.read_list.logical_scroll_top();
-            let previous = self.read_rows.get(anchor.item_ix);
-            self.read_list.reset(rows.len() + 1);
-            if let Some(index) = previous.and_then(|row| rows.iter().position(|item| item == row)) {
-                anchor.item_ix = index;
-                self.read_list.scroll_to(anchor);
-            }
-        }
+        reconcile_read_rows(&self.read_list, &self.read_rows, &rows);
         self.read_rows = rows;
         self.read_md = views;
+        if presentation_changed {
+            self.read_list.remeasure_items(0..self.read_rows.len());
+        } else {
+            for card in &changed {
+                self.remeasure_card(card);
+            }
+        }
         self.open_commented_proofs(cx);
         if self
             .comment_popup
@@ -447,6 +521,15 @@ impl Workbench {
                 self.read_list.remeasure_items(ix..ix + 1);
             }
         }
+    }
+
+    pub(super) fn read_row_measurement_ready(&self, index: usize, cx: &App) -> bool {
+        let Some(ReadRow::Card(card)) = self.read_rows.get(index) else { return true };
+        self.card_body_measured(card) && [false, true].into_iter()
+            .filter(|&proof| !proof || self.proof_is_open(card))
+            .all(|proof| self.read_md.get(&ReadPart { card: card.clone(), proof }).is_none_or(|text| {
+                text.view.read(cx).rendered_text().source() == text.display.markdown
+            }))
     }
 
     pub(super) fn highlight_quotes(
@@ -593,7 +676,6 @@ impl Workbench {
         });
         let reader = gpui_kit::list(self.read_list.clone(), move |ix, _window, cx| {
             let theme = cx.theme().clone();
-            Self::queue_visible_card(ix, cx, entity.clone());
             let this = entity.read(cx);
             let Some(row) = this.read_rows.get(ix) else {
                 return div().h(tail).into_any_element();
@@ -647,7 +729,7 @@ impl Workbench {
                             SharedString::from(format!("theorem-heading-{id}")),
                             this.display_card_tex(&header).markdown,
                         )
-                        .markdown_extensions(math::extensions())
+                        .markdown_extensions(math::extensions_with_macros(&this.doc_math_macros))
                         .selectable(false)
                         .into_any_element()
                     } else {
@@ -705,14 +787,10 @@ impl Workbench {
                         statement = statement.child(this.research_origin_link(origin, format!("read-origin-{id}"), entity.clone(), cx));
                     }
                     // Lean の状態をまとめて一言
-                    if let Some(c) = card.filter(|c| !c.lean.is_empty()) {
-                        let n = c.lean.len();
-                        let ok = c
-                            .lean
-                            .iter()
-                            .filter(|d| this.lean.get(*d).map(String::as_str) == Some("proved"))
-                            .count();
-                        let color = if ok == n {
+                    if let Some((c, (label, complete))) = card.and_then(|c| {
+                        lean_card_progress(c, &this.lean).map(|progress| (c, progress))
+                    }) {
+                        let color = if complete {
                             theme.success
                         } else {
                             theme.warning
@@ -721,7 +799,7 @@ impl Workbench {
                             div()
                                 .text_xs()
                                 .text_color(color)
-                                .child(tr!("paper-lean-proved", ok = ok.to_string(), n = n.to_string())),
+                                .child(label),
                         );
                         if this.protocol >= fuzukue_proto::LITERATE_LEAN_PROTOCOL {
                             statement = statement.children(c.lean.iter().map(|name| {
@@ -1028,19 +1106,17 @@ impl Workbench {
                             .vertical_scrollbar(&self.read_list),
                     )
                     .on_children_prepainted(move |_, window, cx| {
-                        let (Some((card, index)), Some(entity)) = (&jump, workbench.upgrade())
-                        else {
-                            return;
-                        };
-                        let Some(tail) = entity.read(cx).paper_jump_tail(*index) else {
-                            return;
-                        };
-                        let card = card.clone();
-                        let index = *index;
+                        let Some(entity) = workbench.upgrade() else { return };
+                        let settled_jump = jump.as_ref().and_then(|(card, index)| {
+                            entity.read(cx).paper_jump_tail(*index).map(|tail| (card.clone(), *index, tail))
+                        });
                         let workbench = workbench.clone();
                         window.defer(cx, move |_, cx| {
                             let _ = workbench.update(cx, |this, cx| {
-                                this.settle_paper_jump(&card, index, tail, cx)
+                                this.load_visible_card_bodies(cx);
+                                if let Some((card, index, tail)) = settled_jump {
+                                    this.settle_paper_jump(&card, index, tail, cx);
+                                }
                             });
                         });
                     }).into_any_element()
@@ -1523,6 +1599,31 @@ mod paper_tests {
     use gpui_kit::{list, point, size, Bounds, ListOffset, WindowBounds, WindowOptions};
 
     #[test]
+    fn headings_use_each_formal_kind_in_japanese_and_english() {
+        let refs = fuzukue_proto::DocReferences {
+            labels: [("card:sample".into(), fuzukue_proto::DocReference {
+                kind: "Theorem".into(), number: "1.3".into(), page: "2".into(),
+                title: String::new(), card: None,
+            })].into(),
+            ..Default::default()
+        };
+        for (kind, en, ja) in [
+            ("theorem", "Theorem", "定理"), ("introthm", "Theorem", "定理"),
+            ("lemma", "Lemma", "補題"), ("proposition", "Proposition", "命題"),
+            ("corollary", "Corollary", "系"), ("definition", "Definition", "定義"),
+            ("introdef", "Definition", "定義"), ("remark", "Remark", "注意"),
+            ("example", "Example", "例"), ("question", "Question", "問い"),
+            ("axiom", "Axiom", "公理"), ("proof", "Proof", "証明"),
+        ] {
+            for (tag, expected) in [("en", en), ("ja", ja)] {
+                let locale = fuzukue_i18n::Locale::supported(tag).unwrap();
+                let label = theorem_kind_label(kind, locale).unwrap();
+                assert_eq!(theorem_heading_with_label(label, "sample", "", Some(&refs)), format!("{expected} 1.3"));
+            }
+        }
+    }
+
+    #[test]
     fn self_update_card_keeps_the_shell_fence_and_its_line_breaks() {
         let card = include_str!("../../../cards/design/self-update.md");
         let start = card.find("## 改名前の監督での入れ替え\n").unwrap();
@@ -1537,7 +1638,7 @@ mod paper_tests {
         };
         let mut source = TexMarkdown::unmapped(format!("## {heading}"));
         source.append(fuzukue_view::read_card_tex(&section[range.clone()], None, &[]), range.start);
-        let blocks = parse_markdown(&source.markdown, paper_extensions().into()).unwrap();
+        let blocks = parse_markdown(&source.markdown, paper_extensions(&[]).into()).unwrap();
 
         let [BlockNode::Heading { .. }, BlockNode::Paragraph(first), BlockNode::Paragraph(second), BlockNode::CodeBlock(code)] =
             blocks.as_slice()
@@ -1559,7 +1660,7 @@ mod paper_tests {
         let input = format!("`echo $HOME` と $x^2$\n\n```sh\n{shell}\n```");
         let card = fuzukue_view::read_card_tex(&input, None, &[]);
         let chat = fuzukue_view::link_card_refs(&input);
-        for (source, extensions) in [(card.markdown, paper_extensions()), (chat, math::extensions())] {
+        for (source, extensions) in [(card.markdown, paper_extensions(&[])), (chat, math::extensions())] {
             let blocks = parse_markdown(&source, extensions.into()).unwrap();
             let [BlockNode::Paragraph(prose), BlockNode::CodeBlock(code)] = blocks.as_slice() else {
                 panic!("expected prose and one fenced code block, got {blocks:?}");
@@ -1593,7 +1694,7 @@ mod paper_tests {
             None,
             &[],
         );
-        let blocks = parse_markdown(&source.markdown, paper_extensions().into()).unwrap();
+        let blocks = parse_markdown(&source.markdown, paper_extensions(&[]).into()).unwrap();
         let [BlockNode::Surface { name, children, .. }, BlockNode::Surface { name: center, .. }] =
             blocks.as_slice()
         else {

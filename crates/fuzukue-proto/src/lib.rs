@@ -1329,7 +1329,7 @@ pub struct DeckDiagnosticPage {
     pub diagnostics: Vec<CardDiagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResearchOrigin {
     pub deck: String,
     pub card: String,
@@ -1724,13 +1724,13 @@ pub struct DocSection {
 }
 
 /// PDF を作ったときに確定した相互参照と文献の表示番号。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocReferences {
     pub labels: BTreeMap<String, DocReference>,
     pub citations: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocReference {
     pub kind: String,
     pub number: String,
@@ -2593,7 +2593,7 @@ pub enum ServerEvent {
     PaperJobsReset,
     ReviewDecksPruned { decks: Vec<String> },
     BuildStatus { deck: String, state: String, message: String, pdf: Option<String> },
-    /// Lean の宣言ごとの状態: "proved" / "sorry" / "missing" / "axioms: …" / "error: …"。`running` は確認中。
+    /// Lean の宣言ごとの状態: "proved" / "defined" / "sorry" / "missing" / "axioms: …" / "error: …"。`running` は確認中。
     LeanReadingCards { request: u64, cards: Vec<LeanReadingCard> },
     LeanStatus {
         decls: Vec<(String, String)>,
@@ -2624,12 +2624,14 @@ pub enum ServerEvent {
     CommentsSent { deck: String, session: String },
     /// 縦タブ（研究）の一覧と、今表示しているデッキ。
     Workspace { tabs: Vec<TabView>, deck: String },
-    /// カードの並び（structure.yaml）と、数式のマクロ（harness.toml の mathjax_macros）。
+    /// カードの並び（structure.yaml）と、デッキの数式マクロ。
     /// 並びのないデッキでは `sections` が空。
     Document {
         title: String,
         sections: Vec<DocSection>,
         macros: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        math_macros: Vec<MathMacro>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         references: Option<DocReferences>,
     },

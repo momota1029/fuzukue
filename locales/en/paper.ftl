@@ -24,6 +24,8 @@ paper-findings = { $count ->
    *[other] { $count } findings
     }
 paper-lean-proved = Lean: { $ok }/{ $n } proved
+paper-lean-checked = Lean: { $ok }/{ $n } declarations checked
+paper-math-unknown-macros = Undefined TeX macros: { $names }
 paper-lean-review = Lean review
 paper-math-review = Math review
 paper-output-review = Output review
@@ -50,6 +52,8 @@ paper-kind-definition = Definition
 paper-kind-remark = Remark
 paper-kind-example = Example
 paper-kind-question = Question
+paper-kind-axiom = Axiom
+paper-kind-proof = Proof
 paper-dismiss-review = Dismiss review
 
 paper-audit-title = PDF audit

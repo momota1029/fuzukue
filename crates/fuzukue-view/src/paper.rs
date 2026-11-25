@@ -5,7 +5,7 @@ use markdown::{mdast::Node, Constructs, ParseOptions};
 
 use super::{group, link_card_refs_with, tex_to_markdown, tex_to_markdown_with_refs};
 
-/// The printed heading for a theorem-like card, using its PDF reference when available.
+/// The printed name of a theorem-like card kind.
 pub(super) fn theorem_kind(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "theorem" | "introthm" => "Theorem",
@@ -29,7 +29,7 @@ pub fn theorem_heading(
     Some(theorem_heading_with_label(theorem_kind(kind)?, id, title, refs))
 }
 
-/// Format a theorem heading using a translated fallback when the document has no label.
+/// Format a card-kind heading with the number from its PDF reference, if available.
 pub fn theorem_heading_with_label(
     label: &str,
     id: &str,
@@ -43,11 +43,7 @@ pub fn theorem_heading_with_label(
                 .find(|reference| reference.card.as_deref() == Some(id))
         })
     });
-    let mut heading = reference
-        .map(|reference| reference.kind.trim())
-        .filter(|kind| !kind.is_empty())
-        .unwrap_or(label)
-        .to_owned();
+    let mut heading = label.to_owned();
     if let Some(number) = reference
         .map(|reference| reference.number.trim())
         .filter(|number| !number.is_empty())
@@ -331,7 +327,7 @@ mod tests {
         };
         assert_eq!(
             theorem_heading("introthm", "intro", "集中", Some(&refs)).as_deref(),
-            Some("定理 E · 集中")
+            Some("Theorem E · 集中")
         );
         assert_eq!(
             theorem_heading("lemma", "lemma", "", Some(&refs)).as_deref(),

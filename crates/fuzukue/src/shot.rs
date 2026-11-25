@@ -4052,7 +4052,7 @@ mod tests {
                         deck: DECK.into(), cards: vec![card], diagnostics: vec![],
                     }, cx);
                     view.on_event(ServerEvent::Document {
-                        title: "論文".into(), macros: vec![], references: None,
+                        title: "論文".into(), macros: vec![], math_macros: vec![], references: None,
                         sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: CARD.into() }] }],
                     }, cx);
                 });
@@ -6547,7 +6547,7 @@ mod tests {
                 })).unwrap()],
             }, cx);
             view.on_event(ServerEvent::Document {
-                title: "Paper".into(), macros: vec![], references: None,
+                title: "Paper".into(), macros: vec![], math_macros: vec![], references: None,
                 sections: vec![DocSection { title: "Section".into(), items: vec![DocItem::Card { id: id.into() }] }],
             }, cx);
         }
@@ -6646,7 +6646,7 @@ mod tests {
                         deck: "papers/test".into(), cards: vec![card], diagnostics: vec![],
                     }, cx);
                     view.on_event(ServerEvent::Document {
-                        title: "論文".into(), macros: vec![], references: None,
+                        title: "論文".into(), macros: vec![], math_macros: vec![], references: None,
                         sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: "lemma".into() }] }],
                     }, cx);
                 });
@@ -6726,7 +6726,7 @@ mod tests {
                     deck: "papers/test".into(), cards: vec![card], diagnostics: vec![],
                 }, cx);
                 view.on_event(ServerEvent::Document {
-                    title: "論文".into(), macros: vec![], references: None,
+                    title: "論文".into(), macros: vec![], math_macros: vec![], references: None,
                     sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: "lemma".into() }] }],
                 }, cx);
                 for (item, text) in [("reply-read-only", "変更なし。"), ("silent", "<silent />"), ("reply-1", "本文を補った。")] {

@@ -1,4 +1,4 @@
-use fuzukue_proto::{CardView, MathMacro};
+use fuzukue_proto::CardView;
 use fuzukue_view::{card_section_ranges, read_card_markdown, TexMarkdown};
 use gpui_kit::{
     component::text::{TextView, TextViewStyle},
@@ -69,21 +69,12 @@ impl Workbench {
 
     pub(super) fn card_body_text(&self, view: TextView, uses_tex: bool, cx: &App) -> TextView {
         let view = if uses_tex {
-            paper::paper_text(view, cx)
+            paper::paper_text_with_macros(view, &self.doc_math_macros, cx)
         } else {
             let mut table = StyleRefinement::default();
             table.overflow.x = Some(Overflow::Scroll);
-            let macros: Vec<_> = self
-                .doc_macros
-                .iter()
-                .map(|(name, body)| MathMacro {
-                    name: name.clone(),
-                    body: body.clone(),
-                    arguments: 0,
-                })
-                .collect();
             self.markdown_code_style(view, TextViewStyle::default().table(table), cx)
-                .markdown_extensions(math::extensions_with_macros(&macros))
+                .markdown_extensions(math::extensions_with_macros(&self.doc_math_macros))
                 .w_full()
                 .min_w_0()
         };

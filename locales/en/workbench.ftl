@@ -57,6 +57,7 @@ workbench-plan = Plan
 workbench-source-card-missing = { $file }:{ $line } points to card { $id }, which is missing from this deck
 workbench-press-ctrl-enter-to-send = Press Ctrl+Enter to send
 workbench-proved = Proved
+workbench-declaration-checked = Declaration checked
 workbench-read = Read
 workbench-read-through-deck = Read through · { $title }
 workbench-reconnecting = Reconnecting ({ $e })

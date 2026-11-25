@@ -266,10 +266,11 @@ fn card_parts_exact_replace_and_scoped_checks() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
     let before = fs::metadata(&path).unwrap();
     for (old, expected) in [("aa", "複数箇所"), ("missing", "見つからない"), ("", "空")] {
-        let args = json!({"card":"target", "part":"proof", "old":old, "new":"X"});
+        let args = json!({"card":"target", "part":"proof", "old":old, "new":""});
         let err = Tool::CardEdit.call(&graph, args, project.path()).unwrap_err();
         assert!(err.to_string().contains(expected), "{err}");
         assert_eq!(fs::metadata(&path).unwrap().ino(), before.ino());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "aaa\nUse the bound.\n");
     }
     let reply = call(&graph, Tool::CardEdit, json!({
         "card":"target", "part":"proof", "old":"Use the bound.", "new":"Apply the bound."

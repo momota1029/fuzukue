@@ -200,6 +200,7 @@ struct Workbench {
     doc_sections: Vec<DocSection>,
     document_deck: Option<String>,
     doc_macros: Vec<(String, String)>,
+    doc_math_macros: Vec<fuzukue_proto::MathMacro>,
     doc_references: Option<DocReferences>,
     /// 通して読む画面の行と、カードごとの選択可能な Markdown
     read_rows: Vec<ReadRow>,
@@ -248,7 +249,7 @@ struct Workbench {
     tests: project_tests::TestsPane,
     symbols: symbols::SymbolPane,
     library: library::LibraryPane,
-    /// Lean の宣言 → 状態（"proved" / "sorry" / "missing" / …）
+    /// Lean の宣言 → 状態（"proved" / "defined" / "sorry" / "missing" / …）
     lean: HashMap<String, String>,
     lean_running: bool,
     lean_doc_findings: Vec<fuzukue_proto::LeanDocFinding>,
@@ -470,6 +471,11 @@ impl Workbench {
         cx: &mut Context<Self>,
         target: Option<Result<conn::Target, &'static str>>,
     ) -> Self {
+        let read_list = paper_list();
+        let reader = cx.weak_entity();
+        read_list.set_item_measurement_readiness(move |index, cx| {
+            reader.upgrade().is_none_or(|view| view.read(cx).read_row_measurement_ready(index, cx))
+        });
         let view_focus = cx.focus_handle();
         Self::track_window_close(window, cx);
         cx.on_focus_lost(window, |this, window, cx| {
@@ -723,10 +729,11 @@ impl Workbench {
             doc_sections: Vec::new(),
             document_deck: None,
             doc_macros: Vec::new(),
+            doc_math_macros: Vec::new(),
             doc_references: None,
             read_rows: Vec::new(),
             read_md: HashMap::new(),
-            read_list: paper_list(),
+            read_list,
             open_proofs: HashMap::new(),
             proof_comments: HashSet::new(),
             paper_jump: None,
@@ -1689,6 +1696,7 @@ impl Workbench {
         self.doc_title.clear();
         self.doc_sections.clear();
         self.doc_macros.clear();
+        self.doc_math_macros.clear();
         self.doc_references = None;
         self.rebuild_read(false, cx);
     }
@@ -2109,17 +2117,25 @@ impl Workbench {
                     }
                 }
             }
-            ServerEvent::Document { title, sections, macros, references } => {
+            ServerEvent::Document { title, sections, macros, mut math_macros, references } => {
                 self.document_deck = Some(self.deck.clone());
                 self.doc_title = title;
                 // Keep the last PDF's numbering while a body-only change is rebuilt.
+                let mut presentation_changed = false;
                 if references.is_some() || self.doc_sections != sections {
+                    presentation_changed = self.doc_references != references;
                     self.doc_references = references;
                 }
                 self.doc_sections = sections;
+                if math_macros.is_empty() {
+                    math_macros = macros.iter().map(|(name, body)| fuzukue_proto::MathMacro {
+                        name: name.clone(), body: body.clone(), arguments: 0,
+                    }).collect();
+                }
+                presentation_changed |= self.doc_macros != macros || self.doc_math_macros != math_macros;
                 self.doc_macros = macros;
-                // PDF reference changes can affect theorem headings even when the body is unchanged.
-                self.rebuild_read(true, cx);
+                self.doc_math_macros = math_macros;
+                self.rebuild_read(presentation_changed, cx);
                 self.finish_paper_open(cx);
                 // 動作確認用: 起動時に通して読む画面を開く。
                 if fuzukue_proto::compat::env("FUZUKUE_READ").is_ok() && self.right == RightPane::None && !self.doc_sections.is_empty() {
@@ -2485,10 +2501,29 @@ impl Workbench {
         if self.selected.as_ref().is_some_and(|id| !cards.iter().any(|c| &c.id == id)) {
             self.selected = None;
         }
-        self.cards = cards;
+        let previous = std::mem::replace(&mut self.cards, cards);
         self.card_diags = diagnostics;
         self.sync_card_file_style_notes(cx);
-        self.rebuild_read(true, cx);
+        self.rebuild_read(false, cx);
+        let mut previous: HashMap<_, _> = previous.iter().map(|card| (card.id.as_str(), card)).collect();
+        let mut changed = HashSet::new();
+        for card in &self.cards {
+            if previous.remove(card.id.as_str()).is_none_or(|old| {
+                old.path != card.path || old.kind != card.kind || old.title != card.title
+                    || old.status != card.status || old.lean != card.lean || old.external != card.external
+                    || old.research_origin != card.research_origin
+                    || old.edit_body.as_ref().map(|source| &source.tex) != card.edit_body.as_ref().map(|source| &source.tex)
+                    || old.edit_proof.as_ref().map(|source| &source.tex) != card.edit_proof.as_ref().map(|source| &source.tex)
+            }) {
+                changed.insert(card.id.as_str());
+            }
+        }
+        changed.extend(previous.into_keys());
+        for (index, row) in self.read_rows.iter().enumerate() {
+            if matches!(row, ReadRow::Card(id) if changed.contains(id.as_str())) {
+                self.read_list.remeasure_items(index..index + 1);
+            }
+        }
         self.finish_overview_deck_request(deck);
         if self.pending_research_origin.as_ref().is_some_and(|origin| origin.deck == deck) {
             let origin = self.pending_research_origin.take().unwrap();
@@ -3082,6 +3117,9 @@ impl Workbench {
         let mut lean_box = v_flex().gap_0p5();
         for decl in &card.lean {
             let (mark, color, word) = match self.lean.get(decl).map(String::as_str) {
+                Some("defined") => (Symbol::Check, theme.success, tr!("workbench-declaration-checked").to_string()),
+                Some("proved") if matches!(card.kind.as_str(), "definition" | "introdef") =>
+                    (Symbol::Check, theme.success, tr!("workbench-declaration-checked").to_string()),
                 Some("proved") => (Symbol::Check, theme.success, tr!("workbench-proved").to_string()),
                 Some("sorry") => (Symbol::TriangleAlert, theme.warning, tr!("workbench-contains-sorry").to_string()),
                 Some("missing") => (Symbol::X, theme.danger, tr!("workbench-not-found").to_string()),
@@ -3141,7 +3179,10 @@ impl Workbench {
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(div().text_lg().child(if card.title.is_empty() { card.id.clone() } else { card.title.clone() }))
+                            .child(div().text_lg().child(
+                                paper::theorem_heading(&card.kind, &card.id, &card.title, self.doc_references.as_ref())
+                                    .unwrap_or_else(|| if card.title.is_empty() { card.id.clone() } else { card.title.clone() }),
+                            ))
                             .child(
                                 div()
                                     .text_xs()

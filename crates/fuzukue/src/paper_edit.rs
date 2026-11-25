@@ -114,6 +114,11 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if source.base_hash.is_empty() {
+            self.notice = Some(tr!("workbench-loading-card").into());
+            cx.notify();
+            return;
+        }
         if tex && source.tex != Access::Editable {
             self.notice = Some(tex_access_notice(source.tex).into());
             cx.notify();

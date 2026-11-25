@@ -118,6 +118,7 @@ async fn receive_step(
 fn status(state: Option<&str>) -> SharedString {
     match state {
         Some("proved") => tr!("workbench-proved").into(),
+        Some("defined") => tr!("workbench-declaration-checked").into(),
         Some("sorry") => tr!("workbench-contains-sorry").into(),
         Some(state) if state.starts_with("axioms:") => tr!(
             "literate-lean-axioms",

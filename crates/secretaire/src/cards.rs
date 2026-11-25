@@ -172,19 +172,21 @@ fn is_source_change(project: &Path, path: &Path) -> bool {
         })
 }
 
-/// デッキの並び（structure.yaml）とマクロ（harness.toml の [mathjax_macros]）。
+/// デッキの並び（structure.yaml）と、プリアンブルおよび設定のマクロ。
 pub(crate) fn document_for_deck(deck: &Path, built_pdf: Option<&Path>) -> ServerEvent {
     let cfg = DeckConfig::read(deck).ok();
     let (title, sections) = cfg.as_ref().and_then(|cfg| read_document_structure(deck, cfg).ok()).unwrap_or_default();
     let references = cfg.as_ref().and_then(|cfg| crate::paper_refs::read(deck, cfg, built_pdf));
     let title = deck_display_title(deck, cfg.as_ref(), title.as_deref());
-    let macros = cfg
+    let math_macros: Vec<_> = cfg
         .as_ref()
         .into_iter()
         .flat_map(|cfg| math_macros(deck, cfg))
-        .filter_map(|m| (m.arguments == 0).then_some((m.name, m.body)))
         .collect();
-    ServerEvent::Document { title, sections, macros, references }
+    // Older clients can expand only macros without arguments.
+    let macros = math_macros.iter().filter(|m| m.arguments == 0)
+        .map(|m| (m.name.clone(), m.body.clone())).collect();
+    ServerEvent::Document { title, sections, macros, math_macros, references }
 }
 
 pub(crate) fn math_macros(deck: &Path, cfg: &DeckConfig) -> impl Iterator<Item = MathMacro> {
@@ -463,6 +465,11 @@ fn save_card_edit(
     }
     let (path, frontmatter, base_hash) = match edit {
         CardEdit::Body { part, base_hash, .. } => {
+            if base_hash.is_empty() {
+                return Ok((CardSaveOutcome::Error {
+                    message: "Load the card source before saving.".into(),
+                }, None));
+            }
             let (path, frontmatter) = edit_path(&root, card, part)?;
             (path, frontmatter, base_hash)
         }
@@ -571,8 +578,17 @@ pub fn save_file(app: &Workspace, project: &Path, path: &Path, draft: String) ->
     let _write = CARD_WRITE_LOCK.lock().unwrap();
     let info = std::fs::metadata(path)?;
     anyhow::ensure!(info.is_file(), "{} はファイルではない", path.display());
-    let card = is_harness_card(project, path)? || is_card_source(project, path);
-    let text = if is_harness_card(project, path)? {
+    let harness = is_harness_card(project, path)?;
+    let folder_card = is_card_source(project, path);
+    let draft_body = fuzukue_cards::split_frontmatter(&draft).map_or(draft.as_str(), |(_, body)| body);
+    if draft_body.trim().is_empty() {
+        let inline_card = path.extension().is_some_and(|ext| ext == "md")
+            && std::fs::read_to_string(path).is_ok_and(|current| {
+                fuzukue_cards::parse_card(project, path, &current).is_ok()
+            });
+        anyhow::ensure!(!(harness || folder_card || inline_card), "Load the card source and use a versioned save to clear it.");
+    }
+    let text = if harness {
         let current = std::fs::read_to_string(path)?;
         if fuzukue_cards::split_frontmatter(&current).is_some() {
             fuzukue_cards::merge_card_edit(&current, &draft)?
@@ -589,7 +605,7 @@ pub fn save_file(app: &Workspace, project: &Path, path: &Path, draft: String) ->
         baseline.record();
     }
     drop(_write);
-    if card {
+    if harness || folder_card {
         crate::extensions::card_saved(app, path);
     }
     Ok(())

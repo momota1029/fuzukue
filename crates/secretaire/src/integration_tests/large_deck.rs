@@ -38,6 +38,73 @@ async fn receive(socket: &mut WebSocketStream<DuplexStream>) -> Result<(ServerEv
     Ok((env.event, text.len()))
 }
 
+#[test]
+fn harness_document_sends_macros_with_arguments_from_its_macro_file() -> Result<()> {
+    let project = TempProject::new()?;
+    let root = project.path();
+    fs::write(root.join("harness.toml"), r#"
+macros = "macros.tex"
+[mathjax_macros]
+sampleConstant = "7"
+"#)?;
+    fs::write(root.join("macros.tex"), r"\newcommand{\sampleWrap}[1]{\left(#1\right)}")?;
+    let ServerEvent::Document { macros, math_macros, .. } =
+        crate::cards::document_for_deck(root, None) else { unreachable!() };
+    assert_eq!(macros, [("sampleConstant".into(), "7".into())]);
+    assert_eq!(math_macros, [
+        fuzukue_proto::MathMacro { name: "sampleConstant".into(), body: "7".into(), arguments: 0 },
+        fuzukue_proto::MathMacro { name: "sampleWrap".into(), body: r"\left(#1\right)".into(), arguments: 1 },
+    ]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn card_summary_cannot_clear_the_file_and_open_editors_keep_version_checks() -> Result<()> {
+    use fuzukue_proto::{CardEditPart, CardSaveOutcome, ClientMsg, SourceEdit, SourceSaveOutcome};
+    use sha2::{Digest, Sha256};
+
+    let project = TempProject::new()?;
+    let root = project.path().join(DECK);
+    fs::create_dir_all(root.join("cards"))?;
+    fs::write(root.join("harness.toml"), "title = 'Synthetic deck'\n")?;
+    let front = "---\nid: sample\nkind: explanation\n---\n";
+    let original = format!("{front}Synthetic statement.\n");
+    let relative = format!("{DECK}/cards/sample.md");
+    let path = project.path().join(&relative);
+    fs::write(&path, &original)?;
+    let app = mcp_app(&project);
+    let peer = "127.0.0.1:1234".parse::<std::net::SocketAddr>()?;
+    let access = crate::remote::Access::new(project.path(), Default::default())?;
+    let router = crate::router(crate::App::fixture(app.clone()), std::sync::Arc::new(access)).layer(Extension(ConnectInfo(peer)));
+    let page: DeckCardPage = serde_json::from_slice(&get(&router, &format!("/deck/cards?deck={DECK}"), DECK_PAGE_BYTES).await?)?;
+    let summary = &page.cards[0];
+    assert!(summary.body.is_empty() && summary.edit_body.is_none() && summary.edit_proof.is_none());
+
+    let save = |body: &str, hash: &str| crate::cards::save_card(project.path(), DECK, &summary.id, CardEditPart::Body, body, hash, None);
+    assert!(matches!(save(&summary.body, "")?, CardSaveOutcome::Error { .. }));
+    let empty_hash = format!("{:x}", Sha256::digest(summary.body.as_bytes()));
+    assert!(matches!(save(&summary.body, &empty_hash)?, CardSaveOutcome::Conflict { .. }));
+    let outcome = crate::source_editor::save(project.path(), &app.state_dir, SourceEdit {
+        path: relative.clone(), base_hash: empty_hash, range: None, text: summary.body.clone(),
+    }, None).await?;
+    assert!(matches!(outcome, SourceSaveOutcome::Conflict { .. }));
+    for text in [summary.body.clone(), front.to_owned()] {
+        assert!(crate::handle(&app, ClientMsg::SaveFile { path: relative.clone(), text }).await.is_err());
+        assert_eq!(fs::read_to_string(&path)?, original);
+    }
+
+    let content: CardContent = serde_json::from_slice(&get(
+        &router, &format!("/deck/card?deck={DECK}&revision={}&card=sample", page.revision), CARD_CONTENT_BYTES,
+    ).await?)?;
+    let open_editor = content.edit_body.context("missing editing source")?;
+    let updated = format!("{front}Edited elsewhere.\n");
+    fs::write(&path, &updated)?;
+    assert!(matches!(save("Open editor's draft.\n", &open_editor.base_hash)?,
+        CardSaveOutcome::Conflict { latest } if latest.body == "Edited elsewhere.\n"));
+    assert_eq!(fs::read_to_string(&path)?, updated);
+    Ok(())
+}
+
 #[tokio::test]
 async fn large_deck_opens_without_bodies_and_loads_one_large_editable_card() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(180), large_deck()).await?
@@ -272,7 +339,7 @@ fn oversized_snapshots_and_replies_degrade_inside_the_frame_budget() -> Result<(
         Ok((decoded, text.len()))
     };
     let cases: [(&str, fn() -> ServerEvent); 7] = [
-        ("Deck structure", || ServerEvent::Document { title: large(), sections: vec![], macros: vec![], references: None }),
+        ("Deck structure", || ServerEvent::Document { title: large(), sections: vec![], macros: vec![], math_macros: vec![], references: None }),
         ("Thread history", || ServerEvent::ThreadTail { session: "session".into(), request: 1, generation: 1,
             through: 2, workers: vec![large()], events: vec![], next_before: None }),
         ("Thread history", || ServerEvent::ThreadHistoryPage { session: "session".into(), request: 2, next_before: Some(1),
