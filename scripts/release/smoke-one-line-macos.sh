@@ -9,7 +9,7 @@ work=$(cd "$work" && pwd -P)
 export HOME="$work/Test Home & Notes"
 export LC_ALL=en_US.UTF-8
 export XDG_CONFIG_HOME="$HOME/.config"
-unset XDG_STATE_HOME
+unset XDG_STATE_HOME DEVELOPER_DIR
 unset FUZUKUE_SERVICE FUZUKUE_SELF_UPDATE_READY FUZUKUE_SELF_UPDATE_SOURCE FUZUKUE_SERVER_CONFIG
 for tool in sh bash awk codesign cp curl defaults id launchctl mkdir mktemp mv open osascript \
     plutil rm shasum shlock sleep stat sw_vers sysctl tar touch uname unzip xcode-select; do
@@ -199,14 +199,19 @@ plutil -lint "$agents/$server_label.plist" "$agents/$update_label.plist"
 [[ $(plutil -extract StartInterval raw "$agents/$update_label.plist") == 21600 ]]
 [[ $(plutil -extract ProgramArguments.1 raw "$agents/$update_label.plist") == "$app/Contents/Resources/install.sh" ]]
 plist_path=$(plutil -extract EnvironmentVariables.PATH raw "$agents/$server_label.plist")
+package_mode=$(plutil -extract EnvironmentVariables.FUZUKUE_MACOS_PACKAGE raw "$agents/$server_label.plist")
+[[ $package_mode == 1 ]] || exit 1
 guard="$app/Contents/Resources/bin"
-[[ $plist_path == "$guard:"* ]]
-[[ $plist_path == *":$base/bin:"* ]]
+if [[ $plist_path != "$guard:"* || $plist_path != *":$base/bin:"* ]]; then
+    echo "The LaunchAgent PATH is missing the bundled tools: $plist_path" >&2
+    exit 1
+fi
 
 # Verify a clean Git resolution and that a real executable's status propagates.
 status=0
-DEVELOPER_DIR="$HOME/no-developer" PATH="$guard:/usr/bin:/bin" "$guard/git" --version || status=$?
-[[ $status == 127 ]]
+DEVELOPER_DIR="$HOME/no-developer" PATH="$guard:/usr/bin:/bin" "$guard/git" --version \
+    > "$work/no-git.log" 2>&1 || status=$?
+[[ $status == 127 ]] || { cat "$work/no-git.log" >&2; exit 1; }
 guide=$(DEVELOPER_DIR="$HOME/no-developer" LC_ALL=ja_JP.UTF-8 \
     sh "$root/install.sh" --guide "${flags[@]}" --stage-only)
 [[ $guide == *'自分のアカウントでログイン'* ]]
@@ -227,30 +232,48 @@ if "$gui"; then
     launchctl print "$domain/$server_label" | awk -v pid="$first_pid" '$1 == "pid" && $3 == pid { found=1 } END { exit !found }'
     launchctl print "$domain/$update_label" >/dev/null
 else
-    PATH="$plist_path" FUZUKUE_MACOS_PACKAGE=1 FUZUKUE_ADDR="127.0.0.1:$port" \
+    PATH="$plist_path" FUZUKUE_MACOS_PACKAGE="$package_mode" FUZUKUE_ADDR="127.0.0.1:$port" \
         "$base/secretaire" "$HOME/fuzukue-project" > "$work/direct-server.log" 2>&1 &
     direct_server=$!
     for _ in {1..30}; do if health_pid >/dev/null 2>&1; then break; fi; sleep 1; done
     [[ $(health_pid) == "$direct_server" ]]
 fi
 
-# The packaged server's Git PATH must also support the actual history journal.
+# Check the LaunchAgent's Git resolver, then wait for the server's first history
+# snapshot without opening the project in a client.
+if ! PATH="$plist_path" git --version; then
+    echo 'Git could not be resolved using the LaunchAgent PATH.' >&2
+    exit 1
+fi
+history=
+for _ in {1..15}; do
+    history=$(find "$HOME" -type d -name history.git -print)
+    if [[ -n $history && -f $history/history.index ]]; then break; fi
+    sleep 1
+done
+if [[ -z $history || ! -f $history/history.index ]]; then
+    echo "The packaged server did not initialize history for $project." >&2
+    exit 1
+fi
+
+manuscript='History & Notes.txt'
 record=
 for attempt in {1..15}; do
-    history=$(find "$HOME" -type d -name history.git -print)
-    if [[ -n $history && -f $history/history.index ]]; then
-        printf 'history smoke %s\n' "$attempt" > "$project/history-smoke.txt"
-        sleep 1
-        record=$(git --git-dir="$history" for-each-ref --format='%(objectname)' --count=1 refs/history/)
-        if [[ -n $record ]]; then break; fi
-    else
-        sleep 1
-    fi
+    # An edit that races the initial snapshot can become part of the baseline.
+    printf 'history smoke %s\n' "$attempt" > "$project/$manuscript"
+    sleep 1
+    record=$(git --git-dir="$history" for-each-ref --sort=-refname --format='%(objectname)' \
+        --count=1 refs/history/) || exit 1
+    if [[ -n $record ]]; then break; fi
 done
-[[ -n $record ]]
-[[ $(git --git-dir="$history" diff-tree --no-commit-id --name-only -r "$record") == history-smoke.txt ]]
-[[ $(git -C "$project" rev-parse HEAD) == "$baseline" ]]
-rm "$project/history-smoke.txt"
+if [[ -z $record ]]; then
+    echo "The packaged server did not record the edit to $manuscript in $history." >&2
+    exit 1
+fi
+[[ $(git --git-dir="$history" diff-tree --no-commit-id --name-only -r "$record") == "$manuscript" ]] || exit 1
+recorded=$(git --git-dir="$history" show "$record:$manuscript") || exit 1
+[[ $recorded == 'history smoke '* && $(git -C "$project" rev-parse HEAD) == "$baseline" ]] || exit 1
+rm "$project/$manuscript"
 
 if "$gui"; then
     FUZUKUE_URL="ws://127.0.0.1:$port/ws" "$app/Contents/MacOS/fuzukue" > "$work/direct-client.log" 2>&1 &
@@ -360,6 +383,7 @@ sh "$root/install.sh" --uninstall "${flags[@]}"
 [[ ! -e $app && ! -e $base/secretaire && ! -e $agents/$server_label.plist && ! -e $agents/$update_label.plist ]]
 [[ $(< "$HOME/fuzukue-project/keep.txt") == keep && -f $settings ]]
 [[ $(git -C "$project" rev-parse HEAD) == "$baseline" && -x $base/bin/gh ]]
+[[ $(git --git-dir="$history" show "$record:$manuscript") == "$recorded" ]] || exit 1
 if "$gui"; then
     ! launchctl print "$domain/$server_label" >/dev/null 2>&1
     ! launchctl print "$domain/$update_label" >/dev/null 2>&1

@@ -636,7 +636,9 @@ async fn run_server() -> anyhow::Result<()> {
     let _ = app.shutdown_drain_seconds.set(config.shutdown_drain_seconds);
     let _ = app.self_update.set(shutdown_control.clone());
     if let Some(update) = &update {
-        service::start_project(app.clone(), update.clone());
+        let macos_package = cfg!(target_os = "macos")
+            && std::env::var_os("FUZUKUE_MACOS_PACKAGE").as_deref() == Some(std::ffi::OsStr::new("1"));
+        service::start_project(app.clone(), update.clone(), macos_package);
         watch::restore(app.clone(), update.clone());
         workspace_requests::start(&app);
     }

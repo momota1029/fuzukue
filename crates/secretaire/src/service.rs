@@ -29,8 +29,9 @@ pub(crate) fn managed() -> bool {
 pub(crate) fn start_project(
     app: std::sync::Arc<crate::App>,
     update: std::sync::Arc<crate::self_update::Update>,
+    macos_package: bool,
 ) {
-    if !managed() {
+    if !managed() && !macos_package {
         return;
     }
     tokio::spawn(async move {

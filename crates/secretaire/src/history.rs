@@ -1488,6 +1488,67 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn packaged_server_starts_history_before_a_client_opens_the_project() -> Result<()> {
+        let root = TestDir::new();
+        let home = root.path().join("Test Home & Notes");
+        let project = home.join("fuzukue-project");
+        let state = home.join("Application State & History");
+        let filename = "Manuscript & Notes.txt";
+        let manuscript = project.join(filename);
+        fs::create_dir_all(&project)?;
+        let git = |args: &[&str]| checked(git_command(&project).args(args).output()?, args[0]);
+        git(&["init", "--quiet", "--template="])?;
+        git(&[
+            "-c", "user.name=Fixture Writer", "-c", "user.email=fixture@example.invalid",
+            "commit", "--quiet", "--allow-empty", "-m", "Initialize fuzukue project",
+        ])?;
+        let head = git(&["rev-parse", "HEAD"])?;
+        fs::write(&manuscript, "original draft\n")?;
+        let status_before = git(&["status", "--porcelain"])?;
+
+        let registry = crate::App::new(home, project.clone(), state.clone(), String::new(), None)?;
+        let update = Arc::new(crate::self_update::Update::shutdown_only(&project, &state));
+        assert!(registry.loaded(None).is_err());
+        crate::service::start_project(registry.clone(), update, true);
+
+        let workspace = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(workspace) = registry.loaded(None) {
+                    break workspace;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.context("packaged service did not load its project")?;
+        // Unit tests register the watcher explicitly. The production loader starts it.
+        crate::cards::watch(workspace.clone(), Default::default())?;
+        let history = &workspace.history;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while history.inner.lock().unwrap().observed.is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.context("history watcher did not take its initial snapshot")?;
+
+        fs::write(&manuscript, "edited draft\n")?;
+        let record = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(record) = list(history)?.into_iter().next() {
+                    break Ok::<_, anyhow::Error>(record);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.context("history watcher did not record the edit")??;
+        assert_eq!(record.actor, "external");
+        assert_eq!(record.files, [filename]);
+        let HistoryOutcome::Diff { text, .. } = history.diff(&record.id)? else {
+            panic!("missing external diff");
+        };
+        assert!(text.contains("-original draft\n+edited draft"));
+        assert_eq!(git(&["rev-parse", "HEAD"])?, head);
+        assert_eq!(git(&["status", "--porcelain"])?, status_before);
+        Ok(())
+    }
+
     #[test]
     fn observes_idle_edits_without_duplicating_a_recorded_save() -> Result<()> {
         let (project, history) = fixture();

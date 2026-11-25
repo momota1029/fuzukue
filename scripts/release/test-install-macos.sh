@@ -54,3 +54,24 @@ reject 'Expected one regular secretaire' sh "$server" --fixture "$assets" --fixt
 [[ ! -e $HOME/Library && ! -e $HOME/.local && ! -e $XDG_DATA_HOME ]]
 echo 'macOS installer dry-run fixtures passed.'
 python3 "$root/scripts/release/test-macos-update.py"
+
+# Exercise the packaged resolver with the LaunchAgent's PATH shape and real
+# Git. The wrapper is a distinct file so the guard will skip the system shim.
+guard="$HOME/Applications/fuzukue.app/Contents/Resources/bin"
+git_bin="$tmp/Real Git & Tools"
+fixture_git=$(command -v git)
+mkdir -p "$guard" "$git_bin"
+install -m 755 "$root/scripts/release/macos/git" "$guard/git"
+reject 'Git is unavailable on this Mac.' env PATH="$guard" "$guard/git" --version
+printf '#!/bin/sh\nexec "$FIXTURE_GIT" "$@"\n' > "$git_bin/git"
+chmod 755 "$git_bin/git"
+(
+    export PATH="$guard:$git_bin" FIXTURE_GIT="$fixture_git" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+    git -C "$project" init --quiet --template=
+    git -C "$project" -c user.name='Fixture Writer' -c user.email=fixture@example.invalid \
+        commit --quiet --allow-empty -m 'Initialize fuzukue project'
+    [[ $(git -C "$project" log -1 --format=%s) == 'Initialize fuzukue project' ]]
+    [[ -z $(git -C "$project" status --porcelain) ]]
+)
+echo 'Packaged Git resolver fixtures passed.'
