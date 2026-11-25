@@ -104,6 +104,7 @@ enum Step {
     },
     ResolveApproval { decision: String },
     SeedApprovalDock,
+    SeedCommandApproval,
     SeedComposerContext,
     AssertApprovalDockScrolled,
     ResolveApprovalDock,
@@ -636,6 +637,18 @@ impl Runner {
             Step::SeedApprovalDock => {
                 ensure!(!self.read_only, "approval dock needs an isolated fixture");
                 self.update(cx, |view, window, cx| view.seed_approval_dock_fixture(window, cx))?;
+            }
+            Step::SeedCommandApproval => {
+                ensure!(!self.read_only, "command approval needs an isolated fixture");
+                self.update(cx, |view, _, cx| {
+                    view.on_event(ServerEvent::ApprovalRequested {
+                        session: view.active.clone(),
+                        request_id: "command-fixture".into(),
+                        actor: fuzukue_proto::Actor::Claude,
+                        summary: long_approval_command(),
+                        localized: None, shell_directory: None, shell_prefix: None,
+                    }, cx);
+                })?;
             }
             Step::SeedComposerContext => self.update(cx, |view, _, cx| seed_composer_context(view, cx))?,
             Step::AssertApprovalDockScrolled => {
@@ -1617,6 +1630,12 @@ async fn pause(cx: &AsyncApp, ms: u64) {
         .await;
 }
 
+fn long_approval_command() -> String {
+    format!("Bash: printf '%s\\n' \\\n{}", (1..=18).map(|line| {
+        format!("  'Draft section {line} for the workspace' \\")
+    }).collect::<Vec<_>>().join("\n"))
+}
+
 fn screenshot_fixture_png() -> Result<Vec<u8>> {
     let mut png = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -2402,7 +2421,7 @@ mod tests {
                 for id in ["approved", "denied", "pending"] {
                     view.on_event(ServerEvent::ApprovalRequested {
                         session: "approvals".into(), request_id: id.into(), actor: fuzukue_proto::Actor::Claude,
-                        summary: "Bash: printf test".into(), localized: None, shell_directory: None, shell_prefix: None,
+                        summary: long_approval_command(), localized: None, shell_directory: None, shell_prefix: None,
                     }, cx);
                 }
                 for (id, decision) in [("approved", "accept"), ("denied", "decline")] {
@@ -2419,6 +2438,19 @@ mod tests {
                     runner.step(wait("decided-approvals-approved"), cx).await?;
                     runner.step(wait("accept-pending"), cx).await?;
                     runner.step(wait("decline-pending"), cx).await?;
+                    runner.step(wait("approval-details-pending"), cx).await?;
+                    let collapsed = runner.update(cx, |_, window, _| {
+                        (window.shot_element_bounds("accept-pending").unwrap(),
+                            window.shot_element_bounds("approval-preview-pending").unwrap())
+                    })?;
+                    runner.step(click("approval-details-pending"), cx).await?;
+                    runner.wait_for(cx, "expanded approval and stable buttons", TIMEOUT_MS, |_, window| {
+                        let Some(expanded) = window.shot_element_bounds("approval-preview-pending") else { return false };
+                        let Some(allow) = window.shot_element_bounds("accept-pending") else { return false };
+                        expanded.size.height > collapsed.1.size.height
+                            && allow.origin.y - expanded.origin.y == collapsed.0.origin.y - collapsed.1.origin.y
+                    }).await?;
+                    runner.step(click("approval-details-pending"), cx).await?;
                     assert!(runner.update(cx, |_, window, _| {
                         let allow = window.shot_element_bounds("accept-pending").unwrap().size.height;
                         let deny = window.shot_element_bounds("decline-pending").unwrap().size.height;

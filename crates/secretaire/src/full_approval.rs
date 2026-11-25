@@ -158,6 +158,7 @@ pub(crate) fn registration(
 ) -> Registration {
     Registration {
         owner,
+        thread_auto: false,
         risk,
         unattended: ApprovalUnattended::DeferAndContinue,
         reason: "Full approval requested for an eligible operation".into(),
@@ -166,6 +167,18 @@ pub(crate) fn registration(
         display_args: json!("[redacted]"),
         display_scope: scope,
     }
+}
+
+pub(crate) fn desk_registration(
+    session: &str, backend: &str, tool: &str, request: &str, input: &Value,
+) -> Registration {
+    let mut request = registration(
+        desk_owner(session), tool, ApprovalRisk::High,
+        json!({"request": request, "fingerprint": fingerprint(input)}),
+        json!({"backend": backend}),
+    );
+    request.thread_auto = true;
+    request
 }
 
 pub(crate) fn authorize_worker(

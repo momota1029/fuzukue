@@ -247,6 +247,8 @@ struct PendingApproval {
     input: Value,
     human_only: bool,
     can_remember_shell: bool,
+    sweepable: bool,
+    _alive: Arc<()>,
 }
 
 fn human_only(request: &Value, tool: &str) -> bool {
@@ -598,25 +600,30 @@ impl ClaudeSession {
                 return Err(error);
             }
         } else {
-            self.apply_turn_settings(true, None).await?;
+            self.apply_turn_settings(true, None, false).await?;
             turns.closed = false;
             self.start_pending(turns).await?;
         }
         Ok(true)
     }
 
-    async fn apply_turn_settings(self: &Arc<Self>, closed: bool, escalation: Option<&ChatSettings>) -> Result<()> {
+    async fn apply_turn_settings(self: &Arc<Self>, closed: bool, escalation: Option<&ChatSettings>, external: bool) -> Result<()> {
         let (Some(launch), Some(app)) = (&self.launch, self.app.upgrade()) else {
             return Ok(());
         };
         let mut process = self.process.lock().await;
         let settings = escalation.cloned().unwrap_or_else(|| app.partner_turn_settings(&self.id));
-        let settings = if fuzukue_proto::AgentBackend::for_model(settings.model.as_deref()) == fuzukue_proto::AgentBackend::Codex {
+        let mut settings = if fuzukue_proto::AgentBackend::for_model(settings.model.as_deref()) == fuzukue_proto::AgentBackend::Codex {
             // Previously queued Claude inputs can finish before the thread switches backends.
             process.settings.clone()
         } else {
             launch.effective(settings)
         };
+        if settings.permission_mode != PermissionMode::Plan
+            && (external || launch.mail_enabled && app.hub.desk_automatic(&self.id, settings.permission_mode)?)
+        {
+            settings.permission_mode = PermissionMode::Default;
+        }
         if !closed && process.stdin.is_some() && settings == process.settings {
             return Ok(());
         }
@@ -669,7 +676,9 @@ impl ClaudeSession {
             ),
             None => text.clone(),
         };
-        self.apply_turn_settings(turns.closed, prompt.escalation.as_ref()).await?;
+        let external = matches!(kind, TurnKind::ExternalInput) || self.app.upgrade()
+            .is_some_and(|app| !crate::mcp::exec::trusted_session(&app, &self.id));
+        self.apply_turn_settings(turns.closed, prompt.escalation.as_ref(), external).await?;
         let input = match self.app.upgrade() {
             Some(app) => app.partner_input(&self.id, input).await?,
             None => input,
@@ -719,6 +728,9 @@ impl ClaudeSession {
             prompt: prompt.text.clone(), images: prompt.escalation_images.clone(),
         });
         self.hub.publish_partner_turn_started(&self.id, request, matches!(kind, TurnKind::Escalated));
+        if external {
+            self.hub.mark_external_approval_input(&self.id);
+        }
         Ok(())
     }
 
@@ -902,7 +914,7 @@ impl ClaudeSession {
         if self.stream.lock().unwrap().native_compact == Some(false) {
             return Err(crate::commands::NativeCompactionUnavailable.into());
         }
-        self.apply_turn_settings(false, None).await?;
+        self.apply_turn_settings(false, None, false).await?;
         let content = if instructions.is_empty() { "/compact".into() } else { format!("/compact {instructions}") };
         let (complete, mut result) = tokio::sync::oneshot::channel();
         turns.idle_since = None;
@@ -1295,6 +1307,12 @@ impl ClaudeSession {
         Ok(writes && mode == PermissionMode::Default)
     }
 
+    pub(crate) async fn trusted_turn(&self) -> bool {
+        self.state.lock().await.active.as_ref().is_some_and(|turn| {
+            !turn.interrupted && !matches!(turn.kind, TurnKind::ExternalInput)
+        })
+    }
+
     /// 許可の問い合わせに答える。自分の問い合わせでなければ false。
     pub async fn resolve(&self, request_id: &str, decision: &str) -> Result<bool> {
         self.resolve_permission(request_id, decision, false, None).await
@@ -1322,16 +1340,24 @@ impl ClaudeSession {
             if automatic && pending.human_only {
                 return Ok(false);
             }
-            let checked_input = if let Some((app, prefix)) = remember {
+            let prepare_input = || if let Some((app, prefix)) = remember {
                 anyhow::ensure!(pending.can_remember_shell && mode != PermissionMode::Plan,
                     "This request is ineligible for a saved shell approval");
                 let scope = crate::worker_scope::Scope::open(&app.project_dir, &self.project, &self.project)?;
                 let approved = app.shell_approval_rules.remember(&app.state_dir, &scope, &pending.input, prefix)?;
-                app.publish_approval_settings();
-                Some(approved.input)
+                Ok(Some(approved.input))
             } else {
-                None
+                Ok(None)
             };
+            let checked_input = if pending.sweepable {
+                let Some(input) = self.hub.claim_legacy_approval_with(request_id, prepare_input)? else { return Ok(false) };
+                input
+            } else {
+                prepare_input()?
+            };
+            if let Some((app, _)) = remember {
+                app.publish_approval_settings();
+            }
             (approvals.remove(request_id).expect("approval is locked"), checked_input)
         };
         let PendingApproval { request_id: req_id, tool, input, .. } = approval;
@@ -1366,7 +1392,9 @@ impl ClaudeSession {
         let mut approvals = self.approvals.lock().unwrap();
         approvals.retain(|request_id, pending| {
             if backend_id.is_none_or(|id| id == pending.request_id) {
-                self.publish_approval_cancelled(request_id.clone());
+                if !pending.sweepable || self.hub.claim_legacy_approval(request_id) {
+                    self.publish_approval_cancelled(request_id.clone());
+                }
                 false
             } else {
                 true
@@ -1421,9 +1449,18 @@ impl ClaudeSession {
                 }
                 let id = format!("claude-{}-{}", self.id, crate::mail::session_key());
                 let mode = self.process.lock().await.settings.permission_mode;
+                let external = turns.active.as_ref().is_some_and(|turn| matches!(turn.kind, TurnKind::ExternalInput))
+                    || self.app.upgrade().is_some_and(|app| !crate::mcp::exec::trusted_session(&app, &self.id));
+                let trusted = !external && turns.active.as_ref().is_some_and(|turn| !turn.interrupted);
+                let eligible = trusted && !request.get("human_only").is_some_and(|value| value != &Value::Bool(false))
+                    && (matches!(tool, "Bash" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+                        || tool.strip_prefix("mcp__fuzukue__").is_some_and(crate::mcp::desk_tool_auto_eligible));
+                let audit_tool = tool.strip_prefix("mcp__fuzukue__")
+                    .map(|name| format!("mcp/{name}")).unwrap_or_else(|| tool.into());
                 let mut shell_directory = None;
                 let mut shell_prefix = None;
-                if tool == "Bash" && mode != PermissionMode::Plan && shell_can_be_reviewed(request) {
+                if tool == "Bash" && !external && mode != PermissionMode::Plan && shell_can_be_reviewed(request)
+                    && !(trusted && self.hub.desk_automatic(&self.id, mode)?) {
                     if let Some(app) = self.app.upgrade() {
                         if let Ok(scope) = crate::worker_scope::Scope::open(&app.project_dir, &self.project, &self.project) {
                             let protected = crate::worker_scope::protected_roots(&app.state_dir);
@@ -1453,19 +1490,53 @@ impl ClaudeSession {
                     .or_else(|| input["file_path"].as_str())
                     .map(String::from)
                     .unwrap_or_else(|| input.to_string());
-                let human_only = tool == "Bash" || human_only(request, tool);
-                self.approvals.lock().unwrap().insert(id.clone(), PendingApproval {
-                    request_id: req_id, tool: tool.into(), input, human_only,
-                    can_remember_shell: shell_directory.is_some(),
-                });
-                self.hub.publish(ServerEvent::ApprovalRequested {
+                let can_remember_shell = shell_directory.is_some();
+                let event = ServerEvent::ApprovalRequested {
                     session: self.id.clone(),
-                    request_id: id,
+                    request_id: id.clone(),
                     actor: Actor::Claude,
                     summary: format!("{tool}: {detail}"),
                     localized: None,
                     shell_directory,
                     shell_prefix,
+                };
+                let alive = Arc::new(());
+                if eligible {
+                    use crate::hub::approval_store::FullAuthorization::*;
+                    let tool_id = request.get("tool_use_id").and_then(Value::as_str).unwrap_or(&id);
+                    let request = crate::full_approval::desk_registration(&self.id, "claude", &audit_tool, tool_id, &input);
+                    let session = Arc::downgrade(self);
+                    let resume_id = id.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    match self.hub.publish_sweepable_approval(event, Arc::downgrade(&alive), request, move |granted| {
+                        runtime.spawn(async move {
+                            if let Some(session) = session.upgrade() {
+                                let _turns = session.state.lock().await;
+                                let pending = session.approvals.lock().unwrap().remove(&resume_id);
+                                if let Some(pending) = pending.filter(|_| session.process_generation.load(Ordering::Acquire) == generation) {
+                                    if let Err(error) = session.reply_tool_permission(&pending.request_id, pending.input, granted).await {
+                                        tracing::warn!(%error, "Could not deliver automatic Claude approval");
+                                    }
+                                }
+                            }
+                        });
+                    }) {
+                        Ok(Human) => {}
+                        Ok(Granted) => return self.reply_tool_permission(&req_id, input, true).await,
+                        Ok(AlreadyConsumed) => return Ok(()),
+                        Err(error) => {
+                            tracing::warn!(%error, "Could not audit Claude approval");
+                            return self.reply_tool_permission(&req_id, input, false).await;
+                        }
+                    }
+                } else {
+                    self.hub.publish_local_approval(event, &alive);
+                }
+                self.approvals.lock().unwrap().insert(id, PendingApproval {
+                    request_id: req_id, tool: tool.into(), input,
+                    human_only: external || tool == "Bash" || human_only(request, tool)
+                        || tool.strip_prefix("mcp__fuzukue__").is_some_and(|name| !crate::mcp::desk_tool_auto_eligible(name)),
+                    can_remember_shell, sweepable: eligible, _alive: alive,
                 });
             }
             Some("control_cancel_request") => {
@@ -1487,6 +1558,19 @@ impl ClaudeSession {
                         match block["type"].as_str() {
                             Some("tool_use") => {
                                 let name = block["name"].as_str().unwrap_or_default();
+                                // AcceptEdits can run native edits without a permission RPC.
+                                if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+                                    && self.process.lock().await.settings.permission_mode == PermissionMode::AcceptEdits
+                                    && !turn.interrupted && !matches!(turn.kind, TurnKind::ExternalInput)
+                                    && self.app.upgrade().is_some_and(|app| crate::mcp::exec::trusted_session(&app, &self.id))
+                                {
+                                    if let Some(id) = block["id"].as_str() {
+                                        let request = crate::full_approval::desk_registration(&self.id, "claude", name, id, &block["input"]);
+                                        if let Err(error) = self.hub.authorize_full_approval(request) {
+                                            tracing::warn!(%error, "Could not audit native Claude edit");
+                                        }
+                                    }
+                                }
                                 turn.acted_or_asked |= name == "AskUserQuestion" || name
                                     .strip_prefix("mcp__fuzukue__").is_some_and(crate::front_desk::is_work_tool);
                             }
@@ -1528,6 +1612,17 @@ impl ClaudeSession {
             _ => {}
         }
         Ok(())
+    }
+
+    async fn reply_tool_permission(&self, id: &str, input: Value, granted: bool) -> Result<()> {
+        let response = if granted {
+            json!({"behavior": "allow", "updatedInput": input})
+        } else {
+            json!({"behavior": "deny", "message": "Permission was declined"})
+        };
+        self.write(json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": id, "response": response,
+        }})).await
     }
 }
 
@@ -1785,13 +1880,19 @@ pub(crate) async fn run_worker(
                         let tool = request["tool_name"].as_str().unwrap_or("Claude");
                         if request["subtype"] == "can_use_tool" {
                             use crate::hub::approval_store::FullAuthorization::*;
-                            match crate::full_approval::authorize_worker(&app.hub, session, job, "claude", tool, backend_id, &request["input"]) {
+                            let trusted = app.delegates.worker_approval_trusted(session, job);
+                            let authorization = if trusted {
+                                crate::full_approval::authorize_worker(&app.hub, session, job, "claude", tool, backend_id, &request["input"])
+                            } else {
+                                Ok(Human)
+                            };
+                            match authorization {
                                 Ok(Granted) => {
                                     write_worker_approval(stdin, backend_id, Some(request["input"].clone())).await?;
                                     continue;
                                 }
                                 Ok(AlreadyConsumed) => continue,
-                                Ok(Human) if execution.is_some_and(|policy| !policy.full && policy.approval != Approval::Ask) => {
+                                Ok(Human) if trusted && execution.is_some_and(|policy| !policy.full && policy.approval != Approval::Ask) => {
                                     write_worker_approval(stdin, backend_id, Some(request["input"].clone())).await?;
                                     continue;
                                 }
@@ -1813,7 +1914,7 @@ pub(crate) async fn run_worker(
                             write_worker_approval(stdin, backend_id, None).await?;
                             continue;
                         }
-                        if execution.is_none() && tool == "Bash" {
+                        if execution.is_none() && tool == "Bash" && app.delegates.worker_approval_trusted(session, job) {
                             if let Some((approved, who)) = worker_shell(app, scope, request) {
                                 write_worker_approval(stdin, backend_id, Some(approved.input.clone())).await?;
                                 let id = format!("{job}:{}", crate::mail::session_key());
@@ -1822,7 +1923,8 @@ pub(crate) async fn run_worker(
                             }
                         }
                         let human_only = human_only(request, tool);
-                        let can_remember_shell = tool == "Bash" && !crate::canary() && shell_can_be_reviewed(request);
+                        let can_remember_shell = tool == "Bash" && !crate::canary() && shell_can_be_reviewed(request)
+                            && app.delegates.worker_approval_trusted(session, job);
                         let (abort, registration) = AbortHandle::new_pair();
                         pending_approvals.insert(backend_id.into(), abort);
                         let (backend_id, tool, input) = (backend_id.to_owned(), tool.to_owned(), request["input"].clone());

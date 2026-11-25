@@ -51,6 +51,7 @@ async fn integrate(app: &Workspace, session: &str, args: Value) -> Result<Value>
         crate::mcp::parse_args(&args)?,
         None,
         None,
+        false,
         async { Ok(()) },
     )
     .await
@@ -423,6 +424,7 @@ async fn privacy_override_requires_human_approval_and_pins_the_checked_patch() -
                 crate::mcp::parse_args(&request)?,
                 Some(Actor::System),
                 None,
+                false,
                 async { Ok(()) },
             )
             .await

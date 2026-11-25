@@ -8,9 +8,14 @@ chat-applying-comments = Applying { $count ->
     [one] { $count } comment
    *[other] { $count } comments
     } in a separate thread
-chat-approval-mode-applies-next-turn = Approval mode. Applies next turn
+chat-approval-mode-applies-next-turn = Approval mode. Automatic approval also applies to eligible requests already waiting.
 chat-approve-edits-automatically = Approve edits automatically
-chat-approve-everything = Approve everything
+chat-approve-everything = Approve automatically
+chat-approve-everything-help = Automatically allow shell commands, edits, tools, and delegation in your turns, with an audit record. External turns and actions such as publishing still require confirmation.
+chat-approval-waiting = Awaiting approval
+chat-approval-details = Command or tool details
+chat-approval-shell-once = This request can only be approved once here. Saved shell rules are available for commands the server can check.
+chat-remember-shell = Always allow this command
 chat-ask-every-time = Ask every time
 chat-attach-files = Attach files
 chat-attach-files-up-to-50-mib-each = Attach files (up to 50 MiB each)
@@ -48,7 +53,7 @@ chat-folder-needs-server-update = Update the server to attach a folder
 chat-claude-cli-default = Claude CLI default
 chat-cli-default = CLI default
 chat-cli-default-chat = CLI default
-chat-codex-approval-mode-help = Codex starts in read-only mode with Ask every time. Actions that need approval appear in chat.
+chat-codex-approval-mode-help = Ask every time starts Codex in read-only mode. Automatic approval covers eligible requests already waiting.
 chat-collapse = Collapse
 chat-connect-to-a-server-that-supports-attachments = Connect to a server that supports attachments
 chat-connection-lost-select-the-attachment-again = Connection lost. Select the attachment again.

@@ -1073,6 +1073,24 @@ pub(crate) fn codex_tool_policy(allow: Option<&[String]>) -> Value {
     policy
 }
 
+pub(crate) fn codex_desk_tool_policy() -> Value {
+    let mut policy = codex_tool_policy(None);
+    let approved = policy.as_object_mut().unwrap();
+    // The office server issues and audits approvals for its own tools.
+    for tool in Tool::available(true).filter(|tool| desk_tool_auto_eligible(tool.name())) {
+        approved.insert(tool.name().into(), json!({"approval_mode": "approve"}));
+    }
+    policy
+}
+
+pub(crate) fn desk_tool_auto_eligible(name: &str) -> bool {
+    Tool::available(true).any(|tool| tool.name() == name && !matches!(tool,
+        Tool::GitPush | Tool::MergeBranch | Tool::SelfUpdate | Tool::ClientScreenshot
+        | Tool::GitHub(_) | Tool::GitHubAuth(_) | Tool::Handoff(_)
+        | Tool::Research(crate::workshop::mcp::Tool::Accept) | Tool::WorkspaceRequest(_)
+    ))
+}
+
 #[derive(Deserialize)]
 pub struct McpQuery {
     pub(crate) session: String,
@@ -1204,7 +1222,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
     let result = match method {
         "tools/call" if params["name"] == exec::NAME => {
             let result = Box::pin(async {
-                let lease = exec::lease(&app, &q.session)?;
+                let lease = exec::lease(&app, &q.session, worker.is_none())?;
                 ensure!(!planner, "exec is unavailable to planning and consultation roles");
                 let caller = if let Some((job, allow)) = &worker {
                     ensure!(allow.iter().any(|name| name == exec::NAME), "exec is unavailable to this worker");
@@ -1244,7 +1262,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                     .map(Tool::definition).collect(),
                 None => Tool::available(app.mail.is_some()).map(Tool::definition).collect::<Vec<_>>(),
             };
-            if exec::lease(&app, &q.session).is_err() {
+            if exec::lease(&app, &q.session, worker.is_none()).is_err() {
                 list.retain(|tool| tool["name"] != exec::NAME);
             }
             list.extend(crate::extensions::tools(app.clone()).await.into_iter().filter(|tool| {
@@ -1718,6 +1736,9 @@ async fn call_read_tool(
                 return Err(error);
             };
             if let Some(job) = job {
+                if !app.delegates.worker_approval_trusted(session, job) {
+                    return Err(error);
+                }
                 if let Some(id) = app.hub.auto_folder_access(session, Some(job), &outside.0)? {
                     app.delegates.workspace_read_scope(job)?;
                     return tool.call(scope.with_additional_grant(id), args).await;
@@ -1757,6 +1778,13 @@ async fn exec_front_turn(
 
 async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>, params: &Value) -> Result<Value> {
     let name = params["name"].as_str().context("ツール名を指定する")?;
+    let trusted = exec::trusted_session(app, session)
+        && if let Some(claude) = claude {
+            claude.trusted_turn().await
+        } else {
+            codex.is_some_and(|(codex, key)| codex.trusted_approval_turn(session, key))
+        };
+    let external = (claude.is_some() || codex.is_some()) && !exec::trusted_session(app, session);
     if name.contains('.') {
         let (text, error) = crate::extensions::invoke(app.clone(), name.into(), params["arguments"].clone()).await?;
         return Ok(text_result(text, error));
@@ -1784,14 +1812,14 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         let args: integrate::Args = parse_args(args)?;
         let (approval, push_actor) = if let Some(claude) = claude {
             let confirm = claude.check_mcp(false, true).await?;
-            ((confirm || args.override_privacy).then_some(Actor::Claude), args.push.then_some(Actor::Claude))
+            ((confirm || external || args.override_privacy).then_some(Actor::Claude), args.push.then_some(Actor::Claude))
         } else {
             let (codex, key) = codex.context("A front desk session is required")?;
-            let approval = codex.check_mcp(session, key, true, args.override_privacy)?;
+            let approval = codex.check_mcp(session, key, true, external || args.override_privacy)?;
             let push_actor = if args.push { codex.check_mcp(session, key, true, true)? } else { None };
             (approval, push_actor)
         };
-        return Box::pin(integrate::call(app, session, args, approval, push_actor, async {
+        return Box::pin(integrate::call(app, session, args, approval, push_actor, trusted, async {
             if let Some(claude) = claude {
                 claude.check_mcp(false, true).await?;
             }
@@ -1830,19 +1858,30 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             | Tool::MailJournal | Tool::MailFolders)
             || matches!(tool, Tool::DraftMail) && args.get("in_reply_to_id").is_some_and(Value::is_string);
         let confirm = claude.check_mcp(reads_mail, writes).await?;
-        if remote.is_some() || import.is_some() || (git_write || cancel_job) && confirm {
+        if remote.is_some() || import.is_some() || writes && external || (git_write || cancel_job) && confirm {
             approval = Some(Actor::Claude);
         }
     }
     if let Some((codex, key)) = codex {
         let research_write = matches!(tool, Tool::Research(_)) && writes;
-        approval = codex.check_mcp(session, key, writes, remote.is_some() || import.is_some() || research_write)?;
+        let cli_would_ask = trusted && writes && desk_tool_auto_eligible(name)
+            && codex_tool_policy(None).get(name).is_none();
+        approval = codex.check_mcp(session, key, writes, remote.is_some() || import.is_some()
+            || research_write || cli_would_ask || writes && external)?;
     }
+    let automatic_approval = || {
+        let backend = if claude.is_some() { "claude" } else { "codex" };
+        crate::full_approval::desk_registration(
+            session, backend, &format!("mcp/{name}"), &mail::session_key(), args,
+        )
+    };
+    let auto_eligible = trusted && desk_tool_auto_eligible(name);
     // Box the larger tool futures so their state stays out of the shared dispatcher.
     if let Some(operation) = remote {
         let _: NoArgs = parse_args(args)?;
         let actor = approval.context("Git の承認を表示するパートナーがいない")?;
-        let message = Box::pin(app.git_remote(session, actor, operation)).await?;
+        let full = auto_eligible.then(automatic_approval);
+        let message = Box::pin(app.git_remote_with_approval(session, actor, operation, full)).await?;
         return Ok(data_result(json!({ "message": message }), false));
     }
     if let Tool::Handoff(handoff) = tool {
@@ -1881,7 +1920,9 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             format!("MCP {name}: {}", args.to_string().chars().take(300).collect::<String>())
         };
         let prefix = if git_write { fuzukue_proto::GIT_APPROVAL } else if import.is_some() { "latex-import" } else if cancel_job { "cancel-job" } else { "codex-mcp" };
-        let decision = crate::delegate::request_approval(app, session, prefix, actor, summary).await?;
+        let decision = crate::delegate::request_approval_with_full(
+            app, session, prefix, actor, summary, auto_eligible.then(automatic_approval),
+        ).await?;
         ensure!(decision == "accept", "利用者が承認しなかった");
         if let Some((codex, key)) = codex {
             codex.check_mcp(session, key, writes, false)?;
@@ -1889,6 +1930,8 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         if let Some(claude) = claude {
             claude.check_mcp(false, writes).await?;
         }
+    } else if auto_eligible {
+        crate::full_approval::authorize(&app.hub, automatic_approval())?;
     }
     let data = match tool {
         Tool::ListScreenshotScenarios => {
@@ -2591,6 +2634,10 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
     if matches!(tool, Tool::FetchReference | Tool::SaveAttachment | Tool::DraftMail) {
         app.record_artifacts(session, ["path", "pdf", "bib", "draft_path"]
             .into_iter().filter_map(|key| data[key].as_str()));
+    }
+    if matches!(tool, Tool::SearchMail | Tool::ReadMail | Tool::MailThread | Tool::SaveAttachment) {
+        // Mark the turn before returning sender-controlled data.
+        app.hub.mark_external_approval_input(session);
     }
     if matches!(tool, Tool::SearchMail | Tool::ReadMail | Tool::MailThread | Tool::MailJournal | Tool::SaveAttachment | Tool::MailFolders) {
         return Ok(mail_result(data));

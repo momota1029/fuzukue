@@ -3071,6 +3071,7 @@ fn codex_partner_options(app: &Workspace, session: &str, settings: fuzukue_proto
         mcp_url: url.to_string(),
         mcp_key: mail::session_key(),
         agent_settings: app.agent_settings(),
+        mail_enabled: app.mail.is_some(),
     })
 }
 
@@ -3143,6 +3144,9 @@ async fn prompt_codex_with_images(
         app.hub.publish(event);
     }
     app.hub.publish_partner_turn_started(&session, request, matches!(kind, TurnKind::Escalated));
+    if matches!(kind, TurnKind::ExternalInput) || app.issue_threads.automatic_policy(&session).is_some() {
+        app.hub.mark_external_approval_input(&session);
+    }
     let app = app.clone();
     tokio::spawn(async move {
         let mut prompt = prompt;
@@ -3574,6 +3578,7 @@ async fn set_chat_settings(app: &Workspace, session: &str, settings: fuzukue_pro
         }
     })?;
     app.record_session(session, |record| record.chat_settings = settings.clone());
+    app.hub.sweep_thread_approvals(session)?;
     app.hub.publish_snapshot(ServerEvent::ChatSettingsChanged { session: session.into(), settings });
     Ok(())
 }
@@ -3891,7 +3896,14 @@ async fn handle_from_client(
             let session = app.hub.edit_threads(|store| store.issue_thread(number))?;
             issue_threads::attach(app, &session, link)?;
             app.record_session(&session, |r| r.dir = Some(dir));
-            Box::pin(handle(app, ClientMsg::Prompt { session, text: prompt })).await?;
+            let _start = app.prompt_start.lock().await;
+            let settings = app.partner_turn_settings(&session);
+            let event = Some(prompt_event(&session, fuzukue_proto::Actor::User, &prompt));
+            if AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex {
+                prompt_codex_with_images(app, session, settings, prompt, event, Vec::new(), TurnKind::ExternalInput, None).await?;
+            } else {
+                prompt_claude_with_images(app, &session, prompt, event, Vec::new(), TurnKind::ExternalInput, None).await?;
+            }
             app.issues_refresh.notify_one();
         }
         ClientMsg::ResumeNow { session } => {

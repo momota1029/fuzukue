@@ -486,6 +486,9 @@ struct Approval {
     summary: crate::i18n::Message,
     resolved: Option<String>,
     automatic: bool,
+    details_open: bool,
+    shell: bool,
+    remember_shell: bool,
 }
 
 #[derive(Default)]
@@ -527,6 +530,7 @@ enum Disclosure {
     Input(usize),
     Result(usize),
     DecidedApprovals,
+    ApprovalDetails(usize),
 }
 
 impl Chat {
@@ -654,6 +658,7 @@ impl Chat {
         request_id: String,
         actor: Actor,
         summary: crate::i18n::Message,
+        remember_shell: bool,
         cx: &mut Context<Workbench>,
     ) {
         if self.by_approval.contains_key(&request_id) {
@@ -667,6 +672,8 @@ impl Chat {
         }
         let (row, joined) = self.tool_group(actor);
         if let Content::Tools(group) = &mut self.rows[row].content {
+            let shell = summary.fallback.starts_with("Bash:")
+                || summary.localized.as_ref().is_some_and(|message| message.key == "approval-run-command");
             self.by_approval
                 .insert(request_id.clone(), (row, group.approvals.len()));
             group.approvals.push(Approval {
@@ -674,6 +681,9 @@ impl Chat {
                 summary,
                 resolved: None,
                 automatic: false,
+                details_open: false,
+                shell,
+                remember_shell,
             });
         }
         self.update_tool_group(row, joined, cx);
@@ -1498,6 +1508,7 @@ impl Chat {
             (Content::Tools(group), Disclosure::Input(call)) => &mut group.calls[call].input_open,
             (Content::Tools(group), Disclosure::Result(call)) => &mut group.calls[call].result_open,
             (Content::Tools(group), Disclosure::DecidedApprovals) => &mut group.decided_open,
+            (Content::Tools(group), Disclosure::ApprovalDetails(index)) => &mut group.approvals[index].details_open,
             _ => return,
         };
         *open = !*open;
@@ -2679,19 +2690,45 @@ impl Workbench {
                                 }
                             }
                         }
-                        for approval in group.approvals.iter().filter(|approval| approval.resolved.is_none()) {
+                        for (index, approval) in group.approvals.iter().enumerate().filter(|(_, approval)| approval.resolved.is_none()) {
                             let details = approval.summary.text();
+                            let preview: String = details.lines().take(3).collect::<Vec<_>>().join("\n").chars().take(180).collect();
+                            let clipped = preview.len() < details.trim_end_matches('\n').len();
+                            let mut header = h_flex().flex_wrap().gap_2().items_center()
+                                .child(div().text_color(theme.muted_foreground).text_sm().child(tr!("chat-approval-waiting")))
+                                .child(if approval.request_id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST) {
+                                    folder_approval_buttons(&approval.request_id, &entity, chat.busy).into_any_element()
+                                } else {
+                                    approval_buttons(&approval.request_id, &entity).into_any_element()
+                                });
+                            if approval.remember_shell {
+                                let request_id = approval.request_id.clone();
+                                let entity = entity.clone();
+                                header = header.child(Button::new(SharedString::from(format!("remember-{request_id}")))
+                                    .label(tr!("chat-remember-shell").to_owned()).secondary().on_click(move |_, _, cx| {
+                                        let _ = entity.read(cx).out.send(ClientMsg::RememberShellApproval {
+                                            request_id: request_id.clone(), prefix: None,
+                                        });
+                                    }));
+                            }
                             body = body.child(
                                 v_flex().min_w_0().gap_2().items_start()
-                                    .child(status_row(
-                                        &tr!("chat-awaiting-approval", summary = details.into_owned()),
-                                        theme.muted_foreground,
-                                    ).text_sm().whitespace_normal())
-                                    .child(if approval.request_id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST) {
-                                        folder_approval_buttons(&approval.request_id, &entity, chat.busy).into_any_element()
-                                    } else {
-                                        approval_buttons(&approval.request_id, &entity).into_any_element()
-                                    }),
+                                    .child(header)
+                                    .children((approval.shell && !approval.remember_shell).then(|| {
+                                        div().text_xs().text_color(theme.muted_foreground).whitespace_normal()
+                                            .child(tr!("chat-approval-shell-once"))
+                                    }))
+                                    .children(clipped.then(|| summary_toggle(
+                                        format!("approval-details-{}", approval.request_id).into(),
+                                        Disclosure::ApprovalDetails(index), approval.details_open,
+                                        tr!("chat-approval-details").into(), theme.muted_foreground,
+                                    )))
+                                    .child(div()
+                                        .id(SharedString::from(format!("approval-preview-{}", approval.request_id)))
+                                        .w_full().min_w_0().text_sm().whitespace_normal()
+                                        .map(|details| if approval.shell { details.font(this.appearance.code_font.clone()) } else { details })
+                                        .max_h(px(if approval.details_open { 240. } else { 66. })).overflow_y_scroll()
+                                        .child(if clipped && !approval.details_open { format!("{preview}…") } else { details.into_owned() })),
                             );
                         }
                         if group.open {
@@ -5131,7 +5168,9 @@ impl Workbench {
             .permission_mode
             .effective(mail);
         let codex = self.chats[&session].codex_selected();
-        let tooltip = if codex {
+        let tooltip = if current == PermissionMode::BypassPermissions {
+            tr!("chat-approve-everything-help")
+        } else if codex {
             tr!("chat-codex-approval-mode-help")
         } else if mail {
             tr!("mail-approval-mode-help")
@@ -5149,9 +5188,6 @@ impl Workbench {
                         PermissionMode::Plan,
                         PermissionMode::BypassPermissions,
                     ] {
-                        if codex && mode == PermissionMode::BypassPermissions {
-                            continue;
-                        }
                         let entity = entity.clone();
                         let session = session.clone();
                         menu = menu.item(

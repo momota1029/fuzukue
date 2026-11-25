@@ -341,21 +341,13 @@ async fn approve(
     summary: LocalizedMessage,
 ) -> Result<()> {
     let tool = match summary.key.as_str() {
-        "github-approve-comment" => Some("github_comment"),
         "github-approve-labels" => Some("github_label"),
-        "github-approve-tracking-issue" | "approval-create-issue" => Some("github_issue_create"),
         "github-approve-close" => Some("github_issue_close"),
         _ => None,
     };
-    let full = tool.map(|tool| {
+    let full = tool.filter(|_| crate::mcp::exec::trusted_session(app, session)).map(|tool| {
         let args = serde_json::json!(summary.args);
-        crate::full_approval::registration(
-            crate::full_approval::desk_owner(session),
-            tool,
-            fuzukue_proto::ApprovalRisk::Mid,
-            serde_json::json!({"fingerprint": crate::full_approval::fingerprint(&args)}),
-            serde_json::json!({"target": args.get("item").or_else(|| args.get("repo"))}),
-        )
+        crate::full_approval::desk_registration(session, "mcp", tool, &crate::mail::session_key(), &args)
     });
     if !confirm {
         // Full mode authorizes this call without an explicit confirmation.

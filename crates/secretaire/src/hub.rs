@@ -137,6 +137,7 @@ struct PartnerTurn {
     request_revision: u64,
     handoff: Option<crate::front_desk::Escalation>,
     escalated: bool,
+    external_approval_input: bool,
 }
 
 impl Observed {
@@ -152,7 +153,7 @@ struct WorkerActivity {
 
 enum ApprovalWaiter {
     Backend,
-    Folder,
+    Folder { automatic: bool },
     Local(Weak<()>),
     Restored,
 }
@@ -160,7 +161,7 @@ enum ApprovalWaiter {
 impl PendingApproval {
     fn live(&self) -> bool {
         match &self.waiter {
-            ApprovalWaiter::Backend | ApprovalWaiter::Folder => true,
+            ApprovalWaiter::Backend | ApprovalWaiter::Folder { .. } => true,
             ApprovalWaiter::Local(waiter) => waiter.strong_count() != 0,
             ApprovalWaiter::Restored => false,
         }
@@ -344,7 +345,7 @@ impl Hub {
                 blockers.push(blocker(BlockerKind::Worker, Some(session), id, worker.title.clone(), started_at));
             }
         }
-        for approval in inner.approvals.values().filter(|approval| approval.live() && !matches!(approval.waiter, ApprovalWaiter::Folder)) {
+        for approval in inner.approvals.values().filter(|approval| approval.live() && !matches!(approval.waiter, ApprovalWaiter::Folder { .. })) {
             if let ServerEvent::ApprovalRequested { session, request_id, .. } = &approval.envelope.event {
                 blockers.push(blocker(BlockerKind::Approval, Some(session), request_id,
                     thread_title(session), approval.observed.timestamp));
@@ -542,10 +543,22 @@ impl Hub {
             request_revision: 0,
             handoff: None,
             escalated,
+            external_approval_input: false,
         });
         self.publish_locked(&mut inner, ServerEvent::TurnActivity {
             session: session.into(), running: true,
         }, None, ApprovalWaiter::Backend);
+    }
+
+    pub(crate) fn mark_external_approval_input(&self, session: &str) {
+        if let Some(turn) = self.inner.lock().unwrap().partner_started.get_mut(session) {
+            turn.external_approval_input = true;
+        }
+    }
+
+    pub(crate) fn external_approval_input(&self, session: &str) -> bool {
+        self.inner.lock().unwrap().partner_started.get(session)
+            .is_some_and(|turn| turn.external_approval_input)
     }
 
     pub(crate) fn escalation_turn(&self, session: &str) -> anyhow::Result<(Instant, u64)> {
@@ -681,6 +694,7 @@ impl Hub {
             if running {
                 inner.partner_started.entry(session.clone()).or_insert_with(|| PartnerTurn {
                     observed: Observed::now(), request: None, request_revision: 0, handoff: None, escalated: false,
+                    external_approval_input: false,
                 });
                 inner.running.insert(session.clone());
             } else {

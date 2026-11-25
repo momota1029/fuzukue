@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {"action": "size", "width": 1100, "height": 850},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "new_thread"},
+    {"action": "seed_command_approval"},
+    {"action": "wait_element", "id": "accept-command-fixture"},
+    {"action": "assert_order", "above": "accept-command-fixture", "below": "approval-preview-command-fixture"},
+    {"action": "screenshot", "name": "approval-command-collapsed"},
+    {"action": "click", "id": "approval-details-command-fixture"},
+    {"action": "assert_order", "above": "accept-command-fixture", "below": "approval-preview-command-fixture"},
+    {"action": "screenshot", "name": "approval-command-expanded"}
+  ]
+}

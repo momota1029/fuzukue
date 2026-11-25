@@ -21,6 +21,7 @@ use tokio::sync::broadcast;
 const FILE: &str = "async-approvals.json";
 const FULL_MODE_FILE: &str = "full-approval-mode.json";
 const FULL_MODE_PRINCIPAL: &str = "full_mode";
+const THREAD_MODE_PRINCIPAL: &str = "thread_mode";
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const AUDIT_PAGE: usize = 50;
 
@@ -49,6 +50,7 @@ pub(crate) struct Action {
 #[derive(Clone)]
 pub(crate) struct Registration {
     pub owner: ApprovalOwner,
+    pub thread_auto: bool,
     pub risk: ApprovalRisk,
     pub unattended: ApprovalUnattended,
     /// Safe to display to clients.
@@ -115,12 +117,16 @@ impl Record {
     }
 
     fn grant_full(&mut self, now: i64, mode: &ActiveMode) {
+        self.grant_automatic(now, FULL_MODE_PRINCIPAL, &mode.id);
+    }
+
+    fn grant_automatic(&mut self, now: i64, principal: &str, mode_id: &str) {
         self.summary.state = ApprovalState::Granted;
         self.summary.grant_scope = Some(ApprovalGrantScope::Once);
         self.summary.updated_at = now;
-        self.audit(now, FULL_MODE_PRINCIPAL, None, AuditEvent::Granted {
+        self.audit(now, principal, None, AuditEvent::Granted {
             scope: ApprovalGrantScope::Once,
-            full_mode_id: Some(mode.id.clone()),
+            full_mode_id: Some(mode_id.into()),
         });
     }
 
@@ -333,6 +339,31 @@ impl Queue {
         self.with_store(now, |store, _| Ok(store.folder_sweep.clone()))
     }
 
+    pub(crate) fn stage_thread_folders(&self, folders: Vec<FolderGrant>) -> Result<()> {
+        self.with_store(now, |store, at| {
+            let (principal, mode_id) = store.active_mode(at).map_or(
+                (THREAD_MODE_PRINCIPAL, THREAD_MODE_PRINCIPAL),
+                |mode| (FULL_MODE_PRINCIPAL, mode.id.as_str()),
+            );
+            let mut next = store.clone();
+            for mut grant in folders {
+                if next.records.iter().any(|record| record.summary.approval_id == grant.id) {
+                    continue;
+                }
+                let registration = super::folder_grants::full_registration(
+                    &grant.session, None, &grant.path, &grant.id,
+                );
+                let mut record = self.new_record(grant.id.clone(), registration, at);
+                record.grant_automatic(at, principal, mode_id);
+                record.consume(at);
+                grant.granted_by = principal.into();
+                next.records.push(record);
+                next.folder_sweep.push(grant);
+            }
+            self.commit(store, next, [])
+        })
+    }
+
     pub(crate) fn finish_folder_sweep(&self) -> Result<()> {
         self.with_store(now, |store, _| {
             if store.folder_sweep.is_empty() {
@@ -361,7 +392,7 @@ impl Queue {
                     audit.push(FullApprovalAudit {
                         approval_id: summary.approval_id.clone(),
                         at: entry.at,
-                        granted_by: FULL_MODE_PRINCIPAL.into(),
+                        granted_by: entry.principal.clone(),
                         thread: summary.owner.thread.clone(),
                         job: summary.owner.job.clone(),
                         risk: summary.risk,
@@ -462,15 +493,23 @@ impl Queue {
     }
 
     pub(crate) fn register(&self, request: Registration) -> Result<String> {
-        Ok(self.register_inner(request, false)?.0)
+        Ok(self.register_inner(request, false, true, false, None)?.0)
     }
 
     /// Grant and claim the exact operation of a live caller in one durable mutation.
     pub(crate) fn authorize_full(&self, request: Registration) -> Result<FullAuthorization> {
-        Ok(self.register_inner(request, true)?.1)
+        self.authorize_automatic(request, true, false, None)
     }
 
-    fn register_inner(&self, request: Registration, live: bool) -> Result<(String, FullAuthorization)> {
+    pub(crate) fn authorize_automatic(
+        &self, request: Registration, full: bool, thread: bool, legacy_id: Option<&str>,
+    ) -> Result<FullAuthorization> {
+        Ok(self.register_inner(request, true, full, thread, legacy_id)?.1)
+    }
+
+    fn register_inner(
+        &self, request: Registration, live: bool, full: bool, thread: bool, legacy_id: Option<&str>,
+    ) -> Result<(String, FullAuthorization)> {
         self.with_store(now, |store, now| {
             ensure!(
                 request.expires_at > now,
@@ -484,7 +523,9 @@ impl Queue {
                 "approval request requires a thread, job, requester and tool"
             );
             let eligible = eligible_for_full(&request.owner, request.unattended, &request.action.tool);
-            let mode = store.active_mode(now).filter(|_| eligible).cloned();
+            let mode = store.active_mode(now).filter(|_| eligible && full)
+                .map(|mode| (FULL_MODE_PRINCIPAL, mode.id.clone()))
+                .or_else(|| (eligible && thread).then(|| (THREAD_MODE_PRINCIPAL, THREAD_MODE_PRINCIPAL.into())));
 
             // A grant's operation identity outlives its lease and process. A
             // finalized grant stops replay even if its original deadline passed.
@@ -526,8 +567,8 @@ impl Queue {
                 record.audit(now, &request.owner.requester, None, AuditEvent::Deduplicated);
                 let mut changed = None;
                 let mut authorization = FullAuthorization::Human;
-                if let Some(mode) = &mode {
-                    record.grant_full(now, mode);
+                if let Some((principal, mode_id)) = &mode {
+                    record.grant_automatic(now, principal, mode_id);
                     if live {
                         record.consume(now);
                         authorization = FullAuthorization::Granted;
@@ -537,20 +578,16 @@ impl Queue {
                 self.commit(store, next, changed)?;
                 return Ok((id, authorization));
             }
-            let approval_id = loop {
+            let approval_id = legacy_id.map(str::to_owned).unwrap_or_else(|| loop {
                 let id = format!("apr_{:032x}", rand::random::<u128>());
-                if next
-                    .records
-                    .iter()
-                    .all(|record| record.summary.approval_id != id)
-                {
+                if next.records.iter().all(|record| record.summary.approval_id != id) {
                     break id;
                 }
-            };
+            });
             let mut record = self.new_record(approval_id.clone(), request, now);
             let mut authorization = FullAuthorization::Human;
-            if let Some(mode) = &mode {
-                record.grant_full(now, mode);
+            if let Some((principal, mode_id)) = &mode {
+                record.grant_automatic(now, principal, mode_id);
                 if live {
                     record.consume(now);
                     authorization = FullAuthorization::Granted;
@@ -757,12 +794,14 @@ impl Queue {
 
 // Producers attach the server's own worker or front-desk identity.
 pub(super) fn eligible_for_full(owner: &ApprovalOwner, unattended: ApprovalUnattended, tool: &str) -> bool {
-    owner.requester != "front_desk"
-        || (unattended != ApprovalUnattended::NeverUnattended
-            && matches!(tool,
-                "exec" | "folder_read" | "git_integrate_patch" | "github_comment" | "github_label"
-                | "github_issue_create" | "github_issue_close"
-            ))
+    unattended != ApprovalUnattended::NeverUnattended
+        && (owner.requester != "front_desk"
+            || matches!(tool,
+                "exec" | "folder_read" | "git_integrate_patch" | "github_label" | "github_issue_close"
+                | "Bash" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+                | "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+                | "item/permissions/requestApproval"
+            ) || tool.starts_with("mcp/"))
 }
 
 fn now() -> i64 {

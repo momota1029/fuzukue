@@ -27,7 +27,7 @@ const RECOVERY: &str = "delegate-recovery";
 pub(super) const AUDIT_LIMIT: IntegerRange = IntegerRange::new(1, 100);
 pub(super) static COMMIT: Mutex<()> = Mutex::new(());
 
-pub(crate) const GUIDANCE: &str = "\n\nUse fuzukue fs_write, fs_edit, or fs_apply_patch for worktree edits. Avoid shell redirection, heredocs, and Python for writing files. Changes outside the job's touches require approval.";
+pub(crate) const GUIDANCE: &str = "\n\nUse fuzukue fs_write, fs_edit, or fs_apply_patch for worktree edits. Avoid shell redirection, heredocs, and Python for writing files. Use a worktree-relative path or an absolute path inside your job scratch. Outside the assigned checkout and scratch, changes beyond the job's touches require approval.";
 
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
@@ -53,31 +53,31 @@ impl Tool {
 
     pub(super) fn definition(self) -> Value {
         let path = json!({"type":"string","description": harness_text!(
-            "Worktree-relative file path with an existing parent directory. Symlinks and parent traversal are refused.",
-            "作業ツリー相対のファイルパス。親ディレクトリは既存のものを指定する。シンボリックリンクと親への遡及は禁止。"
+            "Worktree-relative path or absolute path inside this job's scratch. The parent directory must exist. Symlinks and parent traversal are refused.",
+            "作業ツリー相対パス、またはジョブ専用一時領域内の絶対パス。親ディレクトリは既存のものを指定する。シンボリックリンクと親への遡及は禁止。"
         )});
         let text = json!({"type":"string","maxLength": FILE_LIMIT});
         let (description, properties, required): (_, _, &[&str]) = match self {
             Self::Write => (
                 harness_text!(
-                    "Create or overwrite one UTF-8 file (256 KiB). Returns its diff and SHA-256. Changes outside touches require approval.",
-                    "UTF-8 ファイル一件（256 KiB まで）を新規作成または上書きする。差分と SHA-256 を返す。touches の範囲外は承認が必要。"
+                    "Create or overwrite one UTF-8 file (256 KiB). Returns its diff and SHA-256. The current approval mode governs writes outside the job's scope.",
+                    "UTF-8 ファイル一件（256 KiB まで）を新規作成または上書きする。差分と SHA-256 を返す。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
                 ),
                 json!({"path": path, "content": text}),
                 &["path", "content"],
             ),
             Self::Edit => (
                 harness_text!(
-                    "Replace one exact, unique string in a UTF-8 file (256 KiB). A unique replacement with no old match outside it is already applied. Changes outside touches require approval.",
-                    "UTF-8 ファイル（256 KiB まで）内で一意に一致する文字列を置換する。置換後の文字列が一意で、その外側に置換前の一致がなければ適用済みとみなす。touches の範囲外は承認が必要。"
+                    "Replace one exact, unique string in a UTF-8 file (256 KiB). A unique replacement with no old match outside it is already applied. The current approval mode governs writes outside the job's scope.",
+                    "UTF-8 ファイル（256 KiB まで）内で一意に一致する文字列を置換する。置換後の文字列が一意で、その外側に置換前の一致がなければ適用済みとみなす。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
                 ),
                 json!({"path": path, "old": {"type":"string","minLength":1,"maxLength":FILE_LIMIT}, "new": text}),
                 &["path", "old", "new"],
             ),
             Self::ApplyPatch => (
                 harness_text!(
-                    "Apply a unified text diff (768 KiB) to one UTF-8 file (256 KiB), with --- and +++ headers for path. Supports creation via /dev/null. Changes outside touches require approval.",
-                    "単一の UTF-8 ファイル（256 KiB まで）に unified diff（768 KiB まで）を適用する。--- と +++ のヘッダーにパスを指定する。/dev/null からの新規作成にも対応。touches の範囲外は承認が必要。"
+                    "Apply a unified text diff (768 KiB) to one UTF-8 file (256 KiB), with --- and +++ headers for path. Supports creation via /dev/null. The current approval mode governs writes outside the job's scope.",
+                    "単一の UTF-8 ファイル（256 KiB まで）に unified diff（768 KiB まで）を適用する。--- と +++ のヘッダーにパスを指定する。/dev/null からの新規作成にも対応。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
                 ),
                 json!({"path": path, "patch": {"type":"string","maxLength":PATCH_LIMIT}}),
                 &["path", "patch"],
@@ -120,12 +120,12 @@ impl Tool {
             let scope = scope.clone();
             tokio::task::spawn_blocking(move || scope.prepare(path, operation)).await??
         };
-        let needs_approval = staged.changed() && !scope.writes.contains(&staged.path);
+        let needs_approval = staged.changed() && !scope.in_scope(&staged.path);
         if needs_approval {
             scope.check_running(&cancel)?;
         }
         if needs_approval {
-            let full = crate::full_approval::registration(
+            let mut full = crate::full_approval::registration(
                 fuzukue_proto::ApprovalOwner { thread: session.into(), job: job.into(), requester: "worker".into() },
                 self.name(),
                 fuzukue_proto::ApprovalRisk::Mid,
@@ -136,6 +136,10 @@ impl Tool {
                 }),
                 json!({"worktree": scope.root, "path": staged.path}),
             );
+            full.thread_auto = true;
+            if !app.delegates.worker_approval_trusted(session, job) {
+                full.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
+            }
             let mut preview: String = staged.diff.chars().take(1500).collect();
             if preview.len() < staged.diff.len() {
                 preview.push_str("\n…");
@@ -196,6 +200,8 @@ pub(crate) struct Scope {
     protected: Vec<PathBuf>,
     recovery: PathBuf,
     closed: Cancellation,
+    scratch: Option<PathBuf>,
+    checkouts: Vec<PathBuf>,
 }
 
 impl Scope {
@@ -217,6 +223,38 @@ impl Scope {
             protected,
             recovery: recovery_dir(state, job)?,
             closed: Cancellation::default(),
+            scratch: None,
+            checkouts: Vec::new(),
+        })
+    }
+
+    pub(crate) fn with_job_paths(mut self, workspace: &Path, scratch: &Path, assignment: &str) -> Self {
+        self.scratch = Some(scratch.to_owned());
+        if self.root.starts_with(workspace.join("target")) {
+            self.checkouts.push(self.root.clone());
+        }
+        // An assignment may direct a worker to make its own checkout below target.
+        // Only named paths are candidates, and the checkout must exist at write time.
+        self.checkouts.extend(assignment.split(|c: char| {
+            !c.is_alphanumeric() && !matches!(c, '/' | '.' | '-' | '_')
+        }).filter_map(|token| {
+            let path = Path::new(token.trim_end_matches('.'));
+            let path = if path.is_absolute() { path.to_owned() } else { self.root.join(path) };
+            let relative = path.strip_prefix(self.root.join("target")).ok()?;
+            worktree_relative(relative).then_some(path)
+        }));
+        self
+    }
+
+    fn in_scope(&self, path: &Path) -> bool {
+        if path.is_absolute() {
+            return self.scratch.as_ref().is_some_and(|scratch| path.starts_with(scratch));
+        }
+        let absolute = self.root.join(path);
+        self.writes.contains(path) || self.checkouts.iter().any(|checkout| {
+            absolute.starts_with(checkout)
+                && fs::symlink_metadata(checkout.join(".git"))
+                    .is_ok_and(|metadata| metadata.is_dir() || metadata.is_file())
         })
     }
 
@@ -261,13 +299,14 @@ impl Scope {
     }
 
     fn destination(&self, relative: &Path) -> Result<(File, PathBuf)> {
+        let scratch = self.scratch.as_ref().filter(|scratch| {
+            relative.strip_prefix(scratch).is_ok_and(worktree_relative)
+        });
+        ensure!(scratch.is_some() || worktree_relative(relative),
+            "Use a worktree-relative UTF-8 path or an absolute path inside your job scratch without ..");
+        let absolute = scratch.map_or_else(|| self.root.join(relative), |_| relative.to_owned());
         ensure!(
-            worktree_relative(relative),
-            "Use a worktree-relative UTF-8 file path without .."
-        );
-        let absolute = self.root.join(relative);
-        ensure!(
-            !denied(&absolute) && !self.protected.iter().any(|path| absolute.starts_with(path)),
+            !denied(&absolute) && (scratch.is_some() || !self.protected.iter().any(|path| absolute.starts_with(path))),
             "Access denied to a protected write path"
         );
         let parent = absolute.parent().context("Missing parent directory")?;

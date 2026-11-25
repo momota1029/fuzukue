@@ -23,7 +23,7 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
         Arc::new(crate::Hub::new()),
     ));
     *app.worker_approval_policy.lock().unwrap() = fuzukue_proto::WorkerApprovalPolicy::Auto;
-    let session = "scoped-write";
+    let session = &app.hub.edit_threads(|store| store.create(None))?;
     let job = "delegate:scoped-write";
     let key = "test-worker-key";
     let writes = Arc::new(touches::WriteSet::new(
@@ -32,16 +32,24 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
         "",
         || None,
     )?);
+    let checkout = root.join("target/job/checkout");
+    let neighbor = root.join("target/other/checkout");
+    let scratch = state.join("worker-scratch");
+    for dir in [&checkout, &neighbor] {
+        fs::create_dir_all(dir.join(".git"))?;
+    }
+    fs::create_dir(&scratch)?;
     let scope = Arc::new(crate::mcp::workspace_write::Scope::new(
         root.clone(),
         writes,
         &state,
         job,
-    )?);
+    )?.with_job_paths(&root, &scratch, "Work in the isolated checkout target/job/checkout"));
     let tools = crate::mcp::worker_tool_names(&[]);
     let policy = crate::mcp::codex_tool_policy(Some(&tools));
     let worker = Arc::new(RunningJob {
         session: session.into(),
+        external_approval: false,
         key: key.into(),
         tools: tools.into(),
         approach: Default::default(),
@@ -176,6 +184,18 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
     assert_eq!(earlier["writes"][0]["path"], "in.txt");
     assert_eq!(earlier["writes"][0]["approved"], false);
 
+    for path in ["target/job/checkout/new.txt", scratch.join("local.txt").to_str().unwrap()] {
+        let result = tokio::time::timeout(Duration::from_secs(2),
+            request(true, "tools/call", write(path, "isolated\n"))).await??;
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(fs::read_to_string(root.join(path))?, "isolated\n");
+    }
+    let pending = tokio::spawn(request(true, "tools/call", write("target/other/checkout/denied.txt", "other")));
+    let (id, _) = next_approval(&mut events).await?;
+    assert!(app.delegates.resolve_approval(&id, "decline", false)?);
+    assert_eq!(pending.await??["isError"], true);
+    assert!(!neighbor.join("denied.txt").exists());
+
     let pending = tokio::spawn(request(true, "tools/call", write("out.txt", "stale\n")));
     let (id, _) = next_approval(&mut events).await?;
     fs::write(root.join("out.txt"), "concurrent edit\n")?;
@@ -273,6 +293,16 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
         }).collect::<Vec<_>>();
     assert_eq!(resolutions, [("accept".into(), true)]);
     assert!(route(path, &token, Some(json!({"mode": "off"}))).await?.1["active"].is_null());
+
+    let pending = tokio::spawn(request(true, "tools/call", write("thread-mode.txt", "approved by thread\n")));
+    let (pending_id, _) = next_approval(&mut events).await?;
+    app.hub.edit_threads(|store| store.set_partner_permission(session, fuzukue_proto::PermissionMode::BypassPermissions))?;
+    app.hub.sweep_thread_approvals(session)?;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), pending).await???["isError"], false);
+    let audit = app.hub.full_approval_settings(None)?.audit;
+    assert!(audit.iter().any(|entry| entry.approval_id == pending_id && entry.granted_by == "thread_mode"));
+    assert_eq!(request(true, "tools/call", write("thread-mode-next.txt", "automatic\n")).await?["isError"], false);
+    app.hub.edit_threads(|store| store.set_partner_permission(session, fuzukue_proto::PermissionMode::Default))?;
 
     let pending = tokio::spawn(request(
         true,

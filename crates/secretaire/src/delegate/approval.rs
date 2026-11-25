@@ -152,14 +152,18 @@ where
         let path = checked_read(tool, input, human_only, &scope.root, &protected_roots(&app.state_dir))?;
         Some((scope, path))
     };
-    let full = crate::full_approval::worker_registration(
+    let mut full = crate::full_approval::worker_registration(
         &owner.session, &owner.job, "claude", tool, &owner.backend_id, input,
     );
+    let trusted = app.delegates.worker_approval_trusted(&owner.session, &owner.job);
+    if !trusted {
+        full.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
+    }
     // Register the human waiter before invoking the legacy advisor.
     let (wait, mut reply) = super::open_approval_with(app, &owner.session, &owner.job, Actor::Claude,
         format!("{tool} {input}").into(), Some(owner.clone()), None, None, Some(full))?;
     let policy = *app.worker_approval_policy.lock().unwrap();
-    if policy != WorkerApprovalPolicy::Ask {
+    if trusted && policy != WorkerApprovalPolicy::Ask {
         if let Some((scope, reviewed_path)) = path() {
             let answer = tokio::select! {
                 biased;
@@ -253,6 +257,7 @@ mod tests {
         let writes = Arc::new(WriteSet::new(&root, Some(vec!["README.md".into()]), "", || None)?);
         app.delegates.running.lock().unwrap().insert(JOB.into(), Arc::new(RunningJob {
             session: SESSION.into(), key: String::new(), approach: String::new(),
+            external_approval: false,
             summary: Default::default(), retry: Default::default(), tools: Default::default(),
             input: Default::default(), cancel: Default::default(), started: true.into(),
             drain_notice: Default::default(), capture_scope: Default::default(),

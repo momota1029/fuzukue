@@ -114,6 +114,7 @@ pub(crate) async fn hold_all_slots(app: &App) -> admission::Hold {
 
 struct RunningJob {
     session: String,
+    external_approval: bool,
     key: String,
     approach: String,
     summary: Mutex<Option<String>>,
@@ -173,6 +174,9 @@ pub(crate) struct JobInput {
 }
 
 impl JobInput {
+    pub(crate) fn external_approval(&self) -> bool {
+        self.job.external_approval
+    }
     pub fn cancellation(&self) -> Arc<Cancellation> {
         self.attempt_cancel.clone()
     }
@@ -451,6 +455,11 @@ impl Workers {
         scope.context("Worker workspace read scope is unavailable")
     }
 
+    pub(crate) fn worker_approval_trusted(&self, session: &str, id: &str) -> bool {
+        self.running.lock().unwrap().get(id)
+            .is_none_or(|job| job.session == session && !job.external_approval)
+    }
+
     pub(crate) fn workspace_write_scope(&self, session: &str, id: &str) -> Result<(Arc<crate::mcp::workspace_write::Scope>, Arc<Cancellation>)> {
         let jobs = self.running.lock().unwrap();
         let job = jobs.get(id).filter(|job| job.session == session).context("Job not found")?;
@@ -528,6 +537,7 @@ impl Workers {
         let delivered = approval.reply.lock().unwrap().take().is_some_and(|reply| reply.send(ApprovalReply {
             decision: if refused { MUTATION_APPROVAL_EXPIRED } else { decision }.into(),
             shell_input,
+            mode_grant: false,
         }).is_ok());
         if delivered {
             if let Some(review) = &review {
@@ -823,6 +833,7 @@ async fn launch_assignment(
     let (tx, rx) = mpsc::unbounded_channel();
     let control = Arc::new(RunningJob {
         session: session.into(), key: key.clone(), tools: Mutex::new(tools.clone()),
+        external_approval: !crate::mcp::exec::trusted_session(app, session),
         approach: prompt.chars().take(1600).collect(), summary: Mutex::default(), retry: Mutex::default(),
         input: Mutex::new((!blind).then(|| tx.clone())), cancel: Arc::default(),
         started: false.into(), drain_notice: Default::default(),
@@ -1016,11 +1027,16 @@ async fn launch_assignment(
                 attempts.push(attempt);
                 return Ok((timer, result, None));
             }
-            let lease = if crate::canary() { None } else { app.hub.full_approval_lease()? };
+            let lease = if crate::canary() || input.job.external_approval { None } else { app.hub.full_approval_lease()? };
             let execution = if crate::canary() {
                 None
             } else {
-                crate::worker_execution::settings(&app)?.lock().unwrap().effective(lease.is_some())
+                crate::worker_execution::settings(&app)?.lock().unwrap().effective(lease.is_some()).map(|mut policy| {
+                    if input.job.external_approval {
+                        policy.approval = crate::worker_execution::Approval::Ask;
+                    }
+                    policy
+                })
             };
             let read_only = execution.is_some_and(|policy| policy.sandbox == crate::worker_execution::Sandbox::ReadOnly);
             let tools = if read_only { crate::mcp::read_only_worker_tools(tools) } else { tools };
@@ -1122,7 +1138,9 @@ async fn launch_assignment(
             let recovery = crate::mcp::workspace_write::recovery_dir(&app.state_dir, &job)?;
             let write_scope = can_write.then(|| crate::mcp::workspace_write::Scope::new(
                 scope.cwd.clone(), writes.clone(), &app.state_dir, &job,
-            )).transpose()?.map(Arc::new);
+            )).transpose()?.map(|write_scope| Arc::new(
+                write_scope.with_job_paths(&app.project_dir, &scope.scratch, &prompt)
+            ));
             *input.job.workspace_write_scope.lock().unwrap() = write_scope.clone();
             let checkout = scope.cwd.clone();
             let launch = WorkerLaunch { execution, instructions, mcp_url, key, tools, scope: Some(scope) };
@@ -2304,9 +2322,10 @@ struct ShellApproval {
     prefix: Option<&'static str>,
 }
 
-struct ApprovalReply {
-    decision: String,
+pub(crate) struct ApprovalReply {
+    pub(crate) decision: String,
     shell_input: Option<serde_json::Value>,
+    pub(crate) mode_grant: bool,
 }
 
 struct ApprovalWait<'a> {
@@ -2366,10 +2385,11 @@ pub(crate) const MUTATION_APPROVAL_EXPIRED: &str = "mutation-approval-expired";
 
 pub(crate) async fn request_mutation_approval(
     app: &App, session: &str, prefix: &str, actor: Actor, summary: fuzukue_proto::LocalizedMessage,
+    full: Option<crate::hub::approval_store::Registration>,
     authorize: impl FnOnce() -> bool + Send + 'static,
-) -> Result<String> {
-    let (_wait, reply) = open_approval_with(app, session, prefix, actor, summary.into(), None, Some(Box::new(authorize)), None, None)?;
-    Ok(reply.await?.decision)
+) -> Result<ApprovalReply> {
+    let (_wait, reply) = open_approval_with(app, session, prefix, actor, summary.into(), None, Some(Box::new(authorize)), None, full)?;
+    Ok(reply.await?)
 }
 
 fn open_approval_with<'a>(
@@ -2401,7 +2421,7 @@ fn open_approval_with<'a>(
         let resume = |reply: &Mutex<Option<oneshot::Sender<ApprovalReply>>>, granted| {
             if let Some(reply) = reply.lock().unwrap().take() {
                 let decision = if granted { "accept" } else { "decline" };
-                let _ = reply.send(ApprovalReply { decision: decision.into(), shell_input: None });
+                let _ = reply.send(ApprovalReply { decision: decision.into(), shell_input: None, mode_grant: granted });
             }
         };
         let waiter = reply.clone();
@@ -2454,7 +2474,10 @@ pub(crate) async fn request_shell_approval(
     } else {
         (format!("Bash {input}"), None)
     };
-    let full = crate::full_approval::worker_registration(session, job, "claude", "Bash", backend_id, &input);
+    let mut full = crate::full_approval::worker_registration(session, job, "claude", "Bash", backend_id, &input);
+    if !app.delegates.worker_approval_trusted(session, job) {
+        full.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
+    }
     let (_wait, reply) = open_approval_with(app, session, job, Actor::Claude, summary.into(),
         Some(approval::Owner::new(session, job, backend_id)), None, candidate, Some(full))?;
     let reply = reply.await?;
@@ -2604,6 +2627,7 @@ async fn mcp_review_findings_respect_authenticated_worker_access() -> Result<()>
         job.into(),
         Arc::new(RunningJob {
             session: session.into(),
+            external_approval: false,
             key: key.into(),
             tools: tools.into(),
             approach: Default::default(),
@@ -2718,6 +2742,7 @@ async fn mcp_reading_tools_respect_authenticated_worker_access() -> Result<()> {
         job.into(),
         Arc::new(RunningJob {
             session: session.into(),
+            external_approval: false,
             key: key.into(),
             tools: tools.into(),
             approach: Default::default(),

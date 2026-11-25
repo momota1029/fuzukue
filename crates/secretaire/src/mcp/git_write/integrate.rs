@@ -610,6 +610,7 @@ pub(in crate::mcp) async fn call(
     args: Args,
     local_approval: Option<Actor>,
     push_actor: Option<Actor>,
+    trusted: bool,
     recheck: impl Future<Output = Result<()>>,
 ) -> Result<Value> {
     let mutation = Mutation::new(app, session, "Git patch integration".into())?;
@@ -639,20 +640,20 @@ pub(in crate::mcp) async fn call(
             true,
         ));
     }
-    if args.override_privacy || local_approval.is_some() {
-        let full = (!args.override_privacy && prepared.changes.iter().all(|change| change.after.is_some()))
-            .then(|| crate::full_approval::registration(
-                crate::full_approval::desk_owner(session),
+    let full = (trusted && !args.override_privacy)
+            .then(|| crate::full_approval::desk_registration(
+                session,
+                "mcp",
                 NAME,
-                fuzukue_proto::ApprovalRisk::Mid,
-                json!({
+                &crate::mail::session_key(),
+                &json!({
                     "patch": prepared.patch_sha256,
                     "head": prepared.head,
                     "index": prepared.index_hash,
                     "message": crate::full_approval::fingerprint(&json!(prepared.message)),
                 }),
-                json!({"ref": prepared.reference, "files": prepared.changes.len()}),
             ));
+    if args.override_privacy || local_approval.is_some() {
         let actor = local_approval.context("Privacy override requires front desk approval")?;
         let details = format!(
             "Integrate Git patch SHA-256 {} at HEAD {} ({} files){}",
@@ -694,6 +695,8 @@ pub(in crate::mcp) async fn call(
             Err(error) => return Ok(failure("approval_failed", error)),
         }
         recheck.await?;
+    } else if let Some(full) = full {
+        crate::full_approval::authorize(&app.hub, full)?;
     }
 
     let mutation = Mutation::new(app, session, "Git patch integration".into())?;

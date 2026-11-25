@@ -61,15 +61,22 @@ pub(super) fn definition() -> Value {
 
 type Lease = (FullApprovalMode, watch::Receiver<()>);
 
-pub(super) fn lease(app: &Workspace, session: &str) -> Result<Lease> {
+pub(super) fn lease(app: &Workspace, session: &str, front_desk: bool) -> Result<Option<Lease>> {
     ensure!(!crate::canary(), "{FULL_REQUIRED}");
-    let lease = app.hub.full_approval_lease()?.context(FULL_REQUIRED)?;
     ensure!(trusted_session(app, session), "{TRUST_REQUIRED}");
-    Ok(lease)
+    if front_desk {
+        match app.chat_settings(session).permission_mode {
+            fuzukue_proto::PermissionMode::BypassPermissions => return Ok(None),
+            fuzukue_proto::PermissionMode::Default | fuzukue_proto::PermissionMode::Plan => bail!("{FULL_REQUIRED}"),
+            fuzukue_proto::PermissionMode::AcceptEdits => {}
+        }
+    }
+    Ok(Some(app.hub.full_approval_lease()?.context(FULL_REQUIRED)?))
 }
 
-pub(super) fn trusted_session(app: &Workspace, session: &str) -> bool {
+pub(crate) fn trusted_session(app: &Workspace, session: &str) -> bool {
     !app.issue_threads.intake_turn(session) && app.issue_threads.automatic_policy(session).is_none()
+        && !app.hub.external_approval_input(session)
 }
 
 pub(crate) struct Turn {
@@ -384,7 +391,7 @@ pub(super) async fn call(
     request: &Value,
     args: &Value,
     caller: Caller,
-    lease: Lease,
+    lease: Option<Lease>,
 ) -> Result<Value> {
     let args: Args = parse_args(args)?;
     ensure!(
@@ -426,14 +433,15 @@ pub(super) async fn call(
         "turn": caller.turn, "request": request,
         "fingerprint": crate::full_approval::fingerprint(&json!([args.command, &scope]))
     });
-    let registration = crate::full_approval::registration(
+    let mut registration = crate::full_approval::registration(
         caller.owner.clone(),
         NAME,
         ApprovalRisk::High,
         identity,
         scope,
     );
-    ensure!(!lease.1.has_changed().unwrap_or(true), "{FULL_REQUIRED}");
+    registration.thread_auto = caller.worker.is_none();
+    ensure!(lease.as_ref().is_none_or(|(_, changes)| !changes.has_changed().unwrap_or(true)), "{FULL_REQUIRED}");
     if !crate::full_approval::authorize(&app.hub, registration)? {
         bail!("{FULL_REQUIRED}");
     }
@@ -442,7 +450,7 @@ pub(super) async fn call(
         command(&args.command, cwd, scratch_path),
         Duration::from_millis(timeout),
         caller.cancelled(),
-        Some(lease),
+        lease,
     )
     .await?;
     let owner = result_spill::Owner::thread(session);

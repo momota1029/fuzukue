@@ -47,7 +47,7 @@ fn request(approval: &PendingApproval) -> Option<(&str, &str)> {
         return None;
     };
     (request_id.starts_with(FOLDER_ACCESS_REQUEST)
-        && matches!(approval.waiter, ApprovalWaiter::Folder))
+        && matches!(approval.waiter, ApprovalWaiter::Folder { .. }))
     .then_some((session.as_str(), message.args.get("path")?.as_str()))
 }
 
@@ -57,11 +57,13 @@ pub(super) fn full_registration(session: &str, job: Option<&str>, folder: &str, 
         owner.job = job.into();
         owner.requester = "worker".into();
     }
-    crate::full_approval::registration(
+    let mut registration = crate::full_approval::registration(
         owner, "folder_read", ApprovalRisk::Mid,
         serde_json::json!({"expiry": "one_hour", "request": request}),
         serde_json::json!({"folder": folder}),
-    )
+    );
+    registration.thread_auto = job.is_none();
+    registration
 }
 
 pub(crate) enum AccessRequest {
@@ -70,7 +72,7 @@ pub(crate) enum AccessRequest {
 }
 
 impl Hub {
-    pub(super) fn plan_folder_sweep(&self, inner: &Inner) -> (Vec<FolderGrant>, Vec<String>) {
+    pub(super) fn plan_folder_sweep(&self, inner: &Inner, thread: Option<&str>) -> (Vec<FolderGrant>, Vec<String>) {
         let mut grants = Vec::new();
         let mut invalid = Vec::new();
         let Ok(store) = inner.folder_store() else { return (grants, invalid) };
@@ -78,6 +80,15 @@ impl Hub {
         let now = chrono::Utc::now().timestamp_millis();
         for (id, pending) in &inner.approvals {
             let Some((session, path)) = request(pending) else { continue };
+            if !matches!(pending.waiter, ApprovalWaiter::Folder { automatic: true })
+                || thread.is_some_and(|thread| thread != session)
+            {
+                continue;
+            }
+            let (full, bypass) = Self::automatic_modes(inner, &full_registration(session, None, path, id));
+            if thread.map_or(!full, |_| !bypass) {
+                continue;
+            }
             if !inner.live_thread(session)
                 || !canonical_folder(Path::new(path), &protected).is_ok_and(|folder| folder == path)
                 || store.active(session, now, inner.current_turn(session)).count()
@@ -122,27 +133,31 @@ impl Hub {
             return Ok(None);
         }
         self.finish_folder_sweep_locked(inner)?;
-        let Some((mode, changes)) = self.full_approval_lease()? else { return Ok(None) };
         ensure!(inner.live_thread(session), "Thread is archived or missing");
         let folder = canonical_folder(path, &inner.folder_store()?.protected())?;
+        let registration = full_registration(session, job, &folder, &crate::mail::session_key());
+        let (full, thread) = Self::automatic_modes(inner, &registration);
+        let lease = if full { self.full_approval_lease()? } else { None };
+        if lease.is_none() && !thread {
+            return Ok(None);
+        }
+        let principal = if lease.is_some() { "full_mode" } else { "thread_mode" };
         let turn = inner.current_turn(session);
         let grant = inner.folder_store()?.active(session, chrono::Utc::now().timestamp_millis(), turn)
-            .find(|grant| grant.path == folder && grant.granted_by == "full_mode");
+            .find(|grant| grant.path == folder && grant.granted_by == principal);
         let id = if let Some(grant) = grant {
             // Old grants remain available to their existing holders. An active mode
             // is required to give the current caller a new reference to one.
-            if changes.has_changed().unwrap_or(true)
-                || mode.expires_at.is_some_and(|at| at <= chrono::Utc::now().timestamp_millis())
-            {
+            if lease.as_ref().is_some_and(|(mode, changes)| changes.has_changed().unwrap_or(true)
+                || mode.expires_at.is_some_and(|at| at <= chrono::Utc::now().timestamp_millis())) {
                 return Ok(None);
             }
             grant.id.clone()
         } else {
-            let full = full_registration(session, job, &folder, &crate::mail::session_key());
-            if !crate::full_approval::authorize(self, full)? {
+            if self.authorize_automatic_locked(inner, registration, None)? != super::approval_store::FullAuthorization::Granted {
                 return Ok(None);
             }
-            self.add_folder_grant_locked(inner, session, folder, FolderGrantExpiry::OneHour, "full_mode")?.id
+            self.add_folder_grant_locked(inner, session, folder, FolderGrantExpiry::OneHour, principal)?.id
         };
         Ok(Some(id))
     }
@@ -165,6 +180,7 @@ impl Hub {
         }
         ensure!(pending < 20, "Too many pending folder access requests");
         let request_id = format!("{FOLDER_ACCESS_REQUEST}{}", crate::mail::session_key());
+        let automatic = !inner.partner_started.get(session).is_some_and(|turn| turn.external_approval_input);
         self.publish_locked(
             &mut inner,
             ServerEvent::ApprovalRequested {
@@ -180,7 +196,7 @@ impl Hub {
                 shell_prefix: None,
             },
             None,
-            ApprovalWaiter::Folder,
+            ApprovalWaiter::Folder { automatic },
         );
         Ok(AccessRequest::Pending(request_id))
     }

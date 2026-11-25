@@ -4653,7 +4653,7 @@ fn question_events_are_additive_for_legacy_clients() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn front_desk_auto_mode_allows_checked_shell_and_keeps_human_exceptions() -> Result<()> {
+async fn front_desk_accept_edits_preserves_the_checked_shell_policy() -> Result<()> {
     use fuzukue_proto::{ChatSettings, PermissionMode};
     use std::os::unix::fs::PermissionsExt;
 
@@ -4691,7 +4691,7 @@ sys.stdin.readline()
     let app = Arc::new(app);
     let id = app.hub.edit_threads(|threads| threads.create(None))?;
     let settings = ChatSettings {
-        permission_mode: PermissionMode::BypassPermissions, ..Default::default()
+        permission_mode: PermissionMode::AcceptEdits, ..Default::default()
     };
     app.hub.edit_threads(|store| store.set_roles(&id, Some(settings.clone()), None))?;
     assert_eq!(app.chat_settings(&id), settings);
@@ -4727,6 +4727,74 @@ sys.stdin.readline()
         assert!(audit);
         assert_eq!(manual, ["Bash: git push", "Bash: pwd", "Bash: pwd", "mcp__fuzukue__file_inbox: {}"]);
         assert_eq!(fs::read_to_string(project.path().join("finished"))?, "ok");
+        Ok::<_, anyhow::Error>(())
+    }).await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn front_desk_claude_sweeps_bash_and_audits_automatic_edits_and_delegation() -> Result<()> {
+    let project = TempProject::new()?;
+    let app = mcp_app(&project);
+    let id = app.hub.edit_threads(|threads| threads.create(None))?;
+    let mut command = tokio::process::Command::new("/usr/bin/python3");
+    command.arg("-c").arg(r#"
+import json, sys
+from pathlib import Path
+def ask(id, tool, input, **flags):
+    print(json.dumps({"type":"control_request", "request_id":id, "request":{
+        "subtype":"can_use_tool", "tool_name":tool, "input":input, **flags
+    }}), flush=True)
+    response = json.loads(sys.stdin.readline())["response"]
+    assert response["request_id"] == id
+    return response["response"]
+json.loads(sys.stdin.readline())
+shell = {"command":"printf 'hello\\n' > example.txt\nprintf 'continued\\n' >> example.txt"}
+assert ask("shell", "Bash", shell) == {"behavior":"allow", "updatedInput":shell}
+assert ask("write", "Write", {"file_path":"example.txt","content":"example"})["behavior"] == "allow"
+assert ask("delegate", "mcp__fuzukue__delegate", {"prompt":"check results"})["behavior"] == "allow"
+assert ask("publish", "mcp__fuzukue__git_push", {})["behavior"] == "deny"
+assert ask("human", "Bash", shell, human_only=True)["behavior"] == "deny"
+Path("front-desk-finished").write_text("ok")
+print(json.dumps({"type":"result","is_error":False}), flush=True)
+sys.stdin.readline()
+"#);
+    let desk = crate::ClaudeSession::spawn_command(command, id.clone(), app.project_dir.clone(), &app, Box::new(|_| {}))?;
+    app.sessions.lock().await.insert(id.clone(), desk.clone());
+    super::auto_approve(app.clone());
+    let mut events = app.hub.subscribe(u64::MAX).1;
+    desk.prompt_with_auth("Edit and check the workspace.", vec![], crate::TurnKind::UserConversation, None, None, vec![]).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut swept = None;
+        let mut human = 0;
+        loop {
+            match events.recv().await?.event {
+                ServerEvent::ApprovalRequested { request_id, summary, .. } if swept.is_none() => {
+                    assert!(summary.starts_with("Bash:"));
+                    swept = Some(request_id.clone());
+                    let mut settings = app.chat_settings(&id);
+                    settings.permission_mode = fuzukue_proto::PermissionMode::BypassPermissions;
+                    super::handle(&app, ClientMsg::SetChatSettings { session: id.clone(), settings }).await?;
+                }
+                ServerEvent::ApprovalRequested { request_id, summary, .. } => {
+                    assert!(summary.starts_with("Bash:") || summary.starts_with("mcp__fuzukue__git_push:"));
+                    assert!(!desk.resolve_auto(&request_id).await?);
+                    super::resolve_approval(&app, request_id, "decline".into(), false).await?;
+                    human += 1;
+                }
+                ServerEvent::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(human, 2);
+        let audit = app.hub.full_approval_settings(None)?.audit;
+        assert_eq!(audit.len(), 3);
+        assert!(audit.iter().all(|row| row.granted_by == "thread_mode" && row.action.args == "[redacted]"));
+        assert!(audit.iter().any(|row| Some(&row.approval_id) == swept.as_ref() && row.action.tool == "Bash"));
+        assert!(audit.iter().any(|row| row.action.tool == "Write"));
+        assert!(audit.iter().any(|row| row.action.tool == "mcp/delegate"));
+        assert_eq!(fs::read_to_string(project.path().join("front-desk-finished"))?, "ok");
         Ok::<_, anyhow::Error>(())
     }).await??;
     Ok(())
@@ -6773,6 +6841,7 @@ async fn list_agents_merges_builtins_and_project_rules_and_partner_gets_only_des
     codex.open_partner(&session, None, crate::codex::PartnerOptions {
         settings: fuzukue_proto::ChatSettings::default(), context: String::new(),
         mcp_url: "http://127.0.0.1/mcp".into(), mcp_key: "fixture".into(), agent_settings: Default::default(),
+        mail_enabled: false,
     }).await?;
     let launch = fs::read_to_string(log)?;
     assert!(launch.contains("notes: Organize research notes"));

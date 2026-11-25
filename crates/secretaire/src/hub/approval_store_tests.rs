@@ -8,6 +8,7 @@ use crate::{Hub, test_support::TestDir};
 
 fn request() -> Registration {
     Registration {
+        thread_auto: false,
         owner: ApprovalOwner {
             thread: "thread-1".into(),
             job: "job-1".into(),
@@ -59,11 +60,11 @@ fn full_approval_grants_one_claim_and_masks_its_history() -> Result<()> {
     desk_push.owner = crate::full_approval::desk_owner("thread-1");
     desk_push.action.tool = "git push".into();
     desk_push.unattended = ApprovalUnattended::NeverUnattended;
-    assert_eq!(queue.authorize_full(push)?, FullAuthorization::Granted);
+    assert_eq!(queue.authorize_full(push)?, FullAuthorization::Human);
     let pending = queue.register(desk_push)?;
     assert_eq!(queue.pending()?.0[0].approval_id, pending);
     let audit = queue.full_settings(None)?;
-    assert_eq!(audit.audit.len(), 2);
+    assert_eq!(audit.audit.len(), 1);
     assert!(audit.audit.iter().all(|entry| entry.granted_by == "full_mode" && entry.action.args == json!("[redacted]")));
     assert_eq!(audit.last_24_hours_by_tool["fs_write"], 1);
 

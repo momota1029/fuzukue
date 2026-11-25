@@ -2222,12 +2222,12 @@ impl Workbench {
                     self.workshop.approvals.push((request_id, i18n::Message { fallback: summary, localized }));
                 }
             }
-            ServerEvent::ApprovalRequested { session, request_id, actor, summary, localized, .. } => {
+            ServerEvent::ApprovalRequested { session, request_id, actor, summary, localized, shell_directory, .. } => {
                 let summary = i18n::Message { fallback: summary, localized };
                 if actor == fuzukue_proto::Actor::System && request_id.starts_with(fuzukue_proto::GIT_APPROVAL) {
                     self.thread_info.git.show_approval(&session, &request_id, &summary);
                 }
-                self.chat(&session, cx).request_approval(request_id, actor, summary, cx);
+                self.chat(&session, cx).request_approval(request_id, actor, summary, shell_directory.is_some(), cx);
             }
             ServerEvent::ApprovalResolved { request_id, decision, automatic } => {
                 self.thread_info.git.clear_approval(&request_id);

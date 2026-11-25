@@ -83,6 +83,7 @@ async fn receive(
 
 fn request(thread: &str, job: &str) -> Registration {
     Registration {
+        thread_auto: false,
         owner: ApprovalOwner {
             thread: thread.into(),
             job: job.into(),

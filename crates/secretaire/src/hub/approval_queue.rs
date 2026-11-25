@@ -3,7 +3,7 @@ use std::{path::Path, sync::{Arc, Weak}, time::Duration};
 use anyhow::{Context, Result};
 use fuzukue_proto::{
     ApprovalDecision, ApprovalOwner, ApprovalSummary, FullApprovalChange, FullApprovalMode,
-    FullApprovalSettings, ServerEvent,
+    FullApprovalSettings, PermissionMode, ServerEvent,
 };
 use tokio::sync::broadcast;
 
@@ -53,10 +53,12 @@ impl Hub {
         self.finish_folder_sweep_locked(&mut inner)?;
 
         let mut legacy: Vec<_> = inner.approvals.iter().filter_map(|(id, pending)| {
-            let full = pending.full.as_ref().filter(|_| pending.live())?;
+            let full = pending.full.as_ref().filter(|full| {
+                pending.live() && Self::automatic_modes(&inner, &full.registration).0
+            })?;
             Some((id.clone(), full.registration.clone()))
         }).collect();
-        let (folders, invalid) = self.plan_folder_sweep(&inner);
+        let (folders, invalid) = self.plan_folder_sweep(&inner, None);
         legacy.extend(folders.iter().map(|grant| {
             (grant.id.clone(), super::folder_grants::full_registration(&grant.session, None, &grant.path, &grant.id))
         }));
@@ -116,7 +118,7 @@ impl Hub {
         resume: impl FnOnce(bool) + Send + 'static,
     ) -> Result<FullAuthorization> {
         let mut inner = self.inner.lock().unwrap();
-        let authorization = self.authorize_full_approval(registration.clone())?;
+        let authorization = self.authorize_automatic_locked(&inner, registration.clone(), None)?;
         if authorization == FullAuthorization::Human {
             let ServerEvent::ApprovalRequested { request_id, .. } = &event else {
                 unreachable!("only approval requests can have a resumption");
@@ -132,6 +134,70 @@ impl Hub {
             }
         }
         Ok(authorization)
+    }
+
+    pub(super) fn automatic_modes(inner: &Inner, registration: &Registration) -> (bool, bool) {
+        if !registration.thread_auto {
+            return (true, false);
+        }
+        if registration.owner.requester == "front_desk"
+            && inner.partner_started.get(&registration.owner.thread).is_some_and(|turn| turn.external_approval_input)
+        {
+            return (false, false);
+        }
+        let mode = inner.threads.as_ref()
+            .and_then(|store| store.role_settings(&registration.owner.thread))
+            .map(|(settings, _)| settings.permission_mode);
+        (
+            !matches!(mode, Some(PermissionMode::Default | PermissionMode::Plan)),
+            mode == Some(PermissionMode::BypassPermissions),
+        )
+    }
+
+    pub(super) fn authorize_automatic_locked(
+        &self, inner: &Inner, request: Registration, legacy_id: Option<&str>,
+    ) -> Result<FullAuthorization> {
+        let (full, thread) = Self::automatic_modes(inner, &request);
+        if let Some(queue) = self.approval_queue.get().filter(|_| !crate::canary()) {
+            queue.authorize_automatic(request, full, thread, legacy_id)
+        } else {
+            Ok(FullAuthorization::Human)
+        }
+    }
+
+    pub(crate) fn sweep_thread_approvals(&self, session: &str) -> Result<()> {
+        if crate::canary() {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let pending: Vec<_> = inner.approvals.iter().filter_map(|(id, pending)| {
+            let full = pending.full.as_ref()?;
+            let request = &full.registration;
+            (pending.live() && request.owner.thread == session && Self::automatic_modes(&inner, request).1)
+                .then(|| (id.clone(), request.clone()))
+        }).collect();
+        for (id, request) in pending {
+            let decision = self.authorize_automatic_locked(&inner, request, Some(&id))?;
+            if decision == FullAuthorization::Human {
+                continue;
+            }
+            let full = inner.approvals.get_mut(&id).unwrap().full.take().unwrap();
+            let granted = decision == FullAuthorization::Granted;
+            self.publish_locked(&mut inner, ServerEvent::ApprovalResolved {
+                request_id: id, decision: if granted { "accept" } else { "decline" }.into(), automatic: true,
+            }, None, ApprovalWaiter::Backend);
+            (full.resume)(granted);
+        }
+        let (folders, invalid) = self.plan_folder_sweep(&inner, Some(session));
+        if !folders.is_empty() {
+            self.approval_queue()?.stage_thread_folders(folders)?;
+        }
+        for request_id in invalid {
+            self.publish_locked(&mut inner, ServerEvent::ApprovalResolved {
+                request_id, decision: "cancelled".into(), automatic: false,
+            }, None, ApprovalWaiter::Backend);
+        }
+        self.finish_folder_sweep_locked(&mut inner)
     }
 
     // The producer holds its own waiter lock. Taking this slot prevents a mode
@@ -164,11 +230,25 @@ impl Hub {
     }
 
     pub(crate) fn authorize_full_approval(&self, request: Registration) -> Result<FullAuthorization> {
-        if let Some(queue) = self.approval_queue.get().filter(|_| !crate::canary()) {
-            queue.authorize_full(request)
-        } else {
-            Ok(FullAuthorization::Human)
+        if !request.thread_auto {
+            return match self.approval_queue.get().filter(|_| !crate::canary()) {
+                Some(queue) => queue.authorize_full(request),
+                None => Ok(FullAuthorization::Human),
+            };
         }
+        self.authorize_automatic_locked(&self.inner.lock().unwrap(), request, None)
+    }
+
+    pub(crate) fn desk_automatic(&self, session: &str, fallback: PermissionMode) -> Result<bool> {
+        if crate::canary() {
+            return Ok(false);
+        }
+        let mode = self.role_settings(session).map_or(fallback, |(settings, _)| settings.permission_mode);
+        Ok(match mode {
+            PermissionMode::Default | PermissionMode::Plan => false,
+            PermissionMode::AcceptEdits => self.full_approval_lease()?.is_some(),
+            PermissionMode::BypassPermissions => true,
+        })
     }
 
     pub(crate) fn pending_approvals(

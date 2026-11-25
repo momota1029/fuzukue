@@ -629,7 +629,14 @@ impl Workspace {
         actor: Actor,
         operation: RemoteOperation,
     ) -> Result<String> {
-        self.git_remote_expected(session, actor, operation, None).await
+        self.git_remote_with_approval(session, actor, operation, None).await
+    }
+
+    pub(crate) async fn git_remote_with_approval(
+        &self, session: &str, actor: Actor, operation: RemoteOperation,
+        full: Option<crate::hub::approval_store::Registration>,
+    ) -> Result<String> {
+        self.git_remote_inner(session, actor, operation, None, full).await
     }
 
     pub(crate) async fn git_remote_expected(
@@ -638,6 +645,13 @@ impl Workspace {
         actor: Actor,
         operation: RemoteOperation,
         expected: Option<(&str, &str)>,
+    ) -> Result<String> {
+        self.git_remote_inner(session, actor, operation, expected, None).await
+    }
+
+    async fn git_remote_inner(
+        &self, session: &str, actor: Actor, operation: RemoteOperation,
+        expected: Option<(&str, &str)>, full: Option<crate::hub::approval_store::Registration>,
     ) -> Result<String> {
         let (key, label, message) = match operation {
             RemoteOperation::Push => ("approval-git-push", "Git push", "プッシュした"),
@@ -681,7 +695,7 @@ impl Workspace {
         let summary = fuzukue_proto::LocalizedMessage::new(
             key, [("source", source), ("destination", destination), ("urls", urls)],
         );
-        mutation.approve(fuzukue_proto::GIT_APPROVAL, actor, summary).await?;
+        mutation.approve_with_full(fuzukue_proto::GIT_APPROVAL, actor, summary, full).await?;
         let result = mutation.run(async {
             let _guard = self.git_lock.lock().await;
             let repo = Repo::open(&self.project_dir).await?;

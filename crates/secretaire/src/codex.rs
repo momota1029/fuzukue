@@ -33,8 +33,10 @@ struct ThreadInfo {
     parent_tool_use: Option<String>,
     read_only: bool,
     worker_execution: Option<crate::worker_execution::Policy>,
+    worker_external_approval: bool,
     current_turn: Option<String>,
     exec: Option<(String, Arc<crate::cancellation::Cancellation>)>,
+    trusted_approval_turn: bool,
     /// 最後の final_answer
     last_answer: String,
     acted_or_asked: bool,
@@ -63,6 +65,7 @@ pub(crate) struct PartnerOptions {
     pub mcp_url: String,
     pub mcp_key: String,
     pub agent_settings: fuzukue_proto::AgentSettings,
+    pub mail_enabled: bool,
 }
 
 impl PartnerOptions {
@@ -73,7 +76,7 @@ impl PartnerOptions {
     fn policy(&self) -> &'static str {
         match self.mode() {
             PermissionMode::Default => "untrusted",
-            PermissionMode::Plan | PermissionMode::BypassPermissions => "never",
+            PermissionMode::Plan => "never",
             _ => "on-request",
         }
     }
@@ -85,8 +88,8 @@ impl PartnerOptions {
         }
     }
 
-    fn turn_params(&self, project: &Path) -> Value {
-        let sandbox = if self.sandbox() == "read-only" {
+    fn turn_params(&self, project: &Path, restricted: bool) -> Value {
+        let sandbox = if restricted || self.sandbox() == "read-only" {
             json!({"type": "readOnly", "networkAccess": false})
         } else {
             json!({"type": "workspaceWrite", "writableRoots": [project], "networkAccess": false})
@@ -94,7 +97,7 @@ impl PartnerOptions {
         json!({
             "model": self.settings.model,
             "effort": self.settings.effort,
-            "approvalPolicy": self.policy(),
+            "approvalPolicy": if restricted && self.mode() != PermissionMode::Plan { "untrusted" } else { self.policy() },
             "approvalsReviewer": "user",
             "sandboxPolicy": sandbox,
             "summary": "auto",
@@ -457,7 +460,7 @@ impl Codex {
                         "url": options.mcp_url,
                         "http_headers": {"Authorization": format!("Bearer {}", options.mcp_key)},
                         "tool_timeout_sec": crate::capture::mcp_tool_timeout(),
-                        "tools": crate::mcp::codex_tool_policy(None),
+                        "tools": crate::mcp::codex_desk_tool_policy(),
                     }
                 }
             }
@@ -513,6 +516,13 @@ impl Codex {
         Ok(confirm.then(|| Actor::Codex { thread_id: id.clone(), parent_tool_use: None }))
     }
 
+    pub(crate) fn trusted_approval_turn(&self, session: &str, key: &str) -> bool {
+        self.threads.lock().unwrap().values().any(|thread| {
+            thread.session == session && thread.trusted_approval_turn
+                && thread.partner.as_ref().is_some_and(|partner| partner.mcp_key == key)
+        })
+    }
+
     /// 新しいスレッドを作る。作業ディレクトリへの書き込みは許し、それ以外は承認を求めさせる。
     pub async fn start_thread(&self, session: &str, parent_tool_use: Option<String>, launch: Option<&crate::delegate::WorkerLaunch>) -> Result<String> {
         // A legacy worker can start before its parent tool event arrives.
@@ -531,6 +541,9 @@ impl Codex {
         let thread = self.start_thread_with_policy(
             cwd, session, Some(job.into()), false, Some(settings), resume, Some(launch),
         ).await?;
+        if let Some(thread) = self.threads.lock().unwrap().get_mut(&thread) {
+            thread.worker_external_approval = steering.external_approval();
+        }
         let observed = self.threads.lock().unwrap().get(&thread).map(|thread| RunMetadata {
             model: thread.observed.model.clone(),
             effort: thread.observed.effort.clone(),
@@ -873,8 +886,10 @@ impl Codex {
                 parent_tool_use,
                 read_only,
                 worker_execution: None,
+                worker_external_approval: false,
                 current_turn: None,
                 exec: None,
+                trusted_approval_turn: false,
                 last_answer: String::new(),
                 acted_or_asked: false,
                 waiter: None,
@@ -942,6 +957,7 @@ impl Codex {
             before_submit()?;
             t.waiter = Some(tx);
             t.exec = kind.user_conversation().then(|| (exec.id.clone(), exec.cancel.clone()));
+            t.trusted_approval_turn = !matches!(kind, TurnKind::ExternalInput);
             t.last_answer.clear();
             t.acted_or_asked = false;
             t.streamed.clear();
@@ -954,7 +970,9 @@ impl Codex {
                     stats.effort.clone_from(&options.settings.effort);
                     self.session_stats.update(&self.hub, &t.session, "codex", |s| stats.apply_metadata(s));
                 }
-                options.turn_params(&self.project_dir)
+                let restricted = matches!(kind, TurnKind::ExternalInput) || self.hub.external_approval_input(&t.session)
+                    || options.mail_enabled && self.hub.desk_automatic(&t.session, options.mode()).unwrap_or(false);
+                options.turn_params(&self.project_dir, restricted)
             })
         };
         let started = self
@@ -979,6 +997,7 @@ impl Codex {
             Err(error) => {
                 if let Some(t) = self.threads.lock().unwrap().get_mut(thread_id) {
                     t.waiter = None;
+                    t.trusted_approval_turn = false;
                     t.relay_reply = None;
                 }
                 return Err(error);
@@ -1081,7 +1100,8 @@ impl Codex {
     }
 
     pub async fn interrupt(&self, thread_id: &str) -> Result<()> {
-        let turn = self.threads.lock().unwrap().get(thread_id).and_then(|t| {
+        let turn = self.threads.lock().unwrap().get_mut(thread_id).and_then(|t| {
+            t.trusted_approval_turn = false;
             if let Some((_, cancel)) = &t.exec {
                 cancel.cancel();
             }
@@ -1243,8 +1263,7 @@ impl Codex {
             tracing::debug!(thread_id, method, params = %p, "Codex reviewer request");
         }
         let reason = p["reason"].as_str().map(|reason| format!(" · {reason}")).unwrap_or_default();
-        let permissions = (method == "item/permissions/requestApproval" && matches!(&thread,
-            Some((_, Actor::Codex { parent_tool_use: Some(_), .. }, false))))
+        let permissions = (method == "item/permissions/requestApproval" && matches!(&thread, Some((_, _, false))))
             .then(|| p["permissions"].clone());
         let summary = match method {
             "item/commandExecution/requestApproval" => Some(fuzukue_proto::LocalizedMessage::new(
@@ -1261,16 +1280,21 @@ impl Codex {
         };
         let mut full = None;
         if let (Some(_), Some((session, Actor::Codex { parent_tool_use: Some(job), .. }, false))) = (&summary, &thread) {
-            let execution = self.threads.lock().unwrap().get(thread_id).and_then(|thread| thread.worker_execution);
+            let (execution, external) = self.threads.lock().unwrap().get(thread_id)
+                .map(|thread| (thread.worker_execution, thread.worker_external_approval))
+                .unwrap_or_default();
             let request = format!("{thread_id}:{id}");
-            let registration = crate::full_approval::worker_registration(session, job, "codex", method, &request, p);
+            let mut registration = crate::full_approval::worker_registration(session, job, "codex", method, &request, p);
+            if external {
+                registration.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
+            }
             let decision = self.hub.authorize_full_approval(registration.clone());
             full = Some(registration);
             use crate::hub::approval_store::FullAuthorization::*;
             let accept = match decision {
                 Ok(Granted) => Some(true),
                 Ok(AlreadyConsumed) => return,
-                Ok(Human) if execution.is_some_and(|policy| !policy.full && policy.approval != crate::worker_execution::Approval::Ask) => Some(true),
+                Ok(Human) if !external && execution.is_some_and(|policy| !policy.full && policy.approval != crate::worker_execution::Approval::Ask) => Some(true),
                 Ok(Human) => None,
                 Err(error) => {
                     tracing::warn!(%error, %job, "Codex worker approval not granted");
@@ -1281,6 +1305,13 @@ impl Codex {
                 let result = approval_result(permissions, if accept { "accept" } else { "decline" });
                 let _ = self.write(json!({ "jsonrpc": "2.0", "id": id, "result": result })).await;
                 return;
+            }
+        }
+        if let (Some(_), Some((session, Actor::Codex { parent_tool_use: None, .. }, false))) = (&summary, &thread) {
+            let trusted = self.threads.lock().unwrap().get(thread_id)
+                .is_some_and(|thread| thread.partner.is_some() && thread.trusted_approval_turn);
+            if trusted && !self.hub.external_approval_input(session) {
+                full = Some(crate::full_approval::desk_registration(session, "codex", method, &format!("{thread_id}:{id}"), p));
             }
         }
         match (summary, thread) {
@@ -1425,6 +1456,21 @@ impl Codex {
             if full {
                 if let (Some(tool), Actor::Codex { parent_tool_use: Some(job), .. }) = (native, &actor) {
                     crate::full_approval::observe_worker_tool(&self.hub, &session, job, "codex", tool, &item_id);
+                }
+            }
+            if !read_only && matches!(&actor, Actor::Codex { parent_tool_use: None, .. }) {
+                let trusted = self.threads.lock().unwrap().get(thread_id)
+                    .is_some_and(|thread| thread.partner.is_some() && thread.trusted_approval_turn);
+                let tool = match item["type"].as_str() {
+                    Some("commandExecution") => Some("item/commandExecution/requestApproval"),
+                    Some("fileChange") => Some("item/fileChange/requestApproval"),
+                    _ => None,
+                };
+                if let Some(tool) = tool.filter(|_| trusted && !self.hub.external_approval_input(&session)) {
+                    let request = crate::full_approval::desk_registration(&session, "codex", tool, &item_id, item);
+                    if let Err(error) = self.hub.authorize_full_approval(request) {
+                        tracing::warn!(%error, "Could not audit native Codex operation");
+                    }
                 }
             }
         }
@@ -1637,6 +1683,7 @@ impl Codex {
                     let mut threads = self.threads.lock().unwrap();
                     threads.get_mut(thread_id).and_then(|t| {
                         t.current_turn = None;
+                        t.trusted_approval_turn = false;
                         if let Some((_, cancel)) = t.exec.take() { cancel.cancel(); }
                         if t.stats.is_some() && t.waiter.is_some() {
                             self.session_stats.update(&self.hub, &session, "codex", |stats| {
@@ -1755,6 +1802,72 @@ mod tests {
                 ServerEvent::ToolResult { ok: false, output, .. } if output == expected));
         }
         codex.close_worker(&thread).await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn front_desk_codex_auto_approval_respects_opt_out_and_external_turns() -> Result<()> {
+        use fuzukue_proto::{FullApprovalChange, FullApprovalDuration};
+        let project = tempfile::tempdir()?;
+        let hub = Arc::new(Hub::with_timeline(project.path()));
+        hub.init_approval_queue("fixture".into(), project.path());
+        hub.load_threads(project.path(), project.path());
+        let session = hub.edit_threads(|store| store.create(None))?;
+        let fixture = Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/shots/codex"));
+        let codex = Codex::spawn_command(fixture, project.path(), hub.clone(),
+            Arc::new(Usage::new(hub.clone())), Default::default()).await?;
+        let (thread, _) = codex.open_partner(&session, None, PartnerOptions {
+            settings: ChatSettings::default(), context: String::new(), mcp_url: "http://127.0.0.1/mcp".into(),
+            mcp_key: "key".into(), agent_settings: Default::default(), mail_enabled: false,
+        }).await?;
+        let make_trusted = || {
+            codex.threads.lock().unwrap().get_mut(&thread).unwrap().trusted_approval_turn = true;
+        };
+        make_trusted();
+        let mut events = hub.subscribe(u64::MAX).1;
+        fn requested(events: &mut tokio::sync::broadcast::Receiver<fuzukue_proto::Envelope>) -> Option<String> {
+            std::iter::from_fn(|| events.try_recv().ok()).find_map(|env| match env.event {
+                ServerEvent::ApprovalRequested { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+        }
+        let command = json!({"threadId": thread, "command": "printf test > example.txt"});
+        let shell = "item/commandExecution/requestApproval";
+        codex.on_server_request(shell, json!(1000), &command).await;
+        let Some(request_id) = requested(&mut events) else {
+            bail!("AcceptEdits must retain its shell confirmation");
+        };
+        let principal = crate::remote::SettingsPrincipal::fixture();
+        hub.set_full_approval(FullApprovalChange::Full { duration: FullApprovalDuration::OneHour }, &principal)?;
+        assert!(matches!(events.try_recv()?.event, ServerEvent::ApprovalResolved {
+            request_id: id, decision, automatic: true,
+        } if id == request_id && decision == "accept"));
+        codex.on_server_request("item/fileChange/requestApproval", json!(1001), &command).await;
+        assert!(events.try_recv().is_err());
+        for (id, mode) in [(1002, PermissionMode::Default), (1005, PermissionMode::Plan)] {
+            hub.edit_threads(|store| store.set_partner_permission(&session, mode))?;
+            codex.on_server_request(shell, json!(id), &command).await;
+            let Some(request_id) = requested(&mut events) else {
+                bail!("{mode:?} must retain shell confirmation during workspace full approval");
+            };
+            assert!(codex.resolve(&request_id, "decline", false).await?);
+        }
+        hub.set_full_approval(FullApprovalChange::Off, &principal)?;
+        hub.edit_threads(|store| store.set_partner_permission(&session, PermissionMode::BypassPermissions))?;
+        codex.on_server_request(shell, json!(1003), &command).await;
+        assert!(requested(&mut events).is_none());
+        codex.threads.lock().unwrap().get_mut(&thread).unwrap().trusted_approval_turn = false;
+        codex.on_server_request(shell, json!(1004), &command).await;
+        let Some(request_id) = requested(&mut events) else {
+            bail!("An external turn must retain shell confirmation");
+        };
+        hub.sweep_thread_approvals(&session)?;
+        assert!(events.try_recv().is_err());
+        assert!(codex.resolve(&request_id, "decline", false).await?);
+        let audit = hub.full_approval_settings(None)?.audit;
+        assert_eq!(audit.iter().filter(|entry| entry.granted_by == "full_mode").count(), 2);
+        assert_eq!(audit.iter().filter(|entry| entry.granted_by == "thread_mode").count(), 1);
         Ok(())
     }
 

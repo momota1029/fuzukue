@@ -47,6 +47,7 @@ pub(crate) fn asks_question(text: &str) -> bool {
 #[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 pub(crate) enum TurnKind {
     Conversation,
+    ExternalInput,
     UserConversation,
     Escalated,
     Nudge,

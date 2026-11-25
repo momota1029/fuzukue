@@ -119,25 +119,38 @@ impl<'a> Mutation<'a> {
         actor: Actor,
         summary: LocalizedMessage,
     ) -> Result<()> {
+        self.approve_with_full(prefix, actor, summary, None).await
+    }
+
+    pub(crate) async fn approve_with_full(
+        &self, prefix: &str, actor: Actor, summary: LocalizedMessage,
+        full: Option<crate::hub::approval_store::Registration>,
+    ) -> Result<()> {
         let admission = self.admission.clone();
         let cancel = self.cancel.clone();
         // Human response time does not count against the execution deadline.
-        let decision = tokio::select! {
+        let reply = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(anyhow!(update_busy())),
-            decision = delegate::request_mutation_approval(self.app, self.session, prefix, actor, summary, move || {
+            decision = delegate::request_mutation_approval(self.app, self.session, prefix, actor, summary, full, move || {
                 cancel.check().is_ok() && admission.is_none_or(|(update, epoch)| {
                     // The original permit remains held while the answer is delivered and used.
                     update.admit_mutation(Some(epoch)).is_ok()
                 })
             }) => decision?,
         };
+        if reply.mode_grant {
+            self.cancel.check().context(update_busy())?;
+            if let Some((update, epoch)) = &self.admission {
+                update.admit_mutation(Some(*epoch)).context(update_busy())?;
+            }
+        }
         ensure!(
-            decision != delegate::MUTATION_APPROVAL_EXPIRED,
+            reply.decision != delegate::MUTATION_APPROVAL_EXPIRED,
             "{}",
             update_busy()
         );
-        ensure!(decision == "accept", "利用者が承認しなかった");
+        ensure!(reply.decision == "accept", "利用者が承認しなかった");
         Ok(())
     }
 
