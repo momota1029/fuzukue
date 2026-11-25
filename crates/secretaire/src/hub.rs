@@ -469,6 +469,17 @@ impl Hub {
         Ok(change)
     }
 
+    pub(crate) fn dismiss_delegate(&self, session: &str, job: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(job.starts_with(fuzukue_proto::DELEGATE_JOB), "Job not found in this thread");
+        let mut inner = self.inner.lock().unwrap();
+        if inner.threads.as_mut().expect("Workspace initializes the thread store").dismiss_delegate(session, job)? {
+            self.publish_locked(&mut inner, ServerEvent::DelegateDismissed {
+                session: session.into(), job: job.into(),
+            }, None, ApprovalWaiter::Backend);
+        }
+        Ok(())
+    }
+
     pub fn publish(&self, event: ServerEvent) {
         self.publish_event(event, None);
     }
@@ -657,6 +668,9 @@ impl Hub {
                     if saved.get("rename_history").is_some() {
                         input["label"] = saved["label"].clone();
                         input["label_source"] = saved["label_source"].clone();
+                    }
+                    if saved["dismissed_from_panel"].as_bool() == Some(true) {
+                        input["dismissed_from_panel"] = true.into();
                     }
                 }
             }
@@ -1201,6 +1215,9 @@ fn retain_replay_event(event: &mut ServerEvent) -> bool {
 
 fn tool_key(event: &ServerEvent) -> Option<(&str, &str, bool)> {
     match event {
+        // The transcript has current job metadata, including edits made after the call.
+        ServerEvent::ToolCall { item, name, .. }
+            if name == "delegate" && item.starts_with(fuzukue_proto::DELEGATE_JOB) => None,
         ServerEvent::ToolCall { session, item, .. } => Some((session, item, false)),
         ServerEvent::ToolResult { session, item, .. } => Some((session, item, true)),
         _ => None,

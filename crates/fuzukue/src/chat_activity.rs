@@ -374,10 +374,7 @@ impl Workbench {
             }).collect();
         jobs.sort_unstable_by_key(|(row, _)| *row);
         if self.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL {
-            jobs.extend(chat.rows.iter().enumerate().rev().filter_map(|(row, entry)| match &entry.content {
-                Content::Delegate(block) if block.report.is_some() => Some((row, block)),
-                _ => None,
-            }));
+            jobs.extend(chat.finished_panel_jobs());
         }
         let state = panel.read(cx);
         let selected = jobs
@@ -493,7 +490,7 @@ impl Workbench {
                             }),
                     );
             }
-            if self.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL {
+            if running && self.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL {
                 actions = actions.child(self.rename_job_button(session, block, activity_id(&format!("job-rename-{index}"))));
             }
             let job_id = block.id.clone();
@@ -525,6 +522,17 @@ impl Workbench {
                                         .child(this.chat_markdown("job-report-text".into(), fuzukue_view::link_card_refs(&text), chat, cx))
                                         .children((!changes.is_empty()).then(|| div().whitespace_normal().child(changes.clone()))))
                             });
+                        }),
+                );
+            }
+            if !running && self.protocol >= fuzukue_proto::JOB_DISMISS_PROTOCOL {
+                let command = ClientMsg::DismissJob { session: session.to_owned(), job: block.id.clone() };
+                let out = self.out.clone();
+                actions = actions.child(
+                    inline_button(activity_id(&format!("job-dismiss-{index}"))).tab_stop(true)
+                        .label(tr!("chat-job-dismiss"))
+                        .on_click(move |_, _, _| {
+                            let _ = out.send(command.clone());
                         }),
                 );
             }
@@ -823,6 +831,7 @@ mod tests {
                 routing: None,
                 touches: None,
                 waiting: None,
+                dismissed_from_panel: false,
             },
             summary: None,
             progress: vec![

@@ -5781,6 +5781,79 @@ async fn front_desk_cancels_queued_and_running_delegates_through_approval() -> R
 }
 
 #[tokio::test]
+async fn dismiss_finished_jobs_updates_live_clients_and_saved_history() -> Result<()> {
+    use crate::{delegate::JobView, hub::TranscriptResume};
+
+    let project = TempProject::new()?;
+    let app = mcp_app(&project);
+    let session = app.hub.edit_threads(|threads| threads.create(None))?;
+    let other = app.hub.edit_threads(|threads| threads.create(None))?;
+    let (initial, _) = app.hub.subscribe_transcripts(0, &TranscriptResume::default());
+    let epoch = initial.into_iter().find_map(|env| match env.event {
+        ServerEvent::ThreadSync { epoch, .. } => Some(epoch),
+        _ => None,
+    }).context("missing transcript epoch")?;
+    let resume = TranscriptResume {
+        epoch: Some(epoch),
+        cached_sessions: vec![fuzukue_proto::CachedSession { session: session.clone(), generation: 0 }],
+    };
+    let dismiss = |session: &str, job: &str| ClientMsg::DismissJob { session: session.into(), job: job.into() };
+    let jobs = [
+        ("delegate:done", true, false),
+        ("delegate:failed", false, false),
+        ("delegate:stopped", false, true),
+    ];
+    for (job, ok, interrupted) in jobs {
+        app.hub.publish(ServerEvent::ToolCall {
+            session: session.clone(), item: job.into(), name: "delegate".into(), actor: Actor::System,
+            input: json!({"title": "Check the citations", "model": "test", "started_at_ms": 1}),
+        });
+        assert!(handle(&app, dismiss(&session, job)).await.is_err());
+
+        let report = json!({"elapsed_ms": 1000, "text": "Final report", "interrupted": interrupted}).to_string();
+        app.hub.publish(ServerEvent::TextDelta {
+            session: session.clone(), item: format!("{job}:message"), actor: Actor::System, text: "Worker message".into(),
+        });
+        app.hub.publish(ServerEvent::ToolResult {
+            session: session.clone(), item: job.into(), ok, output: report,
+        });
+        assert!(handle(&app, dismiss(&other, job)).await.is_err());
+        let status = app.delegates.job_status(&app, job, JobView::Full)?;
+        assert_eq!(status["final_report"], "Final report");
+
+        let (_, mut live) = app.hub.subscribe(u64::MAX);
+        handle(&app, dismiss(&session, job)).await?;
+        handle(&app, dismiss(&session, job)).await?;
+        let event = live.try_recv()?;
+        assert!(matches!(&event.event, ServerEvent::DelegateDismissed { session: owner, job: id }
+            if owner == &session && id == job));
+        assert!(live.try_recv().is_err());
+        let (reconnect, _) = app.hub.subscribe_transcripts(event.seq - 1, &resume);
+        assert!(reconnect.iter().any(|env| env.seq == event.seq
+            && matches!(env.event, ServerEvent::DelegateDismissed { .. })));
+        assert_eq!(app.delegates.job_status(&app, job, JobView::Full)?, status);
+    }
+
+    let ServerEvent::ThreadTail { events: tail, .. } = app.hub.thread_tail(session.clone(), 1) else {
+        anyhow::bail!("missing thread tail");
+    };
+    let empty_state = TestDir::new();
+    let saved = threads::Store::load(project.path(), empty_state.path(), &Default::default());
+    let (reloaded, _, _) = saved.history_tail(&session, &Default::default(), |event| event).unwrap();
+    for events in [&tail, &reloaded] {
+        for (job, ok, _) in jobs {
+            assert!(events.iter().any(|event| matches!(event, ServerEvent::ToolCall { item, input, .. }
+                if item == job && input["dismissed_from_panel"] == true)));
+            assert!(events.iter().any(|event| matches!(event, ServerEvent::ToolResult { item, ok: result, output, .. }
+                if item == job && *result == ok && output.contains("Final report"))));
+            assert!(events.iter().any(|event| matches!(event, ServerEvent::TextDelta { item, text, .. }
+                if item == &format!("{job}:message") && text == "Worker message")));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_delegate_returns_immediately_and_jobs_run_concurrently() -> Result<()> {
     use fuzukue_proto::{DelegateJob, DelegateReport, DelegateSettings, DELEGATE_JOB};
     let project = TempProject::new()?;

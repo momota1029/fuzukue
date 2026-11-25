@@ -174,6 +174,7 @@ chat-activity-full-message = Full message
 chat-job-list = Jobs
 chat-job-name = Display name
 chat-job-rename = Rename
+chat-job-dismiss = Remove from list
 chat-job-save = Save name
 chat-job-cancel = Cancel
 chat-job-name-help = Up to { $columns } display columns. A longer name is shortened in the list and kept in details.

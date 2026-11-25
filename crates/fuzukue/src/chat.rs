@@ -936,6 +936,14 @@ impl Chat {
         }
     }
 
+    pub(super) fn delegate_dismissed(&mut self, job: &str) {
+        if let Some(&row) = self.by_item.get(job) {
+            if let Content::Delegate(block) = &mut self.rows[row].content {
+                block.job.dismissed_from_panel = true;
+            }
+        }
+    }
+
     pub(super) fn delegate_progress(&mut self, job: &str, summary: String, cx: &mut Context<Workbench>) {
         if summary.trim().is_empty() {
             return;
@@ -999,6 +1007,7 @@ impl Chat {
                             self.pending_delegates.insert(item.clone());
                         }
                         started &= block.job.started_at_ms.is_none() && block.report.is_none();
+                        job.dismissed_from_panel |= block.job.dismissed_from_panel;
                         block.job = job;
                         self.remeasure(row, cx);
                     }
@@ -1230,6 +1239,13 @@ impl Chat {
                 Content::Delegate(block) => Some((row, &block.job)),
                 _ => None,
             }
+        })
+    }
+
+    fn finished_panel_jobs(&self) -> impl Iterator<Item = (usize, &DelegateBlock)> {
+        self.rows.iter().enumerate().rev().filter_map(|(row, entry)| match &entry.content {
+            Content::Delegate(block) if block.report.is_some() && !block.job.dismissed_from_panel => Some((row, block)),
+            _ => None,
         })
     }
 
@@ -2752,7 +2768,7 @@ impl Workbench {
         let height = snap_chat_height(window.rem_size() * 1.5, window.scale_factor());
         let has_commands = self.chat_waiting.has_background_commands(&self.active);
         let has_finished_jobs = self.protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL
-            && chat.rows.iter().any(|row| matches!(&row.content, Content::Delegate(block) if block.report.is_some()));
+            && chat.finished_panel_jobs().next().is_some();
         let goal_status = self.chat_waiting.static_goal_status(&self.active, chat)
             .filter(|_| !has_commands && !has_finished_jobs);
         chat_column().id("chat-status-strip").relative().flex_none().h(height).flex().items_start().gap_2()
@@ -5636,7 +5652,7 @@ mod one_voice_tests {
             agent: Some("Reviewer".into()), title: Some("Check proof".into()), model: String::new(),
             display: Default::default(), queued_at_ms: None,
             started_at_ms: Some(1000), selection: None, routing: None,
-            touches: None, waiting: None,
+            touches: None, waiting: None, dismissed_from_panel: false,
         };
         let waiting = DelegateJob { title: None, started_at_ms: None, ..running.clone() };
         let second = DelegateJob { started_at_ms: Some(55_000), ..running.clone() };
@@ -5742,7 +5758,7 @@ mod one_voice_tests {
             agent: None, title: None, model: String::new(),
             display: Default::default(), queued_at_ms: None,
             started_at_ms: Some(1_000), selection: None, routing: None,
-            touches: None, waiting: None,
+            touches: None, waiting: None, dismissed_from_panel: false,
         };
         assert_eq!(activity_summary(Some(&tool), &[&worker], None, 66_000),
             (format!("{tool_label}{STATUS_SEPARATOR}{}", tr!("chat-status-workers", count = 1)),
@@ -5781,7 +5797,7 @@ mod one_voice_tests {
                 effort: Some("high".into()),
             }),
             routing: Some(fuzukue_proto::TierDecision { tier: fuzukue_proto::Tier::Heavy, reason: "Proof".into() }),
-            touches: None, waiting: None,
+            touches: None, waiting: None, dismissed_from_panel: false,
         };
         let details = delegate_details(&job, None).join("\n");
         let labels = [worker_heading(tr!("chat-working"), None, Some("0:01")), worker_heading(tr!("chat-done"), None, None)];

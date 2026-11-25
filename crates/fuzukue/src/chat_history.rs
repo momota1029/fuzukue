@@ -50,7 +50,8 @@ fn history_item(event: &ServerEvent) -> Option<Cow<'_, str>> {
         | ServerEvent::ToolCall { item, .. } | ServerEvent::ToolResult { item, .. }
         | ServerEvent::MessageDetails { item, .. } | ServerEvent::LocalNotice { item, .. }
         | ServerEvent::GitHubActivity { item, .. } => Some(Cow::Borrowed(item)),
-        ServerEvent::DelegateProgress { job, .. } | ServerEvent::DelegateRenamed { job, .. } => Some(Cow::Borrowed(job)),
+        ServerEvent::DelegateProgress { job, .. } | ServerEvent::DelegateRenamed { job, .. }
+        | ServerEvent::DelegateDismissed { job, .. } => Some(Cow::Borrowed(job)),
         ServerEvent::CommentApplication { application, .. } => Some(Cow::Owned(format!("comments-{}", application.thread))),
         _ => None,
     }
@@ -504,6 +505,7 @@ impl Chat {
             let Content::Delegate(live) = &mut self.rows[live_row].content else {
                 continue;
             };
+            live.job.dismissed_from_panel |= older.job.dismissed_from_panel;
             if older.progress.is_empty() {
                 continue;
             }
@@ -641,6 +643,7 @@ impl Chat {
             ServerEvent::ToolResult { item, ok, output, .. } => self.tool_result(&item, ok, output, cx),
             ServerEvent::DelegateProgress { job, summary, .. } => self.delegate_progress(&job, summary, cx),
             ServerEvent::DelegateRenamed { job, change, .. } => self.delegate_renamed(&job, &change, cx),
+            ServerEvent::DelegateDismissed { job, .. } => self.delegate_dismissed(&job),
             ServerEvent::LocalNotice { item, text, localized, .. } if item != fuzukue_proto::COMPOSER_NOTICE_ITEM =>
                 self.local_notice(item, text, localized, cx),
             ServerEvent::GitHubActivity { item, events, .. } => self.github_activity(item, events, cx),

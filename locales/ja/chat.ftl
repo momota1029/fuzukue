@@ -153,6 +153,7 @@ chat-activity-full-message = 全文
 chat-job-list = ジョブ
 chat-job-name = 表示名
 chat-job-rename = 改名
+chat-job-dismiss = 一覧から消す
 chat-job-save = 名前を保存
 chat-job-cancel = キャンセル
 chat-job-name-help = 表示幅は { $columns } 桁まで。長い名前は一覧で短縮し、詳細に全文を残す。

@@ -38,6 +38,13 @@
     {"action": "screenshot", "name": "worker-message-setting"},
     {"action": "click", "id": "show-worker-messages"},
     {"action": "click", "id": "close-settings"},
-    {"action": "screenshot", "name": "delegate-messages-visible"}
+    {"action": "screenshot", "name": "delegate-messages-visible"},
+    {"action": "click", "id": "chat-tail-activity-trigger"},
+    {"action": "wait_element", "id": "chat-tail-activity-job-dismiss-0"},
+    {"action": "screenshot", "name": "delegate-dismiss-action"},
+    {"action": "click", "id": "chat-tail-activity-job-dismiss-0"},
+    {"action": "wait_event", "event": "delegate_dismissed"},
+    {"action": "assert_delegate_report", "model": "gpt-6.2-sol"},
+    {"action": "screenshot", "name": "delegate-dismissed"}
   ]
 }

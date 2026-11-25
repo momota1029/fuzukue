@@ -855,7 +855,8 @@ async fn launch_assignment(
             .or_else(|| waiting.map(WaitReason::message));
         let mut input = json!(DelegateJob { agent: name.clone(), title: title.clone(), display: display.clone(),
             model, started_at_ms, queued_at_ms: Some(queued_at),
-            selection: Some(selection.clone()), routing: Some(routing.clone()), touches: globs.clone(), waiting });
+            selection: Some(selection.clone()), routing: Some(routing.clone()), touches: globs.clone(), waiting,
+            dismissed_from_panel: false });
         if let Some(isolation) = isolation {
             input["isolation"] = json!(isolation);
         }

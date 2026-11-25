@@ -66,7 +66,8 @@ pub const REVIEW_FINDINGS_PROTOCOL: u32 = 63;
 pub const FOLDER_GRANTS_PROTOCOL: u32 = 65;
 pub const LIVE_MODELS_PROTOCOL: u32 = 66;
 pub const JOB_LABEL_PROTOCOL: u32 = 67;
-pub const PROTOCOL_VERSION: u32 = JOB_LABEL_PROTOCOL;
+pub const JOB_DISMISS_PROTOCOL: u32 = 68;
+pub const PROTOCOL_VERSION: u32 = JOB_DISMISS_PROTOCOL;
 
 mod approvals;
 pub use approvals::*;
@@ -387,6 +388,9 @@ pub struct DelegateJob {
     pub touches: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<String>,
+    /// Hide this job from the activity panel once it has a report.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dismissed_from_panel: bool,
 }
 
 pub use job_labels::{DelegateDisplay, DelegateNameChange, JOB_LABEL_COLUMNS};
@@ -1032,6 +1036,7 @@ pub enum ClientMsg {
     WorkerPrompt { session: String, job: String, text: String, paths: Vec<String> },
     StopWorker { session: String, job: String },
     RenameJob { session: String, job: String, label: String },
+    DismissJob { session: String, job: String },
     RolePrompt { session: String, text: String, paths: Vec<String>, to_worker: bool },
     SetChatSettings { session: String, settings: ChatSettings },
     /// チャンクは接続内で昇順に送る。最後のチャンクで受信済みパスを返す。
@@ -2345,6 +2350,7 @@ pub enum ServerEvent {
     AgentUsageChanged,
     DelegateProgress { session: String, job: String, summary: String },
     DelegateRenamed { session: String, job: String, change: DelegateNameChange },
+    DelegateDismissed { session: String, job: String },
     PlanChanged {
         session: String,
         plan: Plan,
@@ -2542,7 +2548,7 @@ impl ServerEvent {
             Self::TextDelta { session, .. } | Self::UserPrompt { session, .. }
             | Self::ReplySuperseded { session, .. } | Self::GitHubActivity { session, .. }
             | Self::CommentApplication { session, .. } | Self::DelegateProgress { session, .. }
-            | Self::DelegateRenamed { session, .. }
+            | Self::DelegateRenamed { session, .. } | Self::DelegateDismissed { session, .. }
             | Self::ToolCall { session, .. } | Self::ToolResult { session, .. }
             | Self::MessageDetails { session, .. } | Self::TurnEnded { session, .. } => Some(session),
             _ => None,

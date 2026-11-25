@@ -5837,6 +5837,8 @@ mod tests {
                                 && (icon.center().y - label.center().y).abs() <= px(0.5))
                     })?);
                     assert!(visible(&runner, cx, "chat-tail-activity-job-error-0")?);
+                    assert!(visible(&runner, cx, "chat-tail-activity-job-rename-0")?);
+                    assert!(!visible(&runner, cx, "chat-tail-activity-job-dismiss-0")?);
                     for part in ["card", "model", "effort", "tier", "backend", "last-tool"] {
                         let id = format!("chat-tail-activity-job-{part}-0");
                         assert!(runner.update(cx, |_, window, _| window.shot_element_bounds(&id).is_some())?);
@@ -5938,31 +5940,23 @@ mod tests {
                     runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-job-copy-0".into() })?;
                     let copied = runner.update(cx, |_, _, cx| cx.read_from_clipboard().and_then(|value| value.text()))?;
                     assert_eq!(copied.as_deref(), Some("delegate:test"));
-                    runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-job-rename-0".into() })?;
-                    runner.step(Step::WaitElement { id: "rename-job-dialog".into() }, cx).await?;
-                    runner.key(cx, "Ctrl+a")?;
-                    runner.step(Step::Type { text: "Checked references".into() }, cx).await?;
-                    runner.click(cx, ClickTarget::Element { id: "rename-job-save".into() })?;
-                    assert!(messages.try_iter().any(|message| matches!(message,
-                        ClientMsg::RenameJob { session: id, job, label }
-                        if id == session && job == "delegate:test" && label == "Checked references"
-                    )));
-                    runner.update(cx, |view, _, cx| view.on_event(ServerEvent::DelegateRenamed {
-                        session: session.into(), job: "delegate:test".into(),
-                        change: fuzukue_proto::DelegateNameChange {
-                            at_ms: 1, source: "desktop".into(), previous_label: Some("Check citations".into()),
-                            label: "Checked references".into(), label_source: None,
-                        },
-                    }, cx))?;
-                    runner.frame(cx)?;
-                    if !visible(&runner, cx, "chat-tail-activity-job-report-0")? {
-                        runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-trigger".into() })?;
-                    }
-                    runner.step(Step::WaitElement { id: "chat-tail-activity-job-report-0".into() }, cx).await?;
+                    assert!(!visible(&runner, cx, "chat-tail-activity-job-rename-0")?);
                     runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-job-report-0".into() })?;
                     runner.step(Step::WaitElement { id: "job-report-dialog".into() }, cx).await?;
                     runner.key(cx, "escape")?;
                     runner.frame(cx)?;
+                    runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-trigger".into() })?;
+                    runner.step(Step::WaitElement { id: "chat-tail-activity-job-dismiss-0".into() }, cx).await?;
+                    runner.click(cx, ClickTarget::Element { id: "chat-tail-activity-job-dismiss-0".into() })?;
+                    assert!(messages.try_iter().any(|message| matches!(message,
+                        ClientMsg::DismissJob { session: id, job } if id == session && job == "delegate:test"
+                    )));
+                    runner.update(cx, |view, _, cx| view.on_event(ServerEvent::DelegateDismissed {
+                        session: session.into(), job: "delegate:test".into(),
+                    }, cx))?;
+                    runner.frame(cx)?;
+                    assert!(!visible(&runner, cx, "chat-tail-activity-trigger")?);
+                    runner.step(Step::AssertDelegateReport { model: CLAUDE_OPUS.into() }, cx).await?;
 
                     runner.update(cx, |view, _, cx| {
                         for index in 0..30 {

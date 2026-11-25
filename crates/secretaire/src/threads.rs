@@ -306,7 +306,7 @@ impl Transcript {
                     }
                     let mut input = input.clone();
                     if let Some(previous) = &tool.input {
-                        preserve_delegate_name(previous, &mut input);
+                        preserve_delegate_metadata(previous, &mut input);
                     }
                     tool.input = Some(input);
                 }
@@ -314,6 +314,11 @@ impl Transcript {
             ServerEvent::DelegateRenamed { job, change, .. } => {
                 if let Some(input) = self.delegate_input_mut(job) {
                     record_delegate_name(input, change);
+                }
+            }
+            ServerEvent::DelegateDismissed { job, .. } => {
+                if let Some(input) = self.delegate_input_mut(job) {
+                    input["dismissed_from_panel"] = true.into();
                 }
             }
             ServerEvent::DelegateProgress { job, summary, .. } => {
@@ -461,7 +466,7 @@ impl Transcript {
                         saved.meta.tool.as_ref().and_then(|tool| tool.input.as_ref()),
                         entry.meta.tool.as_mut().and_then(|tool| tool.input.as_mut()),
                     ) {
-                        preserve_delegate_name(saved, recovered);
+                        preserve_delegate_metadata(saved, recovered);
                     }
                     saved.meta.tool = entry.meta.tool;
                 }
@@ -931,9 +936,12 @@ pub fn is_legacy_session(session: &str) -> bool {
     session == "main" || session.starts_with("tab-") || session.starts_with("issue-")
 }
 
-fn preserve_delegate_name(previous: &serde_json::Value, input: &mut serde_json::Value) {
-    let Some(history) = previous["rename_history"].as_array() else { return };
+fn preserve_delegate_metadata(previous: &serde_json::Value, input: &mut serde_json::Value) {
     let Some(object) = input.as_object_mut() else { return };
+    if previous["dismissed_from_panel"].as_bool() == Some(true) {
+        object.insert("dismissed_from_panel".into(), true.into());
+    }
+    let Some(history) = previous["rename_history"].as_array() else { return };
     if object.get("rename_history").and_then(serde_json::Value::as_array)
         .is_some_and(|current| current.len() >= history.len())
     {
@@ -968,6 +976,7 @@ pub fn history_session(event: &ServerEvent) -> Option<&str> {
         | ServerEvent::TurnActivity { session, .. }
         | ServerEvent::DelegateProgress { session, .. }
         | ServerEvent::DelegateRenamed { session, .. }
+        | ServerEvent::DelegateDismissed { session, .. }
         | ServerEvent::ToolCall { session, .. }
         | ServerEvent::ToolResult { session, .. }
         | ServerEvent::ApprovalRequested { session, .. }
@@ -1387,6 +1396,23 @@ impl Store {
         let &index = thread.transcript.index.get(job)?;
         let tool = thread.transcript.items[index].meta.tool.as_ref().filter(|tool| tool.name == "delegate")?;
         Some((tool.input.as_ref()?, tool.ok, tool.output.as_deref()))
+    }
+
+    pub(crate) fn dismiss_delegate(&mut self, session: &str, job: &str) -> Result<bool> {
+        let (input, ok, _) = self.delegate_record(session, job).context("Job not found in this thread")?;
+        anyhow::ensure!(ok.is_some(), "Only finished jobs can be removed from the list");
+        if input["dismissed_from_panel"].as_bool() == Some(true) {
+            return Ok(false);
+        }
+        let thread = self.threads.get_mut(session).context("Thread not found")?;
+        let input = thread.transcript.delegate_input_mut(job).context("Job not found in this thread")?;
+        let previous = input.clone();
+        input["dismissed_from_panel"] = true.into();
+        if let Err(error) = thread.save() {
+            *thread.transcript.delegate_input_mut(job).unwrap() = previous;
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub(crate) fn rename_delegate(
@@ -2393,7 +2419,7 @@ impl Store {
                     thread.active = false;
                 }
             }
-            ServerEvent::DelegateProgress { .. } => return Ok(false),
+            ServerEvent::DelegateProgress { .. } | ServerEvent::DelegateDismissed { .. } => return Ok(false),
             ServerEvent::ToolCall { item, .. } if item.starts_with(fuzukue_proto::DELEGATE_JOB) => {
                 return Ok(false);
             }

@@ -1861,6 +1861,9 @@ impl Workbench {
             ServerEvent::DelegateRenamed { session, job, change } if render => {
                 self.chat(&session, cx).delegate_renamed(&job, &change, cx);
             }
+            ServerEvent::DelegateDismissed { session, job } if render => {
+                self.chat(&session, cx).delegate_dismissed(&job);
+            }
             ServerEvent::DelegateProgress { session, job, summary } if render => {
                 self.chat(&session, cx).delegate_progress(&job, summary, cx);
             }
