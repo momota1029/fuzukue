@@ -689,14 +689,22 @@ impl Runner {
                 self.frame(cx)?;
                 self.click(cx, ClickTarget::Element { id: "open-workspace".into() })?;
                 self.wait_for(cx, "workspace browser home", TIMEOUT_MS, |view, _| view.browsed_workspace_path() == Some("~")).await?;
+                // The path is fixture data. Fill it without depending on keyboard focus,
+                // then exercise the chooser's Go and Open buttons.
+                self.update(cx, |view, window, cx| {
+                    let input = view.shot_workspace_path_input().context("workspace browser closed")?;
+                    input.update(cx, |input, cx| input.set_value(path.clone(), window, cx));
+                    Ok::<_, anyhow::Error>(())
+                })??;
                 self.frame(cx)?;
-                self.click(cx, ClickTarget::Element { id: "workspace-path-input".into() })?;
-                self.key(cx, "Ctrl+A")?;
-                self.type_text(cx, &path)?;
-                self.key(cx, "enter")?;
-                self.wait_for(cx, "workspace folder", TIMEOUT_MS, |view, _| {
+                self.click(cx, ClickTarget::Element { id: "workspace-go-to-path".into() })?;
+                let description = format!("workspace folder {path:?}");
+                if let Err(error) = self.wait_for(cx, &description, TIMEOUT_MS, |view, _| {
                     view.browsed_workspace_path().and_then(|p| p.rsplit('/').next()) == Some(path_tail.as_str())
-                }).await?;
+                }).await {
+                    let state = self.update(cx, |view, _, _| view.shot_workspace_browser_state())?;
+                    return Err(error.context(state));
+                }
                 self.frame(cx)?;
                 self.click(cx, ClickTarget::Element { id: "confirm-open-workspace".into() })?;
                 self.wait_for_workspace(cx, &path_tail).await?;

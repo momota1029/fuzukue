@@ -351,6 +351,22 @@ impl Workbench {
             .map(|d| d.path.as_str())
     }
 
+    #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+    pub(super) fn shot_workspace_path_input(&self) -> Option<&Entity<InputState>> {
+        self.workspaces.browser.as_ref().map(|browser| &browser.input)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+    pub(super) fn shot_workspace_browser_state(&self) -> String {
+        let pending = self.workspaces.browser.as_ref().and_then(|browser| browser.loading);
+        format!(
+            "protocol={}, folder={:?}, pending browse={pending:?}, workspace error={:?}",
+            self.protocol,
+            self.browsed_workspace_path(),
+            self.workspaces.error,
+        )
+    }
+
     #[cfg(all(test, target_os = "linux", feature = "headless-shot"))]
     pub(super) fn workspace_browser_scroll(&self) -> gpui_kit::Pixels {
         self.workspaces.browser.as_ref().unwrap().scroll.offset().y
