@@ -629,6 +629,15 @@ impl SettingsPrincipal {
         &self.0
     }
 
+    pub(crate) fn paired_device(&self) -> bool {
+        self.0.starts_with("device:")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paired_device_fixture() -> Self {
+        Self("device:fixture".into())
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         Self("fixture".into())

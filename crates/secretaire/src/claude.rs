@@ -296,6 +296,7 @@ pub(crate) fn partner_system(
     system.push_str("\n\n");
     system.push_str(crate::threads::prompt());
     system.push_str(crate::workspaces::prompt());
+        system.push_str(crate::workspace_requests::prompt());
     system.push_str(crate::workshop::mcp::prompt());
     system.push_str(crate::handoff::prompt());
     system.push_str(crate::issue_threads::prompt());

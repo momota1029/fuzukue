@@ -188,7 +188,7 @@ impl Scenario {
         Fixture {
             mode,
             project,
-            second_project: (name == "workspaces").then_some("examples/code-pilot"),
+            second_project: matches!(name, "workspaces" | "workspace-requests").then_some("examples/code-pilot"),
             git_changes,
         }
     }

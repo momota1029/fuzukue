@@ -86,6 +86,7 @@ mod chat_waiting;
 mod project_tests;
 mod lsp;
 mod workspace;
+mod workspace_requests;
 mod workspaces;
 mod watch;
 mod worker_scope;
@@ -362,8 +363,11 @@ impl Workspace {
             &attachments
         };
         let reports = issue_threads::report_context(self, session);
-        Ok(harness_format!("(secretaire) Current thread attachments\n{context}{reports}\n\nTurn input:\n{prompt}",
-            "(secretaire) このターンの添付先\n{context}{reports}\n\nターンの入力:\n{prompt}"))
+        let requests = self.registry.upgrade()
+            .map(|registry| registry.workspace_requests.front_desk_context(self, session))
+            .unwrap_or_default();
+        Ok(harness_format!("(secretaire) Current thread attachments\n{context}{reports}{requests}\n\nTurn input:\n{prompt}",
+            "(secretaire) このターンの添付先\n{context}{reports}{requests}\n\nターンの入力:\n{prompt}"))
     }
 
     fn record_artifacts<'a>(&self, session: &str, paths: impl IntoIterator<Item = &'a str>) {
@@ -614,6 +618,7 @@ async fn run_server() -> anyhow::Result<()> {
     if let Some(update) = &update {
         service::start_project(app.clone(), update.clone());
         watch::restore(app.clone(), update.clone());
+        workspace_requests::start(&app);
     }
 
     if let Some(addr) = listeners.iter().filter_map(|(listener, _)| listener.local_addr().ok())
@@ -1139,6 +1144,9 @@ async fn serve_workspace(
         .then(|| app.hub.register_question_client());
     let scoped = transcripts.is_some();
     let approval_queue = github_report_client && !canary() && protocol >= 11;
+    let workspace_request_client = workspace_requests::may_preview(protocol, client_version.0, github_report_client);
+    let request_operator = workspace_request_client && settings.is_some_and(remote::SettingsPrincipal::paired_device);
+    let mut request_changes = request_operator.then(|| registry.workspace_requests.subscribe());
     let (initial, mut live) = app.session_stats.subscribe(
         &app.hub, resume_from, protocol >= 2, protocol >= 4, transcripts,
     );
@@ -1217,6 +1225,8 @@ async fn serve_workspace(
             return false;
         }
         match env.event {
+            ServerEvent::WorkspaceRequests { view: Some(_) } => request_operator,
+            ServerEvent::WorkspaceRequests { view: None } | ServerEvent::WorkspaceRequestError { .. } => workspace_request_client,
             ServerEvent::FolderGrants { .. } | ServerEvent::FolderGrantsChanged { .. } =>
                 github_report_client && protocol >= fuzukue_proto::FOLDER_GRANTS_PROTOCOL,
             ServerEvent::ApprovalRequested { ref request_id, .. } | ServerEvent::ApprovalResolved { ref request_id, .. }
@@ -1463,6 +1473,10 @@ async fn serve_workspace(
     let project = app.project_dir.clone();
     let (stop_writer, mut stop) = tokio::sync::oneshot::channel::<()>();
     let writer = async {
+        if workspace_request_client {
+            let event = registry.workspace_requests.event(&app.id, request_operator);
+            if tx.send(send(&snapshot(event))).await.is_err() { return; }
+        }
         let mut background_commands = (protocol >= fuzukue_proto::BACKGROUND_COMMANDS_PROTOCOL)
             .then(background_commands::Feed::default);
         let mut waiting = (protocol >= fuzukue_proto::CHAT_WAITING_PROTOCOL).then(|| {
@@ -1485,6 +1499,11 @@ async fn serve_workspace(
                     break;
                 }
                 _ = &mut stop => break,
+                Ok(()) = async { request_changes.as_mut().unwrap().changed().await }, if request_changes.is_some() => {
+                    let event = registry.workspace_requests.event(&app.id, true);
+                    if tx.send(send(&snapshot(event))).await.is_err() { break; }
+                    continue;
+                }
                 Ok(()) = async { update_status.as_mut().unwrap().changed().await },
                     if protocol >= fuzukue_proto::SELF_UPDATE_PROTOCOL && update_status.is_some() => {
                     let status = update_status.as_mut().unwrap().borrow_and_update().clone();
@@ -1675,6 +1694,12 @@ async fn serve_workspace(
                 other => other,
             };
             match msg {
+                Ok(ClientMsg::WorkspaceRequest { action }) if workspace_request_client && workspace_request => {
+                    let result = workspace_requests::client_action(registry, &app, settings, action);
+                    if let Err(error) = result {
+                        let _ = reply.send(workspace_requests::error_event(error));
+                    }
+                }
                 Ok(ClientMsg::ListPendingApprovals { request }) if approval_queue => {
                     let result = app.hub.pending_approvals().map(|(pending, updates)| {
                         approval_updates = Some(updates);
@@ -2715,6 +2740,7 @@ async fn prompt_codex(
 fn codex_partner_options(app: &Workspace, session: &str, settings: fuzukue_proto::ChatSettings) -> anyhow::Result<codex::PartnerOptions> {
     let mut context = format!("{}\n\n{}", threads::prompt(), delegate::prompt());
     context.push_str(workspaces::prompt());
+    context.push_str(workspace_requests::prompt());
     context.push_str(workshop::mcp::prompt());
     context.push_str(issue_threads::prompt());
     context.push_str(handoff::prompt());
@@ -3239,7 +3265,7 @@ async fn handle_from_client(
     app: &Arc<Workspace>, msg: ClientMsg, client: Option<&screenshots::Connection<'_>>,
 ) -> anyhow::Result<()> {
     match msg {
-        ClientMsg::ListPendingApprovals { .. } | ClientMsg::DecideApproval { .. } => {}
+        ClientMsg::ListPendingApprovals { .. } | ClientMsg::DecideApproval { .. } | ClientMsg::WorkspaceRequest { .. } => {}
         ClientMsg::SaveScreenshot { .. } | ClientMsg::ClientScreenshotResponse { .. }
         | ClientMsg::Trash { .. } | ClientMsg::RemoveWorkspace { .. } | ClientMsg::RewriteReply { .. }
         | ClientMsg::SelfUpdateStatus | ClientMsg::StartSelfUpdate | ClientMsg::RollbackServer

@@ -46,6 +46,7 @@ mod server;
 mod self_update;
 mod screenshot;
 mod sidebar;
+mod workspace_requests;
 #[cfg(all(target_os = "linux", feature = "headless-shot"))]
 mod shot;
 mod source;
@@ -139,6 +140,7 @@ struct Workbench {
     branch_review: branch_review::BranchReview,
     handoffs: handoff::Handoffs,
     chats: HashMap<String, Chat>,
+    workspace_requests: workspace_requests::WorkspaceRequests,
     recent_transcripts: VecDeque<String>,
     question_drafts: HashMap<String, Entity<chat_question::QuestionCard>>,
     chat_capabilities: Option<chat::ChatCapabilities>,
@@ -636,6 +638,7 @@ impl Workbench {
             branch_review: Default::default(),
             handoffs: Default::default(),
             chats: HashMap::new(),
+            workspace_requests: Default::default(),
             recent_transcripts: VecDeque::new(),
             question_drafts: HashMap::new(),
             chat_capabilities: None,
@@ -1378,6 +1381,7 @@ impl Workbench {
             ConnEvent::OwnedServerStopped => self.owned_server_stopped(window, cx),
             ConnEvent::Disconnected(e) => {
                 self.approvals.disconnect();
+                self.workspace_requests = Default::default();
                 self.agent_models.disconnect();
                 self.chat_waiting = Default::default();
                 for chat in self.chats.values_mut() {
@@ -1599,6 +1603,7 @@ impl Workbench {
         self.chat_activity_clock = None;
         self.chat_waiting = Default::default();
         self.chats.clear();
+        self.workspace_requests = Default::default();
         self.recent_transcripts.clear();
         self.github = Default::default();
         self.clear_github_report(window, cx);
@@ -2211,6 +2216,15 @@ impl Workbench {
                     }
                 }
             }
+            ServerEvent::WorkspaceRequests { view } => {
+                self.workspace_requests.available = true;
+                self.workspace_requests.view = view;
+            }
+            ServerEvent::WorkspaceRequestError { message } => {
+                let session = self.active.clone();
+                let text = i18n::Message { fallback: message.key.clone(), localized: Some(message) };
+                self.chat(&session, cx).push_error(text.text().into_owned(), cx);
+            }
             ServerEvent::Error { message } => {
                 self.agent_models.save_failed();
                 let session = self.active.clone();
@@ -2263,6 +2277,7 @@ impl Render for Workbench {
                     .when(loading, |pane| pane.flex().items_center().justify_center()
                         .text_sm().text_color(theme.muted_foreground).child(tr!("workbench-loading")))
                     .when(!loading, |pane| pane.child(self.render_chat(window, cx))))
+                .children(self.render_workspace_request_chat(cx))
                 .child(self.render_chat_footer(window, cx))
                 .children(self.render_approval_dock(window, cx))
                 .child(

@@ -49,6 +49,7 @@ pub struct App {
     pub self_update: std::sync::OnceLock<Arc<crate::self_update::Update>>,
     pub distribution: crate::distribution::Distribution,
     pub workshop: crate::workshop::Workshop,
+    pub(crate) workspace_requests: crate::workspace_requests::Store,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -142,6 +143,7 @@ impl App {
             mail,
             models: Default::default(),
             workshop: crate::workshop::Workshop::new(registry.research),
+            workspace_requests: crate::workspace_requests::Store::open(&state_dir)?,
             entries: Mutex::new(entries),
             changed,
             notices: tokio::sync::broadcast::channel(128).0,
@@ -171,6 +173,7 @@ impl App {
             distribution: crate::distribution::Distribution::new(&workspace.state_dir),
             state_dir: workspace.state_dir.clone(),
             workshop: crate::workshop::Workshop::new(Default::default()),
+            workspace_requests: crate::workspace_requests::Store::open(&workspace.state_dir).unwrap(),
             default: id.clone(),
             addr: workspace.addr.clone(),
             mail: workspace.mail.clone(),
@@ -225,6 +228,17 @@ impl App {
                 .then(a.id.cmp(&b.id))
         });
         workspaces
+    }
+
+    pub(crate) fn request_destination(&self, id: &str) -> Result<fuzukue_proto::WorkspaceRequestDestination> {
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(id).filter(|entry| !entry.known.hidden)
+            .context("Workspace request destination is unavailable")?;
+        ensure!(checked_dir(&self.home, &entry.known.path)? == entry.known.path,
+            "Workspace request destination moved");
+        Ok(fuzukue_proto::WorkspaceRequestDestination::Workspace {
+            id: id.into(), title: entry.known.title.clone(),
+        })
     }
 
     pub async fn codex_models(&self, workspace: &Workspace) -> Vec<fuzukue_proto::CodexModel> {

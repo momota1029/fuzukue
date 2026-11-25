@@ -3003,27 +3003,37 @@ fn folder_approval_buttons(request_id: &str, entity: &Entity<Workbench>, running
 }
 
 pub(super) fn approval_buttons(request_id: &str, entity: &Entity<Workbench>) -> impl IntoElement {
-    let button = |label, decision: &'static str, primary| {
-        let id = request_id.to_owned();
+    let id = request_id.to_owned();
+    approval_decision_buttons(request_id, tr!("chat-deny"), tr!("chat-allow"), entity, move |accept| {
+        ClientMsg::Resolve {
+            request_id: id.clone(),
+            decision: if accept { "accept" } else { "decline" }.into(),
+        }
+    })
+}
+
+pub(super) fn approval_decision_buttons(
+    id: &str, decline: &str, accept: &str, entity: &Entity<Workbench>,
+    action: impl Fn(bool) -> ClientMsg + Clone + 'static,
+) -> impl IntoElement {
+    let button = |label: &str, decision: &'static str, primary| {
         let entity = entity.clone();
-        let button = Button::new(SharedString::from(format!("{decision}-{id}"))).label(label);
+        let action = action.clone();
+        let button = Button::new(SharedString::from(format!("{decision}-{id}"))).label(label.to_owned());
         let button = if primary {
             button.primary()
         } else {
             button.secondary()
         };
         button.on_click(move |_, _, cx| {
-            let _ = entity.read(cx).out.send(ClientMsg::Resolve {
-                request_id: id.clone(),
-                decision: decision.into(),
-            });
+            let _ = entity.read(cx).out.send(action(primary));
         })
     };
     h_flex()
         .flex_none()
         .gap_1()
-        .child(button(tr!("chat-deny"), "decline", false))
-        .child(button(tr!("chat-allow"), "accept", true))
+        .child(button(decline, "decline", false))
+        .child(button(accept, "accept", true))
 }
 
 pub(super) struct ChatCapabilities {

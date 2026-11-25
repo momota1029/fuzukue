@@ -224,6 +224,11 @@ if [[ $mode == fixture ]]; then
     server_target=$(target_directory "$server_manifest")
     cargo build --locked --manifest-path "$server_manifest" --target-dir "$server_target" -p secretaire >&2
     server_bin=$server_target/debug/secretaire
+    if [[ $stem == workspace-requests.json ]]; then
+        FUZUKUE_SHOT_FIXTURE_TOKEN=$(env -i PATH="$run/bin" HOME="$run/home" TMPDIR="$run/tmp" \
+            XDG_CONFIG_HOME="$run/config" XDG_STATE_HOME="$run/state" \
+            "$server_bin" device add screenshot --project "$run/home/project")
+    fi
     # The server's PATH contains the fixture CLIs and, for build_paper, the selected TeX tools.
     launcher=(setsid)
     # The MCP runner owns the entire process group, including the fixture server.
@@ -264,6 +269,7 @@ fi
     export FONTCONFIG_FILE="$run/fonts.conf" VK_DRIVER_FILES="$icd" LANG=C.UTF-8 LC_ALL=C.UTF-8
     unset LABO_SELECT LABO_AUTOPROMPT LABO_ISSUE LABO_PAPER LABO_READ LABO_PDF LABO_THEME
     export FUZUKUE_SHOT_XVFB=1 FUZUKUE_SHOT_SETTINGS="$run/settings.toml"
+    export FUZUKUE_SHOT_FIXTURE_TOKEN="${FUZUKUE_SHOT_FIXTURE_TOKEN:-}"
     capture=(xvfb-run -a -e "$run/xvfb.log" -s "-screen 0 3840x2160x24 -dpi 96 -nolisten tcp"
         sh -c 'xdpyinfo >/dev/null || exit 1; exec "$@"' shot-display
         "$client" --headless-shot "$scenario" "$out" "$url" "$mode")

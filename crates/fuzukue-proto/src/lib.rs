@@ -67,7 +67,8 @@ pub const FOLDER_GRANTS_PROTOCOL: u32 = 65;
 pub const LIVE_MODELS_PROTOCOL: u32 = 66;
 pub const JOB_LABEL_PROTOCOL: u32 = 67;
 pub const JOB_DISMISS_PROTOCOL: u32 = 68;
-pub const PROTOCOL_VERSION: u32 = JOB_DISMISS_PROTOCOL;
+pub const WORKSPACE_REQUESTS_PROTOCOL: u32 = 69;
+pub const PROTOCOL_VERSION: u32 = WORKSPACE_REQUESTS_PROTOCOL;
 
 mod approvals;
 pub use approvals::*;
@@ -931,6 +932,7 @@ pub struct MarkdownComponentCapability {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
+    WorkspaceRequest { action: WorkspaceRequestAction },
     SelfUpdateStatus,
     RequestDrain { reason: DrainReason },
     CancelDrain { started_at: i64 },
@@ -1912,6 +1914,78 @@ pub struct WorkspaceInfo {
     pub running: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceRequestDestination {
+    Workspace { id: String, title: String },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRequestReply {
+    Question,
+    Answer,
+    Result,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkspaceRequestAction {
+    Decide { revision: String, send: bool },
+    Start { id: String },
+    SetAutoStart { enabled: bool },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRequestDraft {
+    pub session: String,
+    pub revision: String,
+    pub destination: WorkspaceRequestDestination,
+    pub title: String,
+    pub body: String,
+    pub reply: Option<WorkspaceRequestReply>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRequestItem {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub session: Option<String>,
+    pub starting: bool,
+    pub failed: bool,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRequestUpdate {
+    pub session: String,
+    pub title: String,
+    pub kind: WorkspaceRequestUpdateKind,
+    pub body: Option<String>,
+    pub external: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRequestUpdateKind {
+    Request,
+    Received,
+    Started,
+    StartFailed,
+    Question,
+    Answer,
+    Result,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceRequestsView {
+    pub auto_start: bool,
+    pub drafts: Vec<WorkspaceRequestDraft>,
+    pub inbox: Vec<WorkspaceRequestItem>,
+    pub updates: Vec<WorkspaceRequestUpdate>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
@@ -2175,6 +2249,8 @@ pub enum ClientCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
+    WorkspaceRequests { view: Option<WorkspaceRequestsView> },
+    WorkspaceRequestError { message: LocalizedMessage },
     GitHubReportResult { request: u64, result: Result<GitHubReportUpdate, GitHubReportError> },
     GitHubAccountChanged { state: GitHubConnectState },
     GitHubAvatar { avatar: GitHubAvatar },

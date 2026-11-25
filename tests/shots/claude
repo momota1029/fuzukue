@@ -70,6 +70,38 @@ while line := (queued or sys.stdin.readline()):
         continue
     content = request["message"]["content"]
     prompt = json.dumps(content, ensure_ascii=False)
+    if ("この不具合を fuzukue に送って" in prompt or
+            "The receiving workspace has started a local request." in prompt or
+            "受信側のワークスペースがローカル依頼に着手した。" in prompt or
+            any(text in prompt for text in (
+                "依頼元に再現した版を聞いて。", "版は 4.0 と返して。", "完了と結果を返して。"))):
+        if "この不具合を fuzukue に送って" in prompt:
+            workspaces = call_labo("list_workspaces", {})["structuredContent"]["workspaces"]
+            destination = next(ws["id"] for ws in workspaces if ws["path"].endswith("/workspace-other"))
+            args = {"action": "send", "destination": {"kind": "workspace", "id": destination},
+                    "title": "空の一覧で選択が消える",
+                    "body": "起きたこと: 空の一覧を開くと選択が消えた。\n期待する動作: 現在の選択を保つ。"}
+            answer = "送信の確認を出した。"
+        elif "started a local request" in prompt or "ローカル依頼に着手した" in prompt:
+            assert "SOURCE-ONLY-77" not in prompt and "現在の選択を保つ" in prompt
+            args = None
+            answer = "依頼を読み、調査を始めた。"
+        else:
+            items = call_labo("list_thread_workspace_requests", {})["structuredContent"]["requests"]
+            if "依頼元に再現した版を聞いて。" in prompt:
+                reply_kind, body = "question", "再現した版はどれ？"
+            elif "版は 4.0 と返して。" in prompt:
+                reply_kind, body = "answer", "版は 4.0。"
+            else:
+                reply_kind, body = "result", "空の一覧でも選択が残ることを確かめた。"
+            args = {"action": "reply", "id": items[0]["id"], "kind": reply_kind, "body": body}
+            answer = "返信の確認を出した。"
+        if args:
+            result = call_labo("draft_workspace_request", args)
+            assert not result["isError"], result
+        emit("assistant", message={"id": f"workspace-request-{number}", "content": [{"type": "text", "text": answer}]})
+        emit("result", is_error=False, session_id=session)
+        continue
     if "xml-components fixture" in prompt or "ui-kit fixture" in prompt:
         fixtures = Path(__file__).resolve().parent
         name = "ui-kit" if "ui-kit fixture" in prompt else "xml-components"

@@ -118,9 +118,8 @@ impl Target {
             request.uri().scheme_str() == Some("ws") && request.uri().path_and_query().is_some_and(|p| p.as_str() == "/ws"),
             "expected a ws://host:port/ws URL"
         );
-        let authorization = read_only
-            .then(|| fuzukue_proto::compat::env("FUZUKUE_SHOT_TOKEN").ok())
-            .flatten()
+        let token_env = if read_only { "FUZUKUE_SHOT_TOKEN" } else { "FUZUKUE_SHOT_FIXTURE_TOKEN" };
+        let authorization = fuzukue_proto::compat::env(token_env).ok().filter(|token| !token.is_empty())
             .map(|token| format!("Bearer {token}"));
         Ok(Self {
             url: url.into(),

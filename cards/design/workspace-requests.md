@@ -72,6 +72,12 @@ links:
 
 ## 公開できる依頼を GitHub に出す
 
+### 決定（2026-11-25、ユーザー）
+
+友人は自分の fuzukue から、組み込みの既定宛先「fuzukue プロジェクト」に依頼を送れる。この宛先は同じサーバー内のワークスペース名とは別に公開リポジトリ `momota1029/fuzukue` を指す。友人自身の GitHub アカウントで一般の外部コントリビューターとして投稿し、管理者権限や受信側のアカウントは使わない。
+
+入口はローカル依頼と同じ会話。「この不具合を fuzukue に送って」と頼むと、どこへ何を送るかを確認画面に出す。公開を選んだ依頼は GitHub Issue として届け、短い見本は本文にコードを載せる。スキルなど複数ファイルの動く見本や実装差分を送るときは、友人の fork から PR を出せる。受信側は既存の Issue・PR 受付で拾い、GitHub の応答は友人の元のスレッドに戻る。宛先の選択、下書き、版ごとの利用者確認、元のスレッドへの返信経路をローカル依頼と共通の入口で扱う。公開配送は R-93 で扱う。
+
 公開用の下書きに、期待する動作、使い方、見本と入出力例、作者表示と許可をまとめる。投稿は既存の起票先の許可・確認を通す。Issue、Gist、fork の各宛先へ出る内容を送信前に見せる。非公開の依頼を丸ごと転載する操作は設けず、公開用に選び直した本文とファイルだけを使う。見本に許可がなければ公開版の合成例を用意するか、ローカルの依頼のままにする。公開 Issue と成果の PR は紐づけ、採用した方法と使える版は承認したコメントで返せる。元のスレッドには URL と短い結果を記録する。
 
 公式資料を確認（2026-11-25）。Issue 作成・更新の REST API の本文は文字列で、一般ファイルをアップロードする項目はない。ブラウザーには対応形式の添付操作があり、GitHub CLI の `gh issue create --attach` は画像・動画を扱う。CLI では一部の添付に失敗しても Issue が作られることがある。別の Issue Artifacts REST API は起票後に `name` と文字列の `body` で Markdown やリンクなどを登録できる公開プレビューで、任意のファイルをそのままアップロードする仕様は確認できない。この設計では公式文書上の対応を確認し、実際のアップロード試験は行っていない。 [Issue の REST API](https://docs.github.com/en/rest/issues/issues#create-an-issue)、[添付できるファイル](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/attaching-files)、[GitHub CLI](https://cli.github.com/manual/gh_issue_create)、[Issue artifacts の使い方](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/using-artifacts-with-issues)、[Issue Artifacts の REST API](https://docs.github.com/en/rest/issues/artifacts#create-an-issue-artifact)
@@ -85,5 +91,5 @@ links:
 ## 実装の順序と完了条件
 
 1. [R-91](../../roadmap/cards/R-91.md) は本文だけで往復できる最小の経路。研究中の操作を合成した例で、別ワークスペースの受信箱に一件だけ届き、受信側の判断で着手し、質問と完了が元のスレッドに戻ることを確かめる。
-2. [R-92](../../roadmap/cards/R-92.md) は動く見本と受信側の自動着手設定。Python とスキルの例で、承認済みの添付だけが届き、受信だけでは実行されず、現行の経路での採用か入出力を使った Rust 実装の結果を返せることを確かめる。
+2. [R-92](../../roadmap/cards/R-92.md) は動く見本。Python とスキルの例で、承認済みの添付だけが届き、受信だけでは実行されず、現行の経路での採用か入出力を使った Rust 実装の結果を返せることを確かめる。
 3. [R-93](../../roadmap/cards/R-93.md) は公開用の Issue。初回は本文と短いコード例を既存の起票で届け、公開本文と対象ファイルだけが送られ、Issue と結果が元のスレッドで追えることを確かめる。Gist と fork からの PR は用途に応じて利用者が選ぶ。新しい自動アップロードは前提としない。

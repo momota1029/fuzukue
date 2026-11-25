@@ -197,6 +197,12 @@ scripts/shot.sh --url ws://127.0.0.1:7878/ws /tmp/read-only.json /tmp/lab-shots/
 scripts/shot.sh --workspace examples/code-pilot examples/lab tests/shots/workspaces.json
 ```
 
+`workspace-requests.json` は同じ二つのフィクスチャと一時端末トークンを使います。通常の会話で依頼を下書きし、完全承認モードで送る操作、受信側の Inbox からの着手、質問・回答・結果の往復を通します。出力は `workspace-request-preview.png`、`workspace-request-inbox.png`、`workspace-request-question.png`、`workspace-request-result.png` です。
+
+```sh
+scripts/shot.sh --workspace examples/code-pilot examples/lab tests/shots/workspace-requests.json
+```
+
 ## Linux の差と Windows で確認する項目
 
 - 描画は Mesa Lavapipe を使用します。既定パスにない場合は `FUZUKUE_SHOT_VK_DRIVER` で ICD の JSON を指定できます。

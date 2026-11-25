@@ -69,6 +69,7 @@ pub(crate) enum Tool {
     CreateResearch,
     CreateWorkspace,
     ListWorkspaces,
+    WorkspaceRequest(crate::workspace_requests::Tool),
     AttachThread,
     RenameThread,
     OpenPaper,
@@ -248,6 +249,7 @@ impl Tool {
             .chain(crate::github_auth::mcp::Tool::ALL.map(Self::GitHubAuth))
             .chain(crate::github_auth::read::Tool::ALL.map(Self::GitHubRead))
             .chain(crate::handoff::Tool::ALL.map(Self::Handoff))
+            .chain(crate::workspace_requests::Tool::ALL.map(Self::WorkspaceRequest))
             .chain(crate::lsp::Tool::ALL.map(Self::Lsp))
             .chain(Self::MAIL.into_iter().filter(move |_| mail))
             .filter(|tool| !crate::canary() || tool.in_canary())
@@ -284,6 +286,7 @@ impl Tool {
             Self::CreateResearch => "create_research",
             Self::CreateWorkspace => "create_workspace",
             Self::ListWorkspaces => "list_workspaces",
+            Self::WorkspaceRequest(tool) => tool.name(),
             Self::AttachThread => "attach_thread",
             Self::RenameThread => "rename_thread",
             Self::OpenPaper => "open_paper",
@@ -432,6 +435,7 @@ impl Tool {
                 &["main", "out_deck"]),
             Self::Research(tool) => return tool.definition(),
             Self::Handoff(tool) => return tool.definition(),
+            Self::WorkspaceRequest(tool) => return tool.definition(),
             Self::GitHub(tool) => return tool.definition(),
             Self::GitHubAuth(tool) => return tool.definition(),
             Self::GitHubRead(tool) => return tool.definition(),
@@ -1318,7 +1322,10 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
         _ => Err(json!({ "code": -32601, "message": format!("method not found: {method}") })),
     };
     let result = match result {
-        Ok(result) if method == "tools/call" => Ok(result_spill::limit(&app.project_dir, spill_owner, result).await),
+        // Workspace-request payloads stay in server state and in the owning thread's context.
+        Ok(result) if method == "tools/call"
+            && params["name"] != crate::workspace_requests::Tool::List.name() =>
+            Ok(result_spill::limit(&app.project_dir, spill_owner, result).await),
         result => result,
     };
     if method == "tools/call" && params["name"] == Tool::BuildPapers.name() {
@@ -1759,6 +1766,17 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         .with_context(|| format!("ツール {name} がない"))?;
     let empty = json!({});
     let args = params.get("arguments").unwrap_or(&empty);
+    if let Tool::WorkspaceRequest(tool) = tool {
+        ensure!(claude.is_some() || codex.is_some(), "Workspace request tools require a front desk session");
+        ensure!(app.hub.thread_running(session), "Workspace request tools require an active front desk turn");
+        ensure!(!app.issue_threads.intake_turn(session) && app.issue_threads.automatic_policy(session).is_none(),
+            "Workspace request tools are unavailable during automatic GitHub intake");
+        if let Some((codex, key)) = codex {
+            codex.check_mcp(session, key, false, false)?;
+        }
+        let _admission = app.admit_work()?;
+        return Ok(data_result(tool.call(app, session, args)?, false));
+    }
     let project = &app.project_dir;
     if matches!(tool, Tool::GitIntegratePatch) {
         use git_write::integrate;
@@ -1893,7 +1911,8 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             json!({"deck": deck_rel, "cards": result.cards, "report": result.report.strip_prefix(project)?,
                 "verification": result.verification})
         }
-        Tool::Research(_) | Tool::GitHub(_) | Tool::GitHubAuth(_) | Tool::GitHubRead(_) | Tool::Handoff(_) => unreachable!("handled above"),
+        Tool::Research(_) | Tool::GitHub(_) | Tool::GitHubAuth(_) | Tool::GitHubRead(_) | Tool::Handoff(_)
+        | Tool::WorkspaceRequest(_) => unreachable!("handled above"),
         Tool::Graph(tool) => crate::graph::WorkspaceGraph::call(app.clone(), tool, args.clone()).await?,
         Tool::Lsp(tool) => json!({ "result": tool.call(&app.lsp, args).await? }),
         Tool::GitStatus => {

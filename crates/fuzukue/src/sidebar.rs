@@ -658,6 +658,7 @@ impl Workbench {
                     .min_h_0()
                     .p_3()
                     .overflow_y_scrollbar()
+                    .children(self.render_workspace_request_inbox(cx))
                     .children(rows.is_empty().then(|| {
                         div()
                             .text_sm()
