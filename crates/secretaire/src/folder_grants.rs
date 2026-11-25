@@ -196,8 +196,7 @@ impl Store {
         fs::create_dir_all(&self.dir)?;
         let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
         serde_json::to_writer(file.as_file_mut(), &durable)?;
-        file.as_file().sync_all()?;
-        file.persist(self.dir.join(GRANTS))?;
+        crate::durable::persist(file, self.dir.join(GRANTS))?;
         self.turns
             .retain(|id, _| grants.iter().any(|grant| &grant.id == id));
         self.grants = grants;
@@ -338,15 +337,21 @@ impl Store {
             time: now,
         };
         let audit = self.audit_path(session);
-        fs::create_dir_all(audit.parent().unwrap())?;
+        let parent = audit.parent().unwrap();
+        crate::durable::create_dir_all(parent)?;
         let mut file = OpenOptions::new()
             .append(true)
             .create(true)
             .mode(0o600)
-            .open(audit)?;
+            .open(&audit)?;
+        let empty = file.metadata()?.len() == 0;
         let mut bytes = serde_json::to_vec(&entry)?;
         bytes.push(b'\n');
         file.write_all(&bytes)?;
+        file.sync_data()?;
+        if empty {
+            crate::durable::sync_dir(parent)?;
+        }
         Ok(())
     }
 

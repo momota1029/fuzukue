@@ -357,7 +357,7 @@ fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer(&mut tmp, value)?;
     tmp.flush()?;
-    tmp.persist(path)?;
+    crate::durable::persist(tmp, path)?;
     Ok(())
 }
 

@@ -123,7 +123,7 @@ impl Rules {
         let mut file = tempfile::NamedTempFile::new_in(state)?;
         serde_json::to_writer(&mut file, rules)?;
         file.flush()?;
-        file.persist(state.join("shell-approval-rules.json"))?;
+        crate::durable::persist(file, state.join("shell-approval-rules.json"))?;
         Ok(())
     }
 }

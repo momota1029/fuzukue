@@ -313,6 +313,8 @@ struct Inputs {
     references: BTreeMap<String, PathBuf>,
     has_unwatched_inputs: bool,
     changed: bool,
+    #[cfg(test)]
+    card_reads: usize,
 }
 
 struct DeckInput {
@@ -448,6 +450,8 @@ impl Cache {
                         card_stamps(md),
                         &mut inputs.changed,
                         || {
+                            #[cfg(test)]
+                            { inputs.card_reads += 1; }
                             fuzukue_cards::read_card(&deck.root, path)
                                 .ok()
                                 .flatten()
@@ -496,7 +500,7 @@ impl Cache {
         serde_json::to_writer(&mut writer, self)?;
         writer.flush()?;
         drop(writer);
-        file.persist(state.join("card-graph.json"))?;
+        crate::durable::persist(file, state.join("card-graph.json"))?;
         Ok(())
     }
 }

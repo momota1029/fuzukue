@@ -201,7 +201,7 @@ impl App {
         fs::create_dir_all(&self.state_dir)?;
         let temp = tempfile::NamedTempFile::new_in(&self.state_dir)?;
         fs::write(temp.path(), toml::to_string_pretty(&registry)?)?;
-        temp.persist(self.state_dir.join("workspaces.toml"))?;
+        crate::durable::persist(temp, self.state_dir.join("workspaces.toml"))?;
         Ok(())
     }
 

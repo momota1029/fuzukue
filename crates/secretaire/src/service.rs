@@ -316,7 +316,7 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
     file.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     io::Write::write_all(&mut file, text.as_bytes())?;
-    file.persist(path)?;
+    crate::durable::persist(file, path)?;
     Ok(())
 }
 

@@ -244,8 +244,7 @@ impl Queue {
         // Use a private file in the same directory for atomic replacement.
         let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
         file.write_all(&serde_json::to_vec(value)?)?;
-        file.as_file().sync_all()?;
-        file.persist(self.dir.join(name))?;
+        crate::durable::persist(file, self.dir.join(name))?;
         Ok(())
     }
 

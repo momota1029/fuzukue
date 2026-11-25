@@ -652,7 +652,7 @@ pub(crate) async fn execute(app: &Workspace, request: Request) -> Result<Outcome
             std::fs::create_dir_all(dir)?;
             let temp = tempfile::NamedTempFile::new_in(dir)?;
             serde_json::to_writer(temp.as_file(), &confirmation)?;
-            temp.persist(path)?;
+            crate::durable::persist(temp, path)?;
             claims.confirmation = Some(confirmation);
             Ok(Outcome::Diff { diff })
         }

@@ -356,7 +356,7 @@ fn write_report(project: &Path, output: &str, markdown: &str) -> Result<()> {
     fs::create_dir_all(parent)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(markdown.as_bytes())?;
-    file.persist(path)?;
+    crate::durable::persist(file, path)?;
     Ok(())
 }
 

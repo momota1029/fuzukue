@@ -254,8 +254,7 @@ pub(crate) fn set(workspace: &crate::Workspace, change: Settings) -> Result<()> 
     std::fs::create_dir_all(&workspace.state_dir)?;
     let mut file = tempfile::NamedTempFile::new_in(&workspace.state_dir)?;
     file.write_all(&serde_json::to_vec(&change)?)?;
-    file.as_file().sync_all()?;
-    file.persist(workspace.state_dir.join("worker-execution.json"))?;
+    crate::durable::persist(file, workspace.state_dir.join("worker-execution.json"))?;
     *current = change;
     Ok(())
 }

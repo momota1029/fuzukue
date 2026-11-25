@@ -3,7 +3,8 @@
 use fuzukue_proto::{GitHubActivity, GitHubAuthor, GitHubLink, GitHubPolicy, ThreadGitHub};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::fs::{self, File, Metadata};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::time::{Instant, SystemTime};
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use fuzukue_proto::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{state, workspace};
+use crate::{durable, state, workspace};
 
 use fuzukue_proto::{AgentSelection, ChatSettings, DelegateSettings};
 
@@ -547,6 +548,7 @@ impl Transcript {
     }
 
     fn read(body: &str) -> Result<Self> {
+        ensure!(!body.as_bytes().contains(&0), "NUL bytes in transcript");
         let mut transcript = Self::default();
         let Some(body) = body.strip_prefix(ENTRY) else {
             ensure!(body.is_empty(), "missing transcript entry");
@@ -990,8 +992,72 @@ impl TranscriptSource {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct FileVersion {
+    length: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl FileVersion {
+    fn read(metadata: Metadata) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+}
+
+fn previous_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(".{}.previous", path.file_name().unwrap().to_string_lossy()))
+}
+
+fn preserve_previous(file: &mut File, path: &Path, dir: &Path) -> Result<()> {
+    file.sync_all()?;
+    let previous = previous_path(path);
+    let staging = tempfile::Builder::new().prefix(".fuzukue-thread-backup-").tempdir_in(dir)?;
+    let staged = staging.path().join("previous");
+    if fs::hard_link(path, &staged).is_err() {
+        let mut copy = File::create_new(&staged)?;
+        copy.set_permissions(file.metadata()?.permissions())?;
+        std::io::copy(file, &mut copy)?;
+        copy.sync_all()?;
+    }
+    fs::rename(staged, previous)?;
+    durable::sync_dir(dir)?;
+    Ok(())
+}
+
+fn remove_stale_thread_temps(entry: &fs::DirEntry) -> std::io::Result<()> {
+    // Leave recent files alone in case another process is writing this workspace.
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else { return Ok(()) };
+    let temp_file = name.strip_prefix(".tmp").is_some_and(|suffix|
+        suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    let backup_dir = name.starts_with(".fuzukue-thread-backup-");
+    if !temp_file && !backup_dir {
+        return Ok(());
+    }
+    let metadata = entry.metadata()?;
+    if metadata.modified()?.elapsed().unwrap_or_default().as_secs() < 3600 {
+        return Ok(());
+    }
+    if temp_file && metadata.is_file() {
+        fs::remove_file(entry.path())?;
+    } else if backup_dir && metadata.is_dir() {
+        fs::remove_dir_all(entry.path())?;
+    }
+    Ok(())
+}
+
 struct Thread {
     path: PathBuf,
+    file_version: RefCell<Option<FileVersion>>,
     front: Front,
     transcript: TranscriptSlot,
     page_revision: u64,
@@ -1003,11 +1069,15 @@ struct Thread {
 
 impl Thread {
     fn read(path: PathBuf) -> Result<Self> {
-        let text = std::fs::read_to_string(&path)?;
+        let mut file = File::open(&path)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        ensure!(!text.as_bytes().contains(&0), "NUL bytes in thread");
         let (front, body) =
             fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
         Ok(Self {
             path,
+            file_version: RefCell::new(Some(FileVersion::read(file.metadata()?)?)),
             front: serde_yaml::from_str(front)?,
             transcript: TranscriptSlot::new(Transcript::read(body)?),
             page_revision: 0,
@@ -1019,10 +1089,12 @@ impl Thread {
     }
 
     fn read_lazy(path: PathBuf, timeline: &state::Timeline) -> Result<Self> {
-        let mut input = BufReader::new(std::fs::File::open(&path)?);
+        let mut input = BufReader::new(File::open(&path)?);
+        let file_version = FileVersion::read(input.get_ref().metadata()?)?;
+        ensure!(input.fill_buf()?.starts_with(b"---\n") || input.fill_buf()?.starts_with(b"---\r\n"),
+            "missing thread front matter");
         let mut text = String::new();
         input.read_line(&mut text)?;
-        ensure!(matches!(text.as_str(), "---\n" | "---\r\n"), "missing thread front matter");
         loop {
             let start = text.len();
             ensure!(input.read_line(&mut text)? != 0, "unterminated thread front matter");
@@ -1030,17 +1102,28 @@ impl Thread {
                 break;
             }
         }
+        ensure!(!text.as_bytes().contains(&0), "NUL bytes in thread front matter");
         let (front, _) = fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
         let front: Front = serde_yaml::from_str(front)?;
+        if file_version.length > text.len() as u64 {
+            let mut last = [0; 2];
+            input.seek(SeekFrom::End(-2))?;
+            input.read_exact(&mut last)?;
+            ensure!(&last == b"\n\n", "missing final transcript separator");
+        }
         let transcript = TranscriptSlot::lazy(TranscriptSource {
             path: path.clone(), session: front.id.clone(), legacy: front.migrated_from.clone(),
             after: 0, timeline: timeline.clone(),
         });
-        Ok(Self { path, front, transcript, page_revision: 0, library_revision: 0, library_updated: 0, active: false, suggestions: Vec::new() })
+        Ok(Self {
+            path, file_version: RefCell::new(Some(file_version)), front, transcript,
+            page_revision: 0, library_revision: 0, library_updated: 0, active: false,
+            suggestions: Vec::new(),
+        })
     }
 
     fn save(&self) -> Result<()> {
-        self.transcript.check()?;
+        self.transcript.check().with_context(|| format!("Thread file {}", self.path.display()))?;
         let dir = self.path.parent().context("missing thread directory")?;
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         {
@@ -1049,7 +1132,21 @@ impl Thread {
             self.transcript.write_markdown(&mut output)?;
             output.flush()?;
         }
-        tmp.persist(&self.path)?;
+        match File::open(&self.path) {
+            Ok(mut file) => {
+                let version = FileVersion::read(file.metadata()?)?;
+                ensure!(self.file_version.borrow().as_ref() == Some(&version),
+                    "Thread file {} changed on disk", self.path.display());
+                preserve_previous(&mut file, &self.path, dir)?;
+                ensure!(FileVersion::read(fs::symlink_metadata(&self.path)?)? == version,
+                    "Thread file {} changed while saving", self.path.display());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && self.file_version.borrow().is_none() => {}
+            Err(error) => return Err(error).with_context(|| format!("Thread file {}", self.path.display())),
+        }
+        let file = durable::persist(tmp, &self.path)?;
+        self.file_version.replace(Some(FileVersion::read(file.metadata()?)?));
         self.transcript.dirty.set(false);
         Ok(())
     }
@@ -1381,11 +1478,16 @@ struct TailCheckpoint {
     page: HistoryPage,
 }
 
+fn damage_notice(file: String) -> ServerEvent {
+    ServerEvent::Error { message: format!("スレッドファイルが破損している: {file}") }
+}
+
 pub struct Store {
     project: PathBuf,
     state_dir: PathBuf,
     timeline: state::Timeline,
     threads: BTreeMap<String, Thread>,
+    damaged_files: Vec<String>,
     migrations: HashMap<String, String>,
     restored_generations: HashMap<String, u64>,
     pages: RefCell<VecDeque<(PageKey, HistoryPage)>>,
@@ -1415,6 +1517,7 @@ impl Store {
             state_dir: state_dir.into(),
             timeline,
             threads: BTreeMap::new(),
+            damaged_files: Vec::new(),
             restored_generations: HashMap::new(),
             pages: RefCell::new(VecDeque::new()),
             migrations: std::fs::read(state_dir.join("removed-thread-migrations.json")).ok()
@@ -1431,6 +1534,9 @@ impl Store {
             .flatten()
             .flatten()
         {
+            if let Err(error) = remove_stale_thread_temps(&entry) {
+                tracing::warn!(path=?entry.path(), %error, "could not remove stale thread temporary file");
+            }
             if entry.path().extension().is_none_or(|e| e != "md")
                 || !entry.file_type().is_ok_and(|kind| kind.is_file())
             {
@@ -1453,8 +1559,12 @@ impl Store {
                     }
                     store.threads.insert(thread.front.id.clone(), thread);
                 }
-                Ok(_) => tracing::warn!("invalid thread ID in {}", entry.path().display()),
-                Err(e) => tracing::warn!("could not restore {}: {e:#}", entry.path().display()),
+                result => {
+                    let error = result.err().map_or_else(|| "invalid thread ID".into(), |e| format!("{e:#}"));
+                    let path = entry.path();
+                    tracing::warn!(?path, %error, "could not restore thread");
+                    store.damaged_files.push(format!("{}: {error}", entry.file_name().to_string_lossy()));
+                }
             }
         }
 
@@ -1512,6 +1622,18 @@ impl Store {
             store.trim_transcripts();
         }
         store
+    }
+
+    pub(crate) fn thread_damage(&self, id: &str) -> Option<ServerEvent> {
+        let thread = self.threads.get(id)?;
+        let error = thread.transcript.loaded.get()?.error.as_ref()?;
+        Some(damage_notice(format!("{} ({}): {error}",
+            thread.front.title, thread.path.file_name()?.to_string_lossy())))
+    }
+
+    pub(crate) fn damage_notices(&self) -> impl Iterator<Item = ServerEvent> + '_ {
+        self.damaged_files.iter().map(|file| damage_notice(file.clone()))
+            .chain(self.threads.keys().filter_map(|id| self.thread_damage(id)))
     }
 
     pub(crate) fn trim_transcripts(&mut self) {
@@ -1772,17 +1894,12 @@ impl Store {
 
     fn write_tail_checkpoint(&self, key: &PageKey, workers: &BTreeSet<String>, page: &HistoryPage) -> Result<()> {
         let path = self.checkpoint_path(&key.session);
-        let dir = path.parent().unwrap();
         let PageRevision::Tail(revision) = &key.revision else { return Ok(()) };
         let encoded = serde_json::to_vec(&TailCheckpoint {
             revision: revision.clone(), workers: workers.clone(), page: page.clone(),
         })?;
         if encoded.len() > CACHE_PAGE_BYTES { return Ok(()); }
-        std::fs::create_dir_all(dir)?;
-        let mut file = tempfile::NamedTempFile::new_in(dir)?;
-        file.write_all(&encoded)?;
-        file.persist(path)?;
-        Ok(())
+        durable::write(&path, |output| Ok(output.write_all(&encoded)?))
     }
 
     pub(crate) fn history_tail(
@@ -2408,6 +2525,7 @@ impl Store {
         let titled = title.is_some();
         Ok(Thread {
             path,
+            file_version: RefCell::new(None),
             front: Front {
                 handoff: None,
                 github: ThreadGitHub::default(),
@@ -2759,11 +2877,15 @@ impl Store {
             let mut removed: HashMap<String, String> = std::fs::read(&path).ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
             removed.insert(legacy.clone(), id.into());
-            let temp = tempfile::NamedTempFile::new_in(&self.state_dir)?;
-            std::fs::write(temp.path(), serde_json::to_vec(&removed)?)?;
-            temp.persist(path)?;
+            durable::json(&path, &removed)?;
         }
         trash.file_unrecorded(app, fuzukue_proto::TrashKind::Thread, id.into(), thread.front.title.clone(), &thread.path)?;
+        let backup = previous_path(&thread.path);
+        if let Err(error) = fs::remove_file(&backup) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path=?backup, %error, "could not remove previous version of trashed thread");
+            }
+        }
         self.threads.remove(id);
         self.pages.borrow_mut().retain(|(key, _)| key.session != id);
         let _ = std::fs::remove_file(self.checkpoint_path(id));
@@ -2908,7 +3030,12 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     pub fn observe(&mut self, event: &ServerEvent, completed: bool) -> Result<bool> {
+        self.observe_persisted(event, completed, false)
+    }
+
+    pub(crate) fn observe_persisted(&mut self, event: &ServerEvent, completed: bool, journaled: bool) -> Result<bool> {
         let Some(thread) = history_session(event).and_then(|id| self.threads.get_mut(id)) else {
             return Ok(false);
         };
@@ -2956,7 +3083,14 @@ impl Store {
                 return Ok(false);
             }
             ServerEvent::ToolResult { item, .. } if item.starts_with(fuzukue_proto::DELEGATE_JOB) => {
-                thread.save()?;
+                // A large checkpoint can wait for the next turn or explicit edit.
+                // The synced journal makes these worker results recoverable meanwhile.
+                const LARGE_CHECKPOINT: u64 = 4 * 1024 * 1024;
+                let large = thread.file_version.borrow().as_ref()
+                    .is_some_and(|version| version.length >= LARGE_CHECKPOINT);
+                if !journaled || !large {
+                    thread.save()?;
+                }
                 return Ok(false);
             }
             ServerEvent::ToolResult { item, ok: true, .. } => {
@@ -3182,7 +3316,7 @@ fn slug(value: &str) -> bool {
 
 fn project_dir(project: &Path, name: &str) -> Result<PathBuf> {
     match std::fs::create_dir(project.join(name)) {
-        Ok(()) => {}
+        Ok(()) => durable::sync_dir(project)?,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
@@ -3193,6 +3327,88 @@ fn project_dir(project: &Path, name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod archive_tests {
+    #[test]
+    fn corrupt_portable_threads_are_reported_and_kept() -> anyhow::Result<()> {
+        use super::*;
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let mut threads = Store::load(project.path(), state.path(), &Default::default());
+        let id = threads.create(None)?;
+        let path = threads.path(&id)?;
+        let original = fs::read(&path)?;
+        threads.rename(&id, "Second generation")?;
+        assert_eq!(fs::read(previous_path(&path))?, original);
+        let valid = fs::read(&path)?;
+        let stale = path.with_file_name(".tmpABC123");
+        File::create(&stale)?.set_modified(SystemTime::UNIX_EPOCH)?;
+        let recent = path.with_file_name(".tmpDEF456");
+        File::create(&recent)?;
+
+        for data in [vec![], vec![0; 18_800_000], [&valid[..], b"partial"].concat()] {
+            fs::write(&path, &data)?;
+            let mut reopened = Store::load(project.path(), state.path(), &Default::default());
+            let filename = path.file_name().unwrap().to_string_lossy();
+            assert!(reopened.damage_notices().any(|event|
+                matches!(event, ServerEvent::Error { message } if message.contains(filename.as_ref()))));
+            assert!(reopened.rename(&id, "Cannot replace").is_err());
+            assert_eq!(fs::read(&path)?, data);
+            assert_eq!(fs::read(previous_path(&path))?, original);
+        }
+        assert!(!stale.exists());
+        assert!(recent.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn large_thread_recovers_worker_result_without_replacing_markdown() -> anyhow::Result<()> {
+        use super::*;
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let hub = crate::hub::Hub::with_timeline(state.path());
+        hub.load_threads(project.path(), state.path());
+        let session = hub.edit_threads(|threads| threads.create(None))?;
+        let path = hub.thread_path(&session)?;
+        hub.publish(ServerEvent::TextDelta {
+            session: session.clone(), item: "synthetic-partner".into(), actor: Actor::Claude,
+            text: "x".repeat(4 * 1024 * 1024),
+        });
+        hub.publish(ServerEvent::TurnEnded { session: session.clone(), actor: Actor::Claude });
+        let before = fs::read(&path)?;
+        let item = "delegate:synthetic-job".to_string();
+        hub.publish(ServerEvent::ToolCall {
+            session: session.clone(), item: item.clone(), actor: Actor::System,
+            name: "delegate".into(), input: serde_json::json!({}),
+        });
+        hub.publish(ServerEvent::ToolResult {
+            session: session.clone(), item: item.clone(), ok: true, output: "done".into(),
+        });
+        assert_eq!(fs::read(&path)?, before);
+        drop(hub);
+
+        let reopened = crate::hub::Hub::with_timeline(state.path());
+        reopened.load_threads(project.path(), state.path());
+        assert!(reopened.read_threads(|threads|
+            matches!(threads.delegate_record(&session, &item), Some((_, Some(true), Some("done"))))));
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_nul_is_detected_on_first_open() -> anyhow::Result<()> {
+        use super::*;
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let mut threads = Store::load(project.path(), state.path(), &Default::default());
+        let id = threads.create_titled(None, Some("Synthetic thread".into()))?;
+        let path = threads.path(&id)?;
+        let mut file = File::options().append(true).open(&path)?;
+        file.write_all(b"<!-- labo-thread {\"item\":\"test\",\"actor\":\"User\"} -->\n## User\n\ntext\0\n\n")?;
+        let threads = Store::load(project.path(), state.path(), &Default::default());
+        assert!(threads.history_tail(&id, &Default::default(), true, |event| event).is_none());
+        assert!(matches!(threads.thread_damage(&id), Some(ServerEvent::Error { message })
+            if message.contains("Synthetic thread") && message.contains("NUL")));
+        Ok(())
+    }
+
     #[test]
     fn worker_activity_never_displaces_conversation_in_compact_history() {
         use super::*;

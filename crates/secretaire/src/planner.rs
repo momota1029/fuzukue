@@ -194,7 +194,7 @@ fn write(app: &Workspace, session: &str, plan: &Plan, stale: bool) -> Result<()>
     ] {
         writeln!(tmp, "\n## {heading}\n\n```yaml\n{yaml}```")?;
     }
-    tmp.persist(path)?;
+    crate::durable::persist(tmp, path)?;
     Ok(())
 }
 

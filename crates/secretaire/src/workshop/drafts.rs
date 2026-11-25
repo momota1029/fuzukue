@@ -394,7 +394,7 @@ impl Change {
         }
         tmp.write_all(&self.after)?;
         self.check()?;
-        tmp.persist(&self.path)?;
+        crate::durable::persist(tmp, &self.path)?;
         Ok(())
     }
 }

@@ -178,7 +178,7 @@ pub(super) fn ready(root: &Path, addr: SocketAddr) -> Result<Option<PathBuf>> {
     let mut marker = tempfile::NamedTempFile::new_in(&pending)?;
     use std::io::Write;
     writeln!(marker, "{} {addr}", std::process::id())?;
-    marker.persist(pending.join(ADDRESS))?;
+    crate::durable::persist(marker, pending.join(ADDRESS))?;
     Ok(Some(pending))
 }
 

@@ -60,6 +60,7 @@ mod recipes;
 mod references;
 mod remote;
 mod device_tokens;
+mod durable;
 mod distribution;
 mod android_distribution;
 mod reviewers;

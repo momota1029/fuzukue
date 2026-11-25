@@ -219,8 +219,7 @@ impl Preferences {
         update(&mut preferences)?;
         let mut staged = tempfile::NamedTempFile::new_in(dir)?;
         staged.write_all(&serde_json::to_vec_pretty(&preferences)?)?;
-        staged.as_file().sync_all()?;
-        staged.persist(dir.join("extensions.json"))?;
+        crate::durable::persist(staged, dir.join("extensions.json"))?;
         Ok(preferences)
     }
 

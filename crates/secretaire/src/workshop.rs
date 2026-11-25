@@ -405,7 +405,7 @@ impl Queue {
         std::fs::create_dir_all(&self.dir)?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
         tmp.write_all(&serde_json::to_vec_pretty(jobs)?)?;
-        tmp.persist(self.dir.join("jobs.json"))?;
+        crate::durable::persist(tmp, self.dir.join("jobs.json"))?;
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::Path;
 
@@ -17,7 +17,8 @@ impl Drop for Journal {
 
 impl Journal {
     pub(super) fn open(path: &Path) -> Result<(Self, Vec<Record>)> {
-        fs::create_dir_all(path.parent().context("missing recipe audit directory")?)?;
+        let parent = path.parent().context("missing recipe audit directory")?;
+        crate::durable::create_dir_all(parent)?;
         let mut options = OpenOptions::new();
         options.read(true).append(true).create(true);
         #[cfg(unix)]
@@ -28,6 +29,8 @@ impl Journal {
         let mut file = options.open(path)?;
         file.try_lock()
             .context("another server owns the recipe audit journal")?;
+        file.sync_all()?;
+        crate::durable::sync_dir(parent)?;
 
         // A restart may leave a partially appended final record. All admitted requests
         // had their queued record synced before they could run.

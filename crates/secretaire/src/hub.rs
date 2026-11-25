@@ -732,8 +732,9 @@ impl Hub {
         }
         // 送信は lock を握ったまま行い、backlog と live の順序を揃える。
         let journal_done_at = timing.as_ref().map(|_| Instant::now());
+        let journaled = replayable && inner.writer.as_ref().is_some_and(|writer| writer.appends_synced());
         let saved = inner.threads.as_mut().map(|threads| {
-            let saved = threads.observe(&env.event, completed_session.is_some());
+            let saved = threads.observe_persisted(&env.event, completed_session.is_some(), journaled);
             if matches!(env.event, ServerEvent::TurnEnded { .. }) {
                 threads.trim_transcripts();
             }
@@ -1013,6 +1014,9 @@ impl Hub {
             let event = tool_key(&event).and_then(|key| tools.get(&key)).map(|&event| event.clone()).unwrap_or(event);
             crate::threads::bound_history_tool(event)
         });
+        if let Some(event) = threads.thread_damage(&session) {
+            let _ = self.tx.send(crate::snapshot(event));
+        }
         inner.threads.as_mut().unwrap().trim_transcripts();
         match tail {
             Some((events, workers, next_before)) => ServerEvent::ThreadTail {
@@ -1033,6 +1037,9 @@ impl Hub {
         } else {
             threads.history_page(&session, before).ok_or(Unavailable)
         };
+        if let Some(event) = threads.thread_damage(&session) {
+            let _ = self.tx.send(crate::snapshot(event));
+        }
         inner.threads.as_mut().unwrap().trim_transcripts();
         match page {
             Ok((events, next_before)) => ServerEvent::ThreadHistoryPage {
@@ -1048,6 +1055,9 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
         let page = threads.history_from(&session, start, generation);
+        if let Some(event) = threads.thread_damage(&session) {
+            let _ = self.tx.send(crate::snapshot(event));
+        }
         threads.trim_transcripts();
         match page {
             Ok((events, next_after)) => ServerEvent::ThreadHistoryFrom {
@@ -1129,6 +1139,7 @@ impl Hub {
             turns: inner.running.iter().cloned().collect(), workers,
         }));
         initial.push(crate::snapshot(threads.snapshot()));
+        initial.extend(threads.damage_notices().map(crate::snapshot));
         initial.push(crate::snapshot(ServerEvent::ThreadSync {
             epoch: self.epoch.clone(), through, reset_sessions: reset_sessions.into_iter().collect(),
         }));
@@ -1206,6 +1217,7 @@ impl Hub {
                 turns: inner.running.iter().cloned().collect(), workers,
             } });
             backlog.push(Envelope { workspace: None, seq, event: threads.snapshot() });
+            backlog.extend(threads.damage_notices().map(crate::snapshot));
         }
         if include_threads {
             if let Some(threads) = inner.threads.as_mut() {

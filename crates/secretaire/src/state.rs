@@ -103,14 +103,17 @@ pub struct TimelineWriter {
     file: std::fs::File,
     timeline: Timeline,
     repair_tail: bool,
+    append_failed: bool,
 }
 
 impl TimelineWriter {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        crate::durable::create_dir_all(dir)?;
         let mut file = std::fs::OpenOptions::new().create(true).read(true).append(true).open(dir.join(TIMELINE))?;
         Self::seal_line(&mut file)?;
-        Ok(Self { file, timeline: Timeline::open(dir), repair_tail: false })
+        file.sync_all()?;
+        crate::durable::sync_dir(dir)?;
+        Ok(Self { file, timeline: Timeline::open(dir), repair_tail: false, append_failed: false })
     }
 
     fn seal_line(file: &mut std::fs::File) -> std::io::Result<u64> {
@@ -132,6 +135,10 @@ impl TimelineWriter {
         self.timeline.clone()
     }
 
+    pub(crate) fn appends_synced(&self) -> bool {
+        !self.append_failed
+    }
+
     pub fn append(&mut self, env: &Envelope) -> u64 {
         let mut line = serde_json::to_vec(env).expect("serializable timeline envelope");
         line.push(b'\n');
@@ -141,12 +148,14 @@ impl TimelineWriter {
                 Self::seal_line(&mut self.file)?;
             }
             self.file.write_all(&line)?;
+            self.file.sync_data()?;
             let end = self.file.stream_position()?;
             self.timeline.record_append(end - len, end, env);
             Ok(())
         })();
         self.repair_tail = result.is_err();
         if let Err(error) = result {
+            self.append_failed = true;
             tracing::error!(%error, seq=env.seq, "could not append timeline event");
         }
         len
@@ -201,12 +210,7 @@ pub fn save_sessions(dir: &Path, sessions: &BTreeMap<String, SessionRecord>) {
 }
 
 pub fn save_sessions_checked(dir: &Path, sessions: &BTreeMap<String, SessionRecord>) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let serialized = serde_json::to_string_pretty(sessions)?;
-    let tmp = dir.join("thread-sessions.json.tmp");
-    std::fs::write(&tmp, serialized)?;
-    std::fs::rename(tmp, dir.join(SESSIONS))?;
-    Ok(())
+    crate::durable::json(&dir.join(SESSIONS), sessions)
 }
 
 #[cfg(test)]
@@ -281,11 +285,7 @@ pub fn load_delegate_settings(dir: &Path) -> fuzukue_proto::DelegateSettings {
 }
 
 pub fn save_delegate_settings(dir: &Path, settings: &fuzukue_proto::DelegateSettings) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join("delegate-settings.json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(settings)?)?;
-    std::fs::rename(tmp, dir.join("delegate-settings.json"))?;
-    Ok(())
+    crate::durable::json(&dir.join("delegate-settings.json"), settings)
 }
 
 pub(crate) fn load_worker_approval_policy(dir: &Path) -> fuzukue_proto::WorkerApprovalPolicy {
@@ -337,11 +337,7 @@ pub(crate) fn load_worker_approval_policy(dir: &Path) -> fuzukue_proto::WorkerAp
 pub(crate) fn save_worker_approval_policy(
     dir: &Path, policy: fuzukue_proto::WorkerApprovalPolicy,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let mut file = tempfile::NamedTempFile::new_in(dir)?;
-    file.write_all(&serde_json::to_vec(&policy)?)?;
-    file.persist(dir.join("worker-approval-policy.json"))?;
-    Ok(())
+    crate::durable::json(&dir.join("worker-approval-policy.json"), &policy)
 }
 
 pub fn load_partner_default(dir: &Path) -> fuzukue_proto::ChatSettings {
@@ -356,11 +352,7 @@ pub(crate) fn has_role_settings(dir: &Path) -> bool {
 }
 
 pub fn save_partner_default(dir: &Path, settings: &fuzukue_proto::ChatSettings) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join("partner-default.json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(settings)?)?;
-    std::fs::rename(tmp, dir.join("partner-default.json"))?;
-    Ok(())
+    crate::durable::json(&dir.join("partner-default.json"), settings)
 }
 
 pub fn load_review_settings(dir: &Path) -> fuzukue_proto::ReviewSettings {
@@ -369,11 +361,7 @@ pub fn load_review_settings(dir: &Path) -> fuzukue_proto::ReviewSettings {
 }
 
 pub fn save_review_settings(dir: &Path, settings: &fuzukue_proto::ReviewSettings) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let temp = tempfile::NamedTempFile::new_in(dir)?;
-    std::fs::write(temp.path(), serde_json::to_vec_pretty(settings)?)?;
-    temp.persist(dir.join("review-settings.json"))?;
-    Ok(())
+    crate::durable::json(&dir.join("review-settings.json"), settings)
 }
 
 
@@ -393,9 +381,5 @@ pub fn load_agent_settings(dir: &Path) -> fuzukue_proto::AgentSettings {
 }
 
 pub fn save_agent_settings(dir: &Path, settings: &fuzukue_proto::AgentSettings) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let temp = tempfile::NamedTempFile::new_in(dir)?;
-    std::fs::write(temp.path(), serde_json::to_vec_pretty(settings)?)?;
-    temp.persist(dir.join("agent-settings.json"))?;
-    Ok(())
+    crate::durable::json(&dir.join("agent-settings.json"), settings)
 }

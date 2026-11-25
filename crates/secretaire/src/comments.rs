@@ -59,7 +59,7 @@ pub fn save(deck: &Path, items: &[CommentView]) -> Result<()> {
     }
     let tmp = tempfile::NamedTempFile::new_in(f.parent().unwrap())?;
     std::fs::write(tmp.path(), serde_json::to_vec_pretty(items)?)?;
-    tmp.persist(f)?;
+    crate::durable::persist(tmp, f)?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -216,15 +216,12 @@ impl Journal {
         let mut file = File::open(&self.path)?;
         let sample = Self::sample(&mut file, self.index.end)?;
         let modified = file.metadata()?.modified().ok();
-        let tmp = tempfile::NamedTempFile::new_in(self.path.parent().unwrap())?;
-        let mut output = io::BufWriter::new(tmp.as_file());
-        serde_json::to_writer(&mut output, &BorrowedCheckpoint {
-            version: INDEX_VERSION, sample, modified, index: &self.index,
-        })?;
-        output.flush()?;
-        drop(output);
-        tmp.persist(self.checkpoint_path())?;
-        Ok(())
+        crate::durable::write(&self.checkpoint_path(), |output| {
+            serde_json::to_writer(output, &BorrowedCheckpoint {
+                version: INDEX_VERSION, sample, modified, index: &self.index,
+            })?;
+            Ok(())
+        })
     }
 
     fn visit(&self, records: impl IntoIterator<Item = Record>, mut visit: impl FnMut(Envelope, u64)) {
@@ -368,6 +365,7 @@ impl Timeline {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use super::*;
 
     fn event(seq: u64) -> Envelope {

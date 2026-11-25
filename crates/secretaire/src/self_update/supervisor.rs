@@ -96,7 +96,7 @@ pub(crate) fn ready(addr: SocketAddr) -> Result<Option<PathBuf>> {
             path.parent().context("invalid server health marker")?,
         )?;
         write!(marker, "{addr}")?;
-        marker.persist(&path)?;
+        crate::durable::persist(marker, &path)?;
         return Ok(Some(path));
     }
     Ok(None)

@@ -1,5 +1,4 @@
 use std::fs;
-use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -154,38 +153,37 @@ fn refreshes_two_thousand_cards_and_reuses_cached_inputs() {
         ));
     }
     let graph = WorkspaceGraph::default();
-    let start = Instant::now();
     graph.refresh(project.path(), state.path());
-    let cold = start.elapsed();
     assert!(state.path().join("card-graph.json").is_file());
 
     let overview = graph.with_graph(project.path(), state.path(), true, |graph| {
+        assert_eq!(graph.inputs.card_reads, 2000);
         call(graph, Tool::Overview, json!({}))
     });
     assert_eq!(overview["decks"][0]["card_count"], 2000);
     assert!(overview["decks"][0]["omitted_cards"].as_u64().unwrap() > 0);
     assert!(overview.to_string().len() < 15_000);
 
-    let start = Instant::now();
     let cache = Graph::open(project.path(), state.path());
-    let warm = start.elapsed();
     assert_eq!(cache.cache.cards.len(), 2000);
+    assert_eq!(cache.inputs.card_reads, 0);
 
     project.write(
         "cards/0000.md",
         "---\nid: card-0\ntitle: Updated\n---\nNew marker.",
     );
     graph.invalidate();
-    let start = Instant::now();
     let result = graph.with_graph(project.path(), state.path(), true, |graph| {
+        assert_eq!(graph.cache.cards.len(), 2000);
+        assert_eq!(graph.inputs.card_reads, 1);
         call(
             graph,
             Tool::Search,
             json!({"query":"New marker", "limit":1}),
         )
     });
-    let incremental = start.elapsed();
     let restored = Graph::open(project.path(), state.path());
+    assert_eq!(restored.inputs.card_reads, 0);
     assert_eq!(
         call(
             &restored,
@@ -195,17 +193,6 @@ fn refreshes_two_thousand_cards_and_reuses_cached_inputs() {
         result
     );
     assert_eq!(result["matches"][0]["card"]["title"], "Updated");
-    eprintln!(
-        "2000 cards: cold {cold:?}, disk-cache reopen {warm:?}, update + search {incremental:?}"
-    );
-    assert!(
-        incremental * 3 < cold * 2,
-        "update + search {incremental:?} should take less than two thirds of cold build {cold:?}"
-    );
-    assert!(
-        warm < cold,
-        "disk-cache reopen {warm:?} should be faster than cold build {cold:?}"
-    );
 }
 
 #[test]

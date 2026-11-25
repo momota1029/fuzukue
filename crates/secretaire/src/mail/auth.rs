@@ -92,8 +92,7 @@ impl CredentialFile {
     fn write(&self, credentials: &Credentials) -> Result<()> {
         let mut temp = tempfile::NamedTempFile::new_in(self.directory(false)?)?;
         serde_json::to_writer(temp.as_file_mut(), credentials)?;
-        temp.as_file().sync_all()?;
-        temp.persist(&self.0).map_err(|e| e.error)?;
+        crate::durable::persist(temp, &self.0)?;
         Ok(())
     }
 

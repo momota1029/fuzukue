@@ -366,8 +366,7 @@ impl TokenFile {
             }
             serde_json::to_writer(&mut file, credential)?;
             file.flush()?;
-            file.as_file().sync_all()?;
-            file.persist(&self.0)?;
+            crate::durable::persist(file, &self.0)?;
             Ok(())
         };
         store().map_err(|_| Error::Storage)

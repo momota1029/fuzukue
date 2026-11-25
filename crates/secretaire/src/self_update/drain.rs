@@ -202,8 +202,7 @@ impl Journal {
         let mut file = tempfile::NamedTempFile::new_in(dir)?;
         serde_json::to_writer(&mut file, records)?;
         file.flush()?;
-        file.as_file().sync_all()?;
-        file.persist(dir.join(FILE))?;
+        crate::durable::persist(file, dir.join(FILE))?;
         Ok(())
     }
 

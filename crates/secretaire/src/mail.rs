@@ -980,7 +980,7 @@ fn write_seen(path: &Path, seen: &Seen) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     serde_json::to_writer(file.as_file_mut(), seen)?;
     file.flush()?;
-    file.persist(path).map_err(|e| e.error)?;
+    crate::durable::persist(file, path)?;
     Ok(())
 }
 

@@ -756,7 +756,7 @@ fn write_generated(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut temp =
         tempfile::NamedTempFile::new_in(path.parent().context("build path has no parent")?)?;
     std::io::Write::write_all(&mut temp, bytes)?;
-    temp.persist(path)?;
+    crate::durable::persist(temp, path)?;
     Ok(())
 }
 

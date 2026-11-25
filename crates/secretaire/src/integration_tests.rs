@@ -1014,7 +1014,11 @@ fn legacy_chats_migrate_once_without_changing_the_state_backups() -> Result<()> 
         if threads.len() == 2 && threads.iter().any(|thread| thread.id == main && thread.title == "新しい題"))));
     assert!(restarted.hub.thread_attachments(&tab).is_empty());
     assert_eq!(restarted.session_records.lock().unwrap()[&main].claude_session_id.as_deref(), Some("new-cli-id"));
-    assert_eq!(fs::read_dir(project.path().join("threads"))?.count(), 2);
+    let thread_count = fs::read_dir(project.path().join("threads"))?
+        .filter(|entry| entry.as_ref().is_ok_and(|entry|
+            entry.path().extension().is_some_and(|extension| extension == "md")))
+        .count();
+    assert_eq!(thread_count, 2);
     assert_eq!(fs::read_to_string(backup_timeline)?, journal);
     assert_eq!(fs::read_to_string(backup_sessions)?, sessions);
     let from_markdown = Workspace::new(

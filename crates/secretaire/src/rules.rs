@@ -136,8 +136,7 @@ impl Lock {
     fn save(&self, project: &Path) -> Result<()> {
         let mut temp = NamedTempFile::new_in(project)?;
         write!(temp, "{}", toml::to_string_pretty(self)?)?;
-        temp.as_file().sync_all()?;
-        temp.persist(project.join("fuzukue.lock"))?;
+        crate::durable::persist(temp, project.join("fuzukue.lock"))?;
         Ok(())
     }
 }

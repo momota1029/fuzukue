@@ -147,7 +147,7 @@ impl Log {
         let mut bytes = serde_json::to_vec(entry)?;
         bytes.push(b'\n');
         let _lock = self.0.lock().unwrap();
-        fs::create_dir_all(dir)?;
+        crate::durable::create_dir_all(dir)?;
         let current = dir.join(CURRENT);
         if fs::metadata(&current).is_ok_and(|m| m.len() + bytes.len() as u64 > MAX_BYTES) {
             let previous = dir.join(PREVIOUS);
@@ -157,15 +157,17 @@ impl Log {
             }
             let mut temp = tempfile::NamedTempFile::new_in(dir)?;
             serde_json::to_writer(&mut temp, &last)?;
-            temp.persist(dir.join(LAST_USED))?;
+            crate::durable::persist(temp, dir.join(LAST_USED))?;
             fs::rename(&current, previous)?;
+            crate::durable::sync_dir(dir)?;
         }
         let mut file = OpenOptions::new()
             .append(true)
             .create(true)
             .open(&current)?;
         // Delimit a torn last line before appending the next record.
-        if file.metadata()?.len() > 0 {
+        let empty = file.metadata()?.len() == 0;
+        if !empty {
             use std::io::{Read, Seek, SeekFrom};
             let mut tail = File::open(&current)?;
             tail.seek(SeekFrom::End(-1))?;
@@ -176,6 +178,10 @@ impl Log {
             }
         }
         file.write_all(&bytes)?;
+        file.sync_data()?;
+        if empty {
+            crate::durable::sync_dir(dir)?;
+        }
         Ok(())
     }
 

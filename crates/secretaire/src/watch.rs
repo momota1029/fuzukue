@@ -126,8 +126,7 @@ impl Store {
         std::fs::create_dir_all(dir)?;
         let file = tempfile::NamedTempFile::new_in(dir)?;
         serde_json::to_writer(file.as_file(), &next)?;
-        file.as_file().sync_all()?;
-        file.persist(&self.path)?;
+        crate::durable::persist(file, &self.path)?;
         self.state = next;
         Ok(result)
     }
