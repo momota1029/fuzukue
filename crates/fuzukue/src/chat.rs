@@ -4320,10 +4320,10 @@ impl Workbench {
             return;
         }
         let input = self.input.read(cx);
-        // The unmodified Up binding hands off before moving the caret on its first row.
-        if !down && !extend && input.vertical_arrow_at_edge(false, cx) {
-            self.chat_focus.focus(window, cx);
-            self.chats[&self.active].scroller.scroll_by(-window.line_height());
+        if !extend && input.vertical_arrow_at_edge(down, cx) {
+            let line = window.line_height();
+            self.chats[&self.active].scroller.scroll_by(if down { line } else { -line });
+            self.history_scrolled(cx);
             cx.stop_propagation();
             cx.notify();
             return;

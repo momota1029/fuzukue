@@ -4340,7 +4340,7 @@ mod tests {
                         runner.click(cx, ClickTarget::Element { id: "chat-input".into() })?;
                         for (text, offset, key, selected) in [
                             ("- a", 3, "shift-enter", 4..4),
-                            ("abcd\n0123", 7, "down", 9..9),
+                            ("abcd\n0123", 7, "down", 7..7),
                             ("abcd\n0123", 2, "shift-up", 0..2),
                             ("abcd\n0123", 7, "shift-down", 7..9),
                         ] {
@@ -4374,7 +4374,7 @@ mod tests {
                         runner.frame(cx)?;
                         runner.key(cx, "down")?;
                         let caret = runner.update(cx, |view, _, cx| view.input.read(cx).cursor())?;
-                        ensure!(caret == wrapped.len(), "Down on the last wrapped row should reach the end");
+                         ensure!(caret == wrapped.len() - 1, "Down on the last wrapped row should preserve the caret");
                         Ok(())
                     }.await;
                     let _ = result.send(outcome);
@@ -4495,7 +4495,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_and_thread_exchange_keyboard_focus() {
+    fn composer_arrows_scroll_only_at_visual_edges_and_keep_focus() {
         use gpui_kit::{EntityInputHandler as _, Focusable as _};
         use fuzukue_proto::Actor;
 
@@ -4568,6 +4568,7 @@ mod tests {
                         let composer_focused = |cx: &mut AsyncApp| runner.update(cx, |view, window, cx| {
                             view.input.read(cx).focus_handle(cx).is_focused(window)
                         });
+                        let caret = |cx: &mut AsyncApp| runner.update(cx, |view, _, cx| view.input.read(cx).cursor());
                         let edges = |cx: &mut AsyncApp| runner.update(cx, |view, _, cx| {
                             let input = view.input.read(cx);
                             (input.vertical_arrow_at_edge(false, cx), input.vertical_arrow_at_edge(true, cx))
@@ -4593,7 +4594,7 @@ mod tests {
                         runner.key(cx, "up")?;
                         runner.frame(cx)?;
                         let (y, following) = scroll(cx)?;
-                        ensure!(thread_focused(cx)? && !following, "Up must focus the thread and leave the tail");
+                        ensure!(composer_focused(cx)? && !following, "Up must keep composer focus and leave the tail");
                         ensure!(!thread_has_frame(cx)?, "keyboard focus must leave the transcript frameless");
                         ensure!((y - (bottom - line)).abs() < px(1.),
                             "Up scrolled from {bottom:?} to {y:?}, expected a line of {line:?}");
@@ -4612,12 +4613,32 @@ mod tests {
                             runner.key(cx, key)?;
                             runner.frame(cx)?;
                             let y = scroll(cx)?.0;
-                            ensure!(thread_focused(cx)? && (y - expected).abs() < px(1.),
+                            ensure!(composer_focused(cx)? && (y - expected).abs() < px(1.),
                                 "{key} scrolled to {y:?}, expected {expected:?}");
                         }
                         runner.key(cx, "down")?;
                         runner.frame(cx)?;
-                        ensure!(composer_focused(cx)? && scroll(cx)?.1, "Down at the tail must restore composer focus and following");
+                        ensure!(composer_focused(cx)? && (scroll(cx)?.0 - bottom).abs() < px(1.),
+                            "Down must return to the tail with the composer still focused");
+                        runner.click(cx, ClickTarget::Element { id: "chat-keyboard-thread".into() })?;
+                        runner.frame(cx)?;
+                        ensure!(thread_focused(cx)?, "click must focus the transcript");
+                        runner.key(cx, "down")?;
+                        runner.frame(cx)?;
+                        ensure!(composer_focused(cx)? && scroll(cx)?.1, "Down from the focused transcript's tail must focus the composer");
+
+                        runner.update(cx, |view, window, cx| view.input.update(cx, |input, cx| {
+                            input.set_value("First line\nSecond line", window, cx);
+                            input.set_selected_range(2..2, cx);
+                        }))?;
+                        runner.frame(cx)?;
+                        let before = scroll(cx)?;
+                        for (key, edge) in [("down", (false, true)), ("up", (true, false))] {
+                            runner.key(cx, key)?;
+                            runner.frame(cx)?;
+                            ensure!(edges(cx)? == edge && composer_focused(cx)? && scroll(cx)? == before,
+                                "{key} must move between draft lines without scrolling the transcript");
+                        }
 
                         let wrapped = "wrap ".repeat(150);
                         runner.update(cx, |view, window, cx| view.input.update(cx, |input, cx| {
@@ -4626,11 +4647,12 @@ mod tests {
                         }))?;
                         runner.frame(cx)?;
                         ensure!(edges(cx)? == (true, false), "caret is inside the first wrapped row");
+                        let before = scroll(cx)?;
                         for key in ["alt-up", "ctrl-up", "shift-up"] {
                             runner.key(cx, key)?;
                             ensure!(composer_focused(cx)?, "{key} must stay in the composer");
                         }
-                        ensure!(edges(cx)? == (false, false), "selection must block either handoff");
+                        ensure!(edges(cx)? == (false, false), "selection must block boundary scrolling");
                         runner.key(cx, "up")?;
                         ensure!(composer_focused(cx)?, "Up with a selection must stay in the composer");
                         runner.update(cx, |view, _, cx| view.input.update(cx, |input, cx| {
@@ -4646,35 +4668,82 @@ mod tests {
                         ensure!(edges(cx)? == (false, false), "second of several wrapped rows has no edge");
                         runner.key(cx, "up")?;
                         ensure!(composer_focused(cx)? && edges(cx)?.0, "Up from the second wrapped row must move the caret");
+                        ensure!(scroll(cx)? == before, "navigation inside the wrapped draft scrolled the transcript");
+                        let first_caret = caret(cx)?;
+                        runner.key(cx, "up")?;
+                        runner.frame(cx)?;
+                        let after_up = scroll(cx)?.0;
+                        ensure!(after_up < before.0 && composer_focused(cx)? && caret(cx)? == first_caret,
+                            "Up on the first wrapped row must scroll and preserve the focused caret");
+                        let last_caret = wrapped.len() - 1;
+                        runner.update(cx, |view, _, cx| view.input.update(cx, |input, cx| {
+                            input.set_selected_range(last_caret..last_caret, cx);
+                        }))?;
+                        runner.frame(cx)?;
+                        runner.key(cx, "down")?;
+                        runner.frame(cx)?;
+                        ensure!(scroll(cx)?.0 > after_up && composer_focused(cx)? && caret(cx)? == last_caret,
+                            "Down on the last wrapped row must scroll and preserve the focused caret");
 
                         runner.update(cx, |view, window, cx| view.input.update(cx, |input, cx| {
+                            input.set_value("", window, cx);
                             input.replace_and_mark_text_in_range(None, "あ", Some(1..1), window, cx);
                         }))?;
                         runner.frame(cx)?;
-                        ensure!(!edges(cx)?.0, "preedit must block the handoff");
-                        runner.key(cx, "up")?;
-                        ensure!(composer_focused(cx)?, "Up during preedit must stay in the composer");
+                        let before = scroll(cx)?;
+                        for key in ["up", "down"] {
+                            runner.key(cx, key)?;
+                            runner.frame(cx)?;
+                            let marked = runner.update(cx, |view, window, cx| {
+                                crate::composing(&view.input, window, cx)
+                            })?;
+                            ensure!(marked && composer_focused(cx)? && scroll(cx)? == before,
+                                "{key} during preedit must preserve composition, focus, and scroll");
+                        }
                         runner.update(cx, |view, window, cx| view.input.update(cx, |input, cx| {
                             input.unmark_text(window, cx);
                             input.set_value("draft", window, cx);
                             input.set_selected_range(2..2, cx);
                         }))?;
                         runner.frame(cx)?;
-                        for key in ["enter", "escape"] {
-                            ensure!(edges(cx)?.0, "draft caret must be on the first row");
-                            let before = scroll(cx)?.0;
-                            runner.key(cx, "up")?;
+                        let before = scroll(cx)?.0;
+                        for (key, direction) in [("up", -1.), ("down", 1.)] {
+                            let previous = scroll(cx)?.0;
+                            runner.key(cx, key)?;
                             runner.frame(cx)?;
-                            ensure!(thread_focused(cx)?, "Up must focus the thread from inside the first row");
-                            ensure!(scroll(cx)?.0 < before, "first-row Up must scroll the transcript");
+                            ensure!((scroll(cx)?.0 - previous) * direction > px(0.)
+                                && composer_focused(cx)? && caret(cx)? == 2,
+                                "{key} in a single-line draft must scroll and preserve the focused caret");
+                        }
+                        ensure!((scroll(cx)?.0 - before).abs() < px(1.), "opposite arrows must return to the same offset");
+                        for key in ["enter", "escape"] {
+                            runner.click(cx, ClickTarget::Element { id: "chat-keyboard-thread".into() })?;
+                            runner.frame(cx)?;
+                            ensure!(thread_focused(cx)?, "click must focus the transcript");
                             runner.key(cx, key)?;
                             ensure!(composer_focused(cx)?, "{key} must return focus to the composer");
                         }
-                        runner.key(cx, "up")?;
+                        runner.click(cx, ClickTarget::Element { id: "chat-keyboard-thread".into() })?;
+                        runner.frame(cx)?;
                         runner.type_text(cx, "X")?;
                         let text = runner.update(cx, |view, _, cx| view.input.read(cx).value())?;
                         ensure!(composer_focused(cx)? && text.as_ref() == "drXaft",
                             "typing in the thread must insert at the composer's caret");
+                        runner.update(cx, |view, window, cx| {
+                            view.protocol = fuzukue_proto::SLASH_COMMAND_PROTOCOL;
+                            view.threads_loaded = true;
+                            view.input.update(cx, |input, cx| input.set_value("/", window, cx));
+                            cx.notify();
+                        })?;
+                        runner.frame(cx)?;
+                        let before = scroll(cx)?;
+                        for (key, index) in [("down", 1), ("up", 0)] {
+                            runner.key(cx, key)?;
+                            runner.frame(cx)?;
+                            let selected = runner.update(cx, |view, _, _| view.composer_markdown.command_palette.selected)?;
+                            ensure!(selected == index && composer_focused(cx)? && scroll(cx)? == before,
+                                "{key} must navigate suggestions without scrolling the transcript");
+                        }
                         Ok(())
                     }.await;
                     let _ = result.send(outcome);

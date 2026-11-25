@@ -178,6 +178,12 @@ impl Runner {
             stays(cx, key, "card editor")?;
             ensure!(editor_caret(cx)? == cursor, "card editor: wrong caret after {key}");
         }
+        for key in ["up", "up", "down", "down"] {
+            stays(cx, key, "card editor")?;
+            ensure!(self.update(cx, |view, window, cx| {
+                view.editing.as_ref().unwrap().input.read(cx).focus_handle(cx).is_focused(window)
+            })?, "card editor lost focus after {key}");
+        }
         self.update(cx, |view, _, cx| {
             view.close_card_file_editor(cx);
             view.close_right_pane(cx);
@@ -193,6 +199,12 @@ impl Runner {
         ensure!(self.update(cx, |view, _, cx| {
             view.palette.as_ref().is_some_and(|input| input.read(cx).cursor() == "missing fixture".len())
         })?, "search should keep its End binding");
+        for key in ["up", "down"] {
+            stays(cx, key, "search")?;
+            ensure!(self.update(cx, |view, window, cx| {
+                view.palette.as_ref().is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window))
+            })?, "search lost focus after {key}");
+        }
         press(cx, "escape")?;
 
         self.update(cx, |_, window, cx| {
