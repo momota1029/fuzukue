@@ -234,6 +234,16 @@ for line in sys.stdin:
             mcp = config["config"]["mcp_servers"]["fuzukue"]
             steering = "追加の指示を待って" in prompt
             threading.Thread(target=delegate, args=(thread_id, turn_id, mcp, steering), daemon=True).start()
+        elif "tool-guard-front-desk fixture" in prompt:
+            for i in range(12):
+                item = {"type": "commandExecution", "id": f"{turn_id}-command-{i}",
+                        "command": "fixture", "exitCode": 0}
+                notify("item/started", thread_id, item=item)
+                notify("item/completed", thread_id, item=item)
+            deadline = time.monotonic() + 10
+            while not Path("release-tool-guard-front-desk").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            finish(thread_id, turn_id, "Front desk still answered.")
         elif "codex-question fixture" in prompt:
             ask_id = f"{turn_id}-question"
             questions[ask_id] = (thread_id, turn_id, "dismissal" in prompt)

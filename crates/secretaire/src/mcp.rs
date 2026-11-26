@@ -1174,6 +1174,14 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
     let spill_owner = result_spill::Owner::thread(&q.session);
     let method = req["method"].as_str().unwrap_or("");
     let params = &req["params"];
+    if method == "tools/call" && !planner {
+        let name = params["name"].as_str().unwrap_or_default();
+        if let Some(refusal) = app.hub.record_tool_call(&q.session, q.job.as_deref(), &format!("{SERVER_NAME}.{name}"), None) {
+            return Json(json!({"jsonrpc": "2.0", "id": id,
+                "result": text_result(refusal.message(), true),
+            })).into_response();
+        }
+    }
     let requester = if method == "tools/call" && params["name"] == Tool::SelfUpdate.name()
         && (codex.is_some() || authorized.is_some() && authorized == claude.as_ref().and_then(|s| s.mcp_key()))
     {

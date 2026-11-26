@@ -72,6 +72,7 @@ struct ActiveTurn {
     compaction: Option<Compaction>,
     escalation: Option<ChatSettings>,
     records: Vec<String>,
+    _payload_hold: crate::hub::PayloadHold,
 }
 
 #[derive(Clone, Copy)]
@@ -733,6 +734,7 @@ impl ClaudeSession {
         // The reader can observe a rejected resume while we are writing to its stdin.
         turns.idle_since = None;
         turns.active = Some(ActiveTurn {
+            _payload_hold: self.hub.hold_payload_conversion(&self.id),
             exec: Default::default(),
             history, before, resume_prompt, kind, acted_or_asked: false, last_text: String::new(),
             interrupted: false, compaction: None, escalation: prompt.escalation.clone(), records: prompt.records.clone(),
@@ -950,6 +952,7 @@ impl ClaudeSession {
         let (complete, mut result) = tokio::sync::oneshot::channel();
         turns.idle_since = None;
         turns.active = Some(ActiveTurn {
+            _payload_hold: self.hub.hold_payload_conversion(&self.id),
             exec: Default::default(),
             history: None, before: None, resume_prompt: None,
             kind: TurnKind::Conversation, acted_or_asked: false, last_text: String::new(),
@@ -1467,6 +1470,15 @@ impl ClaudeSession {
                 if self.process_generation.load(Ordering::Acquire) != generation { return Ok(()); }
                 let request = &v["request"];
                 let tool = request["tool_name"].as_str().unwrap_or("?");
+                if !tool.starts_with("mcp__fuzukue__") {
+                    if let Some(refusal) = self.hub.record_tool_call(&self.id, None, tool, request["tool_use_id"].as_str()) {
+                        return self.write(json!({ "type": "control_response", "response": {
+                            "subtype": "success", "request_id": req_id, "response": {
+                                "behavior": "deny", "message": refusal.message(),
+                            }
+                        } })).await;
+                    }
+                }
                 let input = request["input"].clone();
                 if tool == "AskUserQuestion" {
                     let Ok(questions) = crate::questions::parse(&input, true) else {
@@ -1932,6 +1944,13 @@ pub(crate) async fn run_worker(
                         let request = &frame["request"];
                         let tool = request["tool_name"].as_str().unwrap_or("Claude");
                         if request["subtype"] == "can_use_tool" {
+                            if !tool.starts_with("mcp__fuzukue__") {
+                                if let Some(refusal) = app.hub.record_tool_call(session, Some(job), tool, request["tool_use_id"].as_str()) {
+                                    write_worker_approval_response(stdin, backend_id,
+                                        json!({"behavior": "deny", "message": refusal.message()})).await?;
+                                    continue;
+                                }
+                            }
                             use crate::hub::approval_store::FullAuthorization::*;
                             let trusted = app.delegates.worker_approval_trusted(session, job);
                             let authorization = if trusted {
@@ -2042,6 +2061,10 @@ async fn write_worker_approval(stdin: &mut ChildStdin, backend_id: &str, allowed
         Some(input) => json!({ "behavior": "allow", "updatedInput": input }),
         None => json!({ "behavior": "deny", "message": "This action was not approved." }),
     };
+    write_worker_approval_response(stdin, backend_id, response).await
+}
+
+async fn write_worker_approval_response(stdin: &mut ChildStdin, backend_id: &str, response: Value) -> Result<()> {
     let reply = json!({ "type": "control_response", "response": {
         "subtype": "success", "request_id": backend_id, "response": response,
     }});
@@ -2379,6 +2402,11 @@ impl StreamState {
             Some("assistant") => {
                 let msg_id = v["message"]["id"].as_str().unwrap_or("").to_string();
                 for (i, block) in v["message"]["content"].as_array().into_iter().flatten().enumerate() {
+                    if block["type"] == "tool_use" {
+                        if let Some(name) = block["name"].as_str().filter(|name| !name.starts_with("mcp__fuzukue__")) {
+                            hub.record_tool_call(session, job, name, block["id"].as_str());
+                        }
+                    }
                     match block["type"].as_str() {
                         // Claude Code はまとめの本文を 1 ブロックずつ別のメッセージで送るので、ブロックの番号は
                         // 流したときの番号と合わない（思考のブロックがあると流したほうは 1、まとめは 0）。
@@ -2473,6 +2501,35 @@ mod tests {
         assert!(!turns.can_start_worker_digest());
         turns.paused_until = None;
         assert!(turns.can_start_worker_digest());
+    }
+
+    #[tokio::test]
+    async fn payload_publication_waits_for_an_in_memory_claude_turn() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let threads = root.join("threads");
+        std::fs::create_dir(&threads)?;
+        let path = threads.join("synthetic.md");
+        let id = "thread-test";
+        std::fs::write(&path, format!("---\nid: {id}\ntitle: Test\ncreated: 1\nupdated: 1\n---\n"))?;
+        let hub = Arc::new(Hub::new());
+        let app = Arc::new(Workspace::new(root.into(), String::new(), root.join("state"), hub.clone()));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while IFS= read -r line; do :; done"]);
+        let session = ClaudeSession::spawn_command(cmd, id.into(), root.into(), &app, Box::new(|_| {}))?;
+
+        assert!(session.try_background_prompt("synthetic turn".into(), TurnKind::Conversation, None).await?);
+        // Model the submission window where Claude has an active turn but the
+        // Hub has yet to see its explicit running event.
+        hub.publish(ServerEvent::TurnActivity { session: id.into(), running: false });
+        assert!(session.state.lock().await.active.is_some());
+        hub.migrate_idle_payloads(Duration::ZERO).await;
+        assert!(!std::fs::read_to_string(&path)?.contains("preview_payloads: true"));
+
+        session.finish_turn(&json!({ "is_error": true })).await?;
+        hub.migrate_idle_payloads(Duration::ZERO).await;
+        assert!(std::fs::read_to_string(&path)?.contains("preview_payloads: true"));
+        Ok(())
     }
 
     #[tokio::test]

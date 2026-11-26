@@ -1285,6 +1285,16 @@ impl Codex {
             )),
             _ => None,
         };
+        if let (Some((session, Actor::Codex { parent_tool_use, .. }, false)), Some(tool)) = (&thread, match method {
+            "item/commandExecution/requestApproval" => Some("exec"),
+            "item/fileChange/requestApproval" => Some("apply_patch"),
+            _ => None,
+        }) {
+            if self.hub.record_tool_call(session, parent_tool_use.as_deref(), tool, p["itemId"].as_str()).is_some() {
+                let _ = self.write(json!({"jsonrpc": "2.0", "id": id, "result": {"decision": "decline"}})).await;
+                return;
+            }
+        }
         let mut full = None;
         if let (Some(_), Some((session, Actor::Codex { parent_tool_use: Some(job), .. }, false))) = (&summary, &thread) {
             let (execution, external) = self.threads.lock().unwrap().get(thread_id)
@@ -1496,6 +1506,21 @@ impl Codex {
         }
         if self.compaction_event(thread_id, method, p) && method != "thread/tokenUsage/updated" {
             return;
+        }
+        if !read_only && !item_id.is_empty() && matches!(method, "item/started" | "item/completed") {
+            let name = match item["type"].as_str() {
+                // Count local MCP calls at HTTP dispatch, including calls nested inside code tools.
+                Some("mcpToolCall") if item["server"] != crate::mcp::SERVER_NAME =>
+                    Some(format!("{}.{}", item["server"].as_str().unwrap_or("?"), item["tool"].as_str().unwrap_or("?"))),
+                Some("commandExecution") => Some("exec".into()),
+                Some("fileChange") => Some("apply_patch".into()),
+                Some("dynamicToolCall" | "webSearch" | "imageView" | "imageGeneration" | "collabAgentToolCall") =>
+                    item["type"].as_str().map(str::to_owned),
+                _ => None,
+            };
+            if let (Some(name), Actor::Codex { parent_tool_use, .. }) = (name, &actor) {
+                self.hub.record_tool_call(&session, parent_tool_use.as_deref(), &name, Some(&item_id));
+            }
         }
         // Plan calls are hidden from the timeline, so observe the raw item.
         if matches!(method, "item/started" | "item/completed")
@@ -1814,6 +1839,64 @@ mod tests {
                 ServerEvent::ToolResult { ok: false, output, .. } if output == expected));
         }
         codex.close_worker(&thread).await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn front_desk_tool_guard_refuses_mcp_and_keeps_the_codex_turn_alive() -> Result<()> {
+        use axum::{body::to_bytes, extract::{Query, State}, http::{header, HeaderMap}, Json};
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let hub = Arc::new(Hub::with_tool_limits(crate::tool_guard::Limits { same_tool_per_minute: 2, total_calls: 30 }));
+        let app = Arc::new(crate::Workspace::new(project.path().into(), "127.0.0.1:0".into(),
+            state.path().into(), hub.clone()));
+        let session = hub.edit_threads(|store| store.create(None))?;
+        let fixture = Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/shots/codex"));
+        let codex = Codex::spawn_command(fixture, project.path(), hub.clone(),
+            Arc::new(Usage::new(hub.clone())), Default::default()).await?;
+        app.codex.lock().await.replace(codex.clone());
+        let (thread, _) = codex.open_partner(&session, None, PartnerOptions {
+            settings: ChatSettings::default(), context: String::new(), mcp_url: "http://127.0.0.1/mcp".into(),
+            mcp_key: "key".into(), agent_settings: Default::default(), mail_enabled: false,
+        }).await?;
+        let (_, mut events) = hub.subscribe(u64::MAX);
+        hub.publish_partner_turn_started(&session, None, false, None);
+        let run = tokio::spawn({
+            let codex = codex.clone();
+            let thread = thread.clone();
+            async move { codex.run_turn(&thread, "tool-guard-front-desk fixture").await }
+        });
+        let is_notice = |event: &ServerEvent| matches!(event, ServerEvent::LocalNotice {
+            session: owner, localized: Some(message), ..
+        } if owner == &session && message.key == "server-tool-guard-desk");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if is_notice(&events.recv().await?.event) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        }).await??;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer key".parse()?);
+        let response = crate::mcp::handler(
+            State(app),
+            Query(crate::mcp::McpQuery { session: session.clone(), backend: Some(fuzukue_proto::AgentBackend::Codex), workspace: None, job: None }),
+            headers,
+            Json(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs_read"}})),
+        ).await;
+        let result: Value = serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await?)?;
+        assert_eq!(result["result"]["isError"], true);
+        assert!(result.to_string().contains("more than 2 calls to exec in 60 seconds"));
+        assert!(hub.thread_running(&session) && !run.is_finished());
+        std::fs::write(project.path().join("release-tool-guard-front-desk"), "")?;
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(10), run).await???, "Front desk still answered.");
+        assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| is_notice(&event.event)));
+
+        let actor = Actor::Codex { thread_id: thread, parent_tool_use: None };
+        hub.publish_partner_turn_ended(&session, actor, true);
+        hub.publish_partner_turn_started(&session, None, false, None);
+        assert!(hub.record_tool_call(&session, None, "fuzukue.fs_read", None).is_none());
         Ok(())
     }
 

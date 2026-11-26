@@ -194,6 +194,23 @@ impl Blobs {
     }
 
     fn put_with(&self, bytes: &[u8], prepare: impl FnOnce(&Self) -> Result<()>) -> Result<String> {
+        let (digest, _) = self.put_file(bytes, prepare)?;
+        // An earlier writer may have reached rename just before a crash.
+        durable::sync_dir(&self.0)?;
+        Ok(digest)
+    }
+
+    // The conversion prepared the directory and syncs it once before
+    // publication. Reuse verified files from earlier, aborted attempts.
+    pub(super) fn stage(&self, bytes: &[u8]) -> Result<String> {
+        let (digest, created) = self.put_file(bytes, |_| Ok(()))?;
+        if created {
+            self.verify(&digest, bytes)?;
+        }
+        Ok(digest)
+    }
+
+    fn put_file(&self, bytes: &[u8], prepare: impl FnOnce(&Self) -> Result<()>) -> Result<(String, bool)> {
         let digest = format!("{:x}", Sha256::digest(bytes));
         let path = self.0.join(&digest);
         if !path.exists() {
@@ -202,17 +219,14 @@ impl Blobs {
             staged.write_all(bytes)?;
             staged.as_file().sync_all()?;
             match staged.persist_noclobber(&path) {
-                Ok(_) => {}
+                Ok(_) => return Ok((digest, true)),
                 Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => self.verify(&digest, bytes)?,
                 Err(error) => return Err(error.error.into()),
             }
-            durable::sync_dir(&self.0)?;
         } else {
             self.verify(&digest, bytes)?;
-            // An earlier writer may have reached rename just before a crash.
-            durable::sync_dir(&self.0)?;
         }
-        Ok(digest)
+        Ok((digest, false))
     }
 
     pub(super) fn verify(&self, digest: &str, original: &[u8]) -> Result<()> {

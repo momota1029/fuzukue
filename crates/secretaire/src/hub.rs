@@ -18,8 +18,11 @@ pub(crate) mod approval_store;
 
 use crate::state::{BACKLOG, BACKLOG_BYTES};
 use crate::threads::payloads::{self, Refs, Source};
+use crate::tool_guard::{Guard, Limits, Refusal};
 const HANDOFF_LIMIT: usize = 3;
 const HANDOFF_WINDOW: Duration = Duration::from_secs(60 * 60);
+const PAYLOAD_CONVERSION_LOG: &str = "secretaire::hub::payload_conversion";
+pub(crate) const PAYLOAD_CONVERSION_DIRECTIVE: &str = "secretaire::hub::payload_conversion=info";
 
 #[derive(Default)]
 pub(crate) struct TranscriptResume {
@@ -32,7 +35,9 @@ pub struct Hub {
     tx: broadcast::Sender<Envelope>,
     worker_events: broadcast::Sender<WorkerEvent>,
     epoch: String,
+    tool_limits: Limits,
     approval_queue: std::sync::OnceLock<approval_store::Queue>,
+    last_payload_skip: Mutex<Option<Instant>>,
 }
 
 struct Inner {
@@ -41,6 +46,7 @@ struct Inner {
     writer: Option<crate::state::TimelineWriter>,
     threads: Option<crate::threads::Store>,
     partner_started: HashMap<String, PartnerTurn>,
+    worker_tool_guards: HashMap<String, (String, Arc<Guard>)>,
     next_partner_generation: u64,
     handoffs_ready: HashSet<String>,
     recent_handoffs: HashMap<String, VecDeque<tokio::time::Instant>>,
@@ -50,6 +56,7 @@ struct Inner {
     github_auth_requests: HashMap<String, crate::github_auth::mcp::Tool>,
     compactions: HashMap<String, (Arc<crate::cancellation::Cancellation>, i64)>,
     workers: BTreeMap<(String, String), WorkerActivity>,
+    payload_holds: HashMap<String, usize>,
     background: BTreeMap<(BlockerKind, String), i64>,
     chat_pauses: HashMap<String, i64>,
     notifications: notifications::State,
@@ -59,6 +66,39 @@ struct Inner {
     questions: HashMap<String, PendingQuestion>,
     question_clients: usize,
     question_clients_offline_since: Instant,
+}
+
+impl Inner {
+    fn payload_busy(&self, session: &str) -> Option<&'static str> {
+        if self.running.contains(session) {
+            Some("active partner turn")
+        } else if self.compactions.contains_key(session) {
+            Some("active compaction")
+        } else if self.payload_holds.contains_key(session) {
+            Some("live worker or Claude turn")
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) struct PayloadHold {
+    hub: Arc<Hub>,
+    session: String,
+}
+
+impl Drop for PayloadHold {
+    fn drop(&mut self) {
+        let mut inner = self.hub.inner.lock().unwrap();
+        let count = inner.payload_holds.get_mut(&self.session).expect("registered payload hold");
+        *count -= 1;
+        if *count == 0 {
+            inner.payload_holds.remove(&self.session);
+        }
+        if let Some(threads) = &mut inner.threads {
+            threads.mark_payload_activity(&self.session);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -143,6 +183,19 @@ struct PartnerTurn {
     handoff: Option<crate::front_desk::Escalation>,
     escalated: bool,
     external_approval_input: bool,
+    tool_guard: Arc<Guard>,
+}
+
+pub(crate) struct WorkerToolGuard<'a> {
+    hub: &'a Hub,
+    job: &'a str,
+    pub(crate) guard: Arc<Guard>,
+}
+
+impl Drop for WorkerToolGuard<'_> {
+    fn drop(&mut self) {
+        self.hub.inner.lock().unwrap().worker_tool_guards.remove(self.job);
+    }
 }
 
 impl Observed {
@@ -189,12 +242,20 @@ pub(crate) fn worker_approval(request_id: &str, actor: &Actor) -> bool {
 
 impl Hub {
     pub fn new() -> Self {
+        Self::with_tool_limits(Limits::configured())
+    }
+
+    pub(crate) fn with_tool_limits(tool_limits: Limits) -> Self {
         let (tx, _) = broadcast::channel(1024);
         let (worker_events, _) = broadcast::channel(1024);
-        Self { inner: Mutex::new(Inner { next_seq: 1, log: ReplayLog::default(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), next_partner_generation: 0, handoffs_ready: HashSet::new(), recent_handoffs: HashMap::new(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
+        Self { inner: Mutex::new(Inner { next_seq: 1, log: ReplayLog::default(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), worker_tool_guards: HashMap::new(), next_partner_generation: 0, handoffs_ready: HashSet::new(), recent_handoffs: HashMap::new(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now(),
+            payload_holds: HashMap::new(),
+        }), tx,
             worker_events,
             epoch: format!("{:032x}", rand::random::<u128>()),
+            tool_limits,
             approval_queue: Default::default(),
+            last_payload_skip: Mutex::new(None),
         }
     }
 
@@ -319,6 +380,9 @@ impl Hub {
             inner.compactions.insert(session.into(), (cancel, chrono::Utc::now().timestamp_millis()));
         } else {
             inner.compactions.remove(session);
+        }
+        if let Some(threads) = &mut inner.threads {
+            threads.mark_payload_activity(session);
         }
         if let Some(changed) = &inner.activity {
             changed.send_replace(());
@@ -547,6 +611,32 @@ impl Hub {
         self.publish_event(event, None);
     }
 
+    pub(crate) fn worker_tool_guard<'a>(&'a self, session: &str, job: &'a str) -> WorkerToolGuard<'a> {
+        let guard = Arc::new(Guard::new(self.tool_limits, true));
+        self.inner.lock().unwrap().worker_tool_guards.insert(job.into(), (session.into(), guard.clone()));
+        WorkerToolGuard { hub: self, job, guard }
+    }
+
+    pub(crate) fn record_tool_call(&self, session: &str, job: Option<&str>, name: &str, native_item: Option<&str>) -> Option<Refusal> {
+        let mut inner = self.inner.lock().unwrap();
+        let guard = match job {
+            Some(job) => {
+                let (owner, guard) = inner.worker_tool_guards.get(job)?;
+                if owner != session {
+                    return None;
+                }
+                guard
+            }
+            None => &inner.partner_started.get(session)?.tool_guard,
+        };
+        let refusal = guard.record(name, native_item)?;
+        if job.is_none() && refusal.first {
+            self.publish_locked(&mut inner, crate::tool_guard::desk_notice(session),
+                None, ApprovalWaiter::Backend);
+        }
+        Some(refusal)
+    }
+
     pub(crate) fn last_partner_progress(&self) -> Option<tokio::time::Instant> {
         self.inner.lock().unwrap().last_partner_progress
     }
@@ -584,6 +674,7 @@ impl Hub {
             handoff: None,
             escalated,
             external_approval_input: false,
+            tool_guard: Arc::new(Guard::new(self.tool_limits, false)),
         });
         self.publish_locked(&mut inner, ServerEvent::TurnActivity {
             session: session.into(), running: true,
@@ -739,6 +830,7 @@ impl Hub {
                     update_proof: None,
                     observed: Observed::now(), request: None, request_revision: 0, handoff: None, escalated: false,
                     external_approval_input: false,
+                    tool_guard: Arc::new(Guard::new(self.tool_limits, false)),
                 });
                 inner.running.insert(session.clone());
             } else {
@@ -927,7 +1019,21 @@ impl Hub {
     pub(crate) fn flush_dirty_transcripts(&self, idle_only: bool) -> anyhow::Result<()> {
         let mut inner = self.inner.try_lock()
             .map_err(|_| anyhow::anyhow!("transcript store is busy"))?;
-        inner.threads.as_mut().map_or(Ok(()), |threads| threads.flush_dirty_transcripts(idle_only))
+        let Inner { threads, running, compactions, payload_holds, .. } = &mut *inner;
+        threads.as_mut().map_or(Ok(()), |threads| threads.flush_dirty_transcripts(|id| {
+            idle_only && (running.contains(id) || compactions.contains_key(id) || payload_holds.contains_key(id))
+        }))
+    }
+
+    // Pair a live writer with its task lifetime. Replay and late events can
+    // leave display state behind, and queued work has no live writer yet.
+    pub(crate) fn hold_payload_conversion(self: &Arc<Self>, session: &str) -> PayloadHold {
+        let mut inner = self.inner.lock().unwrap();
+        *inner.payload_holds.entry(session.into()).or_default() += 1;
+        if let Some(threads) = &mut inner.threads {
+            threads.mark_payload_activity(session);
+        }
+        PayloadHold { hub: self.clone(), session: session.into() }
     }
 
     pub(crate) fn trim_idle_transcripts(&self, idle: std::time::Duration) {
@@ -938,39 +1044,48 @@ impl Hub {
         }
     }
 
+    fn log_payload_skip(&self, thread: Option<&str>, reason: &'static str) {
+        let Ok(mut last) = self.last_payload_skip.try_lock() else { return };
+        if last.is_none_or(|last| last.elapsed() >= Duration::from_secs(60)) {
+            tracing::info!(target: PAYLOAD_CONVERSION_LOG, thread, reason, "idle payload conversion skipped");
+            *last = Some(Instant::now());
+        }
+    }
+
     pub(crate) async fn migrate_idle_payloads(self: &Arc<Self>, idle: Duration) {
-        let candidate = {
-            let Ok(inner) = self.inner.try_lock() else { return };
-            inner.threads.as_ref().and_then(|threads| threads.payload_candidate(idle, |id| {
-                inner.running.contains(id) || inner.compactions.contains_key(id)
-                    || inner.workers.keys().any(|(session, _)| session == id)
-            }))
+        let (candidate, skipped) = {
+            let Ok(inner) = self.inner.try_lock() else {
+                self.log_payload_skip(None, "transcript store is busy");
+                return;
+            };
+            let Some(threads) = &inner.threads else { return };
+            let (candidate, skipped) = threads.payload_candidate(idle, |id| inner.payload_busy(id));
+            (candidate, skipped.map(|(id, reason)| (id.to_owned(), reason)))
         };
+        if let Some((id, reason)) = skipped {
+            self.log_payload_skip(Some(&id), reason);
+        }
         let Some(candidate) = candidate else { return };
+        let id = candidate.id.clone();
+        let started = Instant::now();
+        tracing::info!(target: PAYLOAD_CONVERSION_LOG, thread = %id, "idle payload conversion started");
         let hub = self.clone();
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut staged = candidate.stage()?;
-            let Ok(mut inner) = hub.inner.try_lock() else { return Ok(()) };
+            let mut inner = hub.inner.try_lock().map_err(|_| anyhow::anyhow!("transcript store is busy"))?;
             let id = &staged.candidate.id;
-            if inner.running.contains(id) || inner.compactions.contains_key(id)
-                || inner.workers.keys().any(|(session, _)| session == id)
-            {
-                return Ok(());
+            if let Some(reason) = inner.payload_busy(id) {
+                anyhow::bail!("{reason}");
             }
-            let published = match &mut inner.threads {
-                Some(threads) => threads.publish_payloads(&mut staged)?,
-                None => false,
-            };
+            let threads = inner.threads.as_mut().ok_or_else(|| anyhow::anyhow!("transcript store is unavailable"))?;
+            anyhow::ensure!(threads.publish_payloads(&mut staged)?, "thread changed since staging started");
             drop(inner);
-            if published {
-                staged.finish();
-            }
-            Ok(())
+            staged.finish()
         }).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "idle thread payload conversion deferred"),
-            Err(error) => tracing::warn!(%error, "idle thread payload conversion did not finish"),
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match result.map_err(anyhow::Error::from).and_then(|result| result) {
+            Ok(()) => tracing::info!(target: PAYLOAD_CONVERSION_LOG, thread = %id, elapsed_ms, "idle payload conversion finished"),
+            Err(error) => tracing::warn!(target: PAYLOAD_CONVERSION_LOG, thread = %id, elapsed_ms, %error, "idle payload conversion aborted"),
         }
     }
 

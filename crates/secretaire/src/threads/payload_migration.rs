@@ -23,6 +23,7 @@ pub(crate) struct Candidate {
     pub(crate) id: String,
     pub(super) path: PathBuf,
     pub(super) version: FileVersion,
+    pub(super) activity_revision: u64,
 }
 
 pub(crate) struct Staged {
@@ -139,6 +140,8 @@ impl Candidate {
         } else {
             original.persist_noclobber(&original_path).map_err(|error| error.error)?;
         }
+        // Includes the backup and all sidecar names. Each new file was
+        // synced before linking it, and publication may now reference them.
         durable::sync_dir(blobs.dir())?;
 
         // Hash the live inode itself, after all staging and backup I/O. Check
@@ -182,13 +185,14 @@ impl Staged {
         Ok(version)
     }
 
-    pub(crate) fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) -> Result<()> {
         let path = &self.candidate.path;
         let threads = path.parent().expect("thread directory");
         if let Err(error) = durable::sync_dir(threads).and_then(|()| self.scratch.sync_all()) {
             self.replacement.disable_cleanup(true);
-            tracing::error!(?path, %error, "could not sync converted thread directory");
+            return Err(error).context("could not sync converted thread directory after exchange");
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -199,7 +203,7 @@ impl Staged {
     #[cfg(test)]
     fn publish_locked(mut self, lock: impl FnOnce(&Path) -> Result<File>) -> Result<FileVersion> {
         let version = self.exchange_locked(lock)?;
-        self.finish();
+        self.finish()?;
         Ok(version)
     }
 }
@@ -269,9 +273,7 @@ fn convert_entry(entry: &str, blobs: &Blobs, output: &mut impl Write) -> Result<
     } else if let Some(input) = tool.input {
         let raw = fields["input"].get().as_bytes();
         if payloads::oversized_input(&input).is_some() || raw.len() > 4096 {
-            let digest = blobs.put(raw)?;
-            blobs.verify(&digest, raw)?;
-            refs.input = Some(digest);
+            refs.input = Some(blobs.stage(raw)?);
             fields.insert("input".into(), serde_json::value::to_raw_value(&payloads::input_preview(&input, raw, tool.name == "delegate"))?);
         }
     }
@@ -284,9 +286,7 @@ fn convert_entry(entry: &str, blobs: &Blobs, output: &mut impl Write) -> Result<
         }
     } else if let Some(result) = tool.output {
         if payloads::needs_output_preview(&result) {
-            let digest = blobs.put(result.as_bytes())?;
-            blobs.verify(&digest, result.as_bytes())?;
-            refs.output = Some(digest);
+            refs.output = Some(blobs.stage(result.as_bytes())?);
             fields.insert("output".into(), serde_json::value::to_raw_value(&payloads::output_preview(&result, tool.name == "delegate"))?);
         }
     }
@@ -307,6 +307,11 @@ fn convert_entry(entry: &str, blobs: &Blobs, output: &mut impl Write) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuzukue_proto::{Actor, ServerEvent};
+    use std::{sync::Arc, time::{Duration, Instant}};
+
+    const SESSION: &str = "thread-test";
+    const IDLE: Duration = Duration::from_secs(120);
 
     fn fixture(path: &Path) -> Result<(String, String)> {
         let input = format!(r#"{{"z":"{}", "a":"\u3042"}}"#, "synthetic".repeat(520));
@@ -323,7 +328,154 @@ mod tests {
     }
 
     fn candidate(path: &Path) -> Result<Candidate> {
-        Ok(Candidate { id: "thread-test".into(), path: path.into(), version: FileVersion::read(path.metadata()?)? })
+        Ok(Candidate { id: "thread-test".into(), path: path.into(),
+            version: FileVersion::read(path.metadata()?)?, activity_revision: 0 })
+    }
+
+    fn load_fixture(project: &Path, state: &Path) -> Result<(Arc<crate::hub::Hub>, PathBuf)> {
+        let threads = project.join("threads");
+        fs::create_dir(&threads)?;
+        let path = threads.join("test.md");
+        fixture(&path)?;
+        let hub = Arc::new(crate::hub::Hub::with_timeline(state));
+        hub.load_threads(project, state);
+        Ok((hub, path))
+    }
+
+    fn pass_idle_window(hub: &crate::hub::Hub) -> Result<()> {
+        hub.edit_threads(|store| {
+            store.threads.get_mut(SESSION).unwrap().transcript.last_activity = Instant::now() - IDLE;
+            Ok(())
+        })
+    }
+
+    fn is_converted(path: &Path) -> Result<bool> {
+        Ok(fs::read_to_string(path)?.contains("preview_payloads: true"))
+    }
+
+    #[tokio::test]
+    async fn maintenance_and_history_reads_do_not_reset_write_idleness() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let (hub, path) = load_fixture(project.path(), state.path())?;
+        pass_idle_window(&hub)?;
+        for _ in 0..3 {
+            hub.trim_idle_transcripts(IDLE);
+            hub.flush_dirty_transcripts(true)?;
+            hub.recover_thread_metadata(None);
+            assert!(hub.library_thread(SESSION, |_| true).is_some());
+            assert_eq!(hub.history_cursor(SESSION), 2);
+            assert!(hub.read_threads(|store| store.history_page(SESSION, 2).is_some()));
+        }
+        assert!(hub.read_threads(|store| store.threads[SESSION].transcript.accessed.get().elapsed() < IDLE));
+        hub.migrate_idle_payloads(IDLE).await;
+        assert!(is_converted(&path)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_events_and_failed_flushes_do_not_pin_dirty_transcript() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let (hub, path) = load_fixture(project.path(), state.path())?;
+        let session = SESSION.to_owned();
+        hub.publish(ServerEvent::TurnEnded { session: session.clone(), actor: Actor::Claude });
+        hub.publish(ServerEvent::UserPrompt {
+            session: session.clone(), item: "held".into(), text: "queued prompt".into(),
+            paths: Vec::new(), to_worker: false,
+        });
+        hub.publish(ServerEvent::TextDelta {
+            session: session.clone(), item: "late".into(), actor: Actor::Claude, text: "late reply".into(),
+        });
+        hub.publish(ServerEvent::ToolCall {
+            session, item: "late-tool".into(), actor: Actor::Claude, name: "Read".into(),
+            input: serde_json::json!({}),
+        });
+        assert!(hub.thread_active(SESSION));
+        assert!(!hub.thread_running(SESSION));
+        hub.migrate_idle_payloads(IDLE).await;
+        assert!(!is_converted(&path)?);
+
+        pass_idle_window(&hub)?;
+        hub.edit_threads(|_| {
+            assert_eq!(hub.flush_dirty_transcripts(true).unwrap_err().to_string(), "transcript store is busy");
+            Ok(())
+        })?;
+        let private = path.parent().unwrap().join(fuzukue_proto::THREAD_SAVE_DIR);
+        let save_lock = super::super::save_files::private_dir(&private)?;
+        assert!(hub.flush_dirty_transcripts(true).is_err());
+        assert!(hub.read_threads(|store| store.threads[SESSION].transcript.dirty.get()));
+        drop(save_lock);
+        hub.migrate_idle_payloads(IDLE).await;
+        assert!(is_converted(&path)?);
+        hub.flush_dirty_transcripts(true)?;
+        let saved = fs::read_to_string(&path)?;
+        assert!(saved.contains("queued prompt") && saved.contains("late reply") && saved.contains("late-tool"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_turns_and_workers_block_but_orphaned_worker_events_do_not() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let (hub, path) = load_fixture(project.path(), state.path())?;
+        let session = SESSION.to_owned();
+        hub.publish(ServerEvent::TurnActivity { session: session.clone(), running: true });
+        pass_idle_window(&hub)?;
+        hub.migrate_idle_payloads(IDLE).await;
+        assert!(!is_converted(&path)?);
+        hub.publish(ServerEvent::TurnActivity { session: session.clone(), running: false });
+
+        let worker = hub.hold_payload_conversion(SESSION);
+        let job = format!("{}interrupted", fuzukue_proto::DELEGATE_JOB);
+        hub.publish(ServerEvent::ToolCall {
+            session, item: job.clone(), name: "delegate".into(), actor: Actor::System,
+            input: serde_json::json!({ "started_at_ms": 1 }),
+        });
+        pass_idle_window(&hub)?;
+        hub.migrate_idle_payloads(IDLE).await;
+        assert!(!is_converted(&path)?);
+        drop(worker);
+        assert!(hub.drain_blockers("synthetic").iter().any(|blocker| blocker.id == job));
+        pass_idle_window(&hub)?;
+        hub.migrate_idle_payloads(IDLE).await;
+        assert!(is_converted(&path)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_turn_during_staging_cancels_publication_and_the_next_stage_reuses_sidecars() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let (hub, path) = load_fixture(project.path(), state.path())?;
+        let stage = || {
+            hub.read_threads(|store| store.payload_candidate(Duration::ZERO, |_| None).0)
+                .unwrap().stage()
+        };
+        let mut staged = stage()?;
+        let sidecar = Blobs::new(path.parent().unwrap()).dir().join(
+            staged.refs["tool"].output.as_ref().unwrap());
+        let original = fs::read(&path)?;
+        let inode = sidecar.metadata()?.ino();
+        for running in [true, false] {
+            hub.publish(ServerEvent::TurnActivity { session: SESSION.into(), running });
+        }
+        assert!(!hub.edit_threads(|store| store.publish_payloads(&mut staged))?);
+        assert_eq!(fs::read(&path)?, original);
+        drop(staged);
+
+        hub.publish(ServerEvent::TextDelta {
+            session: SESSION.into(), item: "next".into(), actor: Actor::Claude, text: "new version".into(),
+        });
+        hub.publish(ServerEvent::TurnEnded { session: SESSION.into(), actor: Actor::Claude });
+        assert_ne!(fs::read(&path)?, original);
+        let mut retry = stage()?;
+        assert!(hub.edit_threads(|store| store.publish_payloads(&mut retry))?);
+        retry.finish()?;
+        assert!(is_converted(&path)?);
+        assert_eq!(sidecar.metadata()?.ino(), inode);
+        assert!(fs::read_to_string(&path)?.contains("new version"));
+        Ok(())
     }
 
     #[test]
@@ -498,7 +650,7 @@ mod tests {
         let hub = crate::hub::Hub::with_timeline(state.path());
         hub.load_threads(project.path(), state.path());
         let candidate = hub.read_threads(|store|
-            store.payload_candidate(Duration::ZERO, |_| false)).unwrap();
+            store.payload_candidate(Duration::ZERO, |_| None).0).unwrap();
         let stage_start = Instant::now();
         let mut staged = candidate.stage()?;
         let stage_time = stage_start.elapsed();
@@ -513,7 +665,7 @@ mod tests {
             Ok(started.elapsed())
         })?;
         let sync_start = Instant::now();
-        staged.finish();
+        staged.finish()?;
         let sync_time = sync_start.elapsed();
         drop(staged);
         let converted_size = path.metadata()?.len();

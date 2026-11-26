@@ -10,6 +10,8 @@ mod relay;
 pub(crate) mod touches;
 mod quarantine;
 #[cfg(test)]
+mod tool_guard_tests;
+#[cfg(test)]
 mod workspace_write_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -915,10 +917,12 @@ async fn launch_assignment(
         });
     };
     let admission = app.worker_admission().register(job.clone(), admission_label.clone(), writes.clone());
+    let payload_hold = app.hub.hold_payload_conversion(&session);
     publish(&app, &session, &job, &initial_model.selection, &initial, None, None);
     let mut invocation = Invocation::new(&app, &session, caller, &role, &job, &prompt, None);
     let run = tokio::spawn(async move {
         let job = task_job;
+        let _payload_hold = payload_hold;
         let _approvals = WorkerApprovals { hub: &app.hub, job: &job };
         let mut decision = initial.clone();
         let mut attempts = Vec::new();
@@ -1189,6 +1193,8 @@ async fn launch_assignment(
                         turn: exec_turn.id.clone(),
                     });
                 }
+                let tool_guard = app.hub.worker_tool_guard(&session, &job);
+                record.lock().unwrap().activity.set_tool_guard(Some(tool_guard.guard.clone()));
                 let events = app.hub.subscribe_worker();
                 let on_model = |observed: &RunMetadata| {
                     if observed.model.is_none() && observed.effort.is_none() {
@@ -1225,7 +1231,8 @@ async fn launch_assignment(
                 };
                 let (mut result, transcript) = monitor_attempt(
                     run, &cancel, &attempt_cancel, events, &session, &job,
-                    AttemptWatch::new(Duration::from_secs(crate::capture::worker_tool_timeout(&launch.tools)), |kind| processes.usage(kind)),
+                    AttemptWatch::new(Duration::from_secs(crate::capture::worker_tool_timeout(&launch.tools)), |kind| processes.usage(kind))
+                        .with_tool_guard(tool_guard.guard.clone()),
                     |event| record.lock().unwrap().observe(
                         &event.event, jobs::now(), event.artifact_paths.as_deref(),
                     ),
@@ -1233,6 +1240,11 @@ async fn launch_assignment(
                 drop(exec_turn);
                 processes.stop();
                 input.job.exec.lock().unwrap().take();
+                if result.as_ref().is_err_and(|error| error.is::<crate::tool_guard::WorkerStopped>()) {
+                    app.hub.publish(crate::tool_guard::worker_notice(&session, &job, &admission_label));
+                    // Close admission for late requests from the stopped backend.
+                    cancel.cancel();
+                }
                 if cancel.check().is_ok() {
                     let reported = input.job.retry.lock().unwrap().take();
                     if let Some(reason) = reported {
@@ -1988,11 +2000,17 @@ struct AttemptWatch<F> {
     tools: HashMap<String, ToolWait>,
     tool_timeout: Duration,
     usage: F,
+    tool_guard: Option<Arc<crate::tool_guard::Guard>>,
 }
 
 impl<F: FnMut(CommandKind) -> UsageSample> AttemptWatch<F> {
     fn new(tool_timeout: Duration, usage: F) -> Self {
-        Self { tools: HashMap::new(), tool_timeout, usage }
+        Self { tools: HashMap::new(), tool_timeout, usage, tool_guard: None }
+    }
+
+    fn with_tool_guard(mut self, guard: Arc<crate::tool_guard::Guard>) -> Self {
+        self.tool_guard = Some(guard);
+        self
     }
 
     fn start(&mut self, item: &str, name: &str, now: AttemptInstant) {
@@ -2167,15 +2185,31 @@ async fn monitor_attempt(
     let mut idle_until = AttemptInstant::now() + WORKER_IDLE;
     tokio::pin!(run);
     let mut notes = String::new();
+    let mut partial = String::new();
+    let tool_guard = watch.tool_guard.clone();
+    let guard = async {
+        match &tool_guard {
+            Some(guard) => guard.stopped().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(guard);
     let mut approvals = BTreeSet::new();
     let mut tests = TestEvidence::default();
     let mut events_open = true;
-    let result = loop {
+    let result: Result<Result<String>> = loop {
         let deadline = watch.wake().unwrap_or(idle_until);
         tokio::select! {
             biased;
+            reason = &mut guard => break Err(crate::tool_guard::WorkerStopped { reason, partial: String::new() }.into()),
             _ = cancel.cancelled() => break Err(crate::cancellation::Cancelled.into()),
-            result = &mut run => break Ok(result),
+            result = &mut run => {
+                // The backend can report a burst and finish during the same poll.
+                if let Some(reason) = tool_guard.as_ref().and_then(|guard| guard.stop_reason()) {
+                    break Ok(Err(crate::tool_guard::WorkerStopped { reason, partial: result.unwrap_or_default() }.into()));
+                }
+                break Ok(result);
+            },
             _ = tokio::time::sleep_until(deadline), if approvals.is_empty() => {
                 let now = AttemptInstant::now();
                 if !watch.expired(now) && (watch.wake().is_some() || now < idle_until) {
@@ -2207,8 +2241,10 @@ async fn monitor_attempt(
                     observe(&event);
                     tests.observe(&event, session, job);
                     if let Some(activity) = activity(&event.event, session, job) {
-                        if let Activity::Tool { item, name, .. } = &activity {
-                            watch.start(item, name, now);
+                        match &activity {
+                            Activity::Tool { item, name, .. } => watch.start(item, name, now),
+                            Activity::Prose { text, .. } if tool_guard.is_some() => append_note(&mut partial, text),
+                            _ => {}
                         }
                         activity.append_to(&mut notes);
                         idle_until = now + WORKER_IDLE;
@@ -2222,12 +2258,15 @@ async fn monitor_attempt(
             },
         }
     };
-    let result = match result {
+    let mut result = match result {
         Ok(result) => result,
-        Err(error) => {
+        Err(mut error) => {
             attempt_cancel.cancel();
             // A stalled backend can also ignore interruption or fail to acknowledge it.
-            let _ = tokio::time::timeout(STOP_GRACE, &mut run).await;
+            let finished = tokio::time::timeout(STOP_GRACE, &mut run).await;
+            if let (Some(stop), Ok(Ok(answer))) = (error.downcast_mut::<crate::tool_guard::WorkerStopped>(), finished) {
+                stop.partial = answer;
+            }
             Err(error)
         }
     };
@@ -2235,8 +2274,19 @@ async fn monitor_attempt(
         observe(&event);
         tests.observe(&event, session, job);
         if let Some(activity) = activity(&event.event, session, job) {
+            if let Activity::Prose { text, .. } = &activity {
+                if tool_guard.is_some() {
+                    append_note(&mut partial, text);
+                }
+            }
             activity.append_to(&mut notes);
         }
+    }
+    if let Some(stop) = result.as_mut().err().and_then(|error| error.downcast_mut::<crate::tool_guard::WorkerStopped>()) {
+        if stop.partial.trim().is_empty() {
+            stop.partial = partial;
+        }
+        return (result, notes);
     }
     // Preserve the stop reason even if the attempt had previously reported failed tests.
     let result = if attempt_cancel.check().is_err() { result } else { tests.finish(result) };

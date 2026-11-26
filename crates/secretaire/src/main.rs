@@ -82,6 +82,7 @@ mod send_latency;
 mod synctex;
 mod threads;
 mod tiers;
+mod tool_guard;
 mod trash;
 mod front_desk;
 mod thread_titles;
@@ -630,6 +631,7 @@ async fn run_server() -> anyhow::Result<()> {
     let log_filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
         .from_env_lossy()
+        .add_directive(hub::PAYLOAD_CONVERSION_DIRECTIVE.parse()?)
         .add_directive(remote::AUDIT_DIRECTIVE.parse()?);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let log_filter = if std::env::var_os("RUST_LOG").is_none() {
@@ -657,6 +659,7 @@ async fn run_server() -> anyhow::Result<()> {
     tracing::info!("state: {}", state_dir.display());
     let config = remote::Config::load()?;
     capture::configure(&config.server_config)?;
+    tool_guard::configure(&config.server_config)?;
     let listen = config.listeners(canary()).await?;
     let access = Arc::new(config.access(&state_dir)?);
     let (listeners, local_addr) = if !canary() && self_update::managed() {

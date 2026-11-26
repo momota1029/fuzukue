@@ -1182,6 +1182,9 @@ struct TranscriptSlot {
     dirty: Cell<bool>,
     volatile_payloads: bool,
     accessed: Cell<Instant>,
+    last_activity: Instant,
+    activity_revision: u64,
+    last_conversion_attempt: Cell<Option<Instant>>,
 }
 
 #[derive(Clone)]
@@ -1207,6 +1210,9 @@ impl TranscriptSlot {
             dirty: Cell::new(false),
             volatile_payloads: false,
             accessed: Cell::new(Instant::now()),
+            last_activity: Instant::now(),
+            activity_revision: 0,
+            last_conversion_attempt: Cell::new(None),
         }
     }
 
@@ -1217,7 +1223,15 @@ impl TranscriptSlot {
             dirty: Cell::new(false),
             volatile_payloads: false,
             accessed: Cell::new(Instant::now()),
+            last_activity: Instant::now(),
+            activity_revision: 0,
+            last_conversion_attempt: Cell::new(None),
         }
+    }
+
+    fn mark_activity(&mut self) {
+        self.last_activity = Instant::now();
+        self.activity_revision = self.activity_revision.wrapping_add(1);
     }
 
     fn get(&self) -> &LoadedTranscript {
@@ -1292,6 +1306,7 @@ impl Deref for TranscriptSlot {
 impl DerefMut for TranscriptSlot {
     fn deref_mut(&mut self) -> &mut Transcript {
         self.get();
+        self.mark_activity();
         self.dirty.set(true);
         let loaded = self.loaded.get_mut().unwrap();
         loaded.weight.set(None);
@@ -1436,6 +1451,7 @@ impl Thread {
     }
 
     fn save(&mut self) -> Result<()> {
+        self.transcript.mark_activity();
         self.save_with(SaveFiles::open)
     }
 
@@ -2061,11 +2077,11 @@ impl Store {
         }
     }
 
-    pub(crate) fn flush_dirty_transcripts(&mut self, idle_only: bool) -> Result<()> {
+    pub(crate) fn flush_dirty_transcripts(&mut self, busy: impl Fn(&str) -> bool) -> Result<()> {
         let mut errors = Vec::new();
         for thread in self.threads.values_mut().filter(|thread| {
             thread.transcript.dirty.get()
-                && (!idle_only || !thread.active || thread.transcript.volatile_payloads)
+                && (!busy(&thread.front.id) || thread.transcript.volatile_payloads)
         }) {
             if let Err(error) = thread.save_with(SaveFiles::try_open) {
                 errors.push(format!("{}: {error:#}", thread.path.display()));
@@ -2086,24 +2102,44 @@ impl Store {
         }
     }
 
+    pub(crate) fn mark_payload_activity(&mut self, id: &str) {
+        if let Some(thread) = self.threads.get_mut(id) {
+            thread.transcript.mark_activity();
+        }
+    }
+
     pub(crate) fn payload_candidate(
-        &self, idle: std::time::Duration, busy: impl Fn(&str) -> bool,
-    ) -> Option<payload_migration::Candidate> {
-        let thread = self.threads.values().filter(|thread| {
-            !thread.front.preview_payloads && !thread.active
-                && thread.transcript.accessed.get().elapsed() >= idle && !busy(&thread.front.id)
-        }).max_by_key(|thread| thread.file_version.borrow().as_ref().map_or(0, |version| version.length))?;
-        // Wait an idle interval before retrying a failed or superseded attempt.
-        thread.transcript.accessed.set(Instant::now());
-        Some(payload_migration::Candidate {
-            id: thread.front.id.clone(), path: thread.path.clone(),
-            version: thread.file_version.borrow().clone()?,
-        })
+        &self, idle: std::time::Duration, busy: impl Fn(&str) -> Option<&'static str>,
+    ) -> (Option<payload_migration::Candidate>, Option<(&str, &'static str)>) {
+        let mut largest = None;
+        let candidate = self.threads.values().filter(|thread| !thread.front.preview_payloads)
+            .filter_map(|thread| {
+                let version = thread.file_version.borrow();
+                let length = version.as_ref().map_or(0, |version| version.length);
+                let reason = busy(&thread.front.id)
+                    .or_else(|| (thread.transcript.last_activity.elapsed() < idle).then_some("recent write or turn"))
+                    .or_else(|| thread.transcript.last_conversion_attempt.get()
+                        .filter(|last| last.elapsed() < idle).map(|_| "conversion retry cooldown"))
+                    .or_else(|| version.is_none().then_some("no saved version"));
+                if largest.is_none_or(|(size, _, _)| length >= size) {
+                    largest = Some((length, thread.front.id.as_str(), reason));
+                }
+                reason.is_none().then_some((length, thread))
+            }).max_by_key(|(length, _)| *length).map(|(_, thread)| {
+                thread.transcript.last_conversion_attempt.set(Some(Instant::now()));
+                payload_migration::Candidate {
+                    id: thread.front.id.clone(), path: thread.path.clone(),
+                    version: thread.file_version.borrow().clone().expect("saved version"),
+                    activity_revision: thread.transcript.activity_revision,
+                }
+            });
+        (candidate, largest.and_then(|(_, id, reason)| reason.map(|reason| (id, reason))))
     }
 
     pub(crate) fn publish_payloads(&mut self, staged: &mut payload_migration::Staged) -> Result<bool> {
         let Some(thread) = self.threads.get_mut(&staged.candidate.id) else { return Ok(false) };
-        if thread.active || thread.front.preview_payloads
+        if thread.front.preview_payloads
+            || thread.transcript.activity_revision != staged.candidate.activity_revision
             || thread.file_version.borrow().as_ref() != Some(&staged.candidate.version)
         {
             return Ok(false);
@@ -3674,6 +3710,7 @@ impl Store {
             return Ok(false);
         };
         if let ServerEvent::TurnActivity { running, .. } = event {
+            thread.transcript.mark_activity();
             thread.active = *running;
             return Ok(false);
         }

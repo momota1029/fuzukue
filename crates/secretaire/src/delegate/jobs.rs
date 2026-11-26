@@ -111,6 +111,7 @@ pub(super) struct Timeline {
     tools: HashMap<String, (String, Value)>,
     tool_count: usize,
     last_tool: Option<String>,
+    tool_guard: Option<Arc<crate::tool_guard::Guard>>,
     had_error: bool,
     changed_files: BTreeSet<String>,
     latest_digest: u64,
@@ -119,7 +120,20 @@ pub(super) struct Timeline {
 
 impl Timeline {
     pub(super) fn tool_activity(&self) -> fuzukue_proto::DelegateToolActivity {
-        fuzukue_proto::DelegateToolActivity { count: self.tool_count, last_tool: self.last_tool.clone() }
+        let mut activity = self.tool_guard.as_ref().map_or_else(
+            || fuzukue_proto::DelegateToolActivity { count: 0, last_tool: None },
+            |guard| guard.activity(),
+        );
+        activity.count = activity.count.saturating_add(self.tool_count);
+        activity.last_tool = activity.last_tool.or_else(|| self.last_tool.clone());
+        activity
+    }
+
+    pub(super) fn set_tool_guard(&mut self, guard: Option<Arc<crate::tool_guard::Guard>>) {
+        let previous = self.tool_activity();
+        self.tool_count = previous.count;
+        self.last_tool = previous.last_tool;
+        self.tool_guard = guard;
     }
 
     fn push(&mut self, line: Line) {
@@ -144,6 +158,7 @@ impl Job {
             files: report.files.clone(),
         };
         self.final_report = Some(report);
+        self.activity.set_tool_guard(None);
         self.activity.tools.clear();
     }
 
@@ -183,14 +198,10 @@ impl Job {
                 })
             }
             Some(Activity::Tool { item, name, input }) => {
-                self.activity.last_tool = Some(truncate(name, 120));
-                if self
-                    .activity
-                    .tools
-                    .insert(item.into(), (name.into(), input.clone()))
-                    .is_none()
-                {
-                    self.activity.tool_count += 1;
+                let new = self.activity.tools.insert(item.into(), (name.into(), input.clone())).is_none();
+                if self.activity.tool_guard.is_none() {
+                    self.activity.last_tool = Some(truncate(name, 120));
+                    self.activity.tool_count += usize::from(new);
                 }
                 Some(Line {
                     at: now,
@@ -289,6 +300,9 @@ impl Job {
             "elapsed_ms": elapsed, "error": state == State::Failed || self.activity.had_error,
             "wait_reason": self.wait.as_ref().map(WaitReason::message), "cancel_reason": self.cancel_reason,
         });
+        let tools = self.activity.tool_activity();
+        status["tool_count"] = json!(tools.count);
+        status["last_tool"] = json!(tools.last_tool);
         status["backend"] = json!(self.selection.backend);
         status["model"] = json!(self.selection.model);
         status["effort"] = json!(self.selection.effort);
@@ -309,7 +323,6 @@ impl Job {
         let mut value = self.status_header(now);
         let mut summary = json!({
             "last_activity_at": last_at, "last_activity": last.map(|line| line.text.replace(['\n', '\r'], " ")),
-            "tool_count": self.activity.tool_count, "last_tool": self.activity.last_tool,
             "touches": {"declared": self.declared, "effective": self.effective.touches, "source": self.effective.source},
             "changed_files": files.iter().take(8).collect::<Vec<_>>(), "changed_file_count": files.len(),
             "wait": self.wait,
@@ -579,10 +592,11 @@ impl Inventory {
                 format!(" · {note}")
             };
             table.push(format!(
-                "{} | {}{note} | {} | {activity}",
+                "{} | {}{note} | {} | {activity} | {}",
                 job.short_id(),
                 job.state().label(),
-                job.display.label.as_deref().unwrap_or(&job.title)
+                job.display.label.as_deref().unwrap_or(&job.title),
+                row["tool_count"],
             ));
             jobs.push(row);
         }
@@ -595,7 +609,7 @@ impl Inventory {
         (
             json!({"jobs": jobs, "total": total}),
             format!(
-                "{lines}\n\n{} of {total} jobs\nID | STATE | LABEL | WAIT OR ACTIVITY\n{table}",
+                "{lines}\n\n{} of {total} jobs\nID | STATE | LABEL | WAIT OR ACTIVITY | TOOL CALLS\n{table}",
                 jobs.len()
             ),
         )
@@ -711,6 +725,7 @@ mod tests {
         let (rows, table) = inventory.list(Filter::Active, None, 30, now);
         assert_eq!(rows["total"], 2);
         assert!(table.contains("stalled?") && table.contains("quiet"));
+        assert!(table.contains("WAIT OR ACTIVITY | TOOL CALLS"));
         let queued = &inventory.status("inspect CHAT", now, View::Full)?;
         assert_eq!(queued["state"], "queued");
         assert_eq!(queued["waiting_for"], "delegate:00000000b");
