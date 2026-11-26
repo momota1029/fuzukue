@@ -26,9 +26,69 @@ pub struct DesktopColors {
     pub outline: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreset {
+    #[default]
+    Classic,
+    Parchment,
+    Iris,
+}
+
+impl ThemePreset {
+    pub const ALL: [Self; 3] = [Self::Classic, Self::Parchment, Self::Iris];
+
+    pub const fn accent(self) -> AccentPreset {
+        match self {
+            Self::Classic => AccentPreset::Teal,
+            Self::Parchment => AccentPreset::Orange,
+            Self::Iris => AccentPreset::Purple,
+        }
+    }
+}
+
 impl DesktopColors {
-    pub const fn for_dark_mode(dark: bool) -> Self {
-        if dark {
+    pub const fn for_preset(preset: ThemePreset, dark: bool) -> Self {
+        use ThemePreset::*;
+
+        match (preset, dark) {
+            (Parchment, false) => Self {
+                background: 0xf7efd9,
+                chrome: 0xede1c4,
+                chat: 0xfbf5e8,
+                raised: 0xfffcf5,
+                code: 0xeee1c7,
+                divider: 0xb39e79,
+                outline: 0x806e51,
+            },
+            (Parchment, true) => Self {
+                background: 0x2e251c,
+                chrome: 0x241b13,
+                chat: 0x382d21,
+                raised: 0x46392b,
+                code: 0x201913,
+                divider: 0x79654c,
+                outline: 0xab9676,
+            },
+            (Iris, false) => Self {
+                background: 0xf0eaf8,
+                chrome: 0xe8def4,
+                chat: 0xf6f2fc,
+                raised: 0xfdfaff,
+                code: 0xe6dcf2,
+                divider: 0xa898bd,
+                outline: 0x79668d,
+            },
+            (Iris, true) => Self {
+                background: 0x29243b,
+                chrome: 0x211c31,
+                chat: 0x322b47,
+                raised: 0x3e3555,
+                code: 0x1c182b,
+                divider: 0x746488,
+                outline: 0xa492bd,
+            },
+            (Classic, true) =>
             Self {
                 background: 0x403034,
                 chrome: 0x37292d,
@@ -37,9 +97,8 @@ impl DesktopColors {
                 code: 0x2e2326,
                 divider: 0x806970,
                 outline: 0xb49ba2,
-            }
-        } else {
-            Self {
+            },
+            (Classic, false) => Self {
                 background: 0xe6f1fa,
                 chrome: 0xdceaf5,
                 chat: 0xf0f6fc,
@@ -47,7 +106,7 @@ impl DesktopColors {
                 code: 0xd7e7f4,
                 divider: 0xa69aa0,
                 outline: 0x80717b,
-            }
+            },
         }
     }
 }
@@ -86,6 +145,7 @@ pub enum FontWeightChoice {
 #[serde(rename_all = "lowercase")]
 pub enum AccentPreset {
     #[default]
+    Theme,
     Teal,
     Blue,
     Green,
@@ -111,6 +171,7 @@ impl Default for AccentChoice {
 #[serde(default)]
 pub struct Theme {
     pub base: ThemePreference,
+    pub preset: ThemePreset,
     pub accent: AccentChoice,
     /// Font family for Markdown code. Older settings may contain a comma-separated list.
     pub code_font: String,
@@ -311,7 +372,7 @@ mod tests {
         }
 
         for dark in [false, true] {
-            let colors = DesktopColors::for_dark_mode(dark);
+            let colors = DesktopColors::for_preset(ThemePreset::Classic, dark);
             for (border, minimum) in [(colors.divider, 1.5), (colors.outline, 3.)] {
                 for surface in [
                     colors.background, colors.chrome, colors.chat, colors.raised, colors.code,

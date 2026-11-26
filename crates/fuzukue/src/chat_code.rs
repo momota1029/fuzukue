@@ -26,7 +26,7 @@ impl Workbench {
         cx: &App,
     ) -> TextView {
         let theme = cx.theme();
-        let surface = ThemeSurfaces::for_mode(theme.mode).code;
+        let surface = ThemeSurfaces::current(cx).code;
         let code_font = &self.appearance.code_font;
         let font_style = || {
             let mut style = StyleRefinement::default().font_family(code_font.family.clone());

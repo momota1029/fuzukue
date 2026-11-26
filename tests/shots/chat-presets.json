@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {"action":"size","width":1440,"height":960},
+    {"action":"connect"},
+    {"action":"wait_event","event":"chat_capabilities"},
+    {"action":"new_thread","deck":"papers/levy-families"},
+    {"action":"click","id":"chat-input"},
+    {"action":"type","text":"Compare **the theorem** with its proof and report back.\n\n```rust\n// Keep this example visible in the transcript.\nfn sample(radius: f64) -> bool {\n    radius > 0.5\n}\n```"},
+    {"action":"key","key":"Ctrl+Enter"},
+    {"action":"wait_event","event":"turn_ended"},
+    {"action":"wait_idle"},
+    {"action":"click","id":"title-bar-settings"},
+    {"action":"wait_element","id":"theme-preset-parchment"},
+    {"action":"click","id":"theme-light"},
+    {"action":"click","id":"theme-preset-parchment"},
+    {"action":"click","id":"close-settings"},
+    {"action":"screenshot","name":"chat-parchment-light"},
+    {"action":"click","id":"title-bar-settings"},
+    {"action":"wait_element","id":"theme-preset-iris"},
+    {"action":"click","id":"theme-dark"},
+    {"action":"click","id":"theme-preset-iris"},
+    {"action":"click","id":"close-settings"},
+    {"action":"screenshot","name":"chat-iris-dark"}
+  ]
+}

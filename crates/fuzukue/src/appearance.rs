@@ -5,6 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,7 +13,8 @@ use gpui_kit::base::text::CodeTypography;
 use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    highlighter::HighlightTheme,
+    input::{Input, InputState},
     scroll::{ScrollableElement as _, ScrollbarMode},
     select::{Select, SelectEvent, SelectState},
     v_flex, ActiveTheme as _, Disableable as _, Sizable as _, Theme, ThemeColor, ThemeMode,
@@ -26,7 +28,7 @@ use gpui_kit::{
 use gpui_pdf::PdfStyle;
 use fuzukue_view::appearance::{
     AccentChoice, AccentPreset, AppearanceSettings, DesktopColors, FontWeightChoice, MainWindowPlacement,
-    ThemePreference, CODE_FONT_SIZE_PERCENT, MATH_SCALE, READING_FONT_SIZE, READING_LINE_HEIGHT,
+    ThemePreference, ThemePreset, CODE_FONT_SIZE_PERCENT, MATH_SCALE, READING_FONT_SIZE, READING_LINE_HEIGHT,
     UI_FONT_SIZE,
 };
 use fuzukue_view::server::{ServerMode, ServerSettings};
@@ -92,12 +94,13 @@ pub(super) fn settings_switch(
 pub(super) struct SaveServerOnClose(pub bool);
 impl gpui_kit::Global for SaveServerOnClose {}
 
-const THEMES: [(ThemePreference, &str, &str); 3] = [
+const COLOR_MODES: [(ThemePreference, &str, &str); 3] = [
     (ThemePreference::System, "theme-system", "settings-follow-system"),
     (ThemePreference::Light, "theme-light", "settings-light"),
     (ThemePreference::Dark, "theme-dark", "settings-dark"),
 ];
 
+#[derive(Clone, Copy)]
 pub(super) struct ThemeSurfaces {
     background: Hsla,
     chrome: Hsla,
@@ -108,9 +111,17 @@ pub(super) struct ThemeSurfaces {
     pub(super) code: Hsla,
 }
 
+impl gpui_kit::Global for ThemeSurfaces {}
+
 impl ThemeSurfaces {
-    pub(super) fn for_mode(mode: ThemeMode) -> Self {
-        let colors = DesktopColors::for_dark_mode(mode.is_dark());
+    pub(super) fn current(cx: &App) -> Self {
+        cx.try_global::<Self>()
+            .copied()
+            .unwrap_or_else(|| Self::for_preset(ThemePreset::Classic, cx.theme().is_dark()))
+    }
+
+    fn for_preset(preset: ThemePreset, dark: bool) -> Self {
+        let colors = DesktopColors::for_preset(preset, dark);
         let [background, chrome, raised, divider, outline, chat, code] = [
             colors.background, colors.chrome, colors.raised, colors.divider, colors.outline,
             colors.chat, colors.code,
@@ -126,14 +137,30 @@ impl ThemeSurfaces {
         }
     }
 
+    fn text_surfaces(self) -> [Hsla; 5] {
+        [self.background, self.chrome, self.chat, self.raised, self.code]
+    }
+
+    fn least_contrast(self, dark: bool) -> Hsla {
+        self.text_surfaces().into_iter().reduce(|first, second| {
+            if (luminance(first) > luminance(second)) == dark { first } else { second }
+        }).unwrap()
+    }
+
     pub(super) fn composer_disabled(&self, dark: bool) -> (Hsla, Hsla) {
         let fill = with_lightness(self.chat, self.chat.l + if dark { 0.14 } else { -0.09 });
         let icon = with_lightness(self.chat, if dark { 0.72 } else { 0.43 });
+        let icon = adjust_lightness(icon, dark, |color| contrast_ratio(color, fill) >= 3.);
         (fill, icon)
     }
 
     pub(super) fn composer_stop(&self, dark: bool) -> (Hsla, Hsla) {
-        (with_lightness(self.chat, if dark { 0.85 } else { 0.38 }), self.chat)
+        let (disabled, _) = self.composer_disabled(dark);
+        let fill = with_lightness(self.chat, if dark { 0.85 } else { 0.38 });
+        let fill = adjust_lightness(fill, dark, |color| {
+            contrast_ratio(color, self.chat) >= 3. && contrast_ratio(color, disabled) >= 3.
+        });
+        (fill, self.chat)
     }
 }
 
@@ -283,6 +310,10 @@ pub(super) fn accessible_accent(color: Hsla, surface: Hsla, dark: bool, surface_
     let readable = |color| {
         contrast_ratio(color, foreground) >= 4.5 && contrast_ratio(color, surface) >= surface_ratio
     };
+    adjust_lightness(color, dark, readable)
+}
+
+fn adjust_lightness(color: Hsla, dark: bool, readable: impl Fn(Hsla) -> bool) -> Hsla {
     if readable(color) {
         return color;
     }
@@ -300,17 +331,21 @@ pub(super) fn accessible_accent(color: Hsla, surface: Hsla, dark: bool, surface_
     with_lightness(color, passing)
 }
 
-fn accent_color(choice: &AccentChoice, surface: Hsla, dark: bool) -> Hsla {
-    let color = match choice {
-        AccentChoice::Preset(preset) => ACCENT_SWATCHES
-            .iter()
-            .find(|swatch| swatch.preset == *preset)
-            .unwrap_or(&ACCENT_SWATCHES[0])
-            .color(dark),
+fn accent_swatch(preset: AccentPreset, dark: bool) -> Hsla {
+    ACCENT_SWATCHES
+        .iter()
+        .find(|swatch| swatch.preset == preset)
+        .unwrap_or(&ACCENT_SWATCHES[0])
+        .color(dark)
+}
+
+fn accent_color(choice: &AccentChoice, preset: ThemePreset, dark: bool) -> Hsla {
+    match choice {
+        AccentChoice::Preset(AccentPreset::Theme) => accent_swatch(preset.accent(), dark),
+        AccentChoice::Preset(accent) => accent_swatch(*accent, dark),
         AccentChoice::Custom(value) => parse_hex_color(value)
-            .map_or_else(|| ACCENT_SWATCHES[0].color(dark), |hex| rgb(hex).into()),
-    };
-    accessible_accent(color, surface, dark, 4.5)
+            .map_or_else(|| accent_swatch(preset.accent(), dark), |hex| rgb(hex).into()),
+    }
 }
 
 fn accent_button_states(accent: Hsla, surface: Hsla, dark: bool) -> [Hsla; 3] {
@@ -345,19 +380,24 @@ pub(super) fn accent_button(button: Button, enabled: bool, cx: &App) -> Button {
         .disabled(!enabled)
 }
 
-fn desktop_palette(mut colors: ThemeColor, choice: &AccentChoice, dark: bool) -> ThemeColor {
-    let surfaces = ThemeSurfaces::for_mode(if dark { ThemeMode::Dark } else { ThemeMode::Light });
-    let accent_surface = if dark { surfaces.raised } else { surfaces.code };
-    let is_default = match choice {
-        AccentChoice::Preset(preset) => *preset == AccentPreset::default(),
+fn desktop_palette(
+    mut colors: ThemeColor,
+    preset: ThemePreset,
+    choice: &AccentChoice,
+    dark: bool,
+) -> ThemeColor {
+    let surfaces = ThemeSurfaces::for_preset(preset, dark);
+    let accent_surface = surfaces.least_contrast(dark);
+    let is_classic_teal = preset == ThemePreset::Classic && match choice {
+        AccentChoice::Preset(accent) => matches!(accent, AccentPreset::Theme | AccentPreset::Teal),
         AccentChoice::Custom(value) => parse_hex_color(value).is_none(),
     };
-    let primary = accent_color(choice, accent_surface, dark);
-    let [foreground, muted, selection, text_selection, success, warning, danger, info, danger_bg] =
+    let primary = accessible_accent(accent_color(choice, preset, dark), accent_surface, dark, 4.5);
+    let [foreground, muted, selection, text_selection, success, warning, danger, info] =
         if dark {
-            [0xf9ecee, 0xdec8cd, 0x24594f, 0x235349, 0xc9e477, 0xffc08a, 0xffa7b3, 0xb9d0ff, 0x522c38]
+            [0xf9ecee, 0xdec8cd, 0x24594f, 0x235349, 0xc9e477, 0xffc08a, 0xffa7b3, 0xb9d0ff]
         } else {
-            [0x403034, 0x5d4a50, 0x02fac8, 0xbdf0e4, 0x435817, 0x824008, 0x952b49, 0x294c8a, 0xfbe5ea]
+            [0x403034, 0x5d4a50, 0x02fac8, 0xbdf0e4, 0x435817, 0x824008, 0x952b49, 0x294c8a]
         }.map(|color| Hsla::from(rgb(color)));
 
     colors.background = surfaces.background;
@@ -387,7 +427,7 @@ fn desktop_palette(mut colors: ThemeColor, choice: &AccentChoice, dark: bool) ->
     colors.button_secondary_hover = colors.secondary_hover;
     colors.button_secondary_active = colors.secondary_active;
 
-    let ([hover, active], [link, link_hover, link_active]) = if is_default {
+    let ([hover, active], links) = if is_classic_teal {
         let (button, link) = if dark {
             ([0x61fddc, 0x00ddb1], [0x7affe1, 0xaaffec, 0x02fac8])
         } else {
@@ -395,8 +435,8 @@ fn desktop_palette(mut colors: ThemeColor, choice: &AccentChoice, dark: bool) ->
         };
         (button.map(|color| rgb(color).into()), link.map(|color| rgb(color).into()))
     } else {
-        let [hover, active, _] = accent_button_states(primary, accent_surface, dark);
-        ([hover, active], [primary; 3])
+        let shift = if dark { 0.04 } else { -0.04 };
+        ([with_lightness(primary, primary.l + shift), with_lightness(primary, primary.l + shift * 2.)], [primary; 3])
     };
     colors.primary = primary;
     colors.primary_hover = hover;
@@ -408,33 +448,126 @@ fn desktop_palette(mut colors: ThemeColor, choice: &AccentChoice, dark: bool) ->
     colors.button_primary_foreground = colors.primary_foreground;
     colors.sidebar_primary = primary;
     colors.sidebar_primary_foreground = colors.primary_foreground;
-    colors.link = link;
-    colors.link_hover = link_hover;
-    colors.link_active = link_active;
     colors.ring = primary;
     colors.drag_border = primary;
     colors.caret = primary;
     colors.progress_bar = primary;
 
-    colors.accent = if is_default { selection } else { surfaces.chat.blend(primary.opacity(0.14)) };
+    colors.accent = if is_classic_teal { selection } else { surfaces.chat.blend(primary.opacity(0.13)) };
+    colors.selection = if is_classic_teal { text_selection } else { surfaces.chat.blend(primary.opacity(0.2)) };
+    let text_surfaces = [accent_surface, colors.accent, colors.selection];
+    let readable_text = |color| adjust_lightness(color, dark, |color| {
+        text_surfaces.into_iter().all(|surface| contrast_ratio(color, surface) >= 4.5)
+    });
+    let [link, link_hover, link_active] = links.map(readable_text);
+    colors.link = link;
+    colors.link_hover = link_hover;
+    colors.link_active = link_active;
     colors.accent_foreground = foreground;
     colors.sidebar_accent = colors.accent;
     colors.sidebar_accent_foreground = foreground;
     colors.list_active = colors.accent;
     colors.list_active_border = primary;
     colors.list_highlight_foreground = link_hover;
-    colors.selection = text_selection;
 
-    colors.success = success;
-    colors.warning = warning;
-    colors.danger = danger;
-    colors.info = info;
-    colors.danger_foreground = danger_bg;
-    colors.button_danger = danger;
-    colors.button_danger_foreground = danger_bg;
-    colors.button_danger_hover = danger.blend(danger_bg.opacity(0.08));
-    colors.button_danger_active = danger.blend(danger_bg.opacity(0.16));
+    colors.list = surfaces.raised;
+    colors.list_even = surfaces.chat;
+    colors.list_head = surfaces.chrome;
+    colors.list_hover = surfaces.chat;
+    colors.tab = surfaces.chrome;
+    colors.tab_active = surfaces.raised;
+    colors.tab_bar = surfaces.chrome;
+    colors.tab_bar_segmented = surfaces.chat;
+    colors.tab_foreground = muted;
+    colors.tab_active_foreground = foreground;
+    colors.table = surfaces.background;
+    colors.table_even = surfaces.chat;
+    colors.table_head = surfaces.chrome;
+    colors.table_foot = surfaces.chrome;
+    colors.table_head_foreground = foreground;
+    colors.table_foot_foreground = foreground;
+    colors.table_active = colors.accent;
+    colors.table_active_border = primary;
+    colors.table_hover = surfaces.chat;
+    colors.table_row_border = surfaces.divider;
+    colors.status_bar = surfaces.chrome;
+    colors.status_bar_border = surfaces.divider;
+    colors.scrollbar_thumb = surfaces.outline;
+    colors.scrollbar_thumb_hover = muted;
+    colors.switch = surfaces.outline;
+    colors.switch_thumb = button_foreground(dark);
+    colors.drop_target = colors.selection;
+
+    colors.success = readable_text(success);
+    colors.warning = readable_text(warning);
+    colors.danger = readable_text(danger);
+    colors.info = readable_text(info);
+
+    let on_status = button_foreground(dark);
+    let status_button = |fill: Hsla| {
+        [fill, fill.blend(on_status.opacity(0.08)), fill.blend(on_status.opacity(0.16))]
+            .map(|color| accessible_accent(color, accent_surface, dark, 3.))
+    };
+    [colors.success, colors.success_hover, colors.success_active] = status_button(colors.success);
+    [colors.warning, colors.warning_hover, colors.warning_active] = status_button(colors.warning);
+    [colors.danger, colors.danger_hover, colors.danger_active] = status_button(colors.danger);
+    [colors.info, colors.info_hover, colors.info_active] = status_button(colors.info);
+    colors.success_foreground = on_status;
+    colors.warning_foreground = on_status;
+    colors.danger_foreground = on_status;
+    colors.info_foreground = on_status;
+    [colors.button_success, colors.button_success_hover, colors.button_success_active] =
+        [colors.success, colors.success_hover, colors.success_active];
+    [colors.button_warning, colors.button_warning_hover, colors.button_warning_active] =
+        [colors.warning, colors.warning_hover, colors.warning_active];
+    [colors.button_danger, colors.button_danger_hover, colors.button_danger_active] =
+        [colors.danger, colors.danger_hover, colors.danger_active];
+    [colors.button_info, colors.button_info_hover, colors.button_info_active] =
+        [colors.info, colors.info_hover, colors.info_active];
+    colors.button_success_foreground = on_status;
+    colors.button_warning_foreground = on_status;
+    colors.button_danger_foreground = on_status;
+    colors.button_info_foreground = on_status;
     colors
+}
+
+fn desktop_highlight(colors: ThemeColor, surfaces: ThemeSurfaces, dark: bool) -> Arc<HighlightTheme> {
+    let mut theme = if dark { HighlightTheme::default_dark() } else { HighlightTheme::default_light() };
+    let style = &mut Arc::make_mut(&mut theme).style;
+    style.editor_background = Some(surfaces.code);
+    style.editor_foreground = Some(colors.foreground);
+    style.editor_active_line = Some(surfaces.chat);
+    style.editor_gutter_background = Some(surfaces.code);
+    style.editor_line_number = Some(colors.muted_foreground);
+    style.editor_active_line_number = Some(colors.foreground);
+
+    // Syntax colors from the component theme also appear on the app's code surface
+    // and text selection. Keep their hues and font styles, adjusting lightness as needed.
+    let mut syntax = serde_json::to_value(&style.syntax).expect("serialize syntax colors");
+    for token in syntax.as_object_mut().expect("syntax colors are an object").values_mut() {
+        let Some(value) = token.get_mut("color").filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let color: Hsla = serde_json::from_value(value.clone()).expect("deserialize syntax color");
+        let adjusted = adjust_lightness(color, dark, |candidate| {
+            [surfaces.code, surfaces.chat, colors.selection]
+                .into_iter().all(|surface| contrast_ratio(candidate, surface) >= 4.55)
+        });
+        *value = serde_json::to_value(adjusted).expect("serialize syntax color");
+    }
+    style.syntax = serde_json::from_value(syntax).expect("deserialize syntax colors");
+    theme
+}
+
+fn desktop_pdf_style(colors: ThemeColor) -> PdfStyle {
+    PdfStyle {
+        bg: colors.muted,
+        border: colors.border,
+        placeholder_bg: colors.secondary,
+        placeholder_fg: colors.muted_foreground,
+        header_fg: colors.foreground,
+        header_muted: colors.muted_foreground,
+    }
 }
 
 const FONT_ROLES: [FontRole; 3] = [FontRole::Ui, FontRole::Reading, FontRole::Code];
@@ -525,8 +658,6 @@ pub(super) struct Appearance {
     path: Option<PathBuf>,
     error: Option<String>,
     override_theme: Option<ThemePreference>,
-    accent_input: Entity<InputState>,
-    accent_input_invalid: bool,
     pub(super) code_font: Font,
     pub(super) ui_font: Font,
     reading_font: Font,
@@ -696,26 +827,6 @@ impl Appearance {
         let override_theme = fuzukue_proto::compat::env("FUZUKUE_THEME")
             .ok()
             .and_then(|value| ThemePreference::screenshot_override(&value));
-        let accent_input = cx.new(|cx| {
-            let value = match &settings.theme.accent {
-                AccentChoice::Custom(value) => value.as_str(),
-                AccentChoice::Preset(_) => "",
-            };
-            InputState::new(window, cx)
-                .placeholder("#287b80")
-                .default_value(value.to_owned())
-        });
-        cx.subscribe_in(&accent_input, window, |this, _, event: &InputEvent, window, cx| {
-            match event {
-                InputEvent::PressEnter { .. } => this.apply_custom_accent(window, cx),
-                InputEvent::Change if this.appearance.accent_input_invalid => {
-                    this.appearance.accent_input_invalid = false;
-                    cx.notify();
-                }
-                _ => {}
-            }
-        })
-        .detach();
         let fonts = FontCatalog::from_platform(cx);
         let font_selects = FONT_ROLES.map(|role| {
             let (options, selected) = fonts.options(role, role.saved(&settings));
@@ -762,8 +873,6 @@ impl Appearance {
             path,
             error,
             override_theme,
-            accent_input,
-            accent_input_invalid: false,
             fonts,
             font_selects,
             server_mode,
@@ -829,13 +938,18 @@ impl Appearance {
         let ui_font = &self.ui_font.family;
         let code_font = &self.code_font.family;
         let ui_size = px(self.settings.ui_font_size);
+        let preset = self.settings.theme.preset;
+        let surfaces = ThemeSurfaces::for_preset(preset, mode.is_dark());
+        cx.set_global(surfaces);
         let theme = cx.theme();
-        let colors = desktop_palette(theme.colors, &self.settings.theme.accent, mode.is_dark());
+        let colors = desktop_palette(theme.colors, preset, &self.settings.theme.accent, mode.is_dark());
+        let highlight = desktop_highlight(colors, surfaces, mode.is_dark());
         if theme.font_family != *ui_font
             || theme.mono_font_family != *code_font
             || theme.font_size != ui_size
             || theme.scrollbar_mode != ScrollbarMode::Always
             || theme.colors != colors
+            || *theme.highlight_theme != *highlight
         {
             Theme::update(cx, |theme| {
                 theme.font_family = ui_font.clone();
@@ -843,6 +957,7 @@ impl Appearance {
                 theme.mono_font_family = code_font.clone();
                 theme.scrollbar_mode = ScrollbarMode::Always;
                 theme.colors = colors;
+                theme.highlight_theme = highlight;
             });
         }
         let code_typography = CodeTypography {
@@ -856,15 +971,7 @@ impl Appearance {
             cx.set_global(UiTypography(self.ui_font.clone()));
         }
         cx.set_global(math::MathScale(self.settings.math_scale));
-        let theme = cx.theme();
-        self.pdf_style.set(PdfStyle {
-            bg: theme.muted,
-            border: theme.border,
-            placeholder_bg: theme.secondary,
-            placeholder_fg: theme.muted_foreground,
-            header_fg: theme.foreground,
-            header_muted: theme.muted_foreground,
-        });
+        self.pdf_style.set(desktop_pdf_style(colors));
     }
 
     fn save(&self) -> anyhow::Result<()> {
@@ -1033,73 +1140,85 @@ const NUMBERS: [NumberSetting; 7] = [
 ];
 
 impl Workbench {
-    fn apply_custom_accent(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let value = self.appearance.accent_input.read(cx).value();
-        let Some(hex) = parse_hex_color(&value) else {
-            self.appearance.accent_input_invalid = true;
-            cx.notify();
-            return;
-        };
-        self.appearance.accent_input_invalid = false;
-        self.update_appearance(window, cx, |settings| {
-            settings.theme.accent = AccentChoice::Custom(format!("#{hex:06x}"));
+    fn render_theme_presets(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
+        let theme = cx.theme();
+        let dark = theme.is_dark();
+        let selected = self.appearance.settings.theme.preset;
+        let accent = &self.appearance.settings.theme.accent;
+        let previews = ThemePreset::ALL.map(|preset| {
+            let (id, label) = match preset {
+                ThemePreset::Classic => ("theme-preset-classic", tr!("settings-theme-classic")),
+                ThemePreset::Parchment => ("theme-preset-parchment", tr!("settings-theme-parchment")),
+                ThemePreset::Iris => ("theme-preset-iris", tr!("settings-theme-iris")),
+            };
+            let surfaces = ThemeSurfaces::for_preset(preset, dark);
+            let primary = accessible_accent(accent_color(accent, preset, dark), surfaces.least_contrast(dark), dark, 4.5);
+            let preview = h_flex()
+                .w(px(76.))
+                .h(px(32.))
+                .flex_shrink_0()
+                .rounded_md()
+                .overflow_hidden()
+                .border_1()
+                .border_color(surfaces.outline)
+                .bg(surfaces.background)
+                .child(div().w(px(20.)).h_full().bg(surfaces.chrome).border_r_1().border_color(surfaces.divider))
+                .child(
+                    v_flex().flex_1().gap_1().p_1()
+                        .child(div().h(px(7.)).w(px(22.)).rounded_sm().bg(primary))
+                        .child(div().h(px(7.)).w_full().rounded_sm().bg(surfaces.chat).border_1().border_color(surfaces.divider)),
+                );
+            Button::new(id)
+                .w(px(115.))
+                .h(px(70.))
+                .accessibility_label(label)
+                .toggled(preset == selected)
+                .when(preset == selected, |button| button.primary())
+                .child(v_flex().gap_1().items_center().child(preview).child(label))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.update_appearance(window, cx, |settings| settings.theme.preset = preset);
+                }))
         });
-        cx.notify();
+        v_flex().gap_1()
+            .child(tr!("settings-theme"))
+            .child(h_flex().gap_2().flex_wrap().children(previews))
     }
 
     fn render_accent_settings(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
-        let accent = &self.appearance.settings.theme.accent;
+        let settings = &self.appearance.settings.theme;
         let theme = cx.theme();
         let dark = theme.is_dark();
-        let (applied, error_color, note_color) = (theme.link, theme.danger, theme.muted_foreground);
-        let adjusted = matches!(
-            accent,
-            AccentChoice::Custom(value)
-                if parse_hex_color(value).is_some_and(|hex| Hsla::from(rgb(hex)) != applied)
-        );
-        let mut presets = h_flex().gap_2().flex_wrap();
-        for swatch in ACCENT_SWATCHES {
-            let preset = swatch.preset;
-            presets = presets.child(
-                Button::new(swatch.label)
-                    .small()
-                    .label(tr!(swatch.label))
-                    .toggled(*accent == AccentChoice::Preset(preset))
-                    .child(div().size(px(10.)).rounded_full().bg(swatch.color(dark)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.appearance.accent_input_invalid = false;
-                        this.appearance.accent_input.update(cx, |input, cx| {
-                            input.set_value("", window, cx);
-                        });
-                        this.update_appearance(window, cx, |settings| {
-                            settings.theme.accent = AccentChoice::Preset(preset);
-                        });
-                        cx.notify();
-                    })),
-            );
-        }
-        let custom_label = tr!("settings-accent-custom");
+        let selected = &settings.accent;
+        let options = [(AccentPreset::Theme, "settings-accent-theme")]
+            .into_iter()
+            .chain(ACCENT_SWATCHES.iter().map(|swatch| (swatch.preset, swatch.label)));
+        let current_custom = matches!(selected, AccentChoice::Custom(_)).then(|| {
+            Button::new("settings-accent-custom")
+                .small()
+                .label(tr!("settings-accent-custom"))
+                .toggled(true)
+                .primary()
+                .child(div().size(px(10.)).rounded_full().bg(theme.link))
+        });
+        let swatches = options.map(|(preset, key)| {
+            let color = accent_color(&AccentChoice::Preset(preset), settings.preset, dark);
+            let active = *selected == AccentChoice::Preset(preset);
+            Button::new(key)
+                .small()
+                .label(tr!(key))
+                .toggled(active)
+                .when(active, |button| button.primary())
+                .child(div().size(px(10.)).rounded_full().bg(color))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.update_appearance(window, cx, |settings| {
+                        settings.theme.accent = AccentChoice::Preset(preset);
+                    });
+                }))
+        });
         v_flex()
             .gap_1()
             .child(tr!("settings-accent"))
-            .child(presets)
-            .child(div().text_sm().child(custom_label))
-            .child(
-                h_flex().gap_2()
-                    .child(Input::new(&self.appearance.accent_input).w(px(120.)).aria_label(custom_label))
-                    .child(Button::new("apply-custom-accent")
-                        .label(tr!("settings-accent-apply"))
-                        .on_click(cx.listener(|this, _, window, cx| this.apply_custom_accent(window, cx))))
-                    .when(matches!(accent, AccentChoice::Custom(_)), |row| {
-                        row.child(div().size(px(10.)).rounded_full().bg(applied))
-                    }),
-            )
-            .when(self.appearance.accent_input_invalid, |form| {
-                form.child(div().text_sm().text_color(error_color).child(tr!("settings-accent-invalid")))
-            })
-            .when(adjusted && !self.appearance.accent_input_invalid, |form| {
-                form.child(div().text_sm().text_color(note_color).child(tr!("settings-accent-adjusted")))
-            })
+            .child(h_flex().gap_2().flex_wrap().children(swatches).children(current_custom))
     }
 
     fn update_appearance(
@@ -1350,7 +1469,7 @@ impl Workbench {
         let show_notifications = self.notifications.settings_selected && !self.sidebar.server_settings;
         let theme = cx.theme().clone();
         let mut themes = h_flex().gap_2().flex_wrap();
-        for (preference, id, key) in THEMES {
+        for (preference, id, key) in COLOR_MODES {
             themes = themes.child(
                 Button::new(id)
                     .line_height(UI_LINE_HEIGHT)
@@ -1389,6 +1508,9 @@ impl Workbench {
             .gap_4()
             .child(v_flex().gap_1().child(tr!("settings-language")).child(languages))
             .child(div().text_lg().child(tr!("settings-appearance")))
+            .child(v_flex().gap_1().child(tr!("settings-color-mode")).child(themes))
+            .child(self.render_theme_presets(cx))
+            .child(self.render_accent_settings(cx))
             .child({
                 let view = cx.weak_entity();
                 gpui_kit::component::switch::Switch::new("save-server-on-close")
@@ -1400,8 +1522,6 @@ impl Workbench {
                         });
                     })
             })
-            .child(v_flex().gap_1().child(tr!("settings-theme")).child(themes))
-            .child(self.render_accent_settings(cx))
             .child({
                 let view = cx.weak_entity();
                 gpui_kit::component::switch::Switch::new("show-worker-messages")
@@ -1638,10 +1758,13 @@ mod accent_tests {
             for mode in [ThemeMode::Light, ThemeMode::Dark] {
                 Theme::change(mode, None, cx);
                 Theme::update(cx, |theme| {
-                    theme.colors = desktop_palette(theme.colors, &AccentChoice::default(), mode.is_dark());
+                    let dark = mode.is_dark();
+                    let surfaces = ThemeSurfaces::for_preset(ThemePreset::Classic, dark);
+                    theme.colors = desktop_palette(theme.colors, ThemePreset::Classic, &AccentChoice::default(), dark);
+                    theme.highlight_theme = desktop_highlight(theme.colors, surfaces, dark);
                 });
                 let theme = cx.theme();
-                let background = ThemeSurfaces::for_mode(mode).background;
+                let background = ThemeSurfaces::for_preset(ThemePreset::Classic, mode.is_dark()).background;
                 let mark = style_note_warning(theme.warning, background);
                 assert!((3. ..= 3.25).contains(&contrast_ratio(mark, background)), "{mode:?}");
                 let style = &theme.highlight_theme.style;
@@ -1668,7 +1791,7 @@ mod accent_tests {
     #[test]
     fn theme_surfaces_keep_chrome_subtle_and_chat_distinct() {
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            let surfaces = ThemeSurfaces::for_mode(mode);
+            let surfaces = ThemeSurfaces::for_preset(ThemePreset::Classic, mode.is_dark());
             let chrome_ratio = contrast_ratio(surfaces.background, surfaces.chrome);
             let chat_ratio = contrast_ratio(surfaces.background, surfaces.chat);
             let divider_ratio = contrast_ratio(surfaces.chrome, surfaces.divider);
@@ -1684,8 +1807,8 @@ mod accent_tests {
     #[test]
     fn code_surface_has_contrast_on_chat_page_and_user_bubble() {
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            let colors = desktop_palette(ThemeColor::default(), &AccentChoice::default(), mode.is_dark());
-            let surfaces = ThemeSurfaces::for_mode(mode);
+            let colors = desktop_palette(ThemeColor::default(), ThemePreset::Classic, &AccentChoice::default(), mode.is_dark());
+            let surfaces = ThemeSurfaces::for_preset(ThemePreset::Classic, mode.is_dark());
             for (container, parent, minimum) in [
                 ("assistant page", surfaces.background, 1.10),
                 ("user bubble", surfaces.chat, 1.12),
@@ -1715,8 +1838,8 @@ mod accent_tests {
             (ThemeMode::Light, 0xaaccdd, 0x246c72),
         ] {
             let dark = mode.is_dark();
-            let surfaces = ThemeSurfaces::for_mode(mode);
-            let surface = if dark { surfaces.raised } else { surfaces.code };
+            let surfaces = ThemeSurfaces::for_preset(ThemePreset::Classic, dark);
+            let surface = surfaces.least_contrast(dark);
             let raw: Hsla = rgb(raw).into();
             let foreground = button_foreground(dark);
             assert!(contrast_ratio(raw, foreground) < 4.5);
@@ -1739,7 +1862,7 @@ mod accent_tests {
     #[test]
     fn composer_neutral_icons_meet_contrast_in_both_modes() {
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            let surfaces = ThemeSurfaces::for_mode(mode);
+            let surfaces = ThemeSurfaces::for_preset(ThemePreset::Classic, mode.is_dark());
             let (disabled, arrow) = surfaces.composer_disabled(mode.is_dark());
             let (stop, square) = surfaces.composer_stop(mode.is_dark());
             for (fill, icon) in [(disabled, arrow), (stop, square), (surfaces.chat, stop)] {
@@ -1755,9 +1878,11 @@ mod accent_tests {
             (false, 0x00735e, 0x00735e, 0xbdf0e4),
             (true, 0x02fac8, 0x7affe1, 0x235349),
         ] {
-            let colors = desktop_palette(ThemeColor::default(), &AccentChoice::default(), dark);
+            let colors = desktop_palette(ThemeColor::default(), ThemePreset::Classic, &AccentChoice::default(), dark);
             assert_eq!(colors.primary, rgb(primary).into());
-            assert_eq!(colors.link, rgb(link).into());
+            let original_link = Hsla::from(rgb(link));
+            assert_eq!(colors.link.h, original_link.h);
+            assert!((colors.link.l - original_link.l).abs() <= 0.02);
             assert_eq!(colors.selection, rgb(selection).into());
             assert_ne!(colors.accent, colors.selection);
             assert!(contrast_ratio(colors.accent_foreground, colors.accent) >= 4.5);
@@ -1769,24 +1894,82 @@ mod accent_tests {
     }
 
     #[test]
-    fn every_preset_and_send_state_meet_contrast_in_both_modes() {
-        for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            let dark = mode.is_dark();
-            let surfaces = ThemeSurfaces::for_mode(mode);
-            let backgrounds = [surfaces.background, surfaces.chrome, surfaces.chat, surfaces.raised, surfaces.code];
-            for swatch in ACCENT_SWATCHES {
-                let colors = desktop_palette(ThemeColor::default(), &AccentChoice::Preset(swatch.preset), dark);
-                assert_eq!(colors.primary, colors.button_primary);
-                assert_ne!(colors.primary, colors.primary_hover);
-                assert_ne!(colors.primary, colors.primary_active);
-                for color in [colors.primary, colors.primary_hover, colors.primary_active] {
-                    assert!(contrast_ratio(color, colors.primary_foreground) >= 4.5, "{}", swatch.label);
-                    for background in backgrounds {
-                        assert!(contrast_ratio(color, background) >= 3.0, "{}", swatch.label);
+    fn every_theme_and_accent_keeps_text_controls_and_highlights_readable() {
+        for preset in ThemePreset::ALL {
+            for dark in [false, true] {
+                let surfaces = ThemeSurfaces::for_preset(preset, dark);
+                let accents = std::iter::once(AccentChoice::default())
+                    .chain(ACCENT_SWATCHES.iter().map(|swatch| AccentChoice::Preset(swatch.preset)))
+                    .chain([AccentChoice::Custom("#777777".into())]);
+                for accent in accents {
+                    let colors = desktop_palette(ThemeColor::default(), preset, &accent, dark);
+                    let check = |name, foreground, background, minimum| {
+                        let ratio = contrast_ratio(foreground, background);
+                        assert!(
+                            ratio >= minimum,
+                            "{preset:?} dark={dark} {accent:?}: {name} has {ratio:.2}:1, expected {minimum}:1",
+                        );
+                    };
+
+                    for background in surfaces.text_surfaces().into_iter().chain([colors.accent, colors.selection]) {
+                        for (name, foreground) in [
+                            ("body text", colors.foreground),
+                            ("muted text", colors.muted_foreground),
+                            ("link", colors.link),
+                            ("link hover", colors.link_hover),
+                            ("link active", colors.link_active),
+                            ("added line", colors.success),
+                            ("removed line", colors.danger),
+                            ("warning", colors.warning),
+                            ("info", colors.info),
+                        ] {
+                            check(name, foreground, background, 4.5);
+                        }
                     }
-                }
-                for background in backgrounds {
-                    assert!(contrast_ratio(colors.link, background) >= 4.5, "{}", swatch.label);
+                    check("list search", colors.list_highlight_foreground, colors.list_active, 4.5);
+                    check("popup text", colors.popover_foreground, colors.popover, 4.5);
+                    let pdf = desktop_pdf_style(colors);
+                    check("PDF header", pdf.header_fg, pdf.bg, 4.5);
+                    check("PDF header secondary", pdf.header_muted, pdf.bg, 4.5);
+                    check("PDF placeholder", pdf.placeholder_fg, pdf.placeholder_bg, 4.5);
+
+                    assert_eq!(colors.primary, colors.button_primary);
+                    assert_ne!(colors.primary, colors.primary_hover);
+                    assert_ne!(colors.primary, colors.primary_active);
+                    for fill in [colors.primary, colors.primary_hover, colors.primary_active] {
+                        check("button label", colors.primary_foreground, fill, 4.5);
+                        for surface in surfaces.text_surfaces() {
+                            check("button outline", fill, surface, 3.);
+                        }
+                    }
+                    for surface in surfaces.text_surfaces() {
+                        check("focus ring", colors.ring, surface, 3.);
+                        check("control outline", colors.border, surface, 3.);
+                    }
+                    let (fill, arrow) = surfaces.composer_disabled(dark);
+                    let (stop, square) = surfaces.composer_stop(dark);
+                    check("disabled send icon", arrow, fill, 3.);
+                    check("stop icon", square, stop, 3.);
+                    check("stop control", stop, surfaces.chat, 3.);
+
+                    let highlight = desktop_highlight(colors, surfaces, dark);
+                    let style = &highlight.style;
+                    let syntax = serde_json::to_value(&style.syntax).unwrap();
+                    for (token, value) in syntax.as_object().unwrap() {
+                        let Some(value) = value.get("color").filter(|value| !value.is_null()) else {
+                            continue;
+                        };
+                        let color = serde_json::from_value(value.clone()).unwrap();
+                        for surface in [
+                            style.editor_background.unwrap(),
+                            style.editor_active_line.unwrap(),
+                            colors.selection,
+                        ] {
+                            check(token.as_str(), color, surface, 4.5);
+                        }
+                    }
+                    check("editor text", style.editor_foreground.unwrap(), style.editor_background.unwrap(), 4.5);
+                    check("editor gutter", style.editor_line_number.unwrap(), style.editor_gutter_background.unwrap(), 4.5);
                 }
             }
         }

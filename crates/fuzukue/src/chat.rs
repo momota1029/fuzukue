@@ -2675,7 +2675,7 @@ impl Workbench {
                                                 v_flex().id(SharedString::from(format!("chat-steer-bubble-{ix}-{index}")))
                                                     .gap_1().px_3().py_2()
                                                     .map(|bubble| style_user_bubble(bubble, rems(0.5)))
-                                                    .bg(ThemeSurfaces::for_mode(theme.mode).chat)
+                                                    .bg(theme.secondary)
                                                     .child(div().text_xs().text_color(theme.muted_foreground).child(tr!("chat-to-worker")))
                                                     .children((!text.trim().is_empty()).then(|| div().child(text.clone())))
                                                     .children((!attachments.is_empty()).then(|| {
@@ -3022,7 +3022,7 @@ impl Workbench {
                             .child(body.id(SharedString::from(format!("chat-message-bubble-{ix}")))
                                 .w_full().px_4().py_3()
                                 .map(|bubble| style_user_bubble(bubble, rems(0.75)))
-                                .bg(ThemeSurfaces::for_mode(theme.mode).chat))
+                                .bg(theme.secondary))
                             .children(actions_below),
                     )
                 } else if matches!(row.content, Content::Delegate(_)) || matches!(
@@ -4696,7 +4696,7 @@ impl Workbench {
             .child(input);
         #[cfg(all(target_os = "linux", feature = "headless-shot"))]
         let input = input.id("chat-input");
-        let surfaces = ThemeSurfaces::for_mode(theme.mode);
+        let surfaces = ThemeSurfaces::current(cx);
         let (disabled_fill, disabled_icon) = surfaces.composer_disabled(theme.is_dark());
         let (stop_fill, stop_icon) = surfaces.composer_stop(theme.is_dark());
         let action = match action_state {

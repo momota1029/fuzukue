@@ -168,7 +168,7 @@ impl Workbench {
         let disclosure = id.clone();
         let select = id.clone();
         let scope = json(&item.action.scope);
-        let surface = ThemeSurfaces::for_mode(theme.mode);
+        let surface = ThemeSurfaces::current(cx);
 
         let controls = h_flex().gap_1().items_center().flex_wrap()
             .child(self.dock_button(

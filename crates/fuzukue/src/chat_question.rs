@@ -306,7 +306,7 @@ impl Render for QuestionCard {
                 .child(label)
                 .into_any_element();
         }
-        let surface = ThemeSurfaces::for_mode(theme.mode).code;
+        let surface = ThemeSurfaces::current(cx).code;
         let border = theme.border;
         let muted = theme.muted_foreground;
         let mut body = v_flex()

@@ -152,7 +152,7 @@ fn remember_workspace(settings: &mut Table, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuzukue_view::appearance::{AccentChoice, AccentPreset, FontWeightChoice, ThemePreference};
+    use fuzukue_view::appearance::{AccentChoice, AccentPreset, FontWeightChoice, ThemePreference, ThemePreset};
 
     #[test]
     fn model_setup_round_trip_preserves_existing_settings() {
@@ -209,14 +209,21 @@ sidebar = '#112233'
         fs::write(&path, text).unwrap();
         let mut settings = AppearanceSettings::from_toml(text).unwrap();
         assert_eq!(settings.theme.base, ThemePreference::Light);
+        assert_eq!(settings.theme.preset, ThemePreset::Classic);
         assert_eq!(settings.theme.accent, AccentChoice::Custom("#128ac0".into()));
         assert_eq!(settings.theme.code_font, "Menlo, BIZ UDGothic");
         assert_eq!(settings.code_font, "Consolas");
         assert_eq!(settings.code_font_size_percent, 104.0);
         assert_eq!(settings.theme.overrides["sidebar"], "#112233");
 
-        for choice in [settings.theme.accent.clone(), AccentChoice::Preset(AccentPreset::Purple)] {
-            settings.theme.accent = choice;
+        let saved_accent = settings.theme.accent.clone();
+        for (preset, base, accent) in [
+            (ThemePreset::Iris, ThemePreference::System, saved_accent),
+            (ThemePreset::Parchment, ThemePreference::Dark, AccentChoice::Preset(AccentPreset::Purple)),
+        ] {
+            settings.theme.preset = preset;
+            settings.theme.base = base;
+            settings.theme.accent = accent;
             save_appearance(&path, &settings).unwrap();
             let saved = fs::read_to_string(&path).unwrap();
             assert_eq!(AppearanceSettings::from_toml(&saved).unwrap(), settings);
@@ -227,7 +234,7 @@ sidebar = '#112233'
     }
 
     #[test]
-    fn old_appearance_theme_keeps_its_base_and_defaults_to_teal() {
+    fn old_appearance_theme_keeps_its_base_and_defaults_to_classic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
         for (text, base) in [
@@ -237,7 +244,8 @@ sidebar = '#112233'
             fs::write(&path, text).unwrap();
             let settings = AppearanceSettings::from_toml(text).unwrap();
             assert_eq!(settings.theme.base, base);
-            assert_eq!(settings.theme.accent, AccentChoice::Preset(AccentPreset::Teal));
+            assert_eq!(settings.theme.preset, ThemePreset::Classic);
+            assert_eq!(settings.theme.accent, AccentChoice::default());
             assert!(settings.theme.code_font.is_empty());
             assert!(settings.theme.overrides.is_empty());
             save_appearance(&path, &settings).unwrap();

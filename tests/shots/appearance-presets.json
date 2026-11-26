@@ -1,0 +1,14 @@
+{
+  "steps": [
+    {"action":"size","width":1440,"height":960},
+    {"action":"connect"},
+    {"action":"click","id":"title-bar-settings"},
+    {"action":"wait_element","id":"theme-preset-parchment"},
+    {"action":"click","id":"theme-light"},
+    {"action":"click","id":"theme-preset-parchment"},
+    {"action":"screenshot","name":"settings-parchment-light"},
+    {"action":"click","id":"theme-dark"},
+    {"action":"click","id":"theme-preset-iris"},
+    {"action":"screenshot","name":"settings-iris-dark"}
+  ]
+}
