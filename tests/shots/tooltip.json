@@ -1,0 +1,57 @@
+{
+  "steps": [
+    {
+      "action": "size",
+      "width": 600,
+      "height": 470
+    },
+    {
+      "action": "locale",
+      "locale": "ja"
+    },
+    {
+      "action": "theme",
+      "theme": "light"
+    },
+    {
+      "action": "seed_goal_status",
+      "reason": "実機での試用に移る前に、デスクトップを更新して、通常の受付から依頼を一件送り、結果を受け取るところまで確認する。ログと再現手順は次のファイルにまとめた。`/home/example/workbench/releases/2026-11-26/verification/desktop-smoke-test-abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz.md` を開き、接続先と作業環境が一致しているか確認する。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。問題が再現した場合は、操作した時刻と表示内容を記録して、受付に送る。"
+    },
+    {
+      "action": "wait_element",
+      "id": "chat-tail-activity-label"
+    },
+    {
+      "action": "hover",
+      "id": "chat-tail-activity-label"
+    },
+    {
+      "action": "wait_element",
+      "id": "tooltip-popup"
+    },
+    {
+      "action": "screenshot",
+      "name": "tooltip-light"
+    },
+    {
+      "action": "hover",
+      "id": "chat-input"
+    },
+    {
+      "action": "theme",
+      "theme": "dark"
+    },
+    {
+      "action": "hover",
+      "id": "chat-tail-activity-label"
+    },
+    {
+      "action": "wait_element",
+      "id": "tooltip-popup"
+    },
+    {
+      "action": "screenshot",
+      "name": "tooltip-dark"
+    }
+  ]
+}

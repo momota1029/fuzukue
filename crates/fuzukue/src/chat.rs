@@ -3312,11 +3312,10 @@ impl Workbench {
                 strip.child(self.render_chat_activity(&self.active, cx.weak_entity(), cx))
             })
             .children(chat.composer_notice.clone().map(|text| {
-                let tooltip = text.clone();
-                div().id("chat-composer-notice").flex_1().min_w_0().truncate()
+                let notice = div().id("chat-composer-notice").flex_1().min_w_0().truncate()
                     .text_size(rems(0.75)).line_height(UI_LINE_HEIGHT).text_color(theme.muted_foreground)
-                    .child(text)
-                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .child(text.clone());
+                status_tooltip(notice, text)
             }))
             .when(show_latest, |strip| {
                 strip.child(
@@ -3917,6 +3916,50 @@ impl gpui_kit::RenderOnce for ContextRingTrigger {
     }
 }
 
+fn status_tooltip(
+    trigger: gpui_kit::Stateful<gpui_kit::Div>,
+    label: String,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    let anchor = Rc::new(Cell::new(gpui_kit::Bounds::default()));
+    let tracked_anchor = anchor.clone();
+    trigger.on_prepaint(move |bounds, _, _| tracked_anchor.set(bounds))
+        .tooltip(move |_, cx| {
+            cx.new(|_| StatusTooltip {
+                label: plain_status_tooltip_text(&label),
+                anchor: anchor.clone(),
+            }).into()
+        })
+}
+
+fn plain_status_tooltip_text(label: &str) -> String {
+    // Status reasons can contain snippets supplied by the assistant.
+    if label.contains('`') {
+        if let Ok(markdown) = markdown::to_mdast(label, &markdown::ParseOptions::default()) {
+            return markdown.to_string();
+        }
+    }
+    label.to_owned()
+}
+
+struct StatusTooltip {
+    label: String,
+    anchor: Rc<Cell<gpui_kit::Bounds<Pixels>>>,
+}
+
+impl gpui_kit::Render for StatusTooltip {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::base::{Align, Placement, Positioner};
+
+        div().child(
+            Positioner::side(self.anchor.get())
+                .placement(Placement::Top)
+                .align(Align::Start)
+                .offset(px(4.))
+                .child(Tooltip::new(self.label.clone()).build(window, cx)),
+        )
+    }
+}
+
 struct ComposerTooltip {
     label: String,
     composer_bounds: Rc<Cell<gpui_kit::Bounds<Pixels>>>,
@@ -3928,10 +3971,7 @@ impl gpui_kit::Render for ComposerTooltip {
         let composer = self.composer_bounds.get();
         let gap = px(8.);
         let label = self.label.clone();
-        let tooltip = Tooltip::element(move |_, _| div().id("composer-context-tooltip").whitespace_normal().child(label.clone()))
-            .m_0()
-            .max_w(composer.size.width.min(window.viewport_size().width) - gap * 2.)
-            .line_height(UI_LINE_HEIGHT)
+        let tooltip = Tooltip::element(move |_, _| div().id("composer-context-tooltip").child(label.clone()))
             .build(window, cx);
         div().child(gpui_kit::anchored()
             .anchor(Anchor::BottomRight)

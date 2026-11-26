@@ -4,10 +4,10 @@ use gpui::{
     AnyElement, AnyTooltip, AnyView, App, AppContext as _, Bounds, Context, Div, ElementId,
     EmptyView, Global, InteractiveElement, IntoElement, ParentElement, Pixels, Render, RenderOnce,
     Role, Stateful, StatefulInteractiveElement, Styled, Task, Window, canvas, deferred, div,
-    prelude::FluentBuilder as _, px,
+    prelude::FluentBuilder as _, px, relative,
 };
 
-use crate::{Placement, Positioner};
+use crate::{Placement, Positioner, positioner::frame_insets};
 
 const TOOLTIP_PRIORITY: usize = 200;
 const WINDOW_MARGIN: Pixels = px(4.);
@@ -15,10 +15,10 @@ const WINDOW_MARGIN: Pixels = px(4.);
 type TooltipBuilder = Rc<dyn Fn(&mut Window, &mut App) -> AnyView>;
 type TooltipRenderer = Rc<dyn Fn(AnyView, TooltipTransition, &mut Window, &mut App) -> AnyElement>;
 
-/// An unstyled tooltip popup.
+/// A tooltip popup with window-aware sizing and wrapped text.
 ///
-/// This corresponds to Base UI's `Tooltip.Popup`: it owns the accessible
-/// tooltip role and accepts application-owned content and presentation.
+/// This owns the accessible tooltip role and accepts application-owned content
+/// and colors.
 #[derive(IntoElement)]
 pub struct Tooltip {
     base: Stateful<Div>,
@@ -45,8 +45,32 @@ impl ParentElement for Tooltip {
 }
 
 impl RenderOnce for Tooltip {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(mut self, window: &mut Window, _: &mut App) -> impl IntoElement {
+        let rem = window.rem_size();
+        let viewport = window.viewport_size();
+        let frame = frame_insets(window.window_decorations(), window.client_inset().unwrap_or_default());
+        let outer_gap = WINDOW_MARGIN + rem * 0.25;
+        let width = (viewport.width - frame.left - frame.right - outer_gap * 2.)
+            .min(rem * 24.)
+            .max(px(0.));
+        let height = (viewport.height - frame.top - frame.bottom - outer_gap * 2.).max(px(0.));
+        let font_size = self.base.style().text.font_size
+            .unwrap_or_else(|| window.text_style().font_size);
+        let line_height: gpui::DefiniteLength = relative(1.6);
+        let line_pixels = line_height.to_pixels(font_size, rem).round().max(px(1.));
+        let vertical_chrome = rem * 0.5 + px(2.);
+        let lines = ((height - vertical_chrome) / line_pixels).floor().clamp(1., 8.) as usize;
+
         self.base
+            .m_1()
+            .px_2()
+            .py_1()
+            .max_w(width)
+            .max_h(height)
+            .line_height(line_height)
+            .whitespace_normal()
+            .line_clamp(lines)
+            .text_ellipsis()
     }
 }
 

@@ -106,6 +106,7 @@ enum Step {
     SeedApprovalDock,
     SeedCommandApproval,
     SeedComposerContext,
+    SeedGoalStatus { reason: String },
     AssertApprovalDockScrolled,
     ResolveApprovalDock,
     WaitResearchIssue { number: u64, state: fuzukue_proto::ResearchIssueState },
@@ -656,6 +657,14 @@ impl Runner {
                 })?;
             }
             Step::SeedComposerContext => self.update(cx, |view, _, cx| seed_composer_context(view, cx))?,
+            Step::SeedGoalStatus { reason } => self.update(cx, |view, _, cx| {
+                let session = view.active.clone();
+                view.threads_loaded = true;
+                view.on_event(ServerEvent::ChatWaiting { waiting: fuzukue_proto::ChatWaiting {
+                    goal_status: [(session, fuzukue_proto::GoalTail::PendingVerification { reason })].into(),
+                    ..Default::default()
+                } }, cx);
+            })?,
             Step::AssertApprovalDockScrolled => {
                 self.wait_for(cx, "approval dock scroll", TIMEOUT_MS, |view, _| view.approval_dock_scrolled()).await?;
             }
@@ -5299,6 +5308,50 @@ mod tests {
                     Ok(())
                 }.await;
                 let _ = result.send(outcome);
+                cx.update(|cx| cx.quit());
+            }).detach();
+        });
+        completed.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn goal_tooltip_wraps_and_clears_the_composer() {
+        let scenario: Scenario = serde_json::from_str(include_str!("../../../tests/shots/tooltip.json")).unwrap();
+        let (result, completed) = std::sync::mpsc::channel();
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+            gpui_kit::init(cx);
+            math::init(cx);
+            let (handle, view) = open_workbench_at_size(cx, 600., 470.).unwrap();
+            cx.spawn(async move |cx| {
+                let mut runner = Runner { handle, view, target: None, output: PathBuf::new(),
+                    read_only: false, seen: HashMap::new() };
+                let outcome: Result<()> = async {
+                    for step in scenario.steps {
+                        match step {
+                            Step::Size { .. } => {},
+                            Step::Screenshot { .. } => runner.update(cx, |_, window, _| -> Result<()> {
+                                let bounds = |id: &str| window.shot_element_bounds(id)
+                                    .with_context(|| format!("element is not visible: {id}"));
+                                let tooltip = bounds("tooltip-popup")?;
+                                let status = bounds("chat-tail-activity-label")?;
+                                let composer = bounds("composer-input-frame")?;
+                                let viewport = window.viewport_size();
+                                let rem = window.rem_size();
+                                ensure!(tooltip.left() >= px(0.) && tooltip.right() <= viewport.width
+                                        && tooltip.top() >= px(0.) && tooltip.bottom() <= status.top()
+                                        && tooltip.bottom() < composer.top(),
+                                    "tooltip must fit inside the window above the status: {tooltip:?}, {status:?}");
+                                ensure!(tooltip.size.width <= rem * 24.
+                                        && tooltip.size.height >= rem * 4. && tooltip.size.height <= rem * 12.,
+                                    "tooltip should wrap into a bounded number of lines: {tooltip:?}");
+                                Ok(())
+                            })??,
+                            step => runner.step(step, cx).await?,
+                        }
+                    }
+                    Ok(())
+                }.await;
+                result.send(outcome).unwrap();
                 cx.update(|cx| cx.quit());
             }).detach();
         });

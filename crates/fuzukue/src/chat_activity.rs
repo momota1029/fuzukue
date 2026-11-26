@@ -175,12 +175,12 @@ pub(super) fn goal_activity_row(status: &GoalTail, id: SharedString, cx: &gpui_k
     let row = h_flex().id(id).min_w_0().overflow_hidden().whitespace_nowrap();
     if let Some((state, detail)) = label.split_once(STATUS_SEPARATOR) {
         let full = status_speech(&label);
-        row.role(Role::Group)
+        let row = row.role(Role::Group)
             .aria_label(full.clone())
             .child(div().id(activity_id("goal-state")).flex_none().child(state.to_owned()))
             .child(status_sep(color).id(activity_id("goal-separator")))
-            .child(activity_title(activity_id("goal-title"), detail))
-            .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+            .child(activity_title(activity_id("goal-title"), detail));
+        status_tooltip(row, full)
     } else {
         row.child(activity_title(activity_id("goal-title"), &label))
     }

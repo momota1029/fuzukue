@@ -212,7 +212,7 @@ impl Positioner {
 /// platform needs it stable across tiling changes to size the window), so the
 /// tiling is what says where it actually applies. A server-decorated window
 /// has no frame of its own.
-fn frame_insets(decorations: Decorations, client_inset: Pixels) -> Edges<Pixels> {
+pub(crate) fn frame_insets(decorations: Decorations, client_inset: Pixels) -> Edges<Pixels> {
     match decorations {
         Decorations::Server => Edges::default(),
         Decorations::Client { tiling } => Edges {
