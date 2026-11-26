@@ -1186,31 +1186,29 @@ impl Update {
         let separate_group = step == Step::Publish
             || self.status.borrow().canary_status.is_some();
         let scoped = matches!(step, Step::Build | Step::Test | Step::Shot | Step::Publish);
-        let (mut child, job) = if scoped {
-            let (child, job) = crate::job_process::Job::spawn(cmd, "update-build", None)
+        if scoped {
+            let (mut child, _job) = crate::job_process::Job::spawn(cmd, "update-build", None)
                 .with_context(|| format!("launch {step:?} command"))?;
-            (child, Some(job))
-        } else {
-            if separate_group {
-                cmd.process_group(0);
-            }
-            (cmd.spawn().with_context(|| format!("launch {step:?} command"))?, None)
-        };
+            let stdout = child.stdout.take().context("missing stdout")?;
+            let stderr = child.stderr.take().context("missing stderr")?;
+            return Ok(tokio::try_join!(
+                child.wait(),
+                self.read_log(step, stdout, mode),
+                self.read_log(step, stderr, mode)
+            )?);
+        }
+        if separate_group {
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().with_context(|| format!("launch {step:?} command"))?;
         let mut group = ProcessGroup(
-            child.id().filter(|_| separate_group && !scoped)
+            child.id().filter(|_| separate_group)
                 .and_then(|pid| rustix::process::Pid::from_raw(pid as i32)),
         );
         let stdout = child.stdout.take().context("missing stdout")?;
         let stderr = child.stderr.take().context("missing stderr")?;
-        let wait = async {
-            let status = child.wait().await?;
-            if let Some(job) = &job {
-                job.stop()?;
-            }
-            Ok(status)
-        };
         let result = tokio::try_join!(
-            wait,
+            child.wait(),
             self.read_log(step, stdout, mode),
             self.read_log(step, stderr, mode)
         )?;

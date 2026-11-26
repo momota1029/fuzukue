@@ -3,17 +3,15 @@ use crate::{Workspace, cancellation::Cancellation};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use fuzukue_proto::{ApprovalOwner, ApprovalRisk, FullApprovalMode};
-use rustix::process::Pid;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::fs::File;
 use std::future::{Future, pending, ready};
 use std::io::ErrorKind;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -107,13 +105,14 @@ pub(crate) struct Worker {
     pub(crate) cancel: Arc<Cancellation>,
     pub(crate) job_cancel: Arc<Cancellation>,
     pub(crate) attempt_cancel: Arc<Cancellation>,
+    pub(crate) processes: Weak<crate::job_process::Attempt>,
     pub(crate) turn: String,
 }
 
 #[derive(Default)]
 struct Processes {
     stopping: bool,
-    jobs: HashMap<Pid, crate::job_process::Job>,
+    jobs: Vec<Weak<crate::job_process::Job>>,
 }
 
 static PROCESSES: std::sync::LazyLock<Mutex<Processes>> = std::sync::LazyLock::new(Mutex::default);
@@ -121,38 +120,29 @@ static PROCESSES: std::sync::LazyLock<Mutex<Processes>> = std::sync::LazyLock::n
 pub(crate) fn shutdown() {
     let mut processes = PROCESSES.lock().unwrap();
     processes.stopping = true;
-    for job in processes.jobs.values() {
+    for job in processes.jobs.drain(..).filter_map(|job| job.upgrade()) {
         let _ = job.stop();
     }
 }
 
-struct Group(Pid);
+struct Group(Arc<crate::job_process::Job>);
 
 impl Group {
-    fn spawn(mut command: Command) -> Result<(tokio::process::Child, Self)> {
+    fn spawn(
+        mut command: Command,
+        attempt: Option<&crate::job_process::Attempt>,
+    ) -> Result<(crate::job_process::JobChild, Self)> {
         let mut processes = PROCESSES.lock().unwrap();
         ensure!(!processes.stopping, "The server is stopping");
-        let (child, job) = crate::job_process::Job::spawn(&mut command, "exec", None)
+        let (child, job) = crate::job_process::Job::spawn_tracked(&mut command, "exec", attempt)
             .context("Could not start Bash")?;
-        let pid = child
-            .id()
-            .and_then(|pid| Pid::from_raw(pid as i32))
-            .context("Bash has no process ID")?;
-        processes.jobs.insert(pid, job);
-        Ok((child, Self(pid)))
+        processes.jobs.retain(|job| job.strong_count() != 0);
+        processes.jobs.push(Arc::downgrade(&job));
+        Ok((child, Self(job)))
     }
 
     fn kill(&self) {
-        if let Some(job) = PROCESSES.lock().unwrap().jobs.get(&self.0) {
-            let _ = job.stop();
-        }
-    }
-}
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        let job = PROCESSES.lock().unwrap().jobs.remove(&self.0);
-        drop(job);
+        let _ = self.0.stop();
     }
 }
 
@@ -291,6 +281,7 @@ async fn execute(
     timeout: Duration,
     cancelled: impl Future<Output = ()>,
     lease: Option<Lease>,
+    attempt: Option<&Weak<crate::job_process::Attempt>>,
 ) -> Result<Output> {
     let approval_ended = crate::full_approval::wait_for_end(lease);
     tokio::pin!(cancelled, approval_ended);
@@ -300,7 +291,10 @@ async fn execute(
         _ = &mut approval_ended => bail!("{FULL_REQUIRED}"),
         _ = ready(()) => {}
     }
-    let (mut child, group) = Group::spawn(cmd)?;
+    let (mut child, group) = {
+        let attempt = attempt.map(|attempt| attempt.upgrade().ok_or(crate::cancellation::Cancelled)).transpose()?;
+        Group::spawn(cmd, attempt.as_deref())?
+    };
     let stdout = child.stdout.take().context("Missing Bash stdout")?;
     let stderr = child.stderr.take().context("Missing Bash stderr")?;
     let mut out = Stream::new();
@@ -325,8 +319,6 @@ async fn execute(
                     _ = &mut deadline => break "timed_out",
                     exit = &mut wait, if completed.is_none() => {
                         completed = Some(exit?);
-                        // Reap background jobs even when the shell exits successfully.
-                        group.kill();
                     }
                     result = &mut streams, if !drained => {
                         drained = true;
@@ -451,6 +443,7 @@ pub(super) async fn call(
         Duration::from_millis(timeout),
         caller.cancelled(),
         lease,
+        caller.worker.as_ref().map(|worker| &worker.processes),
     )
     .await?;
     let owner = result_spill::Owner::thread(session);
@@ -492,7 +485,7 @@ mod tests {
             } else {
                 Duration::from_millis(200)
             };
-            let run = execute(cmd, delay, cancel.cancelled(), None);
+            let run = execute(cmd, delay, cancel.cancelled(), None, None);
             let stop = async {
                 if cancelled {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -526,6 +519,7 @@ mod tests {
             Duration::from_secs(5),
             pending(),
             None,
+            None,
         )
         .await?;
         assert_eq!(result.exit.and_then(|exit| exit.code()), Some(17));
@@ -548,6 +542,7 @@ mod tests {
             command("yes", File::open(temp.path())?, temp.path()),
             Duration::from_secs(5),
             pending(),
+            None,
             None,
         )
         .await?;

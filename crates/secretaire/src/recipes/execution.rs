@@ -215,12 +215,17 @@ async fn launch(
         _ = cancel.cancelled() => None,
         result = tokio::time::timeout(timeout, child.wait()) => Some(result),
     };
-    // Stop lingering descendants even after the launcher exits. In the sandbox, killing
-    // the bubblewrap monitor also tears down its PID namespace.
-    drop(group);
+    // JobChild::wait cleans up descendants on exit. Cancellation and timeout interrupt
+    // that wait, so stop the job explicitly before waiting again to collect its status.
     match result {
-        None => Ok(Exit::Cancelled(child.wait().await?)),
-        Some(Err(_)) => Ok(Exit::Timeout(child.wait().await?)),
+        None => {
+            group.stop()?;
+            Ok(Exit::Cancelled(child.wait().await?))
+        }
+        Some(Err(_)) => {
+            group.stop()?;
+            Ok(Exit::Timeout(child.wait().await?))
+        }
         Some(Ok(status)) => {
             let status = status?;
             if let Some(mut report) = sandbox_status {

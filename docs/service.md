@@ -37,7 +37,7 @@ drain_seconds = 60
 
 systemd 254 以降と cgroup v2 では、サービスの `Delegate=yes` と `DelegateSubgroup=server` が、サーバーをユニット配下の `server` に置く。エージェント、テスト、ビルド、レシピは個別の `job-*` cgroup で動く。ジョブの終了時には残った子プロセスも停止し、カーネルが対応していれば `memory.reclaim` で残りのファイルキャッシュの回収を試みる。
 
-ジョブごとの `memory.max` は既定で 8 GiB、`memory.high` は上限の半分。上限は `FUZUKUE_JOB_MEMORY_MIB` で変更できる。レシピにはレシピ自身のメモリ上限を適用する。
+ジョブごとの既定値は `memory.high` が 16 GiB、`memory.max` が 24 GiB。物理 RAM が少ない場合は、`memory.high` を RAM の約半分、`memory.max` を約 4 分の 3 に下げる（それぞれ 16 GiB / 24 GiB を上限とする）。物理 RAM を取得できない場合は 16 GiB / 24 GiB を使う。`FUZUKUE_JOB_MEMORY_MIB` は既定の `memory.max` を変更し、その半分を `memory.high` に設定する。レシピに個別のメモリ上限が設定されていれば、その上限と従来どおりの半分の `memory.high` を使う。
 
 サーバーは起動時、ジョブ終了後、以後 30 秒ごとに、ユニット内のファイルキャッシュ（共有メモリを除く）と slab を調べる。ジョブの cgroup が空のときに限り、合計が既定の 1536 MiB を超えた分の回収を試みる。`FUZUKUE_SERVICE_CACHE_MIB` で変更でき、`0` はユニット単位の回収を無効にする。対応カーネルでは `swappiness=0` を指定する。旧カーネルでは十分な非アクティブファイルキャッシュがあるときだけ小分けに回収し、スワップが増えたらユニット単位の回収を止める。
 

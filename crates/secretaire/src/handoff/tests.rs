@@ -1,5 +1,5 @@
 use super::*;
-use crate::{test_support::TestDir, App, Codex, Hub};
+use crate::{test_support::TestDir, App, Hub};
 use fuzukue_proto::{Actor, HandoffIssueSelection, HandoffWorkerMode, HandoffWorkerStatus};
 use serde_json::{json, Value};
 use tokio::time::timeout;
@@ -348,25 +348,20 @@ async fn adopts_same_codex_thread_and_reports_missing_rollout_without_starting_a
             ),
         );
     dir.write(&format!("project/{PATH}"), &real_note);
-    let app = Arc::new(workspace(&dir));
-    let (session, _) = receive(&app, PATH)?;
+    let app = workspace(&dir);
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/shots/codex");
     let log = dir.path().join("codex.jsonl");
-    let mut command = tokio::process::Command::new(fixture);
-    command
-        .arg("app-server")
-        .env("FUZUKUE_CODEX_FIXTURE_LOG", &log)
-        .env("FUZUKUE_CODEX_FIXTURE_MISSING_THREAD", MISSING_ID)
-        .env_remove("FUZUKUE_CODEX_SHOT");
-    let codex = Codex::spawn_command(
-        command,
-        &app.project_dir,
-        app.hub.clone(),
-        app.usage.clone(),
-        app.session_stats.clone(),
-    )
-    .await?;
-    app.codex.lock().await.replace(codex);
+    let request_log = log.clone();
+    assert!(app.worker_codex_command.set(Box::new(move || {
+        let mut command = tokio::process::Command::new(&fixture);
+        command
+            .env("FUZUKUE_CODEX_FIXTURE_LOG", &request_log)
+            .env("FUZUKUE_CODEX_FIXTURE_MISSING_THREAD", MISSING_ID)
+            .env_remove("FUZUKUE_CODEX_SHOT");
+        command
+    })).is_ok());
+    let app = Arc::new(app);
+    let (session, _) = receive(&app, PATH)?;
     let mut workers = parse(PATH, &real_note)?.workers.into_iter();
     let (_, mut live) = app.hub.subscribe(u64::MAX);
     workers::start(

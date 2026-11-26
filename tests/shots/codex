@@ -178,7 +178,7 @@ for line in sys.stdin:
         continue
     elif method in ("thread/start", "thread/resume"):
         next_thread += 1
-        thread_id = params.get("threadId", f"fixture-thread-{next_thread}")
+        thread_id = params.get("threadId", f"fixture-thread-{os.getpid()}-{next_thread}")
         configs[thread_id] = params
         result = {"thread": {"id": thread_id}, "model": params.get("model") or default_model}
         if "permissions" in params:

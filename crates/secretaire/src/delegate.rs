@@ -24,6 +24,7 @@ use fuzukue_proto::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use crate::job_process::{CommandKind, UsageSample};
 use crate::self_update::drain::Work;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
@@ -1168,6 +1169,7 @@ async fn launch_assignment(
                 let settings = ChatSettings { permission_mode, ..model.selection.chat_settings() };
                 let attempt_cancel: Arc<Cancellation> = Arc::default();
                 input.attempt_cancel = attempt_cancel.clone();
+                let processes = Arc::new(crate::job_process::Attempt::default());
                 let exec_turn = crate::mcp::exec::Turn::default();
                 if exec_allowed && !input.job.exec_revoked.load(std::sync::atomic::Ordering::Acquire) {
                     let scope = launch.scope.as_ref().expect("worker scope");
@@ -1178,6 +1180,7 @@ async fn launch_assignment(
                         cancel: exec_turn.cancel.clone(),
                         job_cancel: cancel.clone(),
                         attempt_cancel: attempt_cancel.clone(),
+                        processes: Arc::downgrade(&processes),
                         turn: exec_turn.id.clone(),
                     });
                 }
@@ -1200,8 +1203,8 @@ async fn launch_assignment(
                 let run = async {
                     let backend = async {
                         match model.selection.backend {
-                            AgentBackend::Codex => app.worker_codex(&launch).await?.run_worker(cwd, &session, &job, settings, &task, &mut input, &launch, &mut metadata, on_model, adopted.as_ref().map(|worker| worker.thread_id.as_str())).await,
-                            AgentBackend::Claude => claude::run_worker(&app, cwd, &session, &job, settings, &task, &mut input, &launch, &mut metadata, on_model).await,
+                            AgentBackend::Codex => app.worker_codex(&launch, Some(&processes)).await?.run_worker(cwd, &session, &job, settings, &task, &mut input, &launch, &mut metadata, on_model, adopted.as_ref().map(|worker| worker.thread_id.as_str())).await,
+                            AgentBackend::Claude => claude::run_worker(&app, cwd, &session, &job, settings, &task, &mut input, &launch, &processes, &mut metadata, on_model).await,
                         }
                     };
                     tokio::pin!(backend);
@@ -1216,10 +1219,12 @@ async fn launch_assignment(
                     }
                 };
                 let (mut result, transcript) = monitor_attempt(
-                    run, &cancel, &attempt_cancel, events, &session, &job, WORKER_IDLE,
+                    run, &cancel, &attempt_cancel, events, &session, &job,
+                    AttemptWatch::new(Duration::from_secs(crate::capture::worker_tool_timeout(&launch.tools)), |kind| processes.usage(kind)),
                     |event| record.lock().unwrap().observe(event, jobs::now()),
                 ).await;
                 drop(exec_turn);
+                processes.stop();
                 input.job.exec.lock().unwrap().take();
                 if cancel.check().is_ok() {
                     let reported = input.job.retry.lock().unwrap().take();
@@ -1291,15 +1296,29 @@ async fn launch_assignment(
             Ok::<_, anyhow::Error>((timer, result, Some(changes)))
         }.await;
         let (timer, mut result, changes) = result.unwrap_or_else(|error| (timer, Err(error), None));
-        let render_changes = |japanese| match &changes {
-            Some(Ok((changes, quarantine))) => {
-                let mut details = changes.render(japanese);
-                details.push_str(&quarantine.render(japanese));
-                details
+        let partial = if !blind && (result.is_err() || cancel.check().is_err()) && (claimed || worktree.is_some()) {
+            Some(PartialWorktree::read(&app.project_dir, worktree.as_deref()).await)
+        } else {
+            None
+        };
+        let render_changes = |japanese| {
+            let mut details = match &changes {
+                Some(Ok((changes, quarantine))) => {
+                    let mut details = changes.render(japanese);
+                    details.push_str(&quarantine.render(japanese));
+                    details
+                }
+                Some(Err(error)) if japanese => format!("変更一覧を取得できなかった。\n\n## 範囲外の書き込み\n検査を完了できなかった（{error}）。"),
+                Some(Err(error)) => format!("Unable to list changes.\n\n## Out-of-scope writes\nThe check failed ({error})."),
+                None => String::new(),
+            };
+            if let Some(partial) = &partial {
+                if !details.is_empty() {
+                    details.push_str("\n\n");
+                }
+                details.push_str(&partial.render(japanese));
             }
-            Some(Err(error)) if japanese => format!("変更一覧を取得できなかった。\n\n## 範囲外の書き込み\n検査を完了できなかった（{error}）。"),
-            Some(Err(error)) => format!("Unable to list changes.\n\n## Out-of-scope writes\nThe check failed ({error})."),
-            None => String::new(),
+            details
         };
         let files = (claimed && !blind).then(|| writes.observation(
             changes.as_ref().and_then(|result| result.as_ref().ok()).map(|(changes, _)| changes.paths.as_slice())
@@ -1372,7 +1391,7 @@ async fn launch_assignment(
         if let Some(worker) = adopted {
             let status = match &result {
                 Ok(_) => fuzukue_proto::HandoffWorkerStatus::Finished(context.clone()),
-                Err(error) => fuzukue_proto::HandoffWorkerStatus::Failed(format!("{error:#}")),
+                Err(_) => fuzukue_proto::HandoffWorkerStatus::Failed(context.clone()),
             };
             crate::handoff::workers::update(&app.hub, &session, &worker.thread_id, status);
             if result.is_ok() {
@@ -1908,6 +1927,110 @@ pub(crate) async fn run_one_shot(
 }
 
 const WORKER_IDLE: Duration = Duration::from_secs(300);
+const COMMAND_IDLE: Duration = Duration::from_secs(30 * 60);
+const COMMAND_LIMIT: Duration = Duration::from_secs(4 * 60 * 60);
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
+type AttemptInstant = tokio::time::Instant;
+
+struct CommandWait {
+    kind: CommandKind,
+    started: AttemptInstant,
+    progress: AttemptInstant,
+    sample_at: AttemptInstant,
+    previous_usage: Arc<UsageSample>,
+}
+
+impl CommandWait {
+    fn deadline(&self) -> AttemptInstant {
+        (self.started + COMMAND_LIMIT).min(self.progress + COMMAND_IDLE)
+    }
+
+    fn wake(&self) -> AttemptInstant {
+        self.sample_at.min(self.deadline())
+    }
+}
+
+enum ToolWait {
+    Ordinary,
+    Timed(AttemptInstant),
+    Command(CommandWait),
+}
+
+struct AttemptWatch<F> {
+    tools: HashMap<String, ToolWait>,
+    tool_timeout: Duration,
+    usage: F,
+}
+
+impl<F: FnMut(CommandKind) -> UsageSample> AttemptWatch<F> {
+    fn new(tool_timeout: Duration, usage: F) -> Self {
+        Self { tools: HashMap::new(), tool_timeout, usage }
+    }
+
+    fn start(&mut self, item: &str, name: &str, now: AttemptInstant) {
+        self.tools.entry(item.into()).or_insert_with(|| {
+            let command = match name {
+                "exec" | "Bash" => Some(CommandKind::Native),
+                "fuzukue.exec" | "mcp__fuzukue__exec" => Some(CommandKind::ServerExec),
+                _ => None,
+            };
+            if let Some(kind) = command {
+                ToolWait::Command(CommandWait {
+                    kind,
+                    started: now,
+                    progress: now,
+                    sample_at: now + WORKER_IDLE,
+                    previous_usage: Arc::new((self.usage)(kind)),
+                })
+            } else if name.starts_with("mcp__fuzukue__") || name.starts_with("fuzukue.") {
+                ToolWait::Timed(now + self.tool_timeout.max(WORKER_IDLE))
+            } else {
+                ToolWait::Ordinary
+            }
+        });
+    }
+
+    fn finish(&mut self, item: &str) -> bool {
+        self.tools.remove(item).is_some()
+    }
+
+    fn wake(&self) -> Option<AttemptInstant> {
+        self.tools.values().filter_map(|tool| match tool {
+            ToolWait::Ordinary => None,
+            ToolWait::Timed(deadline) => Some(*deadline),
+            ToolWait::Command(command) => Some(command.wake()),
+        }).min()
+    }
+
+    fn expired(&mut self, now: AttemptInstant) -> bool {
+        let mut sampled = HashMap::new();
+        for tool in self.tools.values_mut() {
+            match tool {
+                ToolWait::Timed(deadline) if *deadline <= now => return true,
+                ToolWait::Command(command) if command.wake() <= now => {
+                    if now >= command.started + COMMAND_LIMIT {
+                        return true;
+                    }
+                    let current = sampled.entry(command.kind)
+                        .or_insert_with(|| Arc::new((self.usage)(command.kind)));
+                    if !current.is_empty() {
+                        if crate::job_process::usage_advanced(current, &command.previous_usage) {
+                            command.progress = now;
+                        }
+                        command.previous_usage = current.clone();
+                    }
+                    if command.deadline() <= now {
+                        return true;
+                    }
+                    command.sample_at = now + WORKER_IDLE;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+}
 
 pub(crate) fn belongs_to_job(item: &str, actor: &Actor, job: &str) -> bool {
     matches!(actor, Actor::Codex { parent_tool_use: Some(id), .. } if id == job)
@@ -1995,7 +2118,8 @@ impl Activity<'_> {
 
 fn activity<'a>(event: &'a ServerEvent, session: &str, job: &str) -> Option<Activity<'a>> {
     match event {
-        ServerEvent::TextDelta { session: id, item, actor, text } if id == session && belongs_to_job(item, actor, job) =>
+        ServerEvent::TextDelta { session: id, item, actor, text }
+            if id == session && !text.is_empty() && belongs_to_job(item, actor, job) =>
             Some(Activity::Prose { item, text }),
         ServerEvent::ToolCall { session: id, item, actor, name, input } if id == session && belongs_to_job(item, actor, job) =>
             Some(Activity::Tool { item, name, input }),
@@ -2010,75 +2134,86 @@ async fn monitor_attempt(
     mut events: tokio::sync::broadcast::Receiver<fuzukue_proto::Envelope>,
     session: &str,
     job: &str,
-    idle: Duration,
+    mut watch: AttemptWatch<impl FnMut(CommandKind) -> UsageSample>,
     mut observe: impl FnMut(&ServerEvent),
 ) -> (Result<String>, String) {
-    let deadline = tokio::time::sleep(idle);
-    tokio::pin!(run, deadline);
+    let mut idle_until = AttemptInstant::now() + WORKER_IDLE;
+    tokio::pin!(run);
     let mut notes = String::new();
-    let mut pending = BTreeSet::new();
+    let mut approvals = BTreeSet::new();
     let mut tests = TestEvidence::default();
-    loop {
+    let mut events_open = true;
+    let result = loop {
+        let deadline = watch.wake().unwrap_or(idle_until);
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
-                attempt_cancel.cancel();
-                let _ = run.await;
-                while let Ok(event) = events.try_recv() {
-                    observe(&event.event);
-                    if let Some(activity) = activity(&event.event, session, job) {
-                        activity.append_to(&mut notes);
-                    }
+            _ = cancel.cancelled() => break Err(crate::cancellation::Cancelled.into()),
+            result = &mut run => break Ok(result),
+            _ = tokio::time::sleep_until(deadline), if approvals.is_empty() => {
+                let now = AttemptInstant::now();
+                if !watch.expired(now) && (watch.wake().is_some() || now < idle_until) {
+                    continue;
                 }
-                return (Err(crate::cancellation::Cancelled.into()), notes);
+                let reason = if watch.tools.is_empty() {
+                    harness_text!("No activity for five minutes", "5分間進展がなかった")
+                } else {
+                    harness_text!("Worker tool stopped making progress", "作業役のツールが進展しなくなった")
+                };
+                break Err(crate::tiers::Retry::Stalled(reason.into()).into());
             }
-            result = &mut run => {
-                while let Ok(event) = events.try_recv() {
-                    observe(&event.event);
-                    tests.observe(&event.event, session, job);
-                    if let Some(activity) = activity(&event.event, session, job) {
-                        activity.append_to(&mut notes);
-                    }
-                }
-                return (tests.finish(result), notes);
-            },
-            event = events.recv() => match event {
+            event = events.recv(), if events_open => match event {
                 Ok(event) => {
+                    let now = AttemptInstant::now();
                     match &event.event {
                         ServerEvent::ApprovalRequested { session: id, request_id, actor, .. }
                             if id == session && belongs_to_job(request_id, actor, job) => {
-                            pending.insert(request_id.clone());
+                            approvals.insert(request_id.clone());
                         }
-                        ServerEvent::ApprovalResolved { request_id, .. } if pending.remove(request_id) => {
-                            deadline.as_mut().reset(tokio::time::Instant::now() + idle);
+                        ServerEvent::ApprovalResolved { request_id, .. } if approvals.remove(request_id) => {
+                            idle_until = now + WORKER_IDLE;
                         }
-                        ServerEvent::ToolCall { session: id, item, actor, name, .. }
-                            if id == session && belongs_to_job(item, actor, job)
-                                && matches!(name.as_str(), crate::capture::CLAUDE_CAPTURE | crate::capture::CODEX_CAPTURE) => {
-                            pending.insert(item.clone());
-                        }
-                        ServerEvent::ToolResult { session: id, item, .. } if id == session && pending.remove(item) => {
-                            deadline.as_mut().reset(tokio::time::Instant::now() + idle);
+                        ServerEvent::ToolResult { session: id, item, .. } if id == session && watch.finish(item) => {
+                            idle_until = now + WORKER_IDLE;
                         }
                         _ => {}
                     }
                     observe(&event.event);
                     tests.observe(&event.event, session, job);
                     if let Some(activity) = activity(&event.event, session, job) {
+                        if let Activity::Tool { item, name, .. } = &activity {
+                            watch.start(item, name, now);
+                        }
                         activity.append_to(&mut notes);
-                        deadline.as_mut().reset(tokio::time::Instant::now() + idle);
+                        idle_until = now + WORKER_IDLE;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return (run.await, notes),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    events_open = false;
+                    approvals.clear();
+                }
             },
-            _ = &mut deadline, if pending.is_empty() => {
-                attempt_cancel.cancel();
-                let _ = run.await;
-                return (Err(crate::tiers::Retry::Stalled(harness_text!("No activity for five minutes", "5分間進展がなかった").into()).into()), notes);
-            }
+        }
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            attempt_cancel.cancel();
+            // A stalled backend can also ignore interruption or fail to acknowledge it.
+            let _ = tokio::time::timeout(STOP_GRACE, &mut run).await;
+            Err(error)
+        }
+    };
+    while let Ok(event) = events.try_recv() {
+        observe(&event.event);
+        tests.observe(&event.event, session, job);
+        if let Some(activity) = activity(&event.event, session, job) {
+            activity.append_to(&mut notes);
         }
     }
+    // Preserve the stop reason even if the attempt had previously reported failed tests.
+    let result = if attempt_cancel.check().is_err() { result } else { tests.finish(result) };
+    (result, notes)
 }
 
 async fn summarize_progress(
@@ -2190,6 +2325,44 @@ impl Files {
     }
 }
 
+struct PartialWorktree {
+    directory: PathBuf,
+    git_status: Option<String>,
+}
+
+impl PartialWorktree {
+    async fn read(project: &Path, worktree: Option<&Path>) -> Self {
+        let directory = worktree.unwrap_or(project).to_owned();
+        let git_status = if worktree.is_some() {
+            // Keep the report bounded even when the checkout contains generated files.
+            const LIMIT: usize = 4096;
+            match crate::git::run(&directory, &[
+                "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch", "--untracked-files=normal",
+            ], LIMIT).await {
+                Ok(output) if output.status.success() => {
+                    let truncated = output.stdout.len() > LIMIT;
+                    let status = String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(LIMIT)]);
+                    Some(format!("{}{}", status.trim_end(), if truncated { "\n…" } else { "" }))
+                }
+                _ => Some(harness_text!("Git status unavailable", "Git の状態を取得できなかった").into()),
+            }
+        } else {
+            None
+        };
+        Self { directory, git_status }
+    }
+
+    fn render(&self, japanese: bool) -> String {
+        let label = if japanese { "作業ディレクトリ" } else { "Working directory" };
+        let mut report = format!("{label}: {}", self.directory.display());
+        if let Some(status) = &self.git_status {
+            report.push('\n');
+            report.push_str(status);
+        }
+        report
+    }
+}
+
 struct ChangedFiles {
     paths: Vec<PathBuf>,
     cards: Vec<String>,
@@ -2251,7 +2424,7 @@ pub async fn run_legacy_codex(
         }).transpose()?;
         let policy = launch.as_ref().map(|(launch, _scratch)| launch);
         let codex = match policy {
-            Some(launch) => app.worker_codex(launch).await?,
+            Some(launch) => app.worker_codex(launch, None).await?,
             None => app.codex().await?,
         };
         let thread = codex.start_thread(&session, parent.clone(), policy).await?;
@@ -2528,23 +2701,116 @@ mod progress_tests {
 mod tier_retry_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn idle_worker_is_cancelled_as_a_stalled_attempt() {
-        let app_cancel = Cancellation::default();
+    const JOB: &str = "delegate:work";
+    const TOOL: &str = "delegate:work:tool";
+
+    fn tool_call(hub: &crate::Hub, name: &str) {
+        hub.publish(ServerEvent::ToolCall {
+            session: "test".into(), actor: Actor::Claude, item: TOOL.into(),
+            name: name.into(), input: json!({}),
+        });
+    }
+
+    fn assert_stalled(result: Result<String>) {
+        assert!(matches!(result.unwrap_err().downcast_ref::<crate::tiers::Retry>(),
+            Some(crate::tiers::Retry::Stalled(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_worker_is_cancelled_even_if_the_backend_ignores_cancellation() {
+        let cancel = Cancellation::default();
         let attempt_cancel = Cancellation::default();
         let hub = crate::Hub::new();
         let (_, events) = hub.subscribe(u64::MAX);
+        let started = AttemptInstant::now();
         let (result, _) = monitor_attempt(
-            async {
-                attempt_cancel.cancelled().await;
-                Err(crate::cancellation::Cancelled.into())
-            },
-            &app_cancel, &attempt_cancel, events, "test", "delegate:work", Duration::from_millis(5), |_| {},
+            std::future::pending(), &cancel, &attempt_cancel, events, "test", JOB,
+            AttemptWatch::new(Duration::ZERO, |_| UsageSample::new()), |_| {},
         ).await;
-        assert!(matches!(result.unwrap_err().downcast_ref::<crate::tiers::Retry>(),
-            Some(crate::tiers::Retry::Stalled(_))));
+        assert_stalled(result);
+        assert_eq!(started.elapsed(), WORKER_IDLE + STOP_GRACE);
         assert!(attempt_cancel.check().is_err());
-        assert!(app_cancel.check().is_ok());
+        assert!(cancel.check().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_command_with_no_cgroups_can_finish_and_model_idle_starts_again() {
+        let cancel = Cancellation::default();
+        let attempt_cancel = Cancellation::default();
+        let hub = crate::Hub::new();
+        let (_, events) = hub.subscribe(u64::MAX);
+        let started = AttemptInstant::now();
+        let (result, notes) = monitor_attempt(async {
+            tool_call(&hub, "Bash");
+            tokio::time::sleep(WORKER_IDLE * 2).await;
+            hub.publish(ServerEvent::ToolResult {
+                session: "test".into(), item: TOOL.into(), ok: true, output: String::new(),
+            });
+            std::future::pending().await
+        }, &cancel, &attempt_cancel, events, "test", JOB, AttemptWatch::new(Duration::ZERO, |_| UsageSample::new()), |_| {}).await;
+        assert_stalled(result);
+        assert!(notes.contains("Bash"));
+        assert_eq!(started.elapsed(), WORKER_IDLE * 3 + STOP_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_progress_extends_its_idle_window_up_to_the_hard_limit() {
+        for (progress, limit) in [(false, COMMAND_IDLE), (true, COMMAND_LIMIT)] {
+            let cancel = Cancellation::default();
+            let attempt_cancel = Cancellation::default();
+            let hub = crate::Hub::new();
+            let (_, events) = hub.subscribe(u64::MAX);
+            let started = AttemptInstant::now();
+            let (result, _) = monitor_attempt(async {
+                tool_call(&hub, "exec");
+                std::future::pending().await
+            }, &cancel, &attempt_cancel, events, "test", JOB, AttemptWatch::new(Duration::ZERO, |_| {
+                UsageSample::from([((1, 1), crate::job_process::ResourceUsage {
+                    cpu: if progress { started.elapsed().as_secs() } else { 0 },
+                    io_bytes: 0,
+                })])
+            }), |_| {}).await;
+            assert_stalled(result);
+            assert_eq!(started.elapsed(), limit + STOP_GRACE);
+        }
+    }
+
+    #[test]
+    fn server_exec_activity_does_not_extend_a_native_command() {
+        let started = AttemptInstant::now();
+        let mut samples = 0;
+        let mut watch = AttemptWatch::new(Duration::ZERO, |kind| {
+            samples += 1;
+            let cpu = if kind == CommandKind::ServerExec { samples } else { 0 };
+            UsageSample::from([((1, 1), crate::job_process::ResourceUsage { cpu, io_bytes: 0 })])
+        });
+        watch.start("native", "Bash", started);
+        watch.start("server", "fuzukue.exec", started);
+
+        let mut now = started + WORKER_IDLE;
+        while now < started + COMMAND_IDLE {
+            assert_eq!(watch.wake(), Some(now));
+            assert!(!watch.expired(now));
+            now += WORKER_IDLE;
+        }
+        assert_eq!(watch.wake(), Some(now));
+        assert!(watch.expired(now));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_mcp_call_expires_at_its_tool_timeout() {
+        let cancel = Cancellation::default();
+        let attempt_cancel = Cancellation::default();
+        let hub = crate::Hub::new();
+        let (_, events) = hub.subscribe(u64::MAX);
+        let started = AttemptInstant::now();
+        let timeout = WORKER_IDLE * 2 + Duration::from_secs(45);
+        let (result, _) = monitor_attempt(async {
+            tool_call(&hub, "fuzukue.capture_screenshot");
+            std::future::pending().await
+        }, &cancel, &attempt_cancel, events, "test", JOB, AttemptWatch::new(timeout, |_| UsageSample::new()), |_| {}).await;
+        assert_stalled(result);
+        assert_eq!(started.elapsed(), timeout + STOP_GRACE);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2562,9 +2828,63 @@ mod tier_retry_tests {
                 session: "test".into(), item: "delegate:work:shot".into(), ok: true, output: String::new(),
             });
             Ok("shot complete".into())
-        }, &cancel, &cancel, events, "test", "delegate:work", WORKER_IDLE, |_| {}).await;
+        }, &cancel, &cancel, events, "test", JOB, AttemptWatch::new(WORKER_IDLE * 3, |_| UsageSample::new()), |_| {}).await;
         assert_eq!(result.unwrap(), "shot complete");
         assert!(cancel.check().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_worker_publishes_its_partial_worktree() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = crate::test_support::TestDir::new();
+        fixture.write("checkout/.keep", "");
+        let checkout = fixture.path().join("checkout").canonicalize()?;
+        assert!(crate::git::run(&checkout, &["init"], 1024).await?.status.success());
+        fixture.write("claude", r#"#!/bin/sh
+read -r prompt
+echo 'partial work' > partial.patch
+sleep 600 &
+printf '%s\n' '{"type":"assistant","message":{"id":"ready","content":[{"type":"text","text":"Fixture ready"}]}}'
+wait
+"#);
+        let program = fixture.path().join("claude");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+        let mut app = App::new(checkout.clone(), String::new(), fixture.path().join("state"), Arc::new(crate::Hub::new()));
+        app.claude_program = Some(program);
+        let app = Arc::new(app);
+        let session = app.hub.edit_threads(|store| store.create_titled(None, Some("Cancellation fixture".into())))?;
+        let (_, mut events) = app.hub.subscribe(u64::MAX);
+        let selection = AgentSelection { backend: AgentBackend::Claude, model: None, effort: None };
+        let (job, run) = launch(
+            &app, &session, "Write partial.patch".into(), None, Some(checkout.clone()), None,
+            Some(selection), None, None, Default::default(), Some(vec!["partial.patch".into()]),
+        ).await?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match events.recv().await?.event {
+                    ServerEvent::TextDelta { item, actor, text, .. }
+                        if belongs_to_job(&item, &actor, &job) && text == "Fixture ready" => break Ok(()),
+                    ServerEvent::ToolResult { item, output, .. } if item == job => anyhow::bail!("{output}"),
+                    _ => {}
+                }
+            }
+        }).await??;
+        app.delegates.cancel_job(&job, "fixture stop")?;
+        assert!(tokio::time::timeout(Duration::from_secs(15), run).await??.is_err());
+        let report = loop {
+            if let ServerEvent::ToolResult { item, ok, output, .. } = events.try_recv()?.event {
+                if item == job {
+                    assert!(!ok);
+                    break serde_json::from_str::<DelegateReport>(&output)?;
+                }
+            }
+        };
+        assert!(report.text.contains("fixture stop"));
+        assert!(report.changes.contains(checkout.to_str().unwrap()));
+        assert!(report.changes.contains("? partial.patch"));
+        assert_eq!(std::fs::read_to_string(checkout.join("partial.patch"))?, "partial work\n");
+        Ok(())
     }
 
     #[tokio::test]
@@ -2586,7 +2906,7 @@ mod tier_retry_tests {
                     });
                 }
                 Ok("final".into())
-            }, &cancel, &cancel, events, "test", job, WORKER_IDLE, |_| {}).await;
+            }, &cancel, &cancel, events, "test", job, AttemptWatch::new(Duration::ZERO, |_| UsageSample::new()), |_| {}).await;
             if pass_on_retry {
                 assert!(result.is_ok());
             } else {

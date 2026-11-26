@@ -17,7 +17,6 @@ use tokio::sync::Mutex;
 pub(crate) const LIST: &str = "list_screenshot_scenarios";
 pub(crate) const CAPTURE: &str = "capture_screenshot";
 pub(crate) const CLAUDE_CAPTURE: &str = "mcp__fuzukue__capture_screenshot";
-pub(crate) const CODEX_CAPTURE: &str = "fuzukue.capture_screenshot";
 const QUEUED: &str = "撮影待ち: 前の撮影が終わるまで";
 const BUILDING: &str = "ビルド中";
 const KEEP_CAPTURES: usize = 10;
@@ -561,7 +560,6 @@ impl Runner for Script {
 
 #[cfg(target_os = "linux")]
 async fn run_script(run: Run<'_>) -> Result<Exit> {
-    use rustix::process::{kill_process_group, Pid, Signal};
     use std::process::Stdio;
 
     let private = tempfile::tempdir_in(run.output)?;
@@ -645,15 +643,11 @@ async fn run_script(run: Run<'_>) -> Result<Exit> {
         .stderr(log);
     let (mut child, job) = crate::job_process::Job::spawn(&mut command, "capture", None)
         .context("could not start scripts/shot.sh")?;
-    let pid = child
-        .id()
-        .and_then(|pid| Pid::from_raw(pid as i32))
-        .context("missing capture PID")?;
     match tokio::time::timeout(run.timeout, child.wait()).await {
         Ok(status) => Ok(Exit::Status(status?)),
         Err(_) => {
             // Give Xvfb a chance to remove its display lock before killing the group.
-            let _ = kill_process_group(pid, Signal::TERM);
+            let _ = job.terminate();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             job.stop()?;
             child.wait().await?;

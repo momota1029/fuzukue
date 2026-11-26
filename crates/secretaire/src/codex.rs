@@ -260,7 +260,7 @@ pub struct Codex {
     session_stats: Arc<SessionStatsStore>,
     project_dir: PathBuf,
     skill_roots: tokio::sync::Mutex<SkillRoots>,
-    job: crate::job_process::Job,
+    job: Arc<crate::job_process::Job>,
 }
 
 impl Codex {
@@ -276,14 +276,25 @@ impl Codex {
     }
 
     pub(crate) async fn spawn_command(
-        mut command: Command,
+        command: Command,
         project_dir: &Path,
         hub: Arc<Hub>,
         usage: Arc<Usage>,
         session_stats: Arc<SessionStatsStore>,
     ) -> Result<Arc<Self>> {
+        Self::spawn_tracked(command, project_dir, hub, usage, session_stats, None).await
+    }
+
+    pub(crate) async fn spawn_tracked(
+        mut command: Command,
+        project_dir: &Path,
+        hub: Arc<Hub>,
+        usage: Arc<Usage>,
+        session_stats: Arc<SessionStatsStore>,
+        attempt: Option<&crate::job_process::Attempt>,
+    ) -> Result<Arc<Self>> {
         command.current_dir(project_dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        let (mut child, job) = crate::job_process::Job::spawn(&mut command, "codex", None)
+        let (mut child, job) = crate::job_process::Job::spawn_tracked(&mut command, "codex", attempt)
             .context("failed to spawn codex app-server")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -303,12 +314,8 @@ impl Codex {
             job,
         });
 
-        let waiter = Arc::downgrade(&codex);
         tokio::spawn(async move {
             let _ = child.wait().await;
-            if let Some(codex) = waiter.upgrade() {
-                let _ = codex.job.stop();
-            }
         });
 
         let reader = Arc::downgrade(&codex);
@@ -1728,6 +1735,7 @@ impl Codex {
 
 impl Drop for Codex {
     fn drop(&mut self) {
+        let _ = self.job.stop();
         self.cancel_all_questions();
         self.cancel_approvals(None, None);
     }

@@ -149,6 +149,8 @@ pub struct Workspace {
     sessions: Mutex<HashMap<String, Arc<ClaudeSession>>>,
     #[cfg(test)]
     claude_program: Option<PathBuf>,
+    #[cfg(test)]
+    worker_codex_command: std::sync::OnceLock<Box<dyn Fn() -> tokio::process::Command + Send + Sync>>,
     prompt_start: Mutex<()>,
     folder_copy_slots: Arc<tokio::sync::Semaphore>,
     front_desk_nudge: bool,
@@ -236,6 +238,8 @@ impl Workspace {
             sessions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             claude_program: None,
+            #[cfg(test)]
+            worker_codex_command: Default::default(),
             prompt_start: Mutex::new(()),
             folder_copy_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             front_desk_nudge: !canary() && front_desk::nudge_enabled(),
@@ -436,13 +440,28 @@ impl Workspace {
         Ok(codex)
     }
 
-    async fn worker_codex(&self, launch: &delegate::WorkerLaunch) -> anyhow::Result<Arc<Codex>> {
-        let Some(policy) = launch.execution else { return self.codex().await };
+    async fn worker_codex(
+        &self,
+        launch: &delegate::WorkerLaunch,
+        attempt: Option<&job_process::Attempt>,
+    ) -> anyhow::Result<Arc<Codex>> {
         let scope = launch.scope.as_ref().context("worker filesystem scope is missing")?;
-        let mut command = policy.command(Path::new("codex"), scope).await?;
-        policy.backend_home(&mut command, &scope.scratch, "CODEX_HOME", ".codex", &["auth.json", "config.toml"])?;
-        command.arg("app-server").envs(scope.temp_env());
-        let codex = Codex::spawn_command(command, &scope.cwd, self.hub.clone(), self.usage.clone(), self.session_stats.clone()).await?;
+        let (command, project) = if let Some(policy) = launch.execution {
+            let mut command = policy.command(Path::new("codex"), scope).await?;
+            policy.backend_home(&mut command, &scope.scratch, "CODEX_HOME", ".codex", &["auth.json", "config.toml"])?;
+            command.arg("app-server").envs(scope.temp_env());
+            (command, scope.cwd.as_path())
+        } else {
+            // A delegated turn must be stoppable independently of the front desk.
+            let mut command = tokio::process::Command::new("codex");
+            #[cfg(test)]
+            if let Some(fixture) = self.worker_codex_command.get() {
+                command = fixture();
+            }
+            command.arg("app-server");
+            (command, self.project_dir.as_path())
+        };
+        let codex = Codex::spawn_tracked(command, project, self.hub.clone(), self.usage.clone(), self.session_stats.clone(), attempt).await?;
         let mut workers = self.worker_codex.lock().unwrap();
         workers.retain(|worker| worker.strong_count() > 0);
         workers.push(Arc::downgrade(&codex));

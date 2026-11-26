@@ -107,9 +107,13 @@ fn full_width_elements_separate_column_groups() {
     assert_eq!(selection.rects.len(), 5);
 }
 
-#[test]
-fn unicode_clusters_and_hyphenation_keep_the_pdf_text() {
-    let mapping = "
+#[cfg(test)]
+mod unicode {
+    use super::*;
+
+    #[test]
+    fn unicode_clusters_and_hyphenation_keep_the_pdf_text() {
+        let mapping = "
 /CIDInit /ProcSet findresource begin
 12 dict begin begincmap
 /CMapType 2 def
@@ -122,19 +126,20 @@ endcodespacerange
 <43> <006600660069>
 endbfchar
 endcmap CMapName currentdict /CMap defineresource pop end end";
-    let content = "BT /F1 14 Tf 40 705 Td (AB oCce multi-) Tj
+        let content = "BT /F1 14 Tf 40 705 Td (AB oCce multi-) Tj
         0 -18 Td (line AB) Tj ET";
-    let doc = parse(pdf_with_mapping(content, LETTER, Some(mapping)).into()).unwrap();
-    let text = extract_page_text(&doc, 0).unwrap();
-    assert_eq!(text.text(), "日本 office multi-\nline 日本");
-    assert_eq!(text.locate("日本", 1).len(), 1);
-    assert!(text.locate("日本", 0)[0].y < text.locate("日本", 1)[0].y);
-    let ligature = text.locate("ffi", 0)[0];
-    let pos = NormPoint {
-        x: ligature.x + ligature.w * 0.5,
-        y: ligature.y + ligature.h * 0.5,
-    };
-    assert_eq!(text.selected_text(pos, pos).as_deref(), Some("ffi"));
+        let doc = parse(pdf_with_mapping(content, LETTER, Some(mapping)).into()).unwrap();
+        let text = extract_page_text(&doc, 0).unwrap();
+        assert_eq!(text.text(), "日本 office multi-\nline 日本");
+        assert_eq!(text.locate("日本", 1).len(), 1);
+        assert!(text.locate("日本", 0)[0].y < text.locate("日本", 1)[0].y);
+        let ligature = text.locate("ffi", 0)[0];
+        let pos = NormPoint {
+            x: ligature.x + ligature.w * 0.5,
+            y: ligature.y + ligature.h * 0.5,
+        };
+        assert_eq!(text.selected_text(pos, pos).as_deref(), Some("ffi"));
+    }
 }
 
 #[test]

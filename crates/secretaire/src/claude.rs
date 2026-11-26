@@ -20,7 +20,7 @@ use futures_util::{future::{AbortHandle, Abortable}, stream::FuturesUnordered, S
 use fuzukue_proto::{Actor, ChatSettings, ClaudeSessionStart, PermissionMode, ServerEvent};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 
 use crate::auto_review::Snapshot;
 use crate::front_desk::{self, RelayReply, TurnKind};
@@ -124,17 +124,26 @@ pub struct ClaudeSession {
 }
 
 struct ClaudeProcess {
-    job: crate::job_process::Job,
-    child: Child,
+    job: Arc<crate::job_process::Job>,
+    child: crate::job_process::JobChild,
     stdin: Option<ChildStdin>,
     settings: ChatSettings,
     stop_reading: Arc<crate::cancellation::Cancellation>,
 }
 
 impl ClaudeProcess {
-    fn start(mut cmd: Command, project: &Path, settings: ChatSettings) -> Result<(Self, ChildStdout)> {
+    fn start(cmd: Command, project: &Path, settings: ChatSettings) -> Result<(Self, ChildStdout)> {
+        Self::start_tracked(cmd, project, settings, None)
+    }
+
+    fn start_tracked(
+        mut cmd: Command,
+        project: &Path,
+        settings: ChatSettings,
+        attempt: Option<&crate::job_process::Attempt>,
+    ) -> Result<(Self, ChildStdout)> {
         cmd.current_dir(project).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
-        let (mut child, job) = crate::job_process::Job::spawn(&mut cmd, "claude", None)
+        let (mut child, job) = crate::job_process::Job::spawn_tracked(&mut cmd, "claude", attempt)
             .context("failed to spawn claude")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -1748,6 +1757,7 @@ async fn run_read_only(
 pub(crate) async fn run_worker(
     app: &Workspace, cwd: &Path, session: &str, job: &str, settings: ChatSettings, prompt: &str,
     steering: &mut crate::delegate::JobInput, launch: &crate::delegate::WorkerLaunch,
+    attempt: &crate::job_process::Attempt,
     metadata: &mut RunMetadata, on_model: impl Fn(&RunMetadata) + Send,
 ) -> Result<String> {
     if !steering.paced {
@@ -1815,7 +1825,7 @@ pub(crate) async fn run_worker(
         cmd.arg("--allowedTools").args(launch.tools.iter().map(|name| format!("mcp__{}__{name}", crate::mcp::SERVER_NAME)));
         cmd.env("MCP_TOOL_TIMEOUT", (crate::capture::worker_tool_timeout(&launch.tools) * 1000).to_string());
     }
-    let (mut process, stdout) = ClaudeProcess::start(cmd, cwd, settings)?;
+    let (mut process, stdout) = ClaudeProcess::start_tracked(cmd, cwd, settings, Some(attempt))?;
     let cancel = steering.cancellation();
     let result = tokio::select! {
         biased;
@@ -1978,7 +1988,8 @@ pub(crate) async fn run_worker(
         } => result,
     };
     if cancel.check().is_err() {
-        let _ = process.child.kill().await;
+        let _ = process.job.stop();
+        let _ = process.child.wait().await;
     } else {
         process.stop().await;
     }

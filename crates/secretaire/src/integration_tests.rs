@@ -5411,11 +5411,19 @@ done
 
 async fn stub_codex(app: &Workspace, log: &std::path::Path, gate: Option<&std::path::Path>) -> Result<()> {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/shots/codex");
-    let mut command = tokio::process::Command::new(fixture);
-    command.arg("app-server").env("FUZUKUE_CODEX_FIXTURE_LOG", log).env_remove("FUZUKUE_CODEX_SHOT");
-    if let Some(gate) = gate {
-        command.env("FUZUKUE_CODEX_FIXTURE_GATE", gate);
-    }
+    let log = log.to_owned();
+    let gate = gate.map(std::path::Path::to_owned);
+    let fixture_command = move || {
+        let mut command = tokio::process::Command::new(&fixture);
+        command.env("FUZUKUE_CODEX_FIXTURE_LOG", &log).env_remove("FUZUKUE_CODEX_SHOT");
+        if let Some(gate) = &gate {
+            command.env("FUZUKUE_CODEX_FIXTURE_GATE", gate);
+        }
+        command
+    };
+    let mut command = fixture_command();
+    command.arg("app-server");
+    assert!(app.worker_codex_command.set(Box::new(fixture_command)).is_ok());
     let codex = Codex::spawn_command(
         command, &app.project_dir, app.hub.clone(), app.usage.clone(), app.session_stats.clone(),
     ).await?;
