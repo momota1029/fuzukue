@@ -2656,12 +2656,12 @@ impl Store {
         self.threads.get(id).is_some_and(|thread| thread.transcript.index.contains_key(item))
     }
 
-    pub(crate) fn system_note(&mut self, id: &str, item: &str, text: String) -> Result<Option<ServerEvent>> {
+    pub(crate) fn system_note(&mut self, id: &str, item: &str, text: String, allow_archived: bool) -> Result<Option<ServerEvent>> {
         let thread = self.threads.get_mut(id).context("Thread not found")?;
         if thread.transcript.index.contains_key(item) {
             return Ok(None);
         }
-        ensure!(!thread.front.archived && thread.path.is_file(), "Thread is archived or missing");
+        ensure!((allow_archived || !thread.front.archived) && thread.path.is_file(), "Thread is archived or missing");
         let event = ServerEvent::TextDelta { session: id.into(), item: item.into(), actor: Actor::System, text };
         thread.transcript.observe(&event);
         if let Err(error) = thread.save() {

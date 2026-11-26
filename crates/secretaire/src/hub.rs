@@ -975,13 +975,20 @@ impl Hub {
     }
 
     pub(crate) fn deliver_system_note(&self, session: &str, item: &str, text: String) -> anyhow::Result<()> {
+        self.save_system_note(session, item, text, false).map(|_| ())
+    }
+
+    pub(crate) fn deliver_update_note(&self, session: &str, item: &str, text: String) -> anyhow::Result<bool> {
+        self.save_system_note(session, item, text, true)
+    }
+
+    fn save_system_note(&self, session: &str, item: &str, text: String, allow_archived: bool) -> anyhow::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
         let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
-        if let Some(event) = threads.system_note(session, item, text)? {
-            let snapshot = threads.snapshot();
-            self.broadcast_saved(&mut inner, event, snapshot);
-        }
-        Ok(())
+        let Some(event) = threads.system_note(session, item, text, allow_archived)? else { return Ok(false) };
+        let snapshot = threads.snapshot();
+        self.broadcast_saved(&mut inner, event, snapshot);
+        Ok(true)
     }
 
     fn broadcast_saved(&self, inner: &mut Inner, event: ServerEvent, snapshot: ServerEvent) {

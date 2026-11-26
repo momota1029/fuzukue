@@ -3301,7 +3301,7 @@ async fn prompt_escalated_partner(
     };
     match selection.backend {
         AgentBackend::Codex => prompt_codex_with_images(app, session.into(), settings, prompt, user_event, images, TurnKind::Escalated, None).await,
-        AgentBackend::Claude => prompt_claude_turn(app, session, prompt, user_event, images, TurnKind::Escalated, None, Some(settings)).await.map(|_| ()),
+        AgentBackend::Claude => prompt_claude_turn(app, session, prompt, user_event, images, TurnKind::Escalated, None, Some(settings), false).await.map(|_| ()),
     }
 }
 
@@ -3309,13 +3309,13 @@ async fn prompt_claude_with_images(
     app: &Arc<Workspace>, session: &str, prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind,
     report: Option<String>,
 ) -> anyhow::Result<bool> {
-    prompt_claude_turn(app, session, prompt, user_event, images, kind, report, None).await
+    prompt_claude_turn(app, session, prompt, user_event, images, kind, report, None, false).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn prompt_claude_turn(
     app: &Arc<Workspace>, session: &str, prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind,
-    report: Option<String>, escalation: Option<fuzukue_proto::ChatSettings>,
+    report: Option<String>, escalation: Option<fuzukue_proto::ChatSettings>, background: bool,
 ) -> anyhow::Result<bool> {
     let is_report = report.is_some();
     let github_auth = github_auth_request(kind, &prompt, user_event.as_ref());
@@ -3347,7 +3347,7 @@ async fn prompt_claude_turn(
     if let Some(event) = user_event {
         app.hub.publish(event);
     }
-    let result = if is_report || matches!(kind, TurnKind::WorkerDigest | TurnKind::GoalDecision(_)) {
+    let result = if is_report || background {
         s.try_background_prompt(prompt, kind, report).await
     } else {
         s.prompt_with_auth(&prompt, images, kind, github_auth, escalation, escalation_images).await.map(|()| true)
@@ -3413,7 +3413,7 @@ async fn delegate_background_turn(app: &Arc<Workspace>, session: &str, prompt: S
         prompt_codex_with_images(app, session.into(), settings, prompt, None, Vec::new(), kind, None).await?;
         Ok(true)
     } else {
-        prompt_claude_with_images(app, session, prompt, None, Vec::new(), kind, None).await
+        prompt_claude_turn(app, session, prompt, None, Vec::new(), kind, None, None, true).await
     }
 }
 

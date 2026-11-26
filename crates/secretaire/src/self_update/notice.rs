@@ -1,4 +1,4 @@
-//! Route one server update outcome to the desk turn reserved for that attempt.
+//! Save the outcome in the requesting thread and offer the desk a wake.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -36,6 +36,7 @@ struct Request {
 pub(super) struct SavedStatus {
     #[serde(flatten)]
     pub(super) status: Status,
+    // Older servers deserialize the flattened Status and ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request: Option<Request>,
 }
@@ -64,9 +65,16 @@ impl Request {
     fn deliver(self, app: &Arc<App>, status: &Status) -> Result<()> {
         if let Some(recipient) = self.recipient.filter(|recipient| app.has_workspace(&recipient.workspace)) {
             let workspace = app.known_workspace(&recipient.workspace)?;
-            crate::delegate::queue_update_result(
-                &workspace, &recipient.thread, self.id, result_text(status, self.rollback),
-            )?;
+            if workspace.hub.has_thread(&recipient.thread) {
+                let text = result_text(status, self.rollback);
+                let title = harness_text!("Server self-update result", "サーバーの自己更新結果");
+                let note = format!("{title}\n\n```json\n{text}\n```");
+                if workspace.hub.deliver_update_note(&recipient.thread, &self.id, note)?
+                    && workspace.hub.read_threads(|threads| threads.is_live(&recipient.thread))
+                {
+                    crate::delegate::wake_for_update_result(&workspace, &recipient.thread, text);
+                }
+            }
         }
         Ok(())
     }
@@ -137,8 +145,7 @@ impl Update {
         let mut saved = SavedStatus::read(&self.root)?;
         if let Some(request) = saved.request.take() {
             request.deliver(app, &status)?;
-            // The journal or the saved thread note now owns this result.
-            // Either one prevents a duplicate if clearing the request is interrupted.
+            // Retrying after a crash finds the same item in the thread transcript.
             saved.status = status;
             saved.write(&self.root)?;
         }

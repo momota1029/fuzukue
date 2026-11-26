@@ -99,7 +99,6 @@ impl Journal {
 fn desk_kind(work: &Work) -> Option<&'static str> {
     match work {
         Work::Desk(DeskTurn::Report { .. }) => Some("Desk Report"),
-        Work::Desk(DeskTurn::UpdateResult { .. }) => Some("Server Update Result"),
         Work::Claude(_) => Some("Claude"),
         Work::Delegate(_) => Some("Delegate"),
         Work::Checkpoint { .. } => Some("Checkpoint"),

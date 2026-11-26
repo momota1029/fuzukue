@@ -46,7 +46,7 @@ struct TurnState {
     /// Claude にまだ送っていないメッセージ
     queued: VecDeque<PendingPrompt>,
     /// ターンの途中で止めた（再開時に「続きから」と伝える）
-    interrupted: Option<TurnKind>,
+    interrupted: Option<InterruptedTurn>,
     /// タイマーの世代。休憩を取り直したら古いタイマーは何もしない。
     generation: u64,
     drain_notice: Option<i64>,
@@ -72,6 +72,22 @@ struct ActiveTurn {
     compaction: Option<Compaction>,
     escalation: Option<ChatSettings>,
     records: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct InterruptedTurn {
+    kind: TurnKind,
+    durable: bool,
+}
+
+impl ActiveTurn {
+    fn usage_continuation(&self) -> InterruptedTurn {
+        // External background wakes without a journal entry are best-effort.
+        InterruptedTurn {
+            kind: self.kind,
+            durable: !matches!(self.kind, TurnKind::ExternalInput) || !self.records.is_empty(),
+        }
+    }
 }
 
 struct Compaction {
@@ -968,11 +984,11 @@ impl ClaudeSession {
     }
 
     fn save_paused_continuation(&self, app: &Workspace, turns: &mut TurnState, force: bool) -> Result<()> {
-        if turns.interrupted.is_some() && turns.pause_record.is_none() {
+        if let Some(turn) = turns.interrupted.filter(|turn| turn.durable && turns.pause_record.is_none()) {
             let id = crate::mail::session_key();
             let prompt = PendingPrompt {
                 text: "The usage window has reset. Continue from the last saved stopping point.".into(),
-                images: Vec::new(), force, kind: turns.interrupted.unwrap_or(TurnKind::Conversation),
+                images: Vec::new(), force, kind: turn.kind,
                 not_before: turns.paused_until.map(|until| until + RESUME_SLACK_SECS), records: Vec::new(), github_auth: None, escalation: None,
                 escalation_images: Vec::new(),
                 automatic_resume: true,
@@ -1035,7 +1051,7 @@ impl ClaudeSession {
     }
 
     /// 休憩に入る。`until` を過ぎたら再開を試みる。
-    fn pause(self: &Arc<Self>, turns: &mut TurnState, until: i64, reason: String, interrupted: Option<TurnKind>) {
+    fn pause(self: &Arc<Self>, turns: &mut TurnState, until: i64, reason: String, interrupted: Option<InterruptedTurn>) {
         turns.paused_until = Some(until);
         turns.interrupted = interrupted.or(turns.interrupted);
         turns.generation += 1;
@@ -1084,7 +1100,26 @@ impl ClaudeSession {
         }
         turns.paused_until = None;
         turns.generation += 1;
-        let interrupted = std::mem::take(&mut turns.interrupted);
+        let interrupted = turns.interrupted.take().map(|turn| turn.kind);
+        let mut records: Vec<_> = turns.pause_record.take().into_iter().collect();
+        let continuation = harness_text!("(secretaire) The usage window has reset. Continue from where you stopped.", "（secretaire）使用量の枠が空いたので再開する。中断したところから作業を続けて。");
+        self.hub.publish(ServerEvent::Resumed { session: self.id.clone() });
+        if matches!(interrupted, Some(TurnKind::ExternalInput))
+            || turns.queued.iter().any(|prompt| matches!(prompt.kind, TurnKind::ExternalInput))
+        {
+            // A queued user message cannot authorize the continuation of external input.
+            for prompt in &mut turns.queued {
+                prompt.force |= force;
+            }
+            if let Some(kind) = interrupted {
+                turns.queued.push_front(PendingPrompt {
+                    text: continuation.into(), images: Vec::new(), force, kind, not_before: None,
+                    records, github_auth: None, escalation: None, escalation_images: Vec::new(),
+                    automatic_resume: true,
+                });
+            }
+            return self.start_pending(&mut turns).await;
+        }
         let queued = std::mem::take(&mut turns.queued);
         let has_user_input = queued.iter().any(|prompt| matches!(prompt.kind, TurnKind::UserConversation) && !prompt.automatic_resume);
         let kind = if matches!(interrupted, Some(TurnKind::UserConversation))
@@ -1096,14 +1131,12 @@ impl ClaudeSession {
         } else {
             TurnKind::Conversation
         };
-        self.hub.publish(ServerEvent::Resumed { session: self.id.clone() });
         let mut text = String::new();
         if interrupted.is_some() {
-            text.push_str(harness_text!("(secretaire) The usage window has reset. Continue from where you stopped.", "（secretaire）使用量の枠が空いたので再開する。中断したところから作業を続けて。"));
+            text.push_str(continuation);
         }
         let mut images = Vec::new();
         let mut escalation_images = Vec::new();
-        let mut records: Vec<_> = turns.pause_record.take().into_iter().collect();
         let github_auth = queued.back().and_then(|prompt| prompt.github_auth);
         if !queued.is_empty() {
             if interrupted.is_some() {
@@ -1214,7 +1247,9 @@ impl ClaudeSession {
         if rate_limited && turns.paused_until.is_none() {
             let until = self.usage.blocked("claude").map(|(until, _)| until)
                 .unwrap_or_else(|| now() + FALLBACK_PAUSE_SECS);
-            let retry = (!matches!(kind, TurnKind::GoalDecision(_) | TurnKind::Escalated)).then_some(kind);
+            let retry = active.as_ref()
+                .filter(|turn| !matches!(turn.kind, TurnKind::GoalDecision(_) | TurnKind::Escalated))
+                .map(ActiveTurn::usage_continuation);
             self.pause(&mut turns, until, "Claude が使用量の上限で止まった".into(), retry);
         }
         if turns.paused_until.is_none() || interrupted {
@@ -1603,8 +1638,8 @@ impl ClaudeSession {
                         if let Some(turn) = &mut turns.active {
                             if turn.compaction.is_some() { return Ok(()); }
                             turn.before = None;
-                            let kind = turn.kind;
-                            self.pause(&mut turns, until, reason, Some(kind));
+                            let interrupted = turn.usage_continuation();
+                            self.pause(&mut turns, until, reason, Some(interrupted));
                             self.interrupt_claude().await?;
                         }
                     }
@@ -2432,6 +2467,44 @@ mod tests {
         assert!(!turns.can_start_worker_digest());
         turns.paused_until = None;
         assert!(turns.can_start_worker_digest());
+    }
+
+    #[tokio::test]
+    async fn usage_resume_keeps_a_best_effort_external_turn_restricted() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let app = Arc::new(Workspace::new(root.into(), String::new(), root.join("state"), Arc::new(Hub::new())));
+        let id = app.hub.edit_threads(|store| store.create(None))?;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while IFS= read -r line; do :; done"]);
+        let session = ClaudeSession::spawn_command(cmd, id.clone(), root.into(), &app, Box::new(|_| {}))?;
+
+        assert!(session.try_background_prompt("update result".into(), TurnKind::ExternalInput, None).await?);
+        assert!(app.hub.external_approval_input(&id));
+        session.finish_turn(&json!({ "is_error": true, "api_error_status": 429 })).await?;
+        {
+            let mut turns = session.state.lock().await;
+            assert!(turns.paused_until.is_some());
+            session.save_paused_continuation(&app, &mut turns, true)?;
+            assert!(turns.pause_record.is_none());
+        }
+        assert!(app.drain.records(&app.state_dir)?.is_empty());
+
+        session.prompt_with_auth("separate user request", Vec::new(), TurnKind::UserConversation, None, None, Vec::new()).await?;
+        session.resume(true).await?;
+        assert!(app.hub.external_approval_input(&id));
+        {
+            let turns = session.state.lock().await;
+            assert!(matches!(turns.active.as_ref().map(|turn| turn.kind), Some(TurnKind::ExternalInput)));
+            assert_eq!(turns.queued.len(), 1);
+            assert_eq!(turns.queued[0].text, "separate user request");
+            assert!(matches!(turns.queued[0].kind, TurnKind::UserConversation));
+        }
+        session.finish_turn(&json!({ "is_error": false })).await?;
+        let turns = session.state.lock().await;
+        assert!(matches!(turns.active.as_ref().map(|turn| turn.kind), Some(TurnKind::UserConversation)));
+        assert!(!app.hub.external_approval_input(&id));
+        Ok(())
     }
 
     #[test]

@@ -474,6 +474,109 @@ async fn update_failure_before_swap_wakes_only_its_requesting_thread() -> Result
     Ok(())
 }
 
+// These are the 668973e serde shapes for the desk records used in this fixture.
+#[derive(serde::Deserialize)]
+struct OldHeldRecord {
+    id: String,
+    session: String,
+    work: OldHeldWork,
+    claimed: bool,
+}
+
+#[derive(serde::Deserialize)]
+enum OldHeldWork {
+    Desk(OldDeskTurn),
+}
+
+#[derive(serde::Deserialize)]
+enum OldDeskTurn {
+    Report { job: String, text: String, plan_failed: bool },
+}
+
+#[tokio::test]
+async fn update_result_is_saved_while_busy_and_quota_blocked_without_changing_held_work() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let held = drain::Work::Desk(delegate::DeskTurn::Report {
+        job: "held-job".into(), text: "held report".into(), plan_failed: false,
+    });
+    workspace.drain.enqueue(&workspace.state_dir, &session, "held-report".into(), held)?;
+    let journal = workspace.state_dir.join("held-work.json");
+    let before = fs::read(&journal)?;
+
+    let mut status = update.status.borrow().clone();
+    status.active = true;
+    update.begin_result(status, Some(Recipient::new(&workspace, &session)), false)?;
+    let pending = fs::read(update.root.join(STATUS_FILE))?;
+    // The 668973e status reader uses this unchanged protocol type directly.
+    assert!(serde_json::from_slice::<fuzukue_proto::SelfUpdateStatus>(&pending)?.active);
+    let request: serde_json::Value = serde_json::from_slice(&pending)?;
+    let item = request["request"]["id"].as_str().context("missing result ID")?;
+    let transcript = workspace.hub.thread_path(&session)?;
+
+    workspace.hub.publish_partner_turn_started(&session, None, false);
+    workspace.usage.restore(vec![fuzukue_proto::UsageWindow {
+        agent: "claude".into(),
+        name: "test".into(),
+        used: 1.0,
+        resets_at: Some(crate::usage::now() + 600),
+        rejected: true,
+    }]);
+    assert!(workspace.hub.thread_active(&session));
+    assert!(workspace.usage.blocked("claude").is_some());
+    update.fail("candidate failed while the desk was busy".into());
+    update.report_result(&app)?;
+
+    let saved = fs::read_to_string(&transcript)?;
+    assert_eq!(saved.matches(item).count(), 1);
+    assert!(saved.contains("candidate failed while the desk was busy"));
+    assert!(workspace.delegates.has_queued_desk_turn(&session));
+    assert_eq!(prompt_count(&workspace, "candidate failed while the desk was busy"), 0);
+    let after = fs::read(journal)?;
+    let records: Vec<OldHeldRecord> = serde_json::from_slice(&after)?;
+    let [record] = records.as_slice() else { anyhow::bail!("expected one old held record") };
+    assert_eq!(record.id, "held-report");
+    assert_eq!(record.session, session);
+    assert!(!record.claimed);
+    let OldHeldWork::Desk(OldDeskTurn::Report { job, text, plan_failed }) = &record.work;
+    assert_eq!(job, "held-job");
+    assert_eq!(text, "held report");
+    assert!(!plan_failed);
+    assert_eq!(before, after);
+    let status: serde_json::Value = serde_json::from_slice(&fs::read(update.root.join(STATUS_FILE))?)?;
+    assert!(status.get("request").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_result_retries_the_note_and_does_not_wake_an_archived_thread() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    workspace.hub.edit_threads(|threads| threads.set_archived(&session, true))?;
+
+    let mut status = update.status.borrow().clone();
+    status.active = true;
+    update.begin_result(status, Some(Recipient::new(&workspace, &session)), false)?;
+    update.fail("fixture update failed".into());
+    let status_path = update.root.join(STATUS_FILE);
+    let pending = fs::read(&status_path)?;
+    let path = workspace.hub.thread_path(&session)?;
+    let moved = path.with_extension("moved");
+    fs::rename(&path, &moved)?;
+    assert!(update.report_result(&app).is_err());
+    assert_eq!(fs::read(&status_path)?, pending);
+
+    fs::rename(moved, &path)?;
+    update.report_result(&app)?;
+    assert!(fs::read_to_string(path)?.contains("fixture update failed"));
+    assert!(!workspace.delegates.has_queued_desk_turn(&session));
+    let completed: serde_json::Value = serde_json::from_slice(&fs::read(status_path)?)?;
+    assert!(completed.get("request").is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn update_result_survives_a_restart_and_a_replayed_request() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -544,7 +647,8 @@ async fn update_result_survives_a_restart_and_a_replayed_request() -> Result<()>
     assert!(workspace.drain.records(&workspace.state_dir)?.is_empty());
     assert!(!workspace.delegates.has_queued_desk_turn(&session));
     assert_eq!(prompt_count(&workspace, "candidate failed its health check"), 1);
-    assert!(workspace.hub.read_threads(|threads| threads.has_item(&session, &item)));
+    let transcript = fs::read_to_string(workspace.hub.thread_path(&session)?)?;
+    assert_eq!(transcript.matches(&item).count(), 1);
     Ok(())
 }
 
