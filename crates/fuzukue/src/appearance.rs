@@ -20,7 +20,7 @@ use gpui_kit::component::{
     v_flex, ActiveTheme as _, Disableable as _, Sizable as _, Theme, ThemeColor, ThemeMode,
 };
 use gpui_kit::{
-    div, point, prelude::*, px, relative, rgb, size, App, Bounds, Context, DefiniteLength,
+    div, point, prelude::*, px, relative, rems, rgb, size, App, Bounds, Context, DefiniteLength,
     DisplayId, Empty, Entity, Font, FontWeight, Hsla, Pixels, Rgba, SharedString,
     StyleRefinement, Task, Window,
     WindowBounds, WindowOptions,
@@ -177,7 +177,7 @@ impl AccentSwatch {
     }
 }
 
-const ACCENT_SWATCHES: [AccentSwatch; 6] = [
+const ACCENT_SWATCHES: [AccentSwatch; 7] = [
     AccentSwatch {
         preset: AccentPreset::Teal,
         label: "settings-accent-teal",
@@ -213,6 +213,12 @@ const ACCENT_SWATCHES: [AccentSwatch; 6] = [
         label: "settings-accent-orange",
         light: 0x924e21,
         dark: 0xdf935a,
+    },
+    AccentSwatch {
+        preset: AccentPreset::Gray,
+        label: "settings-accent-gray",
+        light: 0x4b4b4b,
+        dark: 0xbdbdbd,
     },
 ];
 
@@ -393,12 +399,20 @@ fn desktop_palette(
         AccentChoice::Custom(value) => parse_hex_color(value).is_none(),
     };
     let primary = accessible_accent(accent_color(choice, preset, dark), accent_surface, dark, 4.5);
-    let [foreground, muted, selection, text_selection, success, warning, danger, info] =
+    let [mut foreground, mut muted, selection, text_selection, success, warning, danger, info] =
         if dark {
             [0xf9ecee, 0xdec8cd, 0x24594f, 0x235349, 0xc9e477, 0xffc08a, 0xffa7b3, 0xb9d0ff]
         } else {
             [0x403034, 0x5d4a50, 0x02fac8, 0xbdf0e4, 0x435817, 0x824008, 0x952b49, 0x294c8a]
         }.map(|color| Hsla::from(rgb(color)));
+
+    let on_primary = if preset.is_monochrome() {
+        [foreground, muted] = if dark { [0xf3f3f3, 0xbcbcbc] } else { [0x191919, 0x545454] }
+            .map(|color| Hsla::from(rgb(color)));
+        rgb(if dark { 0x303030 } else { 0xffffff }).into()
+    } else {
+        button_foreground(dark)
+    };
 
     colors.background = surfaces.background;
     colors.sidebar = surfaces.chrome;
@@ -440,7 +454,7 @@ fn desktop_palette(
     colors.primary = primary;
     colors.primary_hover = hover;
     colors.primary_active = active;
-    colors.primary_foreground = button_foreground(dark);
+    colors.primary_foreground = on_primary;
     colors.button_primary = primary;
     colors.button_primary_hover = hover;
     colors.button_primary_active = active;
@@ -453,7 +467,14 @@ fn desktop_palette(
     colors.progress_bar = primary;
 
     colors.accent = if is_classic_teal { selection } else { surfaces.chat.blend(primary.opacity(0.13)) };
-    colors.selection = if is_classic_teal { text_selection } else { surfaces.chat.blend(primary.opacity(0.2)) };
+    colors.selection = if is_classic_teal {
+        text_selection
+    } else if preset.is_monochrome() {
+        // Keep selection visible on both the prose and code surfaces without relying on hue.
+        accent_surface.blend(primary.opacity(0.28))
+    } else {
+        surfaces.chat.blend(primary.opacity(0.2))
+    };
     let text_surfaces = [accent_surface, colors.accent, colors.selection];
     let readable_text = |color| adjust_lightness(color, dark, |color| {
         text_surfaces.into_iter().all(|surface| contrast_ratio(color, surface) >= 4.5)
@@ -490,13 +511,16 @@ fn desktop_palette(
     colors.table_active = colors.accent;
     colors.table_active_border = primary;
     colors.table_hover = if dark { surfaces.chrome } else { surfaces.raised };
-    colors.table_row_border = surfaces.outline;
+    colors.table_row_border = adjust_lightness(surfaces.outline, dark, |border| {
+        [accent_surface, colors.table_active].into_iter()
+            .all(|surface| contrast_ratio(border, surface) >= 3.)
+    });
     colors.status_bar = surfaces.chrome;
     colors.status_bar_border = surfaces.divider;
     colors.scrollbar_thumb = surfaces.outline;
     colors.scrollbar_thumb_hover = muted;
     colors.switch = surfaces.outline;
-    colors.switch_thumb = button_foreground(dark);
+    colors.switch_thumb = on_primary;
     colors.drop_target = colors.selection;
 
     colors.success = readable_text(success);
@@ -532,7 +556,12 @@ fn desktop_palette(
     colors
 }
 
-fn desktop_highlight(colors: ThemeColor, surfaces: ThemeSurfaces, dark: bool) -> Arc<HighlightTheme> {
+fn desktop_highlight(
+    colors: ThemeColor,
+    surfaces: ThemeSurfaces,
+    preset: ThemePreset,
+    dark: bool,
+) -> Arc<HighlightTheme> {
     let mut theme = if dark { HighlightTheme::default_dark() } else { HighlightTheme::default_light() };
     let style = &mut Arc::make_mut(&mut theme).style;
     style.editor_background = Some(surfaces.code);
@@ -542,14 +571,17 @@ fn desktop_highlight(colors: ThemeColor, surfaces: ThemeSurfaces, dark: bool) ->
     style.editor_line_number = Some(colors.muted_foreground);
     style.editor_active_line_number = Some(colors.foreground);
 
-    // Syntax colors from the component theme also appear on the app's code surface
-    // and text selection. Keep their hues and font styles, adjusting lightness as needed.
+    // Syntax colors also appear over text selection. Preserve font styles and
+    // adjust lightness for readability on both the editor and selection surfaces.
     let mut syntax = serde_json::to_value(&style.syntax).expect("serialize syntax colors");
     for token in syntax.as_object_mut().expect("syntax colors are an object").values_mut() {
         let Some(value) = token.get_mut("color").filter(|value| !value.is_null()) else {
             continue;
         };
-        let color: Hsla = serde_json::from_value(value.clone()).expect("deserialize syntax color");
+        let mut color: Hsla = serde_json::from_value(value.clone()).expect("deserialize syntax color");
+        if preset.is_monochrome() {
+            color.s = 0.;
+        }
         let adjusted = adjust_lightness(color, dark, |candidate| {
             [surfaces.code, surfaces.chat, colors.selection]
                 .into_iter().all(|surface| contrast_ratio(candidate, surface) >= 4.55)
@@ -944,7 +976,7 @@ impl Appearance {
         cx.set_global(surfaces);
         let theme = cx.theme();
         let colors = desktop_palette(theme.colors, preset, &self.settings.theme.accent, mode.is_dark());
-        let highlight = desktop_highlight(colors, surfaces, mode.is_dark());
+        let highlight = desktop_highlight(colors, surfaces, preset, mode.is_dark());
         if theme.font_family != *ui_font
             || theme.mono_font_family != *code_font
             || theme.font_size != ui_size
@@ -1151,44 +1183,53 @@ impl Workbench {
         let theme = cx.theme();
         let dark = theme.is_dark();
         let selected = self.appearance.settings.theme.preset;
-        let accent = &self.appearance.settings.theme.accent;
         let previews = ThemePreset::ALL.map(|preset| {
             let (id, label) = match preset {
                 ThemePreset::Classic => ("theme-preset-classic", tr!("settings-theme-classic")),
                 ThemePreset::Parchment => ("theme-preset-parchment", tr!("settings-theme-parchment")),
                 ThemePreset::Iris => ("theme-preset-iris", tr!("settings-theme-iris")),
+                ThemePreset::Monochrome => ("theme-preset-monochrome", tr!("settings-theme-monochrome")),
+                ThemePreset::Ink => ("theme-preset-ink", tr!("settings-theme-ink")),
+                ThemePreset::Fern => ("theme-preset-fern", tr!("settings-theme-fern")),
+                ThemePreset::Fjord => ("theme-preset-fjord", tr!("settings-theme-fjord")),
+                ThemePreset::Terracotta => ("theme-preset-terracotta", tr!("settings-theme-terracotta")),
+                ThemePreset::Rose => ("theme-preset-rose", tr!("settings-theme-rose")),
+                ThemePreset::Lagoon => ("theme-preset-lagoon", tr!("settings-theme-lagoon")),
             };
             let surfaces = ThemeSurfaces::for_preset(preset, dark);
-            let primary = accessible_accent(accent_color(accent, preset, dark), surfaces.least_contrast(dark), dark, 4.5);
+            let primary = accessible_accent(
+                accent_swatch(preset.accent(), dark), surfaces.least_contrast(dark), dark, 4.5,
+            );
             let preview = h_flex()
-                .w(px(76.))
-                .h(px(32.))
+                .w(px(58.))
+                .h(px(18.))
                 .flex_shrink_0()
                 .rounded_md()
                 .overflow_hidden()
                 .border_1()
                 .border_color(surfaces.outline)
                 .bg(surfaces.background)
-                .child(div().w(px(20.)).h_full().bg(surfaces.chrome).border_r_1().border_color(surfaces.divider))
+                .child(div().w(px(16.)).h_full().bg(surfaces.chrome).border_r_1().border_color(surfaces.divider))
                 .child(
-                    v_flex().flex_1().gap_1().p_1()
-                        .child(div().h(px(7.)).w(px(22.)).rounded_sm().bg(primary))
-                        .child(div().h(px(7.)).w_full().rounded_sm().bg(surfaces.chat).border_1().border_color(surfaces.divider)),
+                    h_flex().flex_1().items_center().gap_1().p_1()
+                        .child(div().h(px(9.)).flex_1().rounded_sm().bg(surfaces.chat).border_1().border_color(surfaces.divider))
+                        .child(div().size(px(8.)).rounded_sm().bg(primary)),
                 );
             Button::new(id)
-                .w(px(115.))
-                .h(px(70.))
+                .w(rems(6.625))
+                .h(rems(2.875))
+                .px_1()
                 .accessibility_label(label)
                 .toggled(preset == selected)
                 .when(preset == selected, |button| button.primary())
-                .child(v_flex().gap_1().items_center().child(preview).child(label))
+                .child(v_flex().gap_1().items_center().text_sm().line_height(relative(1.15)).child(preview).child(label))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.update_appearance(window, cx, |settings| settings.theme.preset = preset);
                 }))
         });
         v_flex().gap_1()
             .child(tr!("settings-theme"))
-            .child(h_flex().gap_2().flex_wrap().children(previews))
+            .child(h_flex().gap_1().flex_wrap().children(previews))
     }
 
     fn render_accent_settings(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
@@ -1768,7 +1809,7 @@ mod accent_tests {
                     let dark = mode.is_dark();
                     let surfaces = ThemeSurfaces::for_preset(ThemePreset::Classic, dark);
                     theme.colors = desktop_palette(theme.colors, ThemePreset::Classic, &AccentChoice::default(), dark);
-                    theme.highlight_theme = desktop_highlight(theme.colors, surfaces, dark);
+                    theme.highlight_theme = desktop_highlight(theme.colors, surfaces, ThemePreset::Classic, dark);
                 });
                 let theme = cx.theme();
                 let background = ThemeSurfaces::for_preset(ThemePreset::Classic, mode.is_dark()).background;
@@ -1909,6 +1950,33 @@ mod accent_tests {
         });
     }
 
+    #[test]
+    fn pdf_card_highlight_is_visible_over_paper_and_keeps_text_readable() {
+        let paper: Hsla = rgb(0xffffff).into();
+        let ink: Hsla = rgb(0x000000).into();
+        let color = crate::paper_pdf::pdf_card_highlight();
+        let highlighted = paper.blend(color);
+        assert!(color.s > 0.);
+        assert!(contrast_ratio(highlighted, paper) >= 1.5);
+        assert!(contrast_ratio(ink, highlighted) >= 4.5);
+    }
+
+    #[test]
+    fn grayscale_presets_allow_explicit_accent_overrides() {
+        for preset in [ThemePreset::Monochrome, ThemePreset::Ink] {
+            for dark in [false, true] {
+                let default = accent_color(&AccentChoice::default(), preset, dark);
+                let blue = accent_color(&AccentChoice::Preset(AccentPreset::Blue), preset, dark);
+                let custom = accent_color(&AccentChoice::Custom("#7c2242".into()), preset, dark);
+                let invalid = accent_color(&AccentChoice::Custom("invalid".into()), preset, dark);
+                assert_eq!(default.s, 0.);
+                assert_eq!(invalid, default);
+                assert!(blue.s > 0.);
+                assert_eq!(custom, rgb(0x7c2242).into());
+            }
+        }
+    }
+
     fn check_resolved_contrast(cx: &mut App) {
         for preset in ThemePreset::ALL {
             for dark in [false, true] {
@@ -1947,13 +2015,38 @@ mod accent_tests {
                         }
                     }
                     check("list search", colors.list_highlight_foreground, colors.list_active, 4.5);
-                    check("popup text", colors.popover_foreground, colors.popover, 4.5);
+                    check("tooltip text", colors.popover_foreground, colors.popover, 4.5);
+                    check("tooltip shortcut", colors.muted_foreground, colors.popover, 4.5);
+                    check("tooltip outline", colors.border, colors.popover, 3.);
+                    check("code chip text", colors.foreground, surfaces.code, 4.5);
+                    check("code chip outline", colors.border, surfaces.code, 3.);
+                    check("selection text", colors.foreground, colors.selection, 4.5);
+
+                    if preset.is_monochrome() {
+                        for surface in [surfaces.chat, surfaces.code] {
+                            check("selection visibility", colors.selection, surface, 1.3);
+                        }
+                        if accent == AccentChoice::default() {
+                            for color in surfaces.text_surfaces().into_iter().chain([
+                                colors.foreground, colors.muted_foreground, colors.primary,
+                                colors.primary_foreground, colors.link, colors.selection,
+                            ]) {
+                                assert_eq!(color.s, 0.);
+                            }
+                            for color in [colors.success, colors.warning, colors.danger] {
+                                assert!(color.s > 0.);
+                            }
+                            assert_ne!(colors.success.h, colors.danger.h);
+                        }
+                    }
                     for background in [colors.table, colors.table_even, colors.table_hover, colors.table_active] {
                         check("table body", colors.foreground, background, 4.5);
                     }
                     check("table header", colors.table_head_foreground, colors.table_head, 4.5);
                     check("table footer", colors.table_foot_foreground, colors.table_foot, 4.5);
-                    for background in [colors.table, colors.table_even, colors.table_hover, colors.table_head] {
+                    for background in [
+                        colors.table, colors.table_even, colors.table_hover, colors.table_head, colors.table_active,
+                    ] {
                         check("table muted text", colors.muted_foreground, background, 4.5);
                         check("table link", colors.link, background, 4.5);
                         check("table border", colors.table_row_border, background, 3.);
@@ -1962,14 +2055,33 @@ mod accent_tests {
                         ("sidebar", colors.sidebar_foreground, colors.sidebar),
                         ("sidebar selected", colors.sidebar_accent_foreground, colors.sidebar_accent),
                         ("secondary", colors.secondary_foreground, colors.secondary),
-                        ("popover secondary", colors.muted_foreground, colors.popover),
                         ("list header", colors.muted_foreground, colors.list_head),
                         ("tab", colors.tab_foreground, colors.tab),
                         ("active tab", colors.tab_active_foreground, colors.tab_active),
-                        ("button", colors.button_foreground, colors.button),
-                        ("secondary button", colors.button_secondary_foreground, colors.button_secondary),
                     ] {
                         check(name, foreground, background, 4.5);
+                    }
+                    for (name, label, fills) in [
+                        ("button", colors.button_foreground, [colors.button, colors.button_hover, colors.button_active]),
+                        ("secondary button", colors.button_secondary_foreground, [
+                            colors.button_secondary, colors.button_secondary_hover, colors.button_secondary_active,
+                        ]),
+                        ("success button", colors.button_success_foreground, [
+                            colors.button_success, colors.button_success_hover, colors.button_success_active,
+                        ]),
+                        ("warning button", colors.button_warning_foreground, [
+                            colors.button_warning, colors.button_warning_hover, colors.button_warning_active,
+                        ]),
+                        ("danger button", colors.button_danger_foreground, [
+                            colors.button_danger, colors.button_danger_hover, colors.button_danger_active,
+                        ]),
+                        ("info button", colors.button_info_foreground, [
+                            colors.button_info, colors.button_info_hover, colors.button_info_active,
+                        ]),
+                    ] {
+                        for fill in fills {
+                            check(name, label, fill, 4.5);
+                        }
                     }
                     let pdf = desktop_pdf_style(colors);
                     check("PDF header", pdf.header_fg, pdf.bg, 4.5);
@@ -1998,14 +2110,17 @@ mod accent_tests {
                     check("stop icon", square, stop, 3.);
                     check("stop control", stop, surfaces.chat, 3.);
 
-                    let highlight = desktop_highlight(colors, surfaces, dark);
+                    let highlight = desktop_highlight(colors, surfaces, preset, dark);
                     let style = &highlight.style;
                     let syntax = serde_json::to_value(&style.syntax).unwrap();
                     for (token, value) in syntax.as_object().unwrap() {
                         let Some(value) = value.get("color").filter(|value| !value.is_null()) else {
                             continue;
                         };
-                        let color = serde_json::from_value(value.clone()).unwrap();
+                        let color: Hsla = serde_json::from_value(value.clone()).unwrap();
+                        if preset.is_monochrome() {
+                            assert_eq!(color.s, 0.);
+                        }
                         for surface in [
                             style.editor_background.unwrap(),
                             style.editor_active_line.unwrap(),

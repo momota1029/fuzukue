@@ -2090,6 +2090,57 @@ mod tests {
     }
 
     #[test]
+    fn theme_gallery_scenario_selects_every_preset_in_both_modes() {
+        use fuzukue_view::appearance::ThemePreset;
+        use gpui_kit::component::ActiveTheme as _;
+
+        let (result, completed) = std::sync::mpsc::channel();
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+            gpui_kit::init(cx);
+            math::init(cx);
+            let (handle, view) = open_workbench_at_size(cx, 1440., 960.).unwrap();
+            cx.spawn(async move |cx| {
+                let mut runner = Runner {
+                    handle, view, target: None, output: PathBuf::new(), read_only: false, seen: HashMap::new(),
+                };
+                let outcome: Result<()> = async {
+                    let settings = tempfile::tempdir()?;
+                    runner.update(cx, |view, _, _| {
+                        view.appearance.isolate_shot_settings(settings.path().join("settings.toml"));
+                    })?;
+                    let scenario: Scenario = serde_json::from_str(include_str!(
+                        "../../../tests/shots/theme-presets-expanded.json"
+                    ))?;
+                    let mut captures = std::collections::HashSet::new();
+                    for step in scenario.steps {
+                        runner.frame(cx)?;
+                        match step {
+                            Step::Screenshot { name } => {
+                                let actual = runner.update(cx, |view, _, cx| {
+                                    let preset = serde_json::to_value(view.appearance.settings.theme.preset)
+                                        .unwrap();
+                                    let mode = if cx.theme().is_dark() { "dark" } else { "light" };
+                                    format!("{}-{mode}", preset.as_str().unwrap())
+                                })?;
+                                assert_eq!(name, actual);
+                                assert!(captures.insert(name));
+                            }
+                            // The headless test opens at the scenario's size.
+                            Step::Size { .. } => {}
+                            step => runner.step(step, cx).await?,
+                        }
+                    }
+                    assert_eq!(captures.len(), ThemePreset::ALL.len() * 2);
+                    Ok(())
+                }.await;
+                result.send(outcome).unwrap();
+                cx.update(|cx| cx.quit());
+            }).detach();
+        });
+        completed.recv().unwrap().unwrap();
+    }
+
+    #[test]
     fn checked_in_scenarios_are_valid_json_steps() {
         for scenario in [
             include_str!("../../../tests/shots/chat.json"),

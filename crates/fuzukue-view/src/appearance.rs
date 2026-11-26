@@ -29,20 +29,47 @@ pub struct DesktopColors {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemePreset {
-    #[default]
-    Classic,
     Parchment,
     Iris,
+    Monochrome,
+    Ink,
+    Fern,
+    Fjord,
+    Terracotta,
+    Rose,
+    Lagoon,
+    #[default]
+    #[serde(other)]
+    Classic,
 }
 
 impl ThemePreset {
-    pub const ALL: [Self; 3] = [Self::Classic, Self::Parchment, Self::Iris];
+    pub const ALL: [Self; 10] = [
+        Self::Classic,
+        Self::Parchment,
+        Self::Iris,
+        Self::Monochrome,
+        Self::Ink,
+        Self::Fern,
+        Self::Fjord,
+        Self::Terracotta,
+        Self::Rose,
+        Self::Lagoon,
+    ];
+
+    pub const fn is_monochrome(self) -> bool {
+        matches!(self, Self::Monochrome | Self::Ink)
+    }
 
     pub const fn accent(self) -> AccentPreset {
         match self {
-            Self::Classic => AccentPreset::Teal,
-            Self::Parchment => AccentPreset::Orange,
+            Self::Classic | Self::Lagoon => AccentPreset::Teal,
+            Self::Parchment | Self::Terracotta => AccentPreset::Orange,
             Self::Iris => AccentPreset::Purple,
+            Self::Monochrome | Self::Ink => AccentPreset::Gray,
+            Self::Fern => AccentPreset::Green,
+            Self::Fjord => AccentPreset::Blue,
+            Self::Rose => AccentPreset::Pink,
         }
     }
 }
@@ -87,6 +114,132 @@ impl DesktopColors {
                 code: 0x1c182b,
                 divider: 0x746488,
                 outline: 0xa492bd,
+            },
+            (Monochrome, false) => Self {
+                background: 0xeeeeee,
+                chrome: 0xe4e4e4,
+                chat: 0xf4f4f4,
+                raised: 0xfafafa,
+                code: 0xdddddd,
+                divider: 0xaaaaaa,
+                outline: 0x747474,
+            },
+            (Monochrome, true) => Self {
+                background: 0x252525,
+                chrome: 0x1d1d1d,
+                chat: 0x2d2d2d,
+                raised: 0x373737,
+                code: 0x212121,
+                divider: 0x696969,
+                outline: 0x9c9c9c,
+            },
+            (Ink, false) => Self {
+                background: 0xfafafa,
+                chrome: 0xf2f2f2,
+                chat: 0xfdfdfd,
+                raised: 0xffffff,
+                code: 0xededed,
+                divider: 0x929292,
+                outline: 0x444444,
+            },
+            (Ink, true) => Self {
+                background: 0x121212,
+                chrome: 0x0b0b0b,
+                chat: 0x1b1b1b,
+                raised: 0x252525,
+                code: 0x0e0e0e,
+                divider: 0x777777,
+                outline: 0xbdbdbd,
+            },
+            (Fern, false) => Self {
+                background: 0xe6f0df,
+                chrome: 0xd9e8d0,
+                chat: 0xf0f6e9,
+                raised: 0xf8fbf3,
+                code: 0xdcead7,
+                divider: 0x9aac93,
+                outline: 0x657d5e,
+            },
+            (Fern, true) => Self {
+                background: 0x222e23,
+                chrome: 0x1a241b,
+                chat: 0x2a382b,
+                raised: 0x334434,
+                code: 0x1a261c,
+                divider: 0x617460,
+                outline: 0x95ac91,
+            },
+            (Fjord, false) => Self {
+                background: 0xe4ecf8,
+                chrome: 0xd7e4f5,
+                chat: 0xedf3fc,
+                raised: 0xf7faff,
+                code: 0xdce7f8,
+                divider: 0x94a8c0,
+                outline: 0x5f7694,
+            },
+            (Fjord, true) => Self {
+                background: 0x1e2a3b,
+                chrome: 0x172132,
+                chat: 0x26354a,
+                raised: 0x2e4057,
+                code: 0x192334,
+                divider: 0x5c7291,
+                outline: 0x92a8c7,
+            },
+            (Terracotta, false) => Self {
+                background: 0xf6e7df,
+                chrome: 0xeed9ce,
+                chat: 0xfbf0e9,
+                raised: 0xfff8f4,
+                code: 0xeedcd1,
+                divider: 0xb79b90,
+                outline: 0x8d6b5d,
+            },
+            (Terracotta, true) => Self {
+                background: 0x32241f,
+                chrome: 0x271b18,
+                chat: 0x3b2b25,
+                raised: 0x48352d,
+                code: 0x231b17,
+                divider: 0x886458,
+                outline: 0xc09a8b,
+            },
+            (Rose, false) => Self {
+                background: 0xf4e5ee,
+                chrome: 0xeed8e5,
+                chat: 0xfaf0f6,
+                raised: 0xfff8fc,
+                code: 0xf0dfe9,
+                divider: 0xb297aa,
+                outline: 0x896780,
+            },
+            (Rose, true) => Self {
+                background: 0x302330,
+                chrome: 0x271a28,
+                chat: 0x3a2a39,
+                raised: 0x473345,
+                code: 0x211822,
+                divider: 0x806480,
+                outline: 0xb89ab4,
+            },
+            (Lagoon, false) => Self {
+                background: 0xe1f0ed,
+                chrome: 0xd3e7e3,
+                chat: 0xeef7f4,
+                raised: 0xf7fcfa,
+                code: 0xd9ebe7,
+                divider: 0x90aaa3,
+                outline: 0x5d7c74,
+            },
+            (Lagoon, true) => Self {
+                background: 0x1e302e,
+                chrome: 0x172624,
+                chat: 0x263c39,
+                raised: 0x2e4944,
+                code: 0x172724,
+                divider: 0x5f7971,
+                outline: 0x8faea5,
             },
             (Classic, true) =>
             Self {
@@ -152,6 +305,7 @@ pub enum AccentPreset {
     Purple,
     Pink,
     Orange,
+    Gray,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,7 +512,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_borders_have_contrast_on_adjacent_surfaces_in_both_themes() {
+    fn desktop_borders_have_contrast_on_adjacent_surfaces_in_every_preset_and_mode() {
         fn luminance(color: u32) -> f64 {
             let linear = |shift: u32| {
                 let channel = f64::from((color >> shift) & 0xff) / 255.;
@@ -371,18 +525,56 @@ mod tests {
             0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0)
         }
 
-        for dark in [false, true] {
-            let colors = DesktopColors::for_preset(ThemePreset::Classic, dark);
-            for (border, minimum) in [(colors.divider, 1.5), (colors.outline, 3.)] {
-                for surface in [
-                    colors.background, colors.chrome, colors.chat, colors.raised, colors.code,
-                ] {
-                    let (border_l, surface_l) = (luminance(border), luminance(surface));
-                    let ratio = (border_l.max(surface_l) + 0.05) / (border_l.min(surface_l) + 0.05);
-                    assert!(ratio >= minimum, "#{border:06x} on #{surface:06x}: {ratio:.2}:1");
+        for preset in ThemePreset::ALL {
+            for dark in [false, true] {
+                let colors = DesktopColors::for_preset(preset, dark);
+                for (border, minimum) in [(colors.divider, 1.5), (colors.outline, 3.)] {
+                    for surface in [
+                        colors.background, colors.chrome, colors.chat, colors.raised, colors.code,
+                    ] {
+                        let (border_l, surface_l) = (luminance(border), luminance(surface));
+                        let ratio = (border_l.max(surface_l) + 0.05) / (border_l.min(surface_l) + 0.05);
+                        assert!(
+                            ratio >= minimum,
+                            "{preset:?} dark={dark}: #{border:06x} on #{surface:06x}: {ratio:.2}:1",
+                        );
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_theme_preset_round_trips_with_its_saved_id() {
+        for (preset, id) in [
+            (ThemePreset::Classic, "classic"),
+            (ThemePreset::Parchment, "parchment"),
+            (ThemePreset::Iris, "iris"),
+            (ThemePreset::Monochrome, "monochrome"),
+            (ThemePreset::Ink, "ink"),
+            (ThemePreset::Fern, "fern"),
+            (ThemePreset::Fjord, "fjord"),
+            (ThemePreset::Terracotta, "terracotta"),
+            (ThemePreset::Rose, "rose"),
+            (ThemePreset::Lagoon, "lagoon"),
+        ] {
+            let settings = AppearanceSettings::from_toml(&format!("[theme]\npreset = '{id}'")).unwrap();
+            assert_eq!(settings.theme.preset, preset);
+            let written = settings.to_toml().unwrap();
+            assert!(written.contains(&format!("preset = \"{id}\"")));
+            assert_eq!(AppearanceSettings::from_toml(&written).unwrap(), settings);
+        }
+    }
+
+    #[test]
+    fn unknown_theme_preset_falls_back_without_losing_other_settings() {
+        let settings = AppearanceSettings::from_toml(
+            "locale = 'en'\n[theme]\npreset = 'future-palette'\nbase = 'dark'\naccent = '#2468ac'",
+        ).unwrap();
+        assert_eq!(settings.locale, "en");
+        assert_eq!(settings.theme.preset, ThemePreset::Classic);
+        assert_eq!(settings.theme.base, ThemePreference::Dark);
+        assert_eq!(settings.theme.accent, AccentChoice::Custom("#2468ac".into()));
     }
 
     #[test]

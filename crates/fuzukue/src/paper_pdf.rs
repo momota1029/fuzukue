@@ -21,6 +21,11 @@ use super::{
     Workbench,
 };
 
+pub(super) fn pdf_card_highlight() -> gpui_kit::Hsla {
+    // PDF pages retain their paper color in both appearance modes.
+    gpui_kit::Hsla::from(gpui_kit::rgb(0xc78000)).opacity(0.42)
+}
+
 #[derive(Default)]
 pub(super) struct PaperPdf {
     decks: HashSet<String>,
@@ -414,7 +419,7 @@ impl Workbench {
 
     fn highlight_pdf_popup(&self, cx: &mut Context<Self>) {
         let Some((_, view)) = &self.pdf else { return };
-        let color = cx.theme().link.opacity(0.10);
+        let color = pdf_card_highlight();
         let highlights = self
             .paper_pdf
             .popup
