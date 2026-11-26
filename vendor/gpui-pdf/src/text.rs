@@ -246,18 +246,18 @@ fn reading_lines(runs: &[Run], page_width: f32) -> Vec<Line> {
         });
     }
 
-    // First split rows at large horizontal gaps. A recurring gap in the body
-    // identifies a column gutter. Each candidate is scored against all gap intervals.
+    // Repeated gaps only support columns if their right-hand fragments start
+    // at a common margin. Justified text and inline math can have wide gaps
+    // on several rows without lining up at that margin.
     let mut gaps = Vec::new();
-    let mut previous_ink: Option<(f32, f32, f32, f32)> = None;
-    for row in &mut rows {
+    let mut previous_ink: Option<(usize, f32, f32, f32, f32)> = None;
+    for (row_id, row) in rows.iter_mut().enumerate() {
         row.runs.sort_by(|&a, &b| {
             runs[a]
                 .reading_x
                 .total_cmp(&runs[b].reading_x)
                 .then(a.cmp(&b))
         });
-        let min_gap = (row.em * 2.5).max(page_width * 0.025);
         let mut left = f32::INFINITY;
         let mut right = f32::NEG_INFINITY;
         for &id in &row.runs {
@@ -265,82 +265,63 @@ fn reading_lines(runs: &[Run], page_width: f32) -> Vec<Line> {
             if glyph.text == " " {
                 continue;
             }
-            if is_gutter(right, glyph.reading_x, min_gap, page_width) {
-                gaps.push((right, glyph.reading_x));
+            if let Some((start, end)) = gutter_interval(right, glyph.reading_x, row.em, page_width) {
+                gaps.push((row_id, start, end));
             }
             left = left.min(glyph.reading_x);
             right = right.max(glyph.reading_right);
         }
-        // Two columns can have different leading. Nearby rows with disjoint ink
-        // give the same evidence as two fragments on one shared baseline.
-        if let Some((old_left, old_right, baseline, em)) = previous_ink
+        // Columns with different leading can appear on adjacent baselines.
+        if let Some((old_row, old_left, old_right, baseline, em)) = previous_ink
             && row.baseline - baseline <= 1.6 * row.em.max(em)
         {
-            let (end, start) = if old_left < left {
-                (old_right, left)
+            let (right_row, end, start, right_em) = if old_left < left {
+                (row_id, old_right, left, row.em)
             } else {
-                (right, old_left)
+                (old_row, right, old_left, em)
             };
-            if is_gutter(end, start, min_gap, page_width) {
-                gaps.push((end, start));
+            if let Some((start, end)) = gutter_interval(end, start, right_em, page_width) {
+                gaps.push((right_row, start, end));
             }
         }
         if left < right {
-            previous_ink = Some((left, right, row.baseline, row.em));
+            previous_ink = Some((row_id, left, right, row.baseline, row.em));
         }
     }
-    let gutter = column_gutter(&gaps, page_width);
+    let splits = column_gutter(&gaps, rows.len(), page_width).and_then(|(support, x)| {
+        let splits: Vec<_> = rows.iter()
+            .map(|row| split_at_gutter(row, runs, x, page_width))
+            .collect();
+        // A few spanning headings or equations are normal. Through-running
+        // text as common as the aligned gaps makes the gutter ambiguous.
+        (splits.iter().filter(|split| split.is_none()).count() < support).then_some(splits)
+    });
 
     // Read down each column until a spanning row or a large vertical break,
     // then resume column-by-column below it.
     let mut lines = Vec::new();
     let mut right_column = Vec::new();
     let mut previous: Option<(f32, f32)> = None;
-    for row in rows {
+    for (row_id, mut row) in rows.into_iter().enumerate() {
         if previous.is_some_and(|(baseline, em)| row.baseline - baseline > 2.5 * em.max(row.em)) {
             lines.append(&mut right_column);
         }
         previous = Some((row.baseline, row.em));
-        if let Some(x) = gutter {
-            let mut left = Vec::new();
-            let mut right = Vec::new();
-            for &id in &row.runs {
-                if runs[id].reading_x < x {
-                    left.push(id);
-                } else {
-                    right.push(id);
-                }
+        if let Some(split) = splits.as_ref().and_then(|splits| splits[row_id]) {
+            let right = row.runs.split_off(split);
+            if row.runs.iter().any(|&id| runs[id].text != " ") {
+                lines.push(Line {
+                    runs: row.runs,
+                    column: Column::Left,
+                });
             }
-            // A row with ink on both sides but no gutter-sized break crosses it.
-            let left_end = left
-                .iter()
-                .filter(|&&id| runs[id].text != " ")
-                .map(|&id| runs[id].reading_right)
-                .reduce(f32::max);
-            let right_start = right
-                .iter()
-                .find(|&&id| runs[id].text != " ")
-                .map(|&id| runs[id].reading_x);
-            let crosses = match (left_end, right_start) {
-                (Some(end), Some(start)) => start - end < (row.em * 2.5).max(page_width * 0.025),
-                (Some(end), None) => end >= x,
-                _ => false,
-            };
-            if !crosses {
-                if left_end.is_some() {
-                    lines.push(Line {
-                        runs: left,
-                        column: Column::Left,
-                    });
-                }
-                if right_start.is_some() {
-                    right_column.push(Line {
-                        runs: right,
-                        column: Column::Right,
-                    });
-                }
-                continue;
+            if right.iter().any(|&id| runs[id].text != " ") {
+                right_column.push(Line {
+                    runs: right,
+                    column: Column::Right,
+                });
             }
+            continue;
         }
         lines.append(&mut right_column);
         lines.push(Line {
@@ -352,35 +333,72 @@ fn reading_lines(runs: &[Run], page_width: f32) -> Vec<Line> {
     lines
 }
 
-fn column_gutter(gaps: &[(f32, f32)], page_width: f32) -> Option<f32> {
-    // Sweep the gap endpoints so a gutter can be found even between lines
-    // with very different ink widths. Prefer the page center on ties.
-    let mut edges: Vec<_> = gaps.iter().flat_map(|&(a, b)| [(a, 1), (b, -1)]).collect();
-    edges.sort_by(|(a, _), (b, _)| a.total_cmp(b));
-    let mut active = 0;
+fn column_gutter(
+    gaps: &[(usize, f32, f32)],
+    row_count: usize,
+    page_width: f32,
+) -> Option<(usize, f32)> {
+    let mut edges: Vec<_> = gaps.iter()
+        .flat_map(|&(row, start, end)| [(start, row, true), (end, row, false)])
+        .collect();
+    edges.sort_by(|(a, _, _), (b, _, _)| a.total_cmp(b));
+    let mut active = vec![0; row_count];
+    let mut support = 0;
     let mut best = None;
     for pair in edges.windows(2) {
-        let [(start, delta), (end, _)] = [pair[0], pair[1]];
-        active += delta;
-        if active < 2 || start >= end {
+        let [(start, row, opens), (end, _, _)] = [pair[0], pair[1]];
+        // A staggered row can pair with both neighbors. Count it only once.
+        if opens {
+            support += usize::from(active[row] == 0);
+            active[row] += 1;
+        } else {
+            active[row] -= 1;
+            support -= usize::from(active[row] == 0);
+        }
+        if support < 3 || start >= end {
             continue;
         }
-        let inset = page_width * 0.01;
-        let x = if end - start > 2.0 * inset {
-            (page_width * 0.5).clamp(start + inset, end - inset)
-        } else {
-            (start + end) * 0.5
-        };
-        let score = (active, -(x - page_width * 0.5).abs());
+        let x = (start + end) * 0.5;
+        let score = (support, -(x - page_width * 0.5).abs());
         if best.is_none_or(|(previous, _)| score > previous) {
             best = Some((score, x));
         }
     }
-    best.map(|(_, x)| x)
+    best.map(|((support, _), x)| (support, x))
 }
 
-fn is_gutter(left_end: f32, right_start: f32, min_gap: f32, width: f32) -> bool {
-    right_start - left_end >= min_gap && left_end > width * 0.16 && right_start < width * 0.84
+fn min_column_gap(em: f32, page_width: f32) -> f32 {
+    (em * 2.5).max(page_width * 0.025)
+}
+
+fn gutter_interval(left_end: f32, right_start: f32, em: f32, width: f32) -> Option<(f32, f32)> {
+    if right_start - left_end < min_column_gap(em, width)
+        || left_end <= width * 0.16
+        || right_start >= width * 0.84
+    {
+        return None;
+    }
+    let alignment = (em * 0.75).max(width * 0.01);
+    Some((right_start - 2.0 * alignment, right_start - alignment))
+}
+
+fn split_at_gutter(row: &Row, runs: &[Run], x: f32, page_width: f32) -> Option<usize> {
+    let split = row.runs.partition_point(|&id| runs[id].reading_x < x);
+    let left_end = row.runs[..split]
+        .iter()
+        .filter(|&&id| runs[id].text != " ")
+        .map(|&id| runs[id].reading_right)
+        .reduce(f32::max);
+    let right_start = row.runs[split..]
+        .iter()
+        .find(|&&id| runs[id].text != " ")
+        .map(|&id| runs[id].reading_x);
+    let crosses = match (left_end, right_start) {
+        (Some(end), Some(start)) => start - end < min_column_gap(row.em, page_width),
+        (Some(end), None) => end >= x,
+        _ => false,
+    };
+    (!crosses).then_some(split)
 }
 
 #[derive(Clone)]

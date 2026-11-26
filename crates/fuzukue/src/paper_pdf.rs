@@ -27,6 +27,7 @@ pub(super) struct PaperPdf {
     maps: HashMap<String, (String, Vec<PdfCardRegion>)>,
     selected_paths: HashMap<String, String>,
     requested: HashSet<String>,
+    source_lookup: Option<(String, String)>,
     pub(super) popup: Option<PdfPopup>,
     pub(super) selection_comment: Option<(CommentTarget, Point<Pixels>)>,
 }
@@ -79,6 +80,7 @@ impl Workbench {
     pub(super) fn invalidate_paper_pdf_maps(&mut self) {
         self.paper_pdf.requested.clear();
         self.paper_pdf.maps.clear();
+        self.paper_pdf.source_lookup = None;
     }
 
     pub(super) fn refresh_other_paper_pdf(
@@ -97,6 +99,22 @@ impl Workbench {
     pub(super) fn request_current_pdf_map(&mut self, path: &str, cx: &mut Context<Self>) {
         if self.paper_pdf_path().as_deref() == Some(path)
             && !self.paper_jobs.contains_key(&(self.deck.clone(), None))
+        {
+            self.request_pdf_map(path, cx);
+        }
+    }
+
+    pub(super) fn ensure_standalone_pdf_map(&mut self, path: &str, cx: &mut Context<Self>) {
+        let build = if self.deck.is_empty() {
+            "build".into()
+        } else {
+            format!("{}/build", self.deck)
+        };
+        if self.protocol >= 10
+            && self.right == RightPane::Pdf
+            && path.rsplit_once('/').is_some_and(|(parent, _)| parent == build)
+            && self.pdf_digest.is_some()
+            && self.pdf_regions().is_none()
         {
             self.request_pdf_map(path, cx);
         }
@@ -210,6 +228,7 @@ impl Workbench {
                     .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
                 self.paper_pdf.selection_comment = None;
                 self.highlight_pdf_popup(cx);
+                self.ensure_standalone_pdf_map(path, cx);
             }
             PdfEvent::PageClicked {
                 page,
@@ -261,16 +280,89 @@ impl Workbench {
                 secondary: true,
                 click_count: 1,
                 ..
-            } if self.right == RightPane::Pdf => {
-                let _ = self.out.send(ClientMsg::LocatePdf {
+            } if self.pdf_lookup_visible(path) => {
+                self.paper_pdf.source_lookup = None;
+                if let Some((card, proof)) = self.pdf_card_at(*page, *x, *y) {
+                    self.jump_to_pdf_card(card, proof, cx);
+                } else if self.out.send(ClientMsg::LocatePdf {
                     pdf: path.into(),
                     page: *page,
                     x: *x,
                     y: *y,
-                });
+                }).is_ok() {
+                    self.paper_pdf.source_lookup = Some((path.into(), self.deck.clone()));
+                }
             }
             _ => {}
         }
+    }
+
+    fn pdf_lookup_visible(&self, path: &str) -> bool {
+        self.pdf_path.as_deref() == Some(path)
+            && (self.paper_pdf_visible() || self.right == RightPane::Pdf)
+    }
+
+    pub(super) fn on_pdf_source_location(
+        &mut self,
+        pdf: String,
+        file: String,
+        line: u64,
+        card: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .paper_pdf
+            .source_lookup
+            .as_ref()
+            .is_some_and(|(path, deck)| *path == pdf && *deck == self.deck)
+        {
+            return;
+        }
+        self.paper_pdf.source_lookup = None;
+        if !self.pdf_lookup_visible(&pdf) {
+            return;
+        }
+        if let Some(id) = card
+            .as_ref()
+            .filter(|id| self.cards.iter().any(|entry| &entry.id == *id))
+        {
+            self.jump_to_pdf_card(id.clone(), true, cx);
+        } else if std::path::Path::new(&file).is_relative() && !file.is_empty() {
+            let lines = usize::try_from(line).ok().map(|line| line..=line);
+            self.open_source_file(file, lines, window, cx);
+        } else {
+            let line = line.to_string();
+            self.notice = Some(
+                match card {
+                    Some(id) => tr!("workbench-source-card-missing", file = file, line = line, id = id),
+                    None => tr!("workbench-is-outside-any-card", file = file, line = line),
+                }
+                .into(),
+            );
+        }
+    }
+
+    fn jump_to_pdf_card(&mut self, card: String, proof: bool, cx: &mut Context<Self>) {
+        let from_standalone = self.right == RightPane::Pdf;
+        if let Some(popup) = self.paper_pdf.popup.take() {
+            // Keep the popup editor in the paper card view, including proof drafts.
+            if self.card_editor(&popup.card, true).is_some() {
+                self.open_proofs
+                    .entry(self.deck.clone())
+                    .or_default()
+                    .insert(popup.card.clone());
+                self.remeasure_card(&popup.card);
+            }
+            self.highlight_pdf_popup(cx);
+        }
+        let show_proof = proof || self.card_editor(&card, true).is_some();
+        self.scroll_paper_to_card(card.clone(), show_proof, cx);
+        if self.right == RightPane::Read {
+            self.highlight_paper_card(card, cx);
+        }
+        self.from_pdf = from_standalone;
+        self.notice = None;
     }
 
     fn pdf_card_at(&self, page: usize, x: f32, y: f32) -> Option<(String, bool)> {

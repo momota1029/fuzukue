@@ -1521,15 +1521,19 @@ impl Workbench {
                 }
             }
             self.scroll_paper_to_card(card.clone(), false, cx);
-            let timer = cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_secs(3)).await;
-                let _ = this.update(cx, |this, cx| {
-                    this.paper_highlight = None;
-                    cx.notify();
-                });
-            });
-            self.paper_highlight = Some((card, timer));
+            self.highlight_paper_card(card, cx);
         }
+    }
+
+    pub(super) fn highlight_paper_card(&mut self, card: String, cx: &mut Context<Self>) {
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.paper_highlight = None;
+                cx.notify();
+            });
+        });
+        self.paper_highlight = Some((card, timer));
     }
 
     pub(super) fn jump_to_card(&mut self, id: String, cx: &mut Context<Self>) {

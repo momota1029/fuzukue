@@ -12,6 +12,8 @@
     {"action": "click_pdf_card", "card": "thm-sphere-concentration"},
     {"action": "screenshot", "name": "popup"},
     {"action": "click", "id": "edit-pdf-card"},
-    {"action": "screenshot", "name": "edit"}
+    {"action": "screenshot", "name": "edit"},
+    {"action": "click_pdf_card", "card": "thm-sphere-concentration", "ctrl": true},
+    {"action": "screenshot", "name": "card"}
   ]
 }

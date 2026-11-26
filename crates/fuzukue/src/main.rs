@@ -1576,6 +1576,9 @@ impl Workbench {
                         ServerEvent::LedgerChanged => self.ledger_changed(cx),
                         ServerEvent::LibraryResults { request, hits, more, decks } => self.on_library_results(request, hits, more, decks),
                         ServerEvent::SymbolResults { request, results } => self.on_symbol_results(request, results, window, cx),
+                        ServerEvent::Located { pdf, file, line, card } if !self.receiving_backlog => {
+                            self.on_pdf_source_location(pdf, file, line, card, window, cx);
+                        }
                         event @ ServerEvent::Threads { .. } => {
                             if !self.transcripts.scoped {
                                 // Legacy snapshots mark the end of replay.
@@ -2183,16 +2186,6 @@ impl Workbench {
                     }
                 }
             }
-            ServerEvent::Located { card, file, line, pdf } if self.right == RightPane::Pdf
-                && self.pdf_path.as_ref() == Some(&pdf) => match card {
-                Some(id) if self.cards.iter().any(|c| c.id == id) => {
-                    self.jump_to_card(id, cx);
-                    self.from_pdf = true;
-                    self.notice = None;
-                }
-                Some(id) => self.notice = Some(tr!("workbench-source-card-missing", file = file.to_string(), line = line.to_string(), id = id.to_string()).into()),
-                None => self.notice = Some(tr!("workbench-is-outside-any-card", file = file.to_string(), line = line.to_string()).into()),
-            },
             ServerEvent::Saved { path } => {
                 if self.protocol < fuzukue_proto::EDITOR_PROTOCOL
                     && self.editing.as_ref().is_some_and(|editor| editor.path == path)
@@ -2605,6 +2598,7 @@ impl Workbench {
         if self.pdf_path.as_ref() == Some(&path) {
             if let Some((_, view)) = &self.pdf {
                 view.update(cx, |pdf, cx| pdf.set_outline_enabled(true, cx));
+                self.ensure_standalone_pdf_map(&path, cx);
             }
             cx.notify();
             return;
@@ -3058,6 +3052,7 @@ impl Workbench {
             if *cur == pdf {
                 view.update(cx, |v, cx| v.reveal_highlight(index, cx));
                 self.right = RightPane::Pdf;
+                self.ensure_standalone_pdf_map(&pdf, cx);
                 cx.notify();
                 return;
             }

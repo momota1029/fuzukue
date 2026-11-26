@@ -143,6 +143,70 @@ endcmap CMapName currentdict /CMap defineresource pop end end";
 }
 
 #[test]
+fn justified_japanese_with_inline_math_selects_whole_middle_lines() {
+    let mapping = "
+/CIDInit /ProcSet findresource begin
+12 dict begin begincmap
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+6 beginbfchar
+<41> <8A3C>
+<42> <660E>
+<43> <306E>
+<44> <65B9>
+<48> <91DD>
+<4A> <5199>
+endbfchar
+endcmap CMapName currentdict /CMap defineresource pop end end";
+    // The runs on each body line have changing starts after a large gap,
+    // as with justified text around inline formulae in an untagged PDF.
+    let content = "
+BT /F1 14 Tf 56 730 Td (ABCDH) Tj ET
+BT /F1 11 Tf 56 705 Td (Lipschitz J construction under condition x) Tj
+/F1 8 Tf 4 Ts (2) Tj 0 Ts /F1 11 Tf 1 0 0 1 308 705 Tm (AB third chapter) Tj ET
+BT /F1 11 Tf 56 689 Td (pyramid CC and the volume bound X) Tj
+1 0 0 1 330 689 Tm (JC measure) Tj ET
+BT /F1 11 Tf 56 673 Td (section 3.5 G gives the following estimate y) Tj
+1 0 0 1 351 673 Tm (AB continues) Tj ET";
+    let doc = parse(pdf_with_mapping(content, LETTER, Some(mapping)).into()).unwrap();
+    let text = extract_page_text(&doc, 0).unwrap();
+    let from = text.locate("itz", 0)[0];
+    let from = NormPoint {
+        x: from.x + 0.001,
+        y: from.y + from.h / 2.,
+    };
+    let to = text.locate("G", 0)[0];
+    let to = NormPoint {
+        x: to.x + to.w / 2.,
+        y: to.y + to.h / 2.,
+    };
+    let [write, proof, bright, of] =
+        [0x5199, 0x8a3c, 0x660e, 0x306e].map(|code| char::from_u32(code).unwrap());
+    let first = format!("itz{write}constructionunderconditionx2{proof}{bright}thirdchapter");
+    let middle = format!("pyramid{of}{of}andthevolumeboundX{write}{of}measure");
+    let middle_rect = text.locate(&middle, 0)[0];
+    let expected = [first.as_str(), middle.as_str(), "section3.5G"];
+
+    for (start, end) in [(from, to), (to, from)] {
+        let selected = text.selected_text(start, end).unwrap();
+        let lines: Vec<String> = selected
+            .lines()
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        assert_eq!(lines, expected);
+        let selection = text.select(start, end).unwrap();
+        assert_eq!(selection.rects.len(), 3);
+        assert_eq!(selection.rects[1], middle_rect);
+        assert_eq!(
+            text.locate(&selection.quote, selection.occurrence),
+            selection.rects
+        );
+    }
+}
+
+#[test]
 fn crop_clips_selection_to_the_same_edge_as_the_raster() {
     for rotation in [0, 90, 180, 270] {
         let specification = format!(

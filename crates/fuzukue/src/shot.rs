@@ -199,7 +199,11 @@ enum Step {
     ExpandProofs,
     BuildPaper,
     WaitPdf,
-    ClickPdfCard { card: String },
+    ClickPdfCard {
+        card: String,
+        #[serde(default)]
+        ctrl: bool,
+    },
     Click {
         id: Option<String>,
         x: Option<f32>,
@@ -1048,14 +1052,14 @@ impl Runner {
             }
             Step::WaitPdf => {
                 self.wait_for_with_context(cx, "first PDF page", TIMEOUT_MS, |view, _, cx| {
-                    view.paper_pdf_visible()
+                    (view.paper_pdf_visible() || view.right == RightPane::Pdf)
                         && view.pdf.as_ref().is_some_and(|(_, pdf)| pdf.read(cx).page_ready(0))
                 }).await?;
             }
-            Step::ClickPdfCard { card } => {
+            Step::ClickPdfCard { card, ctrl } => {
                 self.wait_for(cx, "PDF card map", TIMEOUT_MS, |view, _| view.pdf_regions().is_some()).await?;
                 let (page, x, y) = self.update(cx, |view, _, cx| {
-                    ensure!(view.paper_pdf_visible(), "paper PDF is closed");
+                    ensure!(view.paper_pdf_visible() || (ctrl && view.right == RightPane::Pdf), "paper PDF is closed");
                     let region = view.pdf_regions().unwrap().iter()
                         .filter(|region| region.card == card)
                         .min_by_key(|region| (region.page, region.proof))
@@ -1077,10 +1081,18 @@ impl Runner {
                         "PDF point is outside the visible page");
                     Ok::<_, anyhow::Error>(point)
                 })??;
-                self.click(cx, ClickTarget::Coordinates { x: position.x.into(), y: position.y.into() })?;
-                self.wait_for(cx, "PDF card popup", TIMEOUT_MS, |view, _| {
-                    view.paper_pdf.popup.as_ref().is_some_and(|popup| popup.card == card)
-                }).await?;
+                if ctrl {
+                    self.ctrl_click_pdf(cx, position)?;
+                    self.wait_for(cx, "PDF card jump", TIMEOUT_MS, |view, _| {
+                        !view.paper_pdf_visible() && view.right == RightPane::Read
+                            && view.paper_jump.as_ref().is_some_and(|jump| jump.card == card && !jump.pending)
+                    }).await?;
+                } else {
+                    self.click(cx, ClickTarget::Coordinates { x: position.x.into(), y: position.y.into() })?;
+                    self.wait_for(cx, "PDF card popup", TIMEOUT_MS, |view, _| {
+                        view.paper_pdf.popup.as_ref().is_some_and(|popup| popup.card == card)
+                    }).await?;
+                }
             }
             Step::Scroll { pane, pixels } => {
                 self.update(cx, |view, _, cx| {
@@ -1454,6 +1466,23 @@ impl Runner {
         self.click(cx, ClickTarget::Element { id: menu.into() })?;
         self.frame(cx)?;
         self.click(cx, ClickTarget::Element { id: item.into() })
+    }
+
+    fn ctrl_click_pdf(&self, cx: &mut AsyncApp, position: gpui_kit::Point<gpui_kit::Pixels>) -> Result<()> {
+        cx.update_window(self.handle, |_, window, cx| {
+            let mac = cx.platform_info().is_mac();
+            let modifiers = gpui_kit::Modifiers { control: !mac, platform: mac, ..Default::default() };
+            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                position, modifiers, ..Default::default()
+            }), cx);
+            window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent {
+                position, modifiers, click_count: 1, ..Default::default()
+            }), cx);
+            window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent {
+                position, modifiers, click_count: 1, ..Default::default()
+            }), cx);
+        })?;
+        Ok(())
     }
 
     fn click(&self, cx: &mut AsyncApp, target: ClickTarget) -> Result<()> {
@@ -6233,7 +6262,11 @@ mod tests {
         pdf.into_bytes()
     }
 
-    async fn check_paper_pdf(runner: &mut Runner, cx: &mut AsyncApp) -> Result<()> {
+    async fn check_paper_pdf(
+        runner: &mut Runner,
+        messages: &std::sync::mpsc::Receiver<ClientMsg>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
         use gpui_kit::{ScrollDelta, ScrollEvent};
         use fuzukue_proto::PdfCardRegion;
         use sha2::{Digest, Sha256};
@@ -6300,7 +6333,7 @@ mod tests {
             }
         }
 
-        runner.step(Step::ClickPdfCard { card: "lemma".into() }, cx).await?;
+        runner.step(Step::ClickPdfCard { card: "lemma".into(), ctrl: false }, cx).await?;
         let popup = |runner: &Runner, cx: &mut AsyncApp| runner.update(cx, |_, window, _| {
             window.shot_element_bounds("pdf-card-popup").expect("visible popup")
         });
@@ -6337,7 +6370,7 @@ mod tests {
         runner.click(cx, ClickTarget::Coordinates { x: outside.x.into(), y: outside.y.into() })?;
         runner.wait_for(cx, "dismissed PDF card", TIMEOUT_MS, |view, _| view.paper_pdf.popup.is_none()).await?;
         let (from, to) = runner.update(cx, |view, _, cx| {
-            view.receive_paper_pdf_map(view.deck.clone(), path, format!("{:x}", Sha256::digest(&updated)),
+            view.receive_paper_pdf_map(view.deck.clone(), path.clone(), format!("{:x}", Sha256::digest(&updated)),
                 map, true, cx);
             let pdf = view.pdf.as_ref().unwrap().1.read(cx);
             let at = |x| pdf.page_screen_bounds(0, (x, 0.122, 0., 0.)).unwrap().origin;
@@ -6399,6 +6432,72 @@ mod tests {
             runner.frame(cx)?;
             runner.update(cx, |view, window, _| assert_comment_only(view, window))?;
         }
+        runner.step(Step::ClickPdfCard { card: "lemma".into(), ctrl: false }, cx).await?;
+        runner.step(Step::Click { id: Some("edit-pdf-card".into()), x: None, y: None }, cx).await?;
+        runner.step(Step::Key { key: "Ctrl+a".into() }, cx).await?;
+        runner.step(Step::Type { text: "Unsaved statement".into() }, cx).await?;
+        runner.step(Step::ClickPdfCard { card: "lemma".into(), ctrl: true }, cx).await?;
+        runner.update(cx, |view, window, _| {
+            assert!(view.paper_highlight.as_ref().is_some_and(|(card, _)| card == "lemma"));
+            assert!(window.shot_element_bounds("read-head-lemma").is_some());
+            assert!(view.paper_pdf.popup.is_none());
+            assert_eq!(geometry(window), before);
+        })?;
+        runner.step(Step::Click { id: Some("save-paper-card".into()), x: None, y: None }, cx).await?;
+        runner.update(cx, |view, _, cx| {
+            let request = view.card_save_request;
+            let body = messages.try_iter().find_map(|message| match message {
+                ClientMsg::SaveCard { request: id, card, body, .. }
+                    if card == "lemma" && id == request => Some(body),
+                _ => None,
+            });
+            assert_eq!(body.as_deref(), Some("Unsaved statement"));
+            view.on_event(ServerEvent::CardSaveResult {
+                request, outcome: fuzukue_proto::CardSaveOutcome::Saved,
+            }, cx);
+            view.open_pdf(path.clone(), None, cx);
+        })?;
+        runner.step(Step::ClickPdfCard { card: "lemma".into(), ctrl: true }, cx).await?;
+        runner.update(cx, |view, _, cx| {
+            assert!(view.from_pdf);
+            assert!(view.paper_highlight.as_ref().is_some_and(|(card, _)| card == "lemma"));
+            assert!(!messages.try_iter().any(|message| matches!(message, ClientMsg::LocatePdf { .. })));
+            view.set_paper_pdf(true, cx);
+        })?;
+
+        // A click beyond the mapped rectangle still consults SyncTeX in both views.
+        for standalone in [false, true] {
+            if standalone {
+                runner.update(cx, |view, _, cx| view.open_pdf(path.clone(), None, cx))?;
+            }
+            runner.step(Step::WaitPdf, cx).await?;
+            let position = runner.update(cx, |view, _, cx| {
+                view.pdf.as_ref().unwrap().1.read(cx)
+                    .page_screen_bounds(0, (0.62, 0.122, 0., 0.)).unwrap().origin
+            })?;
+            runner.ctrl_click_pdf(cx, position)?;
+            runner.wait_for(cx, "SyncTeX request", TIMEOUT_MS, |_, _| {
+                messages.try_iter().any(|message| matches!(
+                    message, ClientMsg::LocatePdf { pdf, page: 0, x, .. }
+                        if pdf == path && (x - 0.62).abs() < 0.01
+                ))
+            }).await?;
+            runner.update(cx, |view, window, cx| {
+                let card = (!standalone).then(|| "lemma".into());
+                view.on_pdf_source_location(path.clone(), "paper.tex".into(), 42, card, window, cx);
+                if standalone {
+                    assert!(view.right == RightPane::Source);
+                } else {
+                    assert!(view.right == RightPane::Read && !view.paper_pdf_visible());
+                    assert!(view.paper_highlight.as_ref().is_some_and(|(card, _)| card == "lemma"));
+                }
+            })?;
+        }
+
+        runner.update(cx, |view, _, cx| {
+            view.open_paper_pdf_artifact(view.deck.clone(), path, cx);
+        })?;
+        runner.step(Step::WaitPdf, cx).await?;
         check_pdf_cross_page_drag(runner, cx).await?;
         Ok(())
     }
@@ -6982,7 +7081,7 @@ mod tests {
                             assert!(view.card_editor("lemma", false).is_none());
                             view.protocol = 10;
                         })?;
-                        check_paper_pdf(&mut runner, cx).await?;
+                        check_paper_pdf(&mut runner, &messages, cx).await?;
                         Ok(())
                     }.await;
                     let _ = result.send(outcome);
