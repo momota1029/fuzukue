@@ -45,6 +45,7 @@ enum Flow {
     List {
         start: Option<usize>,
         items: Vec<Item>,
+        bibliography: bool,
     },
     Code {
         info: String,
@@ -251,7 +252,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn blocks(&self, input: &mut Input<'_>, end: Option<&str>, in_list: bool) -> Vec<Block> {
+    fn blocks(&self, input: &mut Input<'_>, end: Option<&str>, item: Option<&str>) -> Vec<Block> {
         let mut blocks = Vec::new();
         let mut paragraph = Vec::new();
         while !input.rest().is_empty() {
@@ -260,7 +261,7 @@ impl<'a> Reader<'a> {
             let command = next.control();
             if let Some(end) = end {
                 let mut closing = *input;
-                if closing.environment_end(end) || (in_list && command == Some("item")) {
+                if closing.environment_end(end) || (item.is_some() && command == item) {
                     break;
                 }
             }
@@ -671,15 +672,17 @@ impl<'a> Reader<'a> {
                     |name| format!("\\begin{{{name}}}{math}\\end{{{name}}}"),
                 ))
             }
-            "enumerate" | "itemize" | "description" => self.list(input, name, base == "enumerate"),
+            "enumerate" | "itemize" | "description" | "thebibliography" => {
+                self.list(input, name, base == "enumerate")
+            }
             _ if is_literal_environment(name) => Self::code(input, name, base, begin),
             "abstract" => {
-                let body = self.blocks(input, Some(name), false);
+                let body = self.blocks(input, Some(name), None);
                 input.environment_end(name);
                 Flow::Abstract(body)
             }
             "quote" | "quotation" | "center" => {
-                let body = self.blocks(input, Some(name), false);
+                let body = self.blocks(input, Some(name), None);
                 input.environment_end(name);
                 if base == "center" {
                     Flow::Center(body)
@@ -725,12 +728,12 @@ impl<'a> Reader<'a> {
                     heading.push(text(" · ", first.source.start..first.source.start));
                     heading.extend(title);
                 }
-                let body = self.blocks(input, Some(name), false);
+                let body = self.blocks(input, Some(name), None);
                 input.environment_end(name);
                 Flow::Theorem { heading, body }
             }
             _ => {
-                let body = self.blocks(input, Some(name), false);
+                let body = self.blocks(input, Some(name), None);
                 input.environment_end(name);
                 Flow::Environment {
                     name: name.into(),
@@ -741,6 +744,11 @@ impl<'a> Reader<'a> {
     }
 
     fn list(&self, input: &mut Input<'_>, name: &str, ordered: bool) -> Flow {
+        let bibliography = name == "thebibliography";
+        let item = if bibliography { "bibitem" } else { "item" };
+        if bibliography {
+            input.arg('{'); // Width sample for the printed labels.
+        }
         let options = input.arg('[');
         let option = |name: &str| {
             options?.rest().split(',').find_map(|entry| {
@@ -756,7 +764,7 @@ impl<'a> Reader<'a> {
         let mut items = Vec::new();
         let mut custom_labels = template.is_some();
         let mut number = start;
-        let initial = self.blocks(input, Some(name), true);
+        let initial = self.blocks(input, Some(name), Some(item));
         if !initial.is_empty() {
             items.push(Item {
                 label: None,
@@ -766,12 +774,20 @@ impl<'a> Reader<'a> {
         loop {
             let at = input.pos;
             let mut next = *input;
-            if next.control() != Some("item") {
+            if next.control() != Some(item) {
                 break;
             }
             *input = next;
             let explicit = input.arg('[');
-            let label = if let Some(label) = explicit {
+            let label = if bibliography {
+                let key = input.arg('{');
+                let resolved = key.and_then(|key| self.refs?.citations.get(key.rest()));
+                let value = resolved.cloned()
+                    .or_else(|| explicit.map(|label| plain_runs(&self.runs(label))))
+                    .unwrap_or_else(|| number.to_string());
+                number += 1;
+                Some(vec![text(&format!("[{value}]"), at..input.pos)])
+            } else if let Some(label) = explicit {
                 custom_labels = true;
                 Some(self.runs(label))
             } else if ordered || template.is_some() {
@@ -791,12 +807,12 @@ impl<'a> Reader<'a> {
             } else {
                 None
             };
-            let body = self.blocks(input, Some(name), true);
+            let body = self.blocks(input, Some(name), Some(item));
             items.push(Item { label, body });
         }
         input.environment_end(name);
         let start = (ordered && !custom_labels).then_some(start);
-        Flow::List { start, items }
+        Flow::List { start, items, bibliography }
     }
 
     fn code(input: &mut Input<'_>, name: &str, base: &str, begin: usize) -> Flow {
@@ -940,7 +956,7 @@ pub fn read_card_tex(
             end: tex.len(),
         },
         None,
-        false,
+        None,
     );
     markdown::serialize(tex, &blocks)
 }

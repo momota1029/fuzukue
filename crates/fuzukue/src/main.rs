@@ -358,6 +358,7 @@ enum ReadRow {
     Section(String),
     Subsection(String),
     Prose(fuzukue_proto::DocProseText),
+    Unmatched,
     Card(String),
 }
 

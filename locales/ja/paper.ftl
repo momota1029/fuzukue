@@ -28,6 +28,7 @@ paper-math-review = 数学査読
 paper-output-review = 出力査読
 paper-consistency-review = 整合確認
 paper-missing-card = { $id }（カードがない）
+paper-unmatched-cards = 原稿内の位置が未確認のカード
 paper-no-pdf-has-been-built = ビルドした PDF がない
 paper-open-as-card = カードで開く
 paper-pdf-build = PDF ビルド

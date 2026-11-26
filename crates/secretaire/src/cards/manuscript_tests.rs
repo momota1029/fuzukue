@@ -323,3 +323,139 @@ fn large_prose_has_a_small_outline_and_bounded_utf8_excerpts() -> Result<()> {
     assert_eq!(prose(&deck, excerpt)?.trim(), text);
     Ok(())
 }
+
+#[test]
+fn writing_harness_projects_title_and_end_hooks_around_the_editable_outline() -> Result<()> {
+    let dir = TestDir::new();
+    dir.write("fictional/deck.toml", "kind = 'paper'\n");
+    let rel = "fictional/harness";
+    let deck = dir.path().join(rel);
+    let write = |path: &str, text: &str| dir.write(&format!("{rel}/{path}"), text);
+    write("harness.toml", "language = 'ja'\npreamble = 'paper/preamble.tex'\nappendix_title = 'B 補足'\n");
+    write("structure.yaml", r"
+title: 雲の分類
+external: []
+sections:
+  - title: 観測
+    label: sec:observation
+    items:
+      - expl-opening
+      - { card: lem-sample, proof: later }
+      - { subsection: 比較 }
+      - expl-between
+appendix:
+  - { proof_of: lem-sample }
+");
+    write("paper/preamble.tex", r"
+\let\draftmaketitle\maketitle
+\renewcommand{\maketitle}{\draftmaketitle\input{../paper/intro.tex}}
+\newcommand{\unused}{\input{../paper/unused.tex}}
+% \AtEndDocument{\input{../paper/unused.tex}}
+\AtEndDocument{\input{../paper/references.tex}}
+");
+    write("paper/intro.tex", r"
+\begin{abstract}
+雲を三つの型に分ける。
+\end{abstract}
+\section*{はじめに}
+観測の条件を説明する。
+\paragraph{■観測の方針} 同じ高度で比較する。
+\input{../paper/bridges/opening}
+");
+    write("paper/bridges/opening.tex", "分類に進む前に単位をそろえる。\n");
+    write("paper/unused.tex", "呼ばれていない命令の本文。");
+    write("paper/references.tex", r"
+\begin{thebibliography}{99}
+\bibitem[Guide]{cloud-guide} A synthetic cloud guide.
+\end{thebibliography}
+");
+    write("cards/expl/opening.md", "---\nid: expl-opening\nkind: expl\n---\n## Prose\n最初の観測。\n");
+    write("cards/lem/sample.md", "---\nid: lem-sample\nkind: lemma\n---\n## Statement\n観測値は有限である。\n\n## Proof\n測定回数が有限である。\n");
+    write("cards/expl/between.md", "---\nid: expl-between\nkind: expl\n---\n## Prose\n比較のための地の文。\n");
+
+    let views = sections(&deck);
+    assert_eq!(
+        views.iter().map(|view| view.title.as_str()).collect::<Vec<_>>(),
+        ["", "はじめに", "観測", "B 補足", ""],
+    );
+    let source_text = |views: &[DocSection]| -> Result<Vec<String>> {
+        views.iter().flat_map(|view| &view.prose).map(|excerpt| prose(&deck, &excerpt.text)).collect()
+    };
+    let excerpts = source_text(&views)?;
+    let markdown = fuzukue_view::read_card_tex(&excerpts.join("\n\n"), None, &[]).markdown;
+    let positions = [
+        "**Abstract**", "雲を三つの型に分ける", "■観測の方針", "分類に進む前に単位をそろえる",
+        "**References**", "[Guide]", "A synthetic cloud guide",
+    ].map(|s| markdown.find(s).unwrap_or_else(|| panic!("missing {s} in {markdown}")));
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(!markdown.contains("呼ばれていない") && !markdown.contains("bibitem"));
+    assert!(!views.iter().any(|view| view.unmatched));
+    assert_eq!(card_id(&views[2].items[0]), "expl-opening");
+    assert_eq!(card_id(&views[2].items[1]), "lem-sample");
+    assert!(matches!(&views[2].items[2], DocItem::Subsection { title } if title == "比較"));
+    assert_eq!(card_id(&views[2].items[3]), "expl-between");
+    assert_eq!(card_id(&views[3].items[0]), "lem-sample");
+    assert!(!deck.join("build").exists());
+
+    let ServerEvent::Cards { cards, .. } = snapshot_for_deck(dir.path(), &deck) else {
+        unreachable!()
+    };
+    let edit = cards.iter().find(|card| card.id == "expl-opening")
+        .and_then(|card| card.edit_body.as_ref()).unwrap();
+    let draft = "## Prose\n校正した観測記録。\n";
+    let outcome = save_card(dir.path(), rel, "expl-opening", CardEditPart::Body, draft, &edit.base_hash, None)?;
+    assert!(matches!(outcome, CardSaveOutcome::Saved));
+    assert_eq!(
+        fs::read_to_string(deck.join("cards/expl/opening.md"))?,
+        format!("---\nid: expl-opening\nkind: expl\n---\n{draft}"),
+    );
+    assert_eq!(source_text(&sections(&deck))?, excerpts);
+    assert_eq!(sections(&deck), views);
+    assert!(!deck.join("build").exists());
+    Ok(())
+}
+
+#[test]
+fn partial_alignment_preserves_source_order_and_retains_outline_cards() -> Result<()> {
+    let dir = TestDir::new();
+    dir.write("deck.toml", "kind = 'paper'\n[build]\ntex_root = 'source/main.tex'\n");
+    dir.write("structure.yaml", "sections: [{title: Results, items: [stable-one, outline-only]}]\n");
+    dir.write("source/main.tex", r"
+\input{preamble}
+\begin{document}
+\maketitle
+\section{Results}
+\begin{lemma}\label{card:stable-one}
+One stable statement.
+\end{lemma}
+\input{missing-bridge}
+\input{bridges/live}
+\begin{theorem}\label{thm:unmapped}
+An unmapped theorem.
+\end{theorem}
+\appendix
+\section{B Supplement}
+Final remarks.
+\end{document}
+");
+    dir.write("source/preamble.tex", r"\renewcommand{\maketitle}{\input{opening}}");
+    dir.write("source/opening.tex", "Manuscript opening.\n");
+    dir.write("source/bridges/live.tex", "Live bridge prose.\n");
+
+    let views = sections(dir.path());
+    assert_eq!(
+        views.iter().map(|view| view.title.as_str()).collect::<Vec<_>>(),
+        ["", "Results", "B Supplement", "Results"],
+    );
+    assert!(prose(dir.path(), &views[0].prose[0].text)?.contains("Manuscript opening."));
+    assert_eq!(views[1].items.iter().map(card_id).collect::<Vec<_>>(), ["stable-one"]);
+    for excerpt in &views[1].prose {
+        assert_eq!(excerpt.before_item, 1);
+    }
+    let results = views[1].prose.iter().map(|p| prose(dir.path(), &p.text)).collect::<Result<Vec<_>>>()?.join("\n");
+    assert!(results.find("Live bridge prose.").unwrap() < results.find("An unmapped theorem.").unwrap());
+    assert!(prose(dir.path(), &views[2].prose[0].text)?.contains("Final remarks."));
+    assert!(views[3].unmatched);
+    assert_eq!(views[3].items.iter().map(card_id).collect::<Vec<_>>(), ["outline-only"]);
+    Ok(())
+}

@@ -44,6 +44,7 @@ fn lazy_card_body_renders_markdown_in_the_reader_and_detail() {
                             title: "Reader".into(),
                             items: vec![DocItem::Card { id: CARD.into() }],
                             prose: vec![],
+                            unmatched: false,
                         }],
                     },
                     cx,
@@ -185,6 +186,7 @@ fn paper_document(ids: &[String]) -> ServerEvent {
             title: "Cards".into(),
             items: ids.iter().map(|id| DocItem::Card { id: id.clone() }).collect(),
             prose: vec![],
+            unmatched: false,
         }],
     }
 }
@@ -219,17 +221,24 @@ fn manuscript_prose_renders_in_order_before_and_between_lazy_cards() {
     use fuzukue_proto::{DocProse, DocProseText};
 
     run_card_reader_test(async |runner, cx| {
-        let ids = ["first".to_owned(), "second".to_owned()];
+        let ids = ["first".to_owned(), "second".to_owned(), "unplaced".to_owned()];
         let opening = DocProseText::Tex(r"\begin{abstract}A short abstract with $x^2$.\end{abstract}".into());
         let between = DocProseText::Tex("Prose between cards.".into());
         runner.update(cx, |view, _, cx| {
             let cards = ids.iter().map(|id| synthetic_card(id, "theorem")).collect();
             view.apply_deck_cards(DECK, cards, vec![], cx);
-            let mut document = paper_document(&ids);
+            let mut document = paper_document(&ids[..2]);
             let ServerEvent::Document { sections, .. } = &mut document else { unreachable!() };
+            sections.push(DocSection {
+                title: String::new(),
+                items: vec![DocItem::Card { id: ids[2].clone() }],
+                prose: vec![],
+                unmatched: true,
+            });
             sections.insert(0, DocSection {
                 title: String::new(), items: vec![],
                 prose: vec![DocProse { before_item: 0, text: opening.clone() }],
+                unmatched: false,
             });
             sections[1].prose.push(DocProse { before_item: 1, text: between.clone() });
             view.on_event(document, cx);
@@ -237,7 +246,9 @@ fn manuscript_prose_renders_in_order_before_and_between_lazy_cards() {
             assert!(matches!(view.read_rows.as_slice(), [
                 crate::ReadRow::Title(_), crate::ReadRow::Prose(front), crate::ReadRow::Section(_),
                 crate::ReadRow::Card(first), crate::ReadRow::Prose(middle), crate::ReadRow::Card(second),
-            ] if front == &opening && first == &ids[0] && middle == &between && second == &ids[1]));
+                crate::ReadRow::Unmatched, crate::ReadRow::Card(unplaced),
+            ] if front == &opening && first == &ids[0] && middle == &between
+                && second == &ids[1] && unplaced == &ids[2]));
             view.open_paper_deck(DECK.into(), cx);
         })?;
         runner.wait_for(cx, "manuscript prose", TIMEOUT_MS, |view, window| {

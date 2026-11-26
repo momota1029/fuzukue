@@ -331,6 +331,9 @@ impl Workbench {
     fn rebuild_read_views(&mut self, presentation_changed: bool, only: Option<&str>, cx: &mut Context<Self>) {
         let mut rows = vec![ReadRow::Title(self.doc_title.clone())];
         for sec in &self.doc_sections {
+            if sec.unmatched {
+                rows.push(ReadRow::Unmatched);
+            }
             if !sec.title.is_empty() {
                 rows.push(ReadRow::Section(sec.title.clone()));
             }
@@ -720,6 +723,13 @@ impl Workbench {
                     .child(t.clone())
                     .into_any_element(),
                 ReadRow::Prose(text) => this.render_prose(text, &entity, cx).into_any_element(),
+                ReadRow::Unmatched => div()
+                    .px(PANE_INSET)
+                    .pt_4()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(tr!("paper-unmatched-cards"))
+                    .into_any_element(),
                 ReadRow::Card(id) => {
                     let card = this.cards.iter().find(|c| &c.id == id);
                     let theorem = card.and_then(|card| {

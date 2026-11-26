@@ -4129,7 +4129,7 @@ mod tests {
                     }, cx);
                     view.on_event(ServerEvent::Document {
                         title: "論文".into(), macros: vec![], math_macros: vec![], references: None,
-                        sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: CARD.into() }], prose: vec![] }],
+                        sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: CARD.into() }], prose: vec![], unmatched: false }],
                     }, cx);
                 });
                 cx.spawn(async move |cx| {
@@ -6939,7 +6939,7 @@ mod tests {
             }, cx);
             view.on_event(ServerEvent::Document {
                 title: "Paper".into(), macros: vec![], math_macros: vec![], references: None,
-                sections: vec![DocSection { title: "Section".into(), items: vec![DocItem::Card { id: id.into() }], prose: vec![] }],
+                sections: vec![DocSection { title: "Section".into(), items: vec![DocItem::Card { id: id.into() }], prose: vec![], unmatched: false }],
             }, cx);
         }
 
@@ -7038,7 +7038,7 @@ mod tests {
                     }, cx);
                     view.on_event(ServerEvent::Document {
                         title: "論文".into(), macros: vec![], math_macros: vec![], references: None,
-                        sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: "lemma".into() }], prose: vec![] }],
+                        sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: "lemma".into() }], prose: vec![], unmatched: false }],
                     }, cx);
                 });
                 cx.spawn(async move |cx| {
@@ -7118,7 +7118,7 @@ mod tests {
                 }, cx);
                 view.on_event(ServerEvent::Document {
                     title: "論文".into(), macros: vec![], math_macros: vec![], references: None,
-                    sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: "lemma".into() }], prose: vec![] }],
+                    sections: vec![DocSection { title: "節".into(), items: vec![DocItem::Card { id: "lemma".into() }], prose: vec![], unmatched: false }],
                 }, cx);
                 for (item, text) in [("reply-read-only", "変更なし。"), ("silent", "<silent />"), ("reply-1", "本文を補った。")] {
                     view.on_event(ServerEvent::TextDelta {

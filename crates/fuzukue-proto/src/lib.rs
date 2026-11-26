@@ -1873,6 +1873,9 @@ pub struct DocSection {
     /// Read-only manuscript text inserted before the indicated outline item.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prose: Vec<DocProse>,
+    /// Outline cards with no confirmed position in the manuscript.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unmatched: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

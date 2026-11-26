@@ -257,7 +257,10 @@ impl Markdown<'_> {
                     self.blocks(body);
                 }
             }
-            Flow::List { start, items } => {
+            Flow::List { start, items, bibliography } => {
+                if *bibliography {
+                    self.write("**References**\n\n");
+                }
                 for (index, item) in items.iter().enumerate() {
                     if index != 0 {
                         self.write("\n\n");

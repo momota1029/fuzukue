@@ -3,7 +3,7 @@ mod reading;
 mod scan;
 mod verify;
 
-pub use reading::manuscript_sections;
+pub use reading::{harness_manuscript_sections, manuscript_sections};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -124,6 +124,25 @@ impl Expanded {
         });
     }
 
+    fn expand_hook_inputs(
+        &mut self,
+        root: &Path,
+        limit: &Path,
+        stack: &mut Vec<PathBuf>,
+        inputs: Vec<reading::HookInput>,
+    ) -> Result<()> {
+        for input in inputs {
+            let Some(target) = reading::find_input(root, &input.local, &input.name, limit) else {
+                continue;
+            };
+            if stack.len() < 64 && !stack.contains(&target) {
+                self.expand(root, &target, stack, false, limit)?;
+                self.tex.push_str("\n\n");
+            }
+        }
+        Ok(())
+    }
+
     fn expand(
         &mut self,
         root: &Path,
@@ -182,13 +201,12 @@ impl Expanded {
                 "{" => braces += 1,
                 "}" => braces = braces.saturating_sub(1),
                 "\\input" | "\\include" | "\\subfile" | "\\subfileinclude" if braces == 0 => {
-                    let (name, end) =
-                        input_name(source, token.end, command).with_context(|| {
-                            format!(
-                                "{} の {command} に固定のファイル名が必要",
-                                relative.display()
-                            )
-                        })?;
+                    let Some((name, end)) = input_name(source, token.end, command) else {
+                        if self.reading.is_some() {
+                            continue;
+                        }
+                        bail!("{} の {command} に固定のファイル名が必要", relative.display());
+                    };
                     let (first, second) = if subfile {
                         (local, root)
                     } else {
@@ -199,13 +217,16 @@ impl Expanded {
                     } else {
                         find_file(first, name, &["tex"])
                             .or_else(|| find_file(second, name, &["tex"]))
+                    };
+                    let Some(target) = target else {
+                        if self.reading.is_some() {
+                            continue;
+                        }
+                        bail!("{} の {command}{{{name}}} が見つからない", relative.display());
+                    };
+                    if self.reading.is_some() && (stack.len() >= 64 || stack.contains(&target)) {
+                        continue;
                     }
-                        .with_context(|| {
-                            format!(
-                                "{} の {command}{{{name}}} が見つからない",
-                                relative.display()
-                            )
-                        })?;
                     self.push(source, relative, cursor..token.start);
                     if let Some(reading) = &mut self.reading {
                         if let Some((id, part)) = reading.card_input(&target) {
@@ -242,8 +263,17 @@ impl Expanded {
                     }
                     cursor = end;
                 }
+                _ if self.reading.is_some() => {
+                    if braces == 0 {
+                        let inputs = self.reading.as_mut().unwrap().hook(source, token.clone(), local);
+                        if !inputs.is_empty() {
+                            self.push(source, relative, cursor..token.start);
+                            self.expand_hook_inputs(root, limit, stack, inputs)?;
+                            cursor = token.start;
+                        }
+                    }
+                }
                 "\\includeonly" if braces == 0 => bail!("\\includeonly を外して本全体を取り込む"),
-                _ if self.reading.is_some() => {}
                 "\\graphicspath" if braces == 0 => {
                     if let Some((paths, _)) = argument(source, token.end, '{', '}') {
                         let mut offset = 0;

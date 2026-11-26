@@ -322,9 +322,17 @@ pub fn read_structure(deck: &Path) -> anyhow::Result<(Option<String>, Vec<DocSec
 fn document_outline(deck: &Path, cfg: &DeckConfig) -> (Option<String>, Vec<DocSection>) {
     let structure = crate::build::read_structure(deck, cfg).ok();
     let (title, mut sections) = structure.as_ref().map(|v| structure_outline(v, cfg)).unwrap_or_default();
-    if !cfg.meta.imported_latex && matches!(cfg.meta.kind.as_str(), "paper" | "book") {
+    if !cfg.meta.imported_latex && (cfg.harness || matches!(cfg.meta.kind.as_str(), "paper" | "book")) {
         if let Some(root) = cfg.meta.build.as_ref().and_then(|build| build.tex_root.as_deref()) {
             if let Ok(source) = fuzukue_cards::latex_book::manuscript_sections(deck, root, &sections) {
+                return (title, source);
+            }
+        }
+        if cfg.harness {
+            let preamble = cfg.meta.preamble.as_deref()
+                .or(cfg.macros_file.as_deref())
+                .unwrap_or(Path::new("macros.tex"));
+            if let Ok(source) = fuzukue_cards::latex_book::harness_manuscript_sections(deck, preamble, sections.clone()) {
                 return (title, source);
             }
         }
@@ -341,6 +349,7 @@ fn document_outline(deck: &Path, cfg: &DeckConfig) -> (Option<String>, Vec<DocSe
                 title: String::new(),
                 items: Vec::new(),
                 prose: vec![DocProse { before_item: 0, text: DocProseText::Tex(tex.to_owned()) }],
+                unmatched: false,
             });
         }
     }
@@ -362,12 +371,13 @@ fn structure_outline(v: &serde_yaml::Value, cfg: &DeckConfig) -> (Option<String>
             title: sec["title"].as_str().unwrap_or("").to_string(),
             items: document_items(&sec["items"], cfg.harness),
             prose: Vec::new(),
+            unmatched: false,
         })
         .collect();
     if cfg.harness {
         let items = document_items(&v["appendix"], true);
         if !items.is_empty() {
-            sections.push(DocSection { title: cfg.meta.appendix_title.clone().unwrap_or_else(|| "Deferred proofs".into()), items, prose: Vec::new() });
+            sections.push(DocSection { title: cfg.meta.appendix_title.clone().unwrap_or_else(|| "Deferred proofs".into()), items, prose: Vec::new(), unmatched: false });
         }
     }
     (title, sections)

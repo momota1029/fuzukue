@@ -31,6 +31,7 @@ paper-math-review = Math review
 paper-output-review = Output review
 paper-consistency-review = Consistency check
 paper-missing-card = { $id } (missing card)
+paper-unmatched-cards = Manuscript position unknown
 paper-no-pdf-has-been-built = No PDF has been built
 paper-open-as-card = Open as card
 paper-pdf-build = PDF build
