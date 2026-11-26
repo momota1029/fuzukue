@@ -73,6 +73,15 @@ pub(crate) async fn get(app: &Workspace, path: &str) -> Result<Value> {
 }
 
 pub(crate) async fn pages(app: &Workspace, path: &str, key: Option<&str>) -> Result<Vec<Value>> {
+    pages_observing(app, path, key, |_| Ok(())).await
+}
+
+pub(crate) async fn pages_observing(
+    app: &Workspace,
+    path: &str,
+    key: Option<&str>,
+    mut observe: impl FnMut(&[Value]) -> Result<()>,
+) -> Result<Vec<Value>> {
     let mut items = Vec::new();
     let mut next = Some(path.to_owned());
     let mut visited = std::collections::HashSet::new();
@@ -83,6 +92,7 @@ pub(crate) async fn pages(app: &Workspace, path: &str, key: Option<&str>) -> Res
             .map_or(&page.body, |key| &page.body[key])
             .as_array()
             .context("GitHub response is missing the expected list")?;
+        observe(rows)?;
         items.extend(rows.iter().cloned());
         next = page.next;
     }

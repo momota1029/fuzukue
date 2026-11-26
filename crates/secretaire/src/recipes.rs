@@ -23,6 +23,14 @@ use config::{Arguments, Config, Recipe};
 use journal::Journal;
 
 static BROKER: OnceLock<Arc<Broker>> = OnceLock::new();
+
+pub(crate) fn active_count() -> usize {
+    BROKER.get().map_or(0, |broker| {
+        broker.state.lock().unwrap().entries.values()
+            .filter(|entry| entry.record.borrow().state.active())
+            .count()
+    })
+}
 const RESPONSE_WAIT: Duration = Duration::from_secs(15);
 
 pub(crate) fn configure(

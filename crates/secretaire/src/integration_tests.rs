@@ -2069,7 +2069,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("detach_thread", &[("deck", "string")], &["deck"]),
         ("list_tests", &[], &[]),
         ("run_tests", &[("suite", "string"), ("filter", "string")], &[]),
-        ("self_update", &[("action", "string"), ("confirm", "boolean"), ("verbose", "boolean"), ("notify", "boolean")], &["action"]),
+        ("self_update", &[("action", "string"), ("confirm", "boolean"), ("turn_proof", "string"), ("verbose", "boolean"), ("notify", "boolean")], &["action"]),
         ("watch", &[("action", "string"), ("id", "string"), ("name", "string"), ("repo", "string"),
             ("remote", "string"), ("kind", "string"), ("interval", "integer"), ("wake", "string"),
             ("attention_patterns", "array"), ("attention_marked_lines", "boolean"), ("sources", "array")],

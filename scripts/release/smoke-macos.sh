@@ -63,16 +63,8 @@ sh "$installer" --fixture "$assets" --launchd "$project" --health-port "$port" -
 pid=$(curl --noproxy '*' --max-time 5 -fsS "$health_url")
 [[ $pid =~ ^[1-9][0-9]*$ && $pid != "$first_pid" ]]
 kill -0 "$pid"
-idle=false
-for _ in {1..20}; do
-    if curl --noproxy '*' --max-time 5 -fsS "http://127.0.0.1:$port/self-update/wait?package_idle=true" |
-        python3 -c 'import json, sys; status = json.load(sys.stdin); sys.exit(0 if status["idle"] and status["pid"] == int(sys.argv[1]) else 1)' "$pid"; then
-        idle=true
-        break
-    fi
-    sleep 1
-done
-[[ $idle == true ]]
+curl --noproxy '*' --max-time 5 -fsS "http://127.0.0.1:$port/self-update/wait?package_idle=true" |
+    python3 -c 'import json, sys; status = json.load(sys.stdin); assert status["idle"] is False and status["pid"] == int(sys.argv[1])' "$pid"
 sh "$client_installer" --fixture "$assets"
 [[ $("$HOME/.local/bin/fuzukue" --version) == "fuzukue $tag" ]]
 client="$HOME/Library/Application Support/fuzukue/install/client/$tag/fuzukue"

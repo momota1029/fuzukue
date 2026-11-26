@@ -6,6 +6,7 @@ mod isolation;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
@@ -21,7 +22,7 @@ use tokio::sync::{mpsc, oneshot, watch, OwnedMutexGuard};
 use tokio::time::Instant;
 
 use super::{
-    append_log, git, steps, supervisor, ProcessGroup, Recipient, State, Step, Update, MAX_LOG,
+    append_log, git, steps, supervisor, ProcessGroup, Recipient, RequestingTurn, State, Step, Update, MAX_LOG,
 };
 
 const PORTS: std::ops::RangeInclusive<u16> = 7879..=7899;
@@ -42,6 +43,7 @@ struct Job {
 
 struct Promotion {
     recipient: Option<Recipient>,
+    requester: Option<RequestingTurn>,
     reply: oneshot::Sender<Result<()>>,
 }
 
@@ -60,11 +62,11 @@ impl Control {
 }
 
 impl Update {
-    pub(crate) async fn start_canary(self: &Arc<Self>, app: Arc<crate::App>) -> Result<()> {
+    pub(crate) async fn start_canary(self: &Arc<Self>, app: Arc<crate::App>, requester: Option<RequestingTurn>) -> Result<()> {
         drop(self.admit()?);
         let mut build = Command::new("cargo");
         build.args(["build", "--locked", "--release", "-p", "secretaire"]);
-        self.start_canary_with(app, build, Network::default()).await
+        self.start_canary_with(app, build, Network::default(), requester.as_ref()).await
     }
 
     async fn start_canary_with(
@@ -72,6 +74,7 @@ impl Update {
         app: Arc<crate::App>,
         build: Command,
         network: Network,
+        requester: Option<&RequestingTurn>,
     ) -> Result<()> {
         let _command = self.canary.commands.lock().await;
         self.canary.ensure_open()?;
@@ -89,12 +92,14 @@ impl Update {
             "試運転のファイル隔離には Linux が必要だよ"
         );
 
+        drop(self.check_planned(&app, requester)?);
         self.end_canary(false).await?;
         let run = self
             .run
             .clone()
             .try_lock_owned()
             .context("サーバーの更新が進んでいるよ")?;
+        drop(self.check_planned(&app, requester)?);
         let lock = self.lock_builds()?;
         self.report_result(&app)?;
         self.status.send_modify(|status| {
@@ -124,17 +129,18 @@ impl Update {
         Ok(())
     }
 
-    pub(crate) async fn promote_canary(&self, recipient: Option<Recipient>) -> Result<()> {
+    pub(crate) async fn promote_canary(&self, app: &crate::App, recipient: Option<Recipient>, requester: Option<RequestingTurn>) -> Result<()> {
         let _command = self.canary.commands.lock().await;
         self.canary.ensure_open()?;
         ensure!(
             self.canary_phase() == Some(Phase::Running),
             "稼働中の試運転が見つからないよ"
         );
+        drop(self.check_planned(app, requester.as_ref())?);
         let job = self.canary.job().context("試運転は終了したよ")?;
         let (result_tx, result) = oneshot::channel();
         job.promote
-            .send(Promotion { recipient, reply: result_tx })
+            .send(Promotion { recipient, requester, reply: result_tx })
             .await
             .context("試運転は終了したよ")?;
         result.await.context("試運転は終了したよ")?
@@ -296,10 +302,12 @@ impl Update {
             self.canary_log(&format!("試運転につなぐ URL は ws://{addr}/ws だよ。\n"));
             self.canary_status(|status| status.state = Phase::Running);
             self.save_canary_status();
-            if let Some(end) = self.await_promotion(candidate, stop, &mut promote, expires, &commit).await? {
-                return Ok(end);
-            }
+            let requester = match self.await_promotion(app, candidate, stop, &mut promote, expires, &commit).await? {
+                ControlFlow::Continue(requester) => requester,
+                ControlFlow::Break(end) => return Ok(end),
+            };
             self.stop_candidate(&mut runtime).await?;
+            drop(self.check_planned(app, requester.as_ref())?);
             self.step(Step::Publish, State::Running);
             let build_state = checkout.path().join(".windows-build");
             tokio::select! {
@@ -312,7 +320,7 @@ impl Update {
                     Ok::<_, anyhow::Error>((binary, self.prepared_registration(checkout)))
                 } => {
                     let (binary, registration) = result?;
-                    Ok(End::Promote { binary, commit, registration })
+                    Ok(End::Promote { binary, commit, registration, requester })
                 },
             }
         }.await;
@@ -327,11 +335,11 @@ impl Update {
 
         match result? {
             end @ End::Discarded(_) => Ok(end),
-            End::Promote { binary, commit, registration } => {
+            End::Promote { binary, commit, registration, requester } => {
                 tokio::select! {
                     biased;
                     _ = wait_for_stop(stop) => Ok(End::Discarded("サーバーの終了に合わせて試運転を終了したよ。\n")),
-                    result = self.swap(app, &binary, lock.try_clone()?, false, Some(&commit), registration) => match result? {
+                    result = self.swap(app, &binary, lock.try_clone()?, false, Some(&commit), registration, requester.as_ref()) => match result? {
                         super::SwapOutcome::Cancelled => Ok(End::Discarded("入れ替えを中止したよ。\n")),
                         super::SwapOutcome::Launched => Ok(End::Swapping),
                     }
@@ -406,21 +414,22 @@ impl Update {
 
     async fn await_promotion(
         &self,
+        app: &crate::App,
         candidate: &mut Runtime,
         stop: &mut watch::Receiver<bool>,
         promote: &mut mpsc::Receiver<Promotion>,
         expires: Instant,
         commit: &str,
-    ) -> Result<Option<End>> {
+    ) -> Result<ControlFlow<End, Option<RequestingTurn>>> {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 biased;
-                _ = wait_for_stop(stop) => return Ok(Some(End::Discarded("試運転を終了したよ。\n"))),
-                _ = tokio::time::sleep_until(expires) => return Ok(Some(End::Discarded("制限時間に達したので、試運転を自動で破棄したよ。\n"))),
+                _ = wait_for_stop(stop) => return Ok(ControlFlow::Break(End::Discarded("試運転を終了したよ。\n"))),
+                _ = tokio::time::sleep_until(expires) => return Ok(ControlFlow::Break(End::Discarded("制限時間に達したので、試運転を自動で破棄したよ。\n"))),
                 result = candidate.child.wait() => bail!("試運転のサーバーが終了したよ ({})", result?),
                 _ = tick.tick() => self.read_canary_log(candidate),
-                Some(Promotion { recipient, reply }) = promote.recv() => {
+                Some(Promotion { recipient, requester, reply }) = promote.recv() => {
                     if let Err(error) = self.check_canary_commit(commit).await {
                         self.status.send_modify(|status| {
                             let message = format!("{error:#}");
@@ -434,6 +443,10 @@ impl Update {
                         let _ = reply.send(Err(anyhow::anyhow!("試運転の制限時間に達したよ")));
                         continue;
                     }
+                    if let Err(error) = self.check_planned(app, requester.as_ref()).map(drop) {
+                        let _ = reply.send(Err(error));
+                        continue;
+                    }
                     let mut status = self.status.borrow().clone();
                     let canary = status.canary_status.as_mut().unwrap();
                     canary.state = Phase::Promoting;
@@ -444,7 +457,7 @@ impl Update {
                         continue;
                     }
                     let _ = reply.send(Ok(()));
-                    return Ok(None);
+                    return Ok(ControlFlow::Continue(requester));
                 }
             }
         }
@@ -471,7 +484,7 @@ async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
 
 enum End {
     Discarded(&'static str),
-    Promote { binary: PathBuf, commit: String, registration: Option<tempfile::TempDir> },
+    Promote { binary: PathBuf, commit: String, registration: Option<tempfile::TempDir>, requester: Option<RequestingTurn> },
     Swapping,
 }
 

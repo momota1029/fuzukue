@@ -86,11 +86,16 @@ pub fn entry_cards(body: &str) -> Vec<String> {
     out
 }
 
-pub(crate) async fn open_issue_rows(app: &Workspace, repo: &str) -> Result<Vec<Value>> {
-    issue_threads::rest::pages(
+pub(crate) async fn open_issue_rows(
+    app: &Workspace,
+    repo: &str,
+    observe: impl FnMut(&[Value]) -> Result<()>,
+) -> Result<Vec<Value>> {
+    issue_threads::rest::pages_observing(
         app,
         &format!("repos/{repo}/issues?state=open&sort=created&direction=desc&per_page=100"),
         None,
+        observe,
     )
     .await
 }

@@ -9,24 +9,29 @@ use crate::Workspace;
 
 type Threads = BTreeMap<String, Vec<BackgroundCommand>>;
 
+pub(crate) fn current(app: &Workspace) -> Option<Threads> {
+    let mut threads = Threads::new();
+    {
+        let sessions = app.sessions.try_lock().ok()?;
+        for (session, claude) in sessions.iter() {
+            let commands = claude.background_commands();
+            if !commands.is_empty() {
+                threads.insert(session.clone(), commands);
+            }
+        }
+    }
+    if let Some(codex) = app.codex.try_lock().ok()?.as_ref() {
+        codex.collect_background_commands(&mut threads);
+    }
+    Some(threads)
+}
+
 #[derive(Default)]
 pub(crate) struct Feed(Option<Threads>);
 
 impl Feed {
     pub(crate) fn latest(&mut self, app: &Workspace) -> Option<ServerEvent> {
-        let mut threads = Threads::new();
-        {
-            let sessions = app.sessions.try_lock().ok()?;
-            for (session, claude) in sessions.iter() {
-                let commands = claude.background_commands();
-                if !commands.is_empty() {
-                    threads.insert(session.clone(), commands);
-                }
-            }
-        }
-        if let Some(codex) = app.codex.try_lock().ok()?.as_ref() {
-            codex.collect_background_commands(&mut threads);
-        }
+        let mut threads = current(app)?;
         for commands in threads.values_mut() {
             commands.sort_unstable_by(|a, b| {
                 (a.started_at_ms, &a.id, &a.summary).cmp(&(b.started_at_ms, &b.id, &b.summary))

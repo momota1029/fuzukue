@@ -708,8 +708,14 @@ impl ClaudeSession {
             Some(app) => app.partner_input(&self.id, input).await?,
             None => input,
         };
+        let update_proof = self.mcp_key.as_ref().map(|_| crate::mail::session_key());
+        let mut context = self.usage.context_line();
+        if let Some(proof) = &update_proof {
+            context.push_str("\n\n");
+            context.push_str(&crate::self_update::RequestingTurn::proof_instruction(proof));
+        }
         let mut content = vec![
-            json!({ "type": "text", "text": self.usage.context_line() }),
+            json!({ "type": "text", "text": context }),
             json!({ "type": "text", "text": input }),
         ];
         content.extend_from_slice(&prompt.images);
@@ -752,7 +758,7 @@ impl ClaudeSession {
         let request = (matches!(kind, TurnKind::UserConversation) && !prompt.automatic_resume).then(|| crate::front_desk::Request {
             prompt: prompt.text.clone(), images: prompt.escalation_images.clone(),
         });
-        self.hub.publish_partner_turn_started(&self.id, request, matches!(kind, TurnKind::Escalated));
+        self.hub.publish_partner_turn_started(&self.id, request, matches!(kind, TurnKind::Escalated), update_proof);
         if external {
             self.hub.mark_external_approval_input(&self.id);
         }

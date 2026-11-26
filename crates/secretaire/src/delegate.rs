@@ -384,9 +384,10 @@ impl Workers {
             .map(|job| job.session.clone()).collect()
     }
 
-    pub(crate) fn queued_desk_sessions(&self) -> Vec<String> {
+    pub(crate) fn queued_desk_sessions(&self, include_durable: bool) -> Vec<String> {
         self.desk.lock().unwrap().iter()
-            .filter(|(_, queue)| !queue.turns.is_empty() || !queue.relay.is_empty())
+            .filter(|(_, queue)| !queue.relay.is_empty()
+                || queue.turns.iter().any(|turn| include_durable || !matches!(turn, DeskTurn::Durable(_))))
             .map(|(session, _)| session.clone())
             .collect()
     }

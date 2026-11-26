@@ -320,6 +320,28 @@ struct IntakeCursor {
     seen: BTreeSet<u64>,
 }
 
+impl IntakeCursor {
+    fn keep_open_rows(&self, path: &Path, rows: &[Value]) -> Result<()> {
+        let mut pending: BTreeMap<u64, Value> = load_json(path)?.unwrap_or_default();
+        let before = pending.len();
+        for row in rows {
+            let (Some(number), Ok(at)) = (
+                row["number"].as_u64(),
+                chrono::DateTime::parse_from_rfc3339(field(row, "created_at")),
+            ) else {
+                continue;
+            };
+            if at.timestamp() >= self.from && !self.seen.contains(&number) {
+                pending.entry(number).or_insert_with(|| row.clone());
+            }
+        }
+        if pending.len() != before {
+            save_json(path, &pending)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct OwnChange {
     actor: String,
@@ -511,6 +533,7 @@ async fn fetch(
     cursor.informational = item.labels.iter().any(|label| tracking_label(label));
     if cursor.informational && !was_informational {
         // Block any queued response as soon as the item has the tracking label.
+        let _work = admit_poll_delivery(app)?;
         save(&cursor_path(app, link), &cursor)?;
     }
     // Keep this value fixed for the life of the cursor so every poll uses
@@ -741,12 +764,9 @@ pub fn watch(app: &Arc<Workspace>) -> Option<tokio::task::JoinHandle<()>> {
 async fn poll_loop(weak: std::sync::Weak<Workspace>) {
     let mut poll = Poll::default();
     while let Some(app) = weak.upgrade() {
-        if let Ok(work) = app.admit_work() {
-            poll.tick(&app).await;
-            drop(work);
-            if let Err(error) = dispatch(&app).await {
-                tracing::warn!("GitHub front desk: {error:#}");
-            }
+        poll.tick(&app).await;
+        if let Err(error) = dispatch(&app).await {
+            tracing::warn!("GitHub front desk: {error:#}");
         }
         let refresh = app.issues_refresh.clone();
         drop(app);
@@ -755,6 +775,21 @@ async fn poll_loop(weak: std::sync::Weak<Workspace>) {
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
         }
     }
+}
+
+#[derive(Debug)]
+struct PollDeferred;
+
+impl std::fmt::Display for PollDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GitHub polling delivery is deferred")
+    }
+}
+
+impl std::error::Error for PollDeferred {}
+
+fn admit_poll_delivery(app: &Workspace) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
+    app.admit_work().map_err(|_| PollDeferred.into())
 }
 
 #[derive(Default)]
@@ -784,38 +819,22 @@ impl Poll {
         app: &Arc<Workspace>,
         repo: &str,
         config: &GitHubConfig,
-        started: i64,
-        rows: &[Value],
+        path: &Path,
+        pending_path: &Path,
+        mut cursor: IntakeCursor,
     ) -> Result<()> {
-        if config.intake == Intake::None || intake::designated(app, repo) {
+        if intake::designated(app, repo) {
             return Ok(());
         }
-        let path = app
-            .state_dir
-            .join("github-items")
-            .join(repo)
-            .join("intake.json");
-        let mut cursor: IntakeCursor = match load_json(&path)? {
-            Some(cursor) => cursor,
-            None => {
-                let cursor = IntakeCursor {
-                    from: started,
-                    seen: BTreeSet::new(),
-                };
-                save_json(&path, &cursor)?;
-                cursor
-            }
+        let Some(pending) = load_json::<BTreeMap<u64, Value>>(pending_path)? else {
+            return Ok(());
         };
-        let seen = cursor.seen.len();
+        let mut saved = cursor.seen.len();
         let owner = repo.split_once('/').map_or("", |(owner, _)| owner);
-        for row in rows.iter().rev() {
-            let (Some(number), Ok(at)) = (
-                row["number"].as_u64(),
-                chrono::DateTime::parse_from_rfc3339(field(row, "created_at")),
-            ) else {
-                continue;
-            };
-            if at.timestamp() < cursor.from || cursor.seen.contains(&number) {
+        let mut rows: Vec<_> = pending.iter().collect();
+        rows.sort_by_key(|(number, row)| (chrono::DateTime::parse_from_rfc3339(field(row, "created_at")).ok(), **number));
+        for (&number, row) in rows {
+            if cursor.seen.contains(&number) {
                 continue;
             }
             let body = field(row, "body");
@@ -837,6 +856,7 @@ impl Poll {
                 }
                 let actor = field(&row["user"], "login");
                 let user = self.user(app).await?;
+                let _work = admit_poll_delivery(app)?;
                 let title = crate::l10n::render(
                     harness_locale(),
                     &LocalizedMessage::new(
@@ -864,19 +884,28 @@ impl Poll {
                     save(&item_path, &item_cursor)?;
                 }
                 deliver(app, &link, &[event], false, !eligible, &user, config, None)?;
+                cursor.seen.insert(number);
+                save_json(path, &cursor)?;
+                saved = cursor.seen.len();
+            } else {
+                cursor.seen.insert(number);
             }
-            cursor.seen.insert(number);
         }
-        if cursor.seen.len() != seen {
-            save_json(&path, &cursor)?;
+        if cursor.seen.len() != saved {
+            let _work = admit_poll_delivery(app)?;
+            save_json(path, &cursor)?;
         }
+        // The acknowledged cursor is durable before removing its fetched rows.
+        std::fs::remove_file(pending_path)?;
         Ok(())
     }
 
     async fn tick(&mut self, app: &Arc<Workspace>) {
         if app.issue_threads.rest.paused().is_none() {
             if let Err(error) = self.tick_intake(app).await {
-                tracing::warn!("GitHub intake: {error:#}");
+                if !error.is::<PollDeferred>() {
+                    tracing::warn!("GitHub intake: {error:#}");
+                }
             }
         }
         let repo = match app.research_issues.repo() {
@@ -903,20 +932,56 @@ impl Poll {
         if retry_at.is_none() && self.list_at.is_none_or(|at| now >= at) {
             attempted = true;
             self.list_at = Some(now + SLOW);
-            let started = Utc::now().timestamp();
             let config = GitHubConfig::from_workspace(&app.project_dir);
-            let result = match github::open_issue_rows(app, &repo).await {
-                Ok(rows) => {
-                    let intake = match &config {
-                        Ok(config) => self.intake_open(app, &repo, config, started, &rows).await,
-                        Err(err) => Err(anyhow::anyhow!("{err:#}")),
-                    };
-                    if let Err(err) = intake {
-                        retry_at = err.downcast_ref::<rest::RateLimit>().map(|limit| limit.retry_at);
-                        error = Some(format!("{err:#}"));
-                    }
-                    github::open_issues(app, &repo, &rows).await
+            let path = app.state_dir.join("github-items").join(&repo).join("intake.json");
+            // Keep fetched rows separate from the cursor so older servers can
+            // read and update intake.json without dropping undelivered rows.
+            let pending_path = path.with_file_name("intake-pending.json");
+            // Persist the first scan's start before fetching, so a cutoff
+            // mid-fetch cannot move the opening cursor forward on restart.
+            let intake_cursor = match &config {
+                Ok(config) if config.intake != Intake::None && !intake::designated(app, &repo) => {
+                    load_json(&path).and_then(|saved| match saved {
+                        Some(cursor) => Ok(Some(cursor)),
+                        None => {
+                            let _work = admit_poll_delivery(app)?;
+                            let cursor = IntakeCursor { from: Utc::now().timestamp(), seen: BTreeSet::new() };
+                            save_json(&path, &cursor)?;
+                            Ok(Some(cursor))
+                        }
+                    })
                 }
+                Ok(_) => Ok(None),
+                Err(err) => Err(anyhow::anyhow!("{err:#}")),
+            };
+            if intake_cursor.as_ref().is_err_and(|error| error.is::<PollDeferred>()) {
+                self.list_at = None;
+                return;
+            }
+            // Retain each page before fetching the next or awaiting delivery.
+            let rows = github::open_issue_rows(app, &repo, |rows| {
+                if let Ok(Some(cursor)) = &intake_cursor {
+                    cursor.keep_open_rows(&pending_path, rows)?;
+                }
+                Ok(())
+            }).await;
+            let intake = match (&config, intake_cursor) {
+                (Ok(config), Ok(Some(cursor))) => {
+                    self.intake_open(app, &repo, config, &path, &pending_path, cursor).await
+                }
+                (_, Err(err)) => Err(err),
+                _ => Ok(()),
+            };
+            if let Err(err) = intake {
+                if err.is::<PollDeferred>() {
+                    self.list_at = None;
+                } else {
+                    retry_at = err.downcast_ref::<rest::RateLimit>().map(|limit| limit.retry_at);
+                    error = Some(format!("{err:#}"));
+                }
+            }
+            let result = match rows {
+                Ok(rows) => github::open_issues(app, &repo, &rows).await,
                 Err(err) => Err(err),
             };
             let ev = match result {
@@ -999,6 +1064,10 @@ impl Poll {
                     Ok(item) => {
                         self.items.insert(number, item);
                     }
+                    Err(err) if err.is::<PollDeferred>() => {
+                        self.last.remove(&number);
+                        break;
+                    }
                     Err(err) => {
                         let message = format!("{err:#}");
                         retry_at = err
@@ -1059,6 +1128,7 @@ impl Poll {
         if intake::designated(app, &link.repo) {
             return Ok(item);
         }
+        let _work = admit_poll_delivery(app)?;
         follow_issue_title(
             app,
             link,
@@ -1088,6 +1158,7 @@ impl Poll {
             events.retain(|event| event.kind != Kind::Check
                 && chrono::DateTime::parse_from_rfc3339(&event.at).is_ok_and(|at| at.timestamp() >= since));
         }
+        let _work = admit_poll_delivery(app)?;
         deliver(app, link, &events, cursor.informational, false, &user, &config, Some(&item))?;
         save(&path, &cursor)?;
         Ok(Some(item))
@@ -1546,6 +1617,22 @@ async fn set_labels_from(
     Ok(())
 }
 
+pub(crate) fn queued_for_dispatch(app: &Workspace) -> Vec<String> {
+    app.hub.read_threads(|store| {
+        store.github_threads().into_iter().filter_map(|(session, state)| {
+            if !store.is_live(&session) {
+                return None;
+            }
+            let policies = state.policies();
+            (store.github_response(&session).is_some_and(|events| !events.is_empty())
+                || store.github_pending(&session).iter().any(|event| {
+                policies.get(event.author) != GitHubPolicy::Notify
+                    && (state.links.contains(&event.link) || state.intake_repo.as_ref() == Some(&event.link.repo))
+            })).then_some(session)
+        }).collect()
+    })
+}
+
 async fn dispatch(app: &Arc<Workspace>) -> Result<()> {
     let threads = app.hub.read_threads(|store| store.github_threads());
     let config = GitHubConfig::from_workspace(&app.project_dir).ok();
@@ -1618,7 +1705,9 @@ async fn dispatch(app: &Arc<Workspace>) -> Result<()> {
                 .cloned()
                 .collect();
             let admitted = {
-                let _serial = app.issue_threads.serial.lock().await;
+                // An item fetch may be holding serial while it waits for GitHub.
+                // Keep the pending events for the next pass in that case.
+                let Ok(_serial) = app.issue_threads.serial.try_lock() else { continue };
                 if eligible[0].intake && linked(&eligible[0]) && !intake::turn_ready(app, &link.repo)? {
                     continue;
                 }

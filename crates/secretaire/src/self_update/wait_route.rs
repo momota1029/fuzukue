@@ -54,23 +54,16 @@ pub(crate) async fn status(
         if !cfg!(target_os = "macos") || std::env::var_os("FUZUKUE_MACOS_PACKAGE").is_none() {
             return Err((StatusCode::NOT_FOUND, "Packaged update is unavailable."));
         }
-        let idle = if matches!(control, WaitControl::Closed)
-            && !update.trial_pending()
-            && !*update.swapping.borrow()
-        {
-            let (gate, reason) = update.swap_gate(&app);
-            gate.is_some() && app.drain_job_count(&reason) == 0
-        } else {
-            false
-        };
-        return Ok(Json(json!({ "idle": idle, "pid": std::process::id() })));
+        // Older package installers use this probe before an independent stop.
+        // A snapshot cannot reserve the server's admission gate for that stop.
+        return Ok(Json(json!({ "idle": false, "pid": std::process::id() })));
     }
     let Some((started_at, DrainReason::Update)) = control.owner() else {
         return Err((StatusCode::CONFLICT, "No update is draining."));
     };
     Ok(Json(json!({
         "started_at": started_at,
-        "accepts_controls": matches!(control, WaitControl::Open(..)),
+        "accepts_controls": matches!(control, WaitControl::Open(..) | WaitControl::Planned(_, _, None)),
     })))
 }
 

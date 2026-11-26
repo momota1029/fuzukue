@@ -2079,7 +2079,7 @@ async fn serve_workspace(
                     if let Some(update) = update {
                         use fuzukue_proto::SelfUpdateCanaryAction::*;
                         let result = match action {
-                            Promote => update.promote_canary(None).await,
+                            Promote => update.promote_canary(&registry, None, None).await,
                             Discard => update.discard_canary().await,
                         };
                         if let Err(error) = result {
@@ -2136,7 +2136,7 @@ async fn serve_workspace(
                         if matches!(msg, ClientMsg::SelfUpdateStatus) {
                             let status = update.refresh().await;
                             let _ = reply.send(ServerEvent::SelfUpdateStatus { status });
-                        } else if let Err(error) = update.start(registry.clone(), matches!(msg, ClientMsg::RollbackServer), None) {
+                        } else if let Err(error) = update.start(registry.clone(), matches!(msg, ClientMsg::RollbackServer), None, None) {
                             let _ = reply.send(ServerEvent::SelfUpdateError { message: format!("{error:#}") });
                         }
                     }
@@ -3254,7 +3254,8 @@ async fn prompt_codex_with_images(
     if let Some(event) = event {
         app.hub.publish(event);
     }
-    app.hub.publish_partner_turn_started(&session, request, matches!(kind, TurnKind::Escalated));
+    let mut update_proof = mail::session_key();
+    app.hub.publish_partner_turn_started(&session, request, matches!(kind, TurnKind::Escalated), Some(update_proof.clone()));
     if matches!(kind, TurnKind::ExternalInput) || app.issue_threads.automatic_policy(&session).is_some() {
         app.hub.mark_external_approval_input(&session);
     }
@@ -3266,12 +3267,14 @@ async fn prompt_codex_with_images(
             let before = app.review_snapshot(&app.project_dir, &session).await;
             let history = app.start_partner_history(&app.project_dir, "codex", &session).await;
             let result = async {
-                let prompt = app.partner_input(&session, prompt).await?;
+                let mut input = app.partner_input(&session, prompt).await?;
+                input.push_str("\n\n");
+                input.push_str(&self_update::RequestingTurn::proof_instruction(&update_proof));
                 let images = if is_nudge { &[][..] } else { &images };
                 if !is_nudge {
                     app.hub.set_github_auth_request(&session, github_auth);
                 }
-                let result = codex.run_turn_with_images(&thread_id, &prompt, images, kind, || {
+                let result = codex.run_turn_with_images(&thread_id, &input, images, kind, || {
                     if let Some(delivery) = delivery.filter(|delivery| delivery.report) {
                         app.drain.begin_submission(&app.state_dir, &session, std::slice::from_ref(&delivery.id))?;
                     }
@@ -3345,7 +3348,8 @@ async fn prompt_codex_with_images(
                 ) => {
                     let Ok(_work) = app.admit_work() else { break };
                     prompt = front_desk::nudge_prompt().into();
-                    app.hub.publish(ServerEvent::TurnActivity { session: session.clone(), running: true });
+                    update_proof = mail::session_key();
+                    app.hub.publish_partner_turn_started(&session, None, false, Some(update_proof.clone()));
                 }
                 Ok(_) => break,
                 Err(error) if !retrying => {

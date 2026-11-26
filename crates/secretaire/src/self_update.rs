@@ -4,6 +4,7 @@ mod build_cache;
 mod canary;
 pub(crate) mod drain;
 mod notice;
+mod planned;
 mod prune;
 mod registration;
 mod retry;
@@ -34,6 +35,7 @@ use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock, RwLockWriteGuard};
 
 pub(crate) use supervisor::{health, legacy_handoff, managed, ready, relocate_build_links, run as supervise, HEALTH_ROUTE};
 pub(crate) use notice::Recipient;
+pub(crate) use planned::RequestingTurn;
 pub(crate) const BUILD_ID: &str = env!("FUZUKUE_SERVER_BUILD_ID");
 const SOURCE_ENV: &str = "FUZUKUE_SELF_UPDATE_SOURCE";
 const STATUS_FILE: &str = "status.json";
@@ -184,6 +186,7 @@ enum WaitControl {
     #[default]
     Closed,
     Open(i64, DrainReason),
+    Planned(i64, DrainReason, Option<WaitAction>),
     Requested(i64, DrainReason, WaitAction),
     Forcing(i64, DrainReason),
     Cancelling(i64, DrainReason),
@@ -194,7 +197,7 @@ impl WaitControl {
     fn owner(self) -> Option<(i64, DrainReason)> {
         match self {
             Self::Closed => None,
-            Self::Open(id, reason) | Self::Requested(id, reason, _) | Self::Forcing(id, reason)
+            Self::Open(id, reason) | Self::Planned(id, reason, _) | Self::Requested(id, reason, _) | Self::Forcing(id, reason)
             | Self::Cancelling(id, reason) | Self::Ready(id, reason) => Some((id, reason)),
         }
     }
@@ -445,7 +448,7 @@ impl Update {
 
     pub(crate) fn hold_input<T>(&self, save: impl FnOnce() -> Result<T>) -> Result<T> {
         let control = self.wait_control.lock().unwrap();
-        ensure!(!self.trial_pending() && !*self.swapping.borrow() && !matches!(*control, WaitControl::Ready(..)),
+        ensure!(!self.trial_pending() && !*self.swapping.borrow() && !matches!(*control, WaitControl::Ready(..) | WaitControl::Planned(..)),
             "server swap in progress");
         save()
     }
@@ -456,11 +459,14 @@ impl Update {
 
     fn control(&self, id: i64, reason: DrainReason, action: WaitAction) -> Result<()> {
         let mut control = self.wait_control.lock().unwrap();
-        ensure!(matches!(*control, WaitControl::Open(current, active) if id == current && active == reason),
-            "this drain is no longer accepting controls");
+        ensure!(matches!(*control, WaitControl::Open(current, active) | WaitControl::Planned(current, active, None)
+            if id == current && active == reason), "this drain is no longer accepting controls");
         ensure!(reason != DrainReason::Shutdown || !self.shutdown_signalled.load(std::sync::atomic::Ordering::Acquire),
             "shutdown was requested by a signal");
-        *control = WaitControl::Requested(id, reason, action);
+        *control = match *control {
+            WaitControl::Planned(..) => WaitControl::Planned(id, reason, Some(action)),
+            _ => WaitControl::Requested(id, reason, action),
+        };
         self.wait_changed.notify_waiters();
         Ok(())
     }
@@ -474,6 +480,10 @@ impl Update {
     }
 
     fn begin_wait(&self, reason: DrainReason, signal: bool) -> Result<Option<i64>> {
+        self.begin_wait_inner(reason, signal, false)
+    }
+
+    fn begin_wait_inner(&self, reason: DrainReason, signal: bool, planned: bool) -> Result<Option<i64>> {
         use std::sync::atomic::Ordering;
         let mut control = self.wait_control.lock().unwrap();
         if reason == DrainReason::Shutdown && signal {
@@ -483,7 +493,7 @@ impl Update {
                 return Ok(None);
             }
             if (control.owner().is_some_and(|(_, reason)| reason == DrainReason::Shutdown)
-                && !matches!(*control, WaitControl::Cancelling(..)))
+                && !matches!(*control, WaitControl::Cancelling(..) | WaitControl::Planned(..)))
                 || *self.swapping.borrow()
             {
                 return Ok(None);
@@ -496,7 +506,7 @@ impl Update {
         let previous = self.last_wait.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
             |previous| Some(now.max(previous + 1))).unwrap();
         let id = now.max(previous + 1);
-        *control = WaitControl::Open(id, reason);
+        *control = if planned { WaitControl::Planned(id, reason, None) } else { WaitControl::Open(id, reason) };
         self.wait_changed.notify_waiters();
         self.drain_status.send_replace(Some(DrainStatus {
             started_at: id, reason, progress: DrainProgress::Draining, jobs_running: 0,
@@ -508,14 +518,26 @@ impl Update {
     pub(crate) fn request_shutdown(
         self: &Arc<Self>, app: Arc<crate::App>, limit: Duration, signal: bool,
     ) -> Result<()> {
-        let Some(id) = self.begin_wait(DrainReason::Shutdown, signal)? else { return Ok(()) };
+        let id = if signal {
+            let Some(id) = self.begin_wait(DrainReason::Shutdown, true)? else { return Ok(()) };
+            id
+        } else {
+            let _run = self.run.try_lock().context("Planned shutdown refused: 1 active server update")?;
+            self.begin_planned_wait(&app, DrainReason::Shutdown, None)?
+        };
         let update = self.clone();
         let stop_by = tokio::time::Instant::now() + limit;
         tokio::spawn(async move {
             let wait = WaitGuard { control: &update.wait_control, id, reason: DrainReason::Shutdown };
-            match update.wait_for_idle(&app, &wait, Some(stop_by)).await {
+            let result = if signal {
+                update.wait_for_idle(&app, &wait, Some(stop_by)).await
+            } else {
+                update.wait_for_planned(&app, &wait, None, stop_by).await
+            };
+            match result {
                 Ok(WaitOutcome::Cancelled) => {}
                 Ok(WaitOutcome::Ready(_)) => {
+                    update.set_drain_progress(id, DrainProgress::Ready, None);
                     update.shutdown_ready.send_replace(true);
                 }
                 Ok(WaitOutcome::TimedOut(errors)) => {
@@ -527,7 +549,7 @@ impl Update {
                 Err(error) => {
                     tracing::error!(%error, "shutdown drain failed");
                     update.set_drain_progress(id, DrainProgress::Failed, Some(format!("{error:#}")));
-                    if update.shutdown_signalled.load(std::sync::atomic::Ordering::Acquire) {
+                    if signal && update.shutdown_signalled.load(std::sync::atomic::Ordering::Acquire) {
                         *update.wait_control.lock().unwrap() = WaitControl::Ready(id, DrainReason::Shutdown);
                         app.mutations.interrupt().await;
                         update.shutdown_ready.send_replace(true);
@@ -545,7 +567,8 @@ impl Update {
         };
         {
             let mut control = self.wait_control.lock().unwrap();
-            ensure!(matches!(*control, WaitControl::Open(current, DrainReason::Shutdown) if current == id),
+            ensure!(matches!(*control, WaitControl::Open(current, DrainReason::Shutdown)
+                | WaitControl::Planned(current, DrainReason::Shutdown, None) if current == id),
                 "this shutdown is no longer accepting controls");
             *control = WaitControl::Ready(id, DrainReason::Shutdown);
         }
@@ -576,7 +599,7 @@ impl Update {
     }
 
     pub(crate) fn start(
-        self: &Arc<Self>, app: Arc<crate::App>, rollback: bool, recipient: Option<Recipient>,
+        self: &Arc<Self>, app: Arc<crate::App>, rollback: bool, recipient: Option<Recipient>, requester: Option<RequestingTurn>,
     ) -> Result<()> {
         self.canary.ensure_open()?;
         drop(self.admit()?);
@@ -599,6 +622,7 @@ impl Update {
             .clone()
             .try_lock_owned()
             .context("self-update already running")?;
+        drop(self.check_planned(&app, requester.as_ref())?);
         let lock = self.lock_builds()?;
         let supervisor_lock = lock.try_clone()?;
         self.report_result(&app)?;
@@ -615,7 +639,7 @@ impl Update {
         let update = self.clone();
         tokio::spawn(async move {
             let result = tokio::select! {
-                result = update.execute(&app, previous, supervisor_lock) => result,
+                result = update.execute(&app, previous, supervisor_lock, requester.as_ref()) => result,
                 _ = update.monitor_planner_queue(&app) => unreachable!(),
             };
             if let Err(error) = result {
@@ -672,7 +696,8 @@ impl Update {
         Ok(lock)
     }
 
-    async fn execute(&self, app: &crate::App, previous: Option<PathBuf>, lock: File) -> Result<()> {
+    async fn execute(&self, app: &crate::App, previous: Option<PathBuf>, lock: File, requester: Option<&RequestingTurn>) -> Result<()> {
+        drop(self.check_planned(app, requester)?);
         let rollback = previous.is_some();
         let (candidate, registration) = match previous {
             Some(path) => (path, None),
@@ -683,22 +708,22 @@ impl Update {
                 self.pipeline(source, cargo).await?
             }
         };
-        self.swap(app, &candidate, lock, rollback, None, registration).await?;
+        self.swap(app, &candidate, lock, rollback, None, registration, requester).await?;
         Ok(())
     }
 
-    async fn swap(&self, app: &crate::App, candidate: &Path, lock: File, rollback: bool, pinned: Option<&str>, registration: Option<tempfile::TempDir>) -> Result<SwapOutcome> {
-        let current = self.snapshot_current()?;
-        let id = self.begin_wait(DrainReason::Update, false)?.context("wait did not start")?;
+    async fn swap(&self, app: &crate::App, candidate: &Path, lock: File, rollback: bool, pinned: Option<&str>, registration: Option<tempfile::TempDir>, requester: Option<&RequestingTurn>) -> Result<SwapOutcome> {
+        let id = self.begin_planned_wait(app, DrainReason::Update, requester)?;
         let wait = WaitGuard { control: &self.wait_control, id, reason: DrainReason::Update };
-        let idle = self.wait_for_idle(app, &wait, None).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(self.config.wait_stall_seconds.max(1)));
+        let idle = self.wait_for_planned(app, &wait, requester, deadline).await;
         if let Err(error) = &idle {
             self.set_drain_progress(wait.id, DrainProgress::Failed, Some(format!("{error:#}")));
-            app.notify_drain_cancelled(wait.id, wait.reason).await;
         }
         let WaitOutcome::Ready(_idle) = idle? else {
             return Ok(SwapOutcome::Cancelled);
         };
+        let current = self.snapshot_current()?;
         if !drain::supports(candidate)? {
             app.protect_legacy_rollback()?;
         }
@@ -752,7 +777,6 @@ impl Update {
         let mut last_jobs = 0;
         let mut last_errors = 0;
         let mut force_started = None;
-        let mut automatic_force = false;
         let mut force_error: Option<String> = None;
         loop {
             let changed = self.wait_changed.notified();
@@ -834,14 +858,7 @@ impl Update {
                         return Ok(WaitOutcome::Ready(gate.unwrap()));
                     }
                     WaitControl::Open(..) if stall_by.is_some_and(|deadline| now >= deadline) => {
-                        let blocker_kinds: Vec<_> = reason.blockers.iter().map(|blocker| blocker.kind).collect();
-                        tracing::warn!(started_at, jobs, ?blocker_kinds, gate_held = reason.gate_held,
-                            save_errors = errors.len(), elapsed_secs = elapsed_wait(started_at),
-                            stalled_secs = now.saturating_duration_since(last_progress).as_secs(),
-                            "Update drain stalled; requesting force");
-                        *control = WaitControl::Requested(started_at, drain, WaitAction::Force);
-                        automatic_force = true;
-                        continue;
+                        bail!("Server update aborted: drain stalled with {jobs} active jobs and {} save errors", errors.len());
                     }
                     _ if expired => {
                         *control = WaitControl::Ready(started_at, drain);
@@ -853,29 +870,11 @@ impl Update {
             drop(gate);
             if cancelled {
                 app.notify_drain_cancelled(started_at, drain).await;
-                self.set_drain_progress(started_at, DrainProgress::Cancelled, None);
-                if drain == DrainReason::Update {
-                    self.status.send_modify(|status| {
-                        status.wait = None;
-                        status.active = false;
-                        status.cancelled = true;
-                        status.planner_work_held = None;
-                        for step in &mut status.steps {
-                            if matches!(step.state, State::Running | State::Pending) {
-                                step.state = State::Skipped;
-                            }
-                        }
-                    });
-                    self.save_status()?;
-                }
-                return Ok(WaitOutcome::Cancelled);
+                return self.finish_cancelled_wait(wait);
             }
 
             let forcing = force_started.is_some();
             let mut messages: Vec<_> = errors.iter().map(String::as_str).collect();
-            if automatic_force {
-                messages.push("Drain made no progress before the timeout. Interrupting work for the server swap.");
-            }
             messages.extend(force_error.as_deref());
             let log = messages.join("\n");
             let status = DrainStatus {
@@ -915,9 +914,6 @@ impl Update {
                     if !log.is_empty() {
                         append_log(&mut message, &format!("\n{log}"));
                     }
-                    if automatic_force {
-                        bail!("{message}");
-                    }
                     let mut control = self.wait_control.lock().unwrap();
                     if control.owner() == Some((started_at, drain)) {
                         *control = WaitControl::Open(started_at, drain);
@@ -940,6 +936,25 @@ impl Update {
                 _ = &mut changed => {}
             }
         }
+    }
+
+    fn finish_cancelled_wait(&self, wait: &WaitGuard<'_>) -> Result<WaitOutcome<'_>> {
+        self.set_drain_progress(wait.id, DrainProgress::Cancelled, None);
+        if wait.reason == DrainReason::Update {
+            self.status.send_modify(|status| {
+                status.wait = None;
+                status.active = false;
+                status.cancelled = true;
+                status.planner_work_held = None;
+                for step in &mut status.steps {
+                    if matches!(step.state, State::Running | State::Pending) {
+                        step.state = State::Skipped;
+                    }
+                }
+            });
+            self.save_status()?;
+        }
+        Ok(WaitOutcome::Cancelled)
     }
 
     fn swap_gate(&self, app: &crate::App) -> (Option<RwLockWriteGuard<'_, ()>>, SelfUpdateWaitReason) {

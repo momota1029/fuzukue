@@ -52,11 +52,12 @@ impl Watches {
         }).collect()
     }
 
-    pub(crate) fn held_threads(&self) -> Vec<String> {
+    pub(crate) fn held_threads(&self, only_enabled: bool) -> Vec<String> {
         let Ok(store) = self.lock() else { return Vec::new() };
         store.watches().filter_map(|watch| {
             let runtime = store.state.runtime.get(&watch.id)?;
-            (!runtime.outbox.is_empty() || !runtime.wake_digest.is_empty())
+            ((!only_enabled || !runtime.paused.unwrap_or(watch.paused))
+                && (!runtime.outbox.is_empty() || !runtime.wake_digest.is_empty()))
                 .then(|| runtime.thread(watch).to_owned())
         }).collect()
     }

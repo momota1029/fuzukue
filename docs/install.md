@@ -66,7 +66,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-client
 
 ## 開発版とクライアントの更新
 
-[ソースからのビルド](../README.md#quick-start-from-source)と[既存のサーバー経由のクライアント更新](update.md)は引き続き使えます。サーバーからの更新はランチャーが起動した 書き込み可能なクライアント実行ファイルを既存の方式で入れ替えます。公開配布の Linux サーバーはインストーラーの再実行で切り替えます。macOS のベータ版は LaunchAgent を使うと自動で確認・適用します。手動操作も [Mac のベータ版ガイド](install-mac.md) にあります。
+[ソースからのビルド](../README.md#quick-start-from-source)と[既存のサーバー経由のクライアント更新](update.md)は引き続き使えます。サーバーからの更新はランチャーが起動した 書き込み可能なクライアント実行ファイルを既存の方式で入れ替えます。公開配布の Linux サーバーはインストーラーの再実行で切り替えます。macOS のベータ版は、作業を終えてからインストーラーを再実行して切り替えます。操作は [Mac のベータ版ガイド](install-mac.md) にあります。
 
 ## English
 

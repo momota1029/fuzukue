@@ -393,7 +393,7 @@ mod tests {
             selection: AgentSelection::from_model(Some(fuzukue_proto::CLAUDE_OPUS.into()), None),
         };
 
-        hub.publish_partner_turn_started("first", Some(request()), false);
+        hub.publish_partner_turn_started("first", Some(request()), false, None);
         let previous = hub.escalation_turn("first")?;
         hub.update_partner_request("first", Request { prompt: "Recheck the endpoint".into(), ..request() });
         let error = hub.request_escalation("first", previous, handoff()).unwrap_err();
@@ -401,7 +401,7 @@ mod tests {
         hub.publish_partner_turn_ended("first", Actor::Claude, false);
 
         let attempt = |thread| {
-            hub.publish_partner_turn_started(thread, Some(request()), false);
+            hub.publish_partner_turn_started(thread, Some(request()), false, None);
             let result = hub.request_escalation(thread, hub.escalation_turn(thread)?, handoff());
             hub.publish_partner_turn_ended(thread, Actor::Claude, false);
             result

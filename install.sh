@@ -202,9 +202,6 @@ function run(args) {
             return item.name + " " + item.size + " " + item.sha256;
         }).join("\n");
     }
-    case "idle":
-        requireValue(data.idle === true && String(data.pid) === first);
-        return "idle";
     default:
         throw Error("Unknown metadata action");
     }
@@ -236,7 +233,6 @@ JXA
         [ -n "$tag" ] ||
             fail 'この Mac 向けの公開版がまだありません。GitHub Releases でベータ版の公開を待ってください。' \
                  'There is no published package for this Mac yet. Check GitHub Releases for the beta.'
-        if [ "$mode" = update ] && [ "$tag" = "$installed" ]; then exit 0; fi
 
         get_api "git/ref/tags/$tag" "ref-$tag" || network_error
         object=$(metadata ref "$work/api.json" "$tag" 2>/dev/null) || verify_error
@@ -623,7 +619,8 @@ APPLESCRIPT
             if loaded "$label" && ! owned_job "$label" "$agents/$label.plist"; then occupied_error; fi
         done
     fi
-    if [ "$mode" = update ] && { [ -f "$base/auto-update-off" ] || [ ! -f "$base/release" ]; }; then exit 0; fi
+    # Scheduled package replacement needs a server-side admission reservation.
+    if [ "$mode" = update ]; then exit 0; fi
     if [ "$mode" = uninstall ] && [ ! -d "$base" ]; then exit 0; fi
 
     work= app_stage= transaction= lock_owned=false
@@ -663,7 +660,6 @@ APPLESCRIPT
 
     mkdir -p "$base" || local_error
     if ! shlock -p "$$" -f "$base/install.lock" 2>/dev/null; then
-        [ "$mode" != update ] || exit 0
         fail 'インストールか更新が進行中です。少し待ってからやり直してください。' \
              'An install or update is in progress. Wait a moment and try again.'
     fi
@@ -689,7 +685,8 @@ APPLESCRIPT
                 say '自動更新を停止しました。' 'Automatic updates are paused.'
             else
                 rm -f "$base/auto-update-off" || local_error
-                say '自動更新を再開しました。' 'Automatic updates are enabled.'
+                say '自動更新の設定を保存しました。現在、サーバーは手動で更新できます。' \
+                    'The update preference was saved. Server updates currently require a manual install.'
             fi
             exit 0 ;;
     esac
@@ -704,11 +701,6 @@ APPLESCRIPT
     if ! "$stage_only"; then
         if loaded "$server_label"; then
             server_was_loaded=true
-            if [ "$mode" = update ]; then
-                pid=$(healthy_pid) || exit 0
-                loopback 'self-update/wait?package_idle=true' > "$work/idle.json" &&
-                    metadata idle "$work/idle.json" "$pid" >/dev/null 2>&1 || exit 0
-            fi
         elif loopback self-update/health >/dev/null; then
             occupied_error
         fi

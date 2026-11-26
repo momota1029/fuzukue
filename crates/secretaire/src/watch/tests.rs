@@ -765,7 +765,7 @@ fn startup_restores_an_unopened_registered_workspace_with_watches() -> Result<()
 }
 
 #[tokio::test]
-async fn watch_wake_held_by_shutdown_resumes_once_after_cancel() -> Result<()> {
+async fn watch_wake_held_by_drain_resumes_once_after_cancel() -> Result<()> {
     use std::time::Duration;
     use fuzukue_proto::{DrainProgress, DrainReason};
 
@@ -783,17 +783,17 @@ async fn watch_wake_held_by_shutdown_resumes_once_after_cancel() -> Result<()> {
     let item = enqueue(&app, &watch)?;
     // Hold the drain open independently of the pending watch event.
     let permit = app.admit_work()?;
-    update.request_shutdown(registry, Duration::from_secs(10), false)?;
+    let (id, drain) = update.test_update_drain(registry)?;
     super::schedule(&app)?;
     assert!(!transcript(&app, &thread).contains(&item));
     assert_eq!(app.watches.lock()?.runtime(&watch).outbox.len(), 1);
 
     let mut progress = update.subscribe_drain();
-    let id = progress.borrow().as_ref().unwrap().started_at;
-    assert_eq!(progress.borrow().as_ref().unwrap().reason, DrainReason::Shutdown);
-    update.cancel_shutdown(id)?;
+    assert_eq!(progress.borrow().as_ref().unwrap().reason, DrainReason::Update);
+    update.control_wait(id, fuzukue_proto::SelfUpdateWaitAction::Cancel)?;
     tokio::time::timeout(Duration::from_secs(3), progress.wait_for(|status| status.as_ref()
         .is_some_and(|status| status.progress == DrainProgress::Cancelled))).await??;
+    assert!(drain.await?.is_err());
     drop(permit);
 
     let mut command = tokio::process::Command::new("sh");

@@ -507,6 +507,7 @@ pub(super) async fn scan(
         };
         if new && allowed_issue && !openings.seen.contains(&number) {
             let user = poll.user(app).await.unwrap_or_default();
+            let _work = admit_poll_delivery(app)?;
             let actor = field(&row["user"], "login");
             let event = GitHubActivity {
                 id: format!("{repo}#{number}:opened"),
@@ -546,6 +547,7 @@ pub(super) async fn scan(
                 .is_ok_and(|at| at.timestamp() >= state.from.max(state.scanned_at - 120))
         {
             // A PR or tracked dot issue may have activity without a new opening.
+            let _work = admit_poll_delivery(app)?;
             let mut state = repository(app, repo)?.context("Missing intake state")?;
             state.issues.entry(number).or_insert_with(|| IssueState {
                 title: one_line(&item.title, 100),
@@ -561,6 +563,7 @@ pub(super) async fn scan(
             state.save(app, repo)?;
         }
     }
+    let _work = admit_poll_delivery(app)?;
     let mut state = repository(app, repo)?.context("Missing intake state")?;
     state.scanned_at = started;
     state.save(app, repo)
@@ -610,6 +613,10 @@ impl Poll {
             {
                 self.intake_scan.insert(repo.clone(), now);
                 if let Err(error) = scan(self, app, &repo, &config).await {
+                    if error.is::<PollDeferred>() {
+                        self.intake_scan.remove(&repo);
+                        return Err(error);
+                    }
                     if rate_limited(&error) {
                         return Err(error);
                     }
@@ -650,7 +657,7 @@ impl Poll {
                         self.items.insert(link.number, item);
                     }
                     Ok(_) => {}
-                    Err(error) if rate_limited(&error) => {
+                    Err(error) if rate_limited(&error) || error.is::<PollDeferred>() => {
                         self.intake_last.remove(&link);
                         return Err(error);
                     }

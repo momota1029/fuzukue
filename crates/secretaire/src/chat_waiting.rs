@@ -123,7 +123,7 @@ impl Feed {
         for session in &self.claude_queued {
             threads.entry(session.clone()).or_insert(workspace).queued = true;
         }
-        for session in app.delegates.queued_desk_sessions() {
+        for session in app.delegates.queued_desk_sessions(true) {
             let backend = AgentBackend::for_model(app.chat_settings(&session).model.as_deref());
             let resume_at = app
                 .usage

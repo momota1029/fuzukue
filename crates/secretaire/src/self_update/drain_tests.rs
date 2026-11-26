@@ -32,7 +32,7 @@ done
     Ok(())
 }
 
-fn load(dir: &Path) -> Result<(Arc<crate::App>, Arc<Update>, Arc<Workspace>)> {
+pub(super) fn load(dir: &Path) -> Result<(Arc<crate::App>, Arc<Update>, Arc<Workspace>)> {
     let (app, update) = tests::waiting_fixture(dir)?;
     let update = Arc::new(update);
     assert!(app.self_update.set(update.clone()).is_ok());
@@ -329,15 +329,24 @@ async fn planner_work_held_during_build_and_test_replays_after_startup() -> Resu
     drain::start(&workspace);
     let task = "Planner assignment submitted during build";
     let session = planner_thread(&workspace, task)?;
-    let review = workspace.hub.edit_threads(|threads| threads.create(None))?;
-    crate::planner::write_test_plan(&workspace, &review)?;
+    let review = planner_thread(&workspace, "Review the saved goal")?;
+    crate::planner::pause_goal(&workspace, &review)?;
+    let usage = |utilization, resets_at| serde_json::json!({
+        "unifiedWindows": { "five_hour": { "utilization": utilization, "resetsAt": resets_at } }
+    });
+    workspace.usage.update_claude(&usage(1.0, crate::usage::now() + 60));
+    assert!(crate::planner::wake_goal(&workspace, &review)?);
+    assert_eq!(crate::planner::resume_eligible(&workspace, &review), Some(false));
 
     update.step(Step::Build, State::Running);
     let job = assign(&workspace, &session, task, AgentCaller::Planner).await?;
+    workspace.usage.update_claude(&usage(0.0, crate::usage::now()));
+    until(|| workspace.drain.records(&workspace.state_dir).unwrap().iter().any(|record|
+        record.session == review
+            && matches!(record.work, drain::Work::Desk(delegate::DeskTurn::Plan { resumed: true }))))
+        .await.context("waiting for the usage monitor to journal the resume")?;
     update.step(Step::Build, State::Passed);
     update.step(Step::Test, State::Running);
-    delegate::plan_follow_up(&workspace, &review);
-    delegate::resume_goal(&workspace, &review);
     delegate::plan_follow_up(&workspace, &review);
 
     let user = workspace.hub.edit_threads(|threads| threads.create(None))?;
@@ -356,10 +365,17 @@ async fn planner_work_held_during_build_and_test_replays_after_startup() -> Resu
         && matches!(record.work, drain::Work::Desk(delegate::DeskTurn::Plan { resumed: true }))));
 
     update.step(Step::Test, State::Passed);
-    let wait = begin(&update)?;
-    let idle = tokio::time::timeout(Duration::from_secs(5), update.wait_for_idle(&app, &wait, None)).await??;
+    update.status.send_modify(|status| status.active = false);
+    let error = update.check_planned(&app, None).unwrap_err();
+    assert!(error.to_string().contains("2 queued work items"), "{error:#}");
+    update.status.send_modify(|status| status.active = true);
+    let reason = DrainReason::Update;
+    let id = update.begin_planned_wait(&app, reason, None)?;
+    let wait = WaitGuard { control: &update.wait_control, id, reason };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let idle = update.wait_for_planned(&app, &wait, None, deadline).await?;
     assert!(matches!(idle, WaitOutcome::Ready(_)));
-    assert_eq!(update.subscribe().borrow().planner_work_held, Some(2));
+    assert_eq!(workspace.drain.queued_planner_count(&workspace.state_dir), 2);
     assert_eq!(app.drain_job_count(&app.swap_blockers()), 0);
 
     let new_app = crate::App::new(
@@ -432,10 +448,8 @@ async fn planner_work_replays_on_update_failure_or_cancel() -> Result<()> {
             assert!(matches!(update.wait_for_idle(&app, &wait, None).await?, WaitOutcome::Cancelled));
             assert!(update.subscribe().borrow().cancelled);
         } else {
-            // The configured source is a fixture directory, so Check fails.
-            update.start(app.clone(), false, None)?;
-            assert!(update.planner_work_held());
-            until(|| update.subscribe().borrow().error.is_some()).await?;
+            // Simulate an accepted build failing after planner work arrived.
+            update.fail("fixture build failed".into());
         }
         assert!(update.subscribe().borrow().planner_work_held.is_none());
         until(|| prompt_count(&workspace, "Resume test goal") == 1).await?;
@@ -453,7 +467,7 @@ async fn update_failure_before_swap_wakes_only_its_requesting_thread() -> Result
     let other = workspace.hub.edit_threads(|threads| threads.create(None))?;
     let (_, mut events) = workspace.hub.subscribe(u64::MAX);
 
-    update.start(app, false, Some(Recipient::new(&workspace, &session)))?;
+    update.start(app, false, Some(Recipient::new(&workspace, &session)), None)?;
     let (item, text) = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await?;
@@ -515,7 +529,7 @@ async fn update_result_is_saved_while_busy_and_quota_blocked_without_changing_he
     let item = request["request"]["id"].as_str().context("missing result ID")?;
     let transcript = workspace.hub.thread_path(&session)?;
 
-    workspace.hub.publish_partner_turn_started(&session, None, false);
+    workspace.hub.publish_partner_turn_started(&session, None, false, None);
     workspace.usage.restore(vec![fuzukue_proto::UsageWindow {
         agent: "claude".into(),
         name: "test".into(),
@@ -874,7 +888,7 @@ async fn shutdown_drain_checkpoints_a_memory_only_tool_result() -> Result<()> {
 
     let lock = std::fs::File::open(payloads.parent().unwrap())?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
-    update.request_shutdown(app.clone(), Duration::from_secs(5), false)?;
+    update.request_shutdown(app.clone(), Duration::from_secs(5), true)?;
     until(|| update.drain_status.borrow().as_ref().is_some_and(|status| {
         status.message.as_deref().is_some_and(|message| message.contains("could not save dirty transcripts"))
     })).await?;
@@ -901,6 +915,12 @@ async fn safe_close_reports_active_threads_and_force_commits_only_the_matching_s
     assert_eq!(work.threads[0].id, session);
 
     let job = workspace.admit_work()?;
+    let error = update.request_shutdown(app.clone(), Duration::from_secs(60), false).unwrap_err();
+    assert!(error.to_string().contains("1 active turns"));
+    assert!(!*update.shutdown_ready.borrow());
+
+    drop(job);
+    workspace.hub.publish(ServerEvent::TurnEnded { session, actor: Actor::Claude });
     update.request_shutdown(app.clone(), Duration::from_secs(60), false)?;
     let id = update.drain_status.borrow().as_ref().unwrap().started_at;
     assert!(update.force_shutdown(&app, Some(id - 1)).await.is_err());
@@ -910,7 +930,6 @@ async fn safe_close_reports_active_threads_and_force_commits_only_the_matching_s
     assert!(workspace.admit_work().is_err());
     assert_eq!(update.drain_status.borrow().as_ref().unwrap().progress, DrainProgress::Ready);
     assert!(update.cancel_shutdown(id).is_err());
-    drop(job);
     tokio::task::yield_now().await;
     assert_eq!(update.drain_status.borrow().as_ref().unwrap().progress, DrainProgress::Ready);
 
@@ -1217,10 +1236,10 @@ async fn force_timeout_leaves_admission_closed_and_allows_cancel() -> Result<()>
 }
 
 #[tokio::test]
-async fn stalled_update_reaps_unresponsive_claude_and_preserves_held_work() -> Result<()> {
+async fn explicit_update_force_reaps_unresponsive_claude_and_preserves_held_work() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (app, mut update) = tests::waiting_fixture(dir.path())?;
-    update.config = toml::from_str("wait_stall_seconds = 1")?;
+    update.config = toml::from_str("wait_stall_seconds = 30")?;
     let update = Arc::new(update);
     assert!(app.self_update.set(update.clone()).is_ok());
     install_desk_fixture(&app, dir.path())?;
@@ -1243,10 +1262,9 @@ done
 
     let (outcome, ()) = tokio::time::timeout(Duration::from_secs(12), async {
         tokio::try_join!(update.wait_for_idle(&app, &wait, None), async {
-            status.wait_for(|status| status.as_ref().is_some_and(|status| {
-                status.progress == DrainProgress::Forcing && status.message.as_ref()
-                    .is_some_and(|message| message.contains("no progress"))
-            })).await?;
+            status.wait_for(|status| status.as_ref().is_some_and(|status| status.jobs_running > 0)).await?;
+            update.control_wait(wait.id, WaitAction::Force)?;
+            status.wait_for(|status| status.as_ref().is_some_and(|status| status.progress == DrainProgress::Forcing)).await?;
             Ok::<_, anyhow::Error>(())
         })
     }).await??;
@@ -1316,7 +1334,7 @@ for line in sys.stdin:
 }
 
 #[tokio::test(start_paused = true)]
-async fn update_progress_resets_the_timeout_and_failed_automatic_force_exits() -> Result<()> {
+async fn update_progress_resets_the_stall_timeout_then_aborts_without_force() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (app, mut update) = tests::waiting_fixture(dir.path())?;
     update.config.wait_stall_seconds = 5;
@@ -1346,16 +1364,16 @@ async fn update_progress_resets_the_timeout_and_failed_automatic_force_exits() -
         workspace.hub.publish(ServerEvent::TextDelta {
             session: stuck, item: "queued".into(), actor: Actor::System, text: "input held".into(),
         });
-        status.wait_for(|status| status.as_ref().is_some_and(|status| status.progress == DrainProgress::Forcing)).await?;
-        tokio::time::advance(WAIT_FORCE_LIMIT + Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
         Ok::<_, anyhow::Error>(())
     };
     let (outcome, action) = tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(update.wait_for_idle(&app, &wait, None), action)
     }).await?;
     action?;
-    let Err(error) = outcome else { panic!("unsafe drain must fail at the force deadline") };
-    assert!(error.to_string().contains("Timed out draining work"));
+    let Err(error) = outcome else { panic!("a stalled drain must abort") };
+    assert!(error.to_string().contains("drain stalled"));
+    assert_ne!(status.borrow().as_ref().unwrap().progress, DrainProgress::Forcing);
     drop(wait);
     assert!(workspace.admit_work().is_ok());
     Ok(())

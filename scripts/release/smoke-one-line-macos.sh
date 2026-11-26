@@ -362,19 +362,9 @@ sh "$root/install.sh" --no-auto-update "${flags[@]}"
 sh "$app/Contents/Resources/install.sh" --update "${flags[@]}"
 [[ $(< "$base/release") == "$tag" ]]
 sh "$root/install.sh" --resume-auto-update "${flags[@]}"
-if "$gui"; then
-    idle=false
-    for _ in {1..30}; do
-        if curl --noproxy '*' -fsS "http://127.0.0.1:$port/self-update/wait?package_idle=true" |
-            python3 -c 'import json,sys; assert json.load(sys.stdin)["idle"]'; then
-            idle=true
-            break
-        fi
-        sleep 1
-    done
-    [[ $idle == true ]]
-fi
 sh "$app/Contents/Resources/install.sh" --update "${flags[@]}"
+[[ $(< "$base/release") == "$tag" ]]
+sh "$root/install.sh" "${flags[@]}"
 [[ $(< "$base/release") == "$next" ]]
 [[ $(plutil -extract FuzukueReleaseTag raw "$app/Contents/Info.plist") == "$next" ]]
 codesign --verify --strict "$app"

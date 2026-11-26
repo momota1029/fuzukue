@@ -362,7 +362,7 @@ impl Snapshot {
         edits
     }
 
-    fn changes(self, project: &Path) -> Result<Vec<(PathBuf, DeckFiles)>> {
+    fn changes(&self, project: &Path) -> Result<Vec<(PathBuf, DeckFiles)>> {
         let defaults = Overrides::read(&fuzukue_proto::compat::workspace_config(project))?;
         if !self.available {
             return Ok(Vec::new());
@@ -520,16 +520,13 @@ impl Workspace {
             if !enabled() {
                 return;
             }
-            let Ok(work) = self.admit_work() else {
-                self.drain.defer(&self.state_dir, session, crate::mail::session_key(),
-                    crate::self_update::drain::Work::AutomaticReview { project: project.into(), before, kind: only });
-                return;
-            };
-            let work = Arc::new(work);
             let dir = project.to_owned();
-            let changes = match tokio::task::spawn_blocking(move || before.changes(&dir)).await {
-                Ok(Ok(changes)) => changes,
-                Ok(Err(error)) => {
+            let (before, changes) = match tokio::task::spawn_blocking(move || {
+                let changes = before.changes(&dir);
+                (before, changes)
+            }).await {
+                Ok((before, Ok(changes))) => (before, changes),
+                Ok((_, Err(error))) => {
                     tracing::warn!("自動査読の変更を読めない: {error:#}");
                     return;
                 }
@@ -538,6 +535,15 @@ impl Workspace {
                     return;
                 }
             };
+            if changes.is_empty() {
+                return;
+            }
+            let Ok(work) = self.admit_work() else {
+                self.drain.defer(&self.state_dir, session, crate::mail::session_key(),
+                    crate::self_update::drain::Work::AutomaticReview { project: project.into(), before, kind: only });
+                return;
+            };
+            let work = Arc::new(work);
             let settings = self.review_settings();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             for (root, baseline) in changes {

@@ -31,6 +31,15 @@ ROW = {"tag_name": NEW, "draft": False, "prerelease": True,
 
 
 class UpdateTests(unittest.TestCase):
+    def test_legacy_automatic_server_install_never_downloads(self):
+        mac = types.SimpleNamespace(sysname="Darwin", machine="arm64")
+        with patch.object(SCRIPT.os, "uname", return_value=mac), (
+            patch.object(sys, "argv", ["install-server.sh", "--automatic", "--version", NEW])
+        ), patch.object(SCRIPT, "download") as download, patch.object(SCRIPT, "switch_launchd") as activate:
+            SCRIPT.main()
+            download.assert_not_called()
+            activate.assert_not_called()
+
     def test_conditional_request_and_backoff(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -72,27 +81,25 @@ class UpdateTests(unittest.TestCase):
         ) as current, patch.object(SCRIPT.subprocess, "run") as install:
             old_server = f"{OLD}/secretaire"
             old_client = f"{OLD}/fuzukue"
-            current.side_effect = [old_server, old_client, old_server]
+            current.side_effect = [old_server, old_client]
+            SCRIPT.scheduled_update()
+            install.assert_not_called()
+
+            current.side_effect = [f"{NEW}/secretaire", old_client]
             SCRIPT.scheduled_update()
             self.assertEqual(install.call_count, 1)
-            self.assertNotIn("--client", install.call_args.args[0])
-
-            install.reset_mock()
-            current.side_effect = [old_server, old_client, f"{NEW}/secretaire"]
-            SCRIPT.scheduled_update()
-            self.assertEqual(install.call_count, 2)
             self.assertIn("--client", install.call_args.args[0])
             args = install.call_args.args[0]
             self.assertEqual(args[args.index("--version") + 1], NEW)
 
             install.reset_mock()
             install.side_effect = SCRIPT.subprocess.CalledProcessError(1, "installer")
-            current.side_effect = [old_server, old_client]
+            current.side_effect = [f"{NEW}/secretaire", old_client]
             with self.assertRaises(SCRIPT.subprocess.CalledProcessError):
                 SCRIPT.scheduled_update()
             self.assertEqual(install.call_count, 1)
             install.reset_mock()
-            current.side_effect = [old_server, old_client]
+            current.side_effect = [f"{NEW}/secretaire", old_client]
             SCRIPT.scheduled_update()
             install.assert_not_called()
 

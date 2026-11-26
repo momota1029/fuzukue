@@ -74,6 +74,13 @@ struct Registry {
     research: crate::workshop::Settings,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockerScan {
+    Drain,
+    Preflight,
+    Cutoff,
+}
+
 impl App {
     pub fn new(
         home: PathBuf,
@@ -538,10 +545,11 @@ impl App {
     }
 
     fn background_job_count(workspace: &Workspace) -> usize {
-        workspace.delegates.running_count()
-            + workspace.running_test_count()
-            + usize::from(workspace.active_build().is_some())
-            + workspace.running_review_count()
+        workspace.delegates.running_count() + Self::background_operation_count(workspace)
+    }
+
+    pub(crate) fn background_operation_count(workspace: &Workspace) -> usize {
+        workspace.running_test_count() + usize::from(workspace.active_build().is_some()) + workspace.running_review_count()
     }
 
     pub(crate) fn shutdown_work(&self) -> fuzukue_proto::ShutdownWork {
@@ -560,8 +568,13 @@ impl App {
     }
 
     pub(crate) fn swap_blockers(&self) -> fuzukue_proto::SelfUpdateWaitReason {
+        Self::workspace_blockers(&self.loaded_workspaces(), BlockerScan::Drain)
+    }
+
+    pub(crate) fn workspace_blockers(workspaces: &[Arc<Workspace>], scan: BlockerScan) -> fuzukue_proto::SelfUpdateWaitReason {
+        let planned = scan != BlockerScan::Drain;
         let mut reason = fuzukue_proto::SelfUpdateWaitReason::default();
-        for workspace in self.loaded_workspaces() {
+        for workspace in workspaces {
             let workers = workspace.delegates.running_sessions();
             let sessions = workspace.sessions.try_lock().ok();
             reason.checking_sessions |= sessions.is_none();
@@ -573,23 +586,49 @@ impl App {
                 }
             }
             reason.blockers.extend(blockers);
-            if let Ok(records) = workspace.drain.records(&workspace.state_dir) {
-                for record in records {
-                    if !record.claimed && record.review.is_none()
-                        && !matches!(record.work, crate::self_update::drain::Work::Checkpoint { .. }
-                            | crate::self_update::drain::Work::Usage(_)
-                            | crate::self_update::drain::Work::LegacyPlan(_)
-                            | crate::self_update::drain::Work::LegacyGitHub(_)
-                            | crate::self_update::drain::Work::LegacyWatch { .. })
-                    {
-                        update_thread_reason(&workspace, &mut reason, &record.session).queued = true;
+            let is_live = |session: &str| workspace.hub.read_threads(|store| store.is_live(session));
+            // Preflight checks runnable journal entries before closing admission.
+            // At cutoff, new journal entries wait for replay. The caller still
+            // checks journal read and save errors before declaring readiness.
+            if scan != BlockerScan::Cutoff {
+                if let Ok(records) = workspace.drain.records(&workspace.state_dir) {
+                    use crate::self_update::drain::Work;
+                    let now = crate::self_update::drain::delivery_now();
+                    let planner_held = planned && workspace.planner_work_held();
+                    for record in records {
+                        let background = matches!(record.work, Work::Build { .. } | Work::HumanReview { .. });
+                        // Deferred automatic reviews can be reopened from their saved baseline.
+                        let deferred_review = matches!(record.work, Work::AutomaticReview { .. });
+                        if !record.claimed && record.review.is_none()
+                            && !matches!(record.work, Work::Checkpoint { .. } | Work::Usage(_)
+                                | Work::LegacyPlan(_) | Work::LegacyGitHub(_) | Work::LegacyWatch { .. })
+                            && (!planned || background || record.ready(now) && is_live(&record.session)
+                                && !deferred_review
+                                && (!record.work.is_planner()
+                                    || !planner_held && !crate::planner::is_paused(workspace, &record.session)))
+                        {
+                            update_thread_reason(workspace, &mut reason, &record.session).queued = true;
+                        }
                     }
                 }
             }
-            for session in workspace.delegates.queued_desk_sessions().into_iter().chain(workspace.watches.held_threads()) {
-                update_thread_reason(&workspace, &mut reason, &session).queued = true;
+            // The journal entries above cover durable desk work. In-memory
+            // entries still need a check even when their thread was archived.
+            for session in workspace.delegates.queued_desk_sessions(!planned) {
+                update_thread_reason(workspace, &mut reason, &session).queued = true;
+            }
+            for session in workspace.watches.held_threads(planned) {
+                if !planned || is_live(&session) {
+                    update_thread_reason(workspace, &mut reason, &session).queued = true;
+                }
+            }
+            if planned {
+                for session in crate::issue_threads::queued_for_dispatch(workspace) {
+                    update_thread_reason(workspace, &mut reason, &session).queued = true;
+                }
             }
         }
+        reason.threads.retain(|thread| thread.running || thread.worker || thread.checking || thread.queued || thread.paused);
         reason.threads.sort_by(|a, b| (&a.workspace, &a.id).cmp(&(&b.workspace, &b.id)));
         reason
     }
@@ -623,8 +662,12 @@ impl App {
     }
 
     pub(crate) fn drain_errors(&self, reason: &mut fuzukue_proto::SelfUpdateWaitReason) -> Vec<String> {
+        Self::workspace_drain_errors(&self.loaded_workspaces(), reason)
+    }
+
+    pub(crate) fn workspace_drain_errors(workspaces: &[Arc<Workspace>], reason: &mut fuzukue_proto::SelfUpdateWaitReason) -> Vec<String> {
         let mut errors = Vec::new();
-        for workspace in self.loaded_workspaces() {
+        for workspace in workspaces {
             if let Some(error) = workspace.test_save_error() {
                 errors.push(format!("{}: saving test results: {error}", workspace.id));
             }

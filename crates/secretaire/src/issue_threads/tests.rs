@@ -113,14 +113,14 @@ async fn escalation_refuses_intake_and_automatic_turns() -> Result<()> {
     let session = app.hub.edit_threads(|store| store.create(None))?;
     let args = || serde_json::from_value(json!({"scope":"task","reason":"Two attempts were blocked"}));
 
-    app.hub.publish_partner_turn_started(&session, None, false);
+    app.hub.publish_partner_turn_started(&session, None, false, None);
     let error = request_escalation(&app, &session, args()?).await.unwrap_err();
     assert_eq!(error.to_string(), "Escalation requires an ordinary user turn");
 
     // Even an active user request cannot authorize escalation while GitHub intake owns the turn.
     app.hub.publish_partner_turn_started(&session, Some(Request {
         prompt: "Ordinary request".into(), images: Vec::new(),
-    }), false);
+    }), false, None);
     app.issue_threads.test_start_automatic_turn(&session, GitHubPolicy::Allow);
     let error = request_escalation(&app, &session, args()?).await.unwrap_err();
     assert_eq!(error.to_string(), "Escalation is unavailable in automatic GitHub turns");
@@ -328,6 +328,133 @@ async fn intake_title_follows_issue_edits_until_the_thread_is_renamed() -> Resul
     write_title(&mut issue, "Edited again");
     Poll::default().poll_item(&app, &link).await?;
     assert_eq!(title(), generated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn planned_shutdown_during_poll_fetch_preserves_the_event_for_one_delivery() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let (registry, app) = fixture.workspace()?;
+    let update = crate::self_update::test_gate(&fixture.dir.path().join("update"));
+    assert!(registry.self_update.set(update.clone()).is_ok());
+    let session = fixture.create(&app, GitHubPolicy::Notify)?;
+    let link = link(&app, 12)?;
+    Poll::default().poll_item(&app, &link).await?;
+    let cursor = cursor_path(&app, &link);
+    let before = std::fs::read(&cursor)?;
+
+    fixture.write(json!({"comments": [authored(42, "Arrived during the poll", "reader")]}));
+    let bin = fixture.dir.path().join("bin");
+    std::fs::rename(bin.join("gh"), bin.join("gh-real"))?;
+    fixture.dir.write("bin/gh", r#"#!/bin/sh
+case "$*" in
+    */issues/12/comments\?*)
+        : > network-started
+        attempt=0
+        while [ ! -f release-network ] && [ "$attempt" -lt 200 ]; do
+            /bin/sleep .05
+            attempt=$((attempt + 1))
+        done
+        ;;
+esac
+exec "${0%/*}/gh-real" "$@"
+"#);
+    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))?;
+
+    let poll = tokio::spawn(poll_loop(Arc::downgrade(&app)));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !app.project_dir.join("network-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.with_context(|| format!("poll did not reach the blocked fetch: {}", fixture.log()))?;
+    update.request_shutdown(registry.clone(), Duration::from_secs(5), false)?;
+    let mut drain = update.subscribe_drain();
+    tokio::time::timeout(Duration::from_secs(5), drain.wait_for(|state| state.as_ref()
+        .is_some_and(|state| state.progress == fuzukue_proto::DrainProgress::Ready)))
+        .await.context("planned shutdown did not become ready during the blocked fetch")??;
+
+    fixture.dir.write("project/release-network", "");
+    let error = Poll::default().poll_item(&app, &link).await.unwrap_err();
+    assert!(error.is::<PollDeferred>(), "{error:#}");
+    poll.abort();
+    assert!(poll.await.unwrap_err().is_cancelled());
+    assert_eq!(std::fs::read(&cursor)?, before);
+    let unread = |app: &Workspace| app.hub.read_threads(|store| store.github_state(&session)).unwrap().unread;
+    assert_eq!(unread(&app), 0);
+    drop(app);
+    drop(registry);
+
+    // Reopening the workspace loads the old cursor and the fetched REST cache.
+    let (_registry, app) = fixture.workspace()?;
+    let poll = Poll::default();
+    poll.poll_item(&app, &link).await?;
+    assert_eq!(unread(&app), 1);
+    poll.poll_item(&app, &link).await?;
+    assert_eq!(unread(&app), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetched_open_issue_survives_cutoff_then_closure_and_delivers_once() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let (registry, app) = fixture.workspace()?;
+    let update = crate::self_update::test_gate(&fixture.dir.path().join("update"));
+    assert!(registry.self_update.set(update.clone()).is_ok());
+    let repo = "example-owner/lab";
+    let cursor_path = app.state_dir.join("github-items").join(repo).join("intake.json");
+    let pending_path = cursor_path.with_file_name("intake-pending.json");
+    fixture.write(json!({"issues": []}));
+    Poll::default().tick(&app).await;
+    let before = std::fs::read(&cursor_path)?;
+
+    let mut issue = opened_issue(12, "reader", "Fetched while still open.", &[]);
+    fixture.write(json!({"issues": [&issue]}));
+    let serial = app.issue_threads.serial.lock().await;
+    let poll = tokio::spawn({
+        let app = app.clone();
+        async move { Poll::default().tick(&app).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !pending_path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.with_context(|| format!("open issue was not staged: {}", fixture.log()))?;
+
+    update.request_shutdown(registry.clone(), Duration::from_secs(5), false)?;
+    let mut drain = update.subscribe_drain();
+    tokio::time::timeout(Duration::from_secs(5), drain.wait_for(|state| state.as_ref()
+        .is_some_and(|state| state.progress == fuzukue_proto::DrainProgress::Ready)))
+        .await.context("planned shutdown did not reach readiness")??;
+    drop(serial);
+    tokio::time::timeout(Duration::from_secs(5), poll).await??;
+    let session = fuzukue_proto::issue_thread_id(12);
+    assert!(!app.hub.has_thread(&session));
+    assert_eq!(std::fs::read(&cursor_path)?, before);
+    let pending = std::fs::read(&pending_path)?;
+    drop(app);
+    drop(registry);
+
+    // The old cursor schema can be written independently of the pending rows.
+    let legacy_cursor: IntakeCursor = serde_json::from_slice(&before)?;
+    save_json(&cursor_path, &legacy_cursor)?;
+    issue["state"] = json!("CLOSED");
+    let mut never_fetched_open = opened_issue(13, "reader", "Already closed.", &[]);
+    never_fetched_open["state"] = json!("CLOSED");
+    fixture.write(json!({"issues": [issue, never_fetched_open]}));
+    let (_registry, app) = fixture.workspace()?;
+    Poll::default().tick(&app).await;
+    let unread = || app.hub.read_threads(|store| store.github_state(&session)).unwrap().unread;
+    assert_eq!(unread(), 1);
+    assert!(!app.hub.has_thread(&fuzukue_proto::issue_thread_id(13)));
+    assert!(!pending_path.exists());
+
+    // Simulate interruption after delivery but before acknowledging the row.
+    save_json(&cursor_path, &legacy_cursor)?;
+    std::fs::write(&pending_path, pending)?;
+    Poll::default().tick(&app).await;
+    assert_eq!(unread(), 1);
+    assert!(load_json::<IntakeCursor>(&cursor_path)?.unwrap().seen.contains(&12));
+    assert!(!pending_path.exists());
     Ok(())
 }
 
@@ -900,8 +1027,11 @@ async fn cli_creation_is_correlated_once_its_returned_number_is_linked() -> Resu
     attach(&app, &session, link(&app, 13)?)?;
     let repo = "example-owner/lab";
     let (_, mut live) = app.hub.subscribe(u64::MAX);
-    Poll::default().intake_open(&app, repo, &GitHubConfig::default(), now,
-        &[opened_issue(13, "fixture", "A report", &[])]).await?;
+    let path = app.state_dir.join("github-items").join(repo).join("intake.json");
+    let cursor = IntakeCursor { from: now, seen: BTreeSet::new() };
+    let pending_path = path.with_file_name("intake-pending.json");
+    cursor.keep_open_rows(&pending_path, &[opened_issue(13, "fixture", "A report", &[])])?;
+    Poll::default().intake_open(&app, repo, &GitHubConfig::default(), &path, &pending_path, cursor).await?;
     assert!(std::iter::from_fn(|| live.try_recv().ok()).any(|env| {
         matches!(&env.event, ServerEvent::LocalNotice { session: id, item, .. }
             if id == &session && item == "github-echo:example-owner/lab#13:opened")

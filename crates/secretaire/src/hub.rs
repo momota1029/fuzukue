@@ -41,6 +41,7 @@ struct Inner {
     writer: Option<crate::state::TimelineWriter>,
     threads: Option<crate::threads::Store>,
     partner_started: HashMap<String, PartnerTurn>,
+    next_partner_generation: u64,
     handoffs_ready: HashSet<String>,
     recent_handoffs: HashMap<String, VecDeque<tokio::time::Instant>>,
     last_partner_progress: Option<tokio::time::Instant>,
@@ -134,6 +135,8 @@ struct Observed {
 }
 
 struct PartnerTurn {
+    generation: u64,
+    update_proof: Option<String>,
     observed: Observed,
     request: Option<crate::front_desk::Request>,
     request_revision: u64,
@@ -188,7 +191,7 @@ impl Hub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
         let (worker_events, _) = broadcast::channel(1024);
-        Self { inner: Mutex::new(Inner { next_seq: 1, log: ReplayLog::default(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), handoffs_ready: HashSet::new(), recent_handoffs: HashMap::new(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
+        Self { inner: Mutex::new(Inner { next_seq: 1, log: ReplayLog::default(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), next_partner_generation: 0, handoffs_ready: HashSet::new(), recent_handoffs: HashMap::new(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
             worker_events,
             epoch: format!("{:032x}", rand::random::<u128>()),
             approval_queue: Default::default(),
@@ -548,6 +551,18 @@ impl Hub {
         self.inner.lock().unwrap().last_partner_progress
     }
 
+    pub(crate) fn update_request_generation(&self, session: &str, proof: &str) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        let turn = inner.partner_started.get(session)?;
+        (turn.update_proof.as_deref() == Some(proof)).then_some(turn.generation)
+    }
+
+    pub(crate) fn partner_is_only_turn(&self, session: &str, generation: u64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        !inner.compactions.contains_key(session)
+            && inner.partner_started.get(session).is_some_and(|turn| turn.generation == generation)
+    }
+
     pub(crate) fn partner_elapsed(&self, session: &str) -> Option<u64> {
         self.inner.lock().unwrap().partner_started.get(session)
             .map(|started| started.observed.instant.elapsed().as_millis() as u64)
@@ -555,9 +570,14 @@ impl Hub {
 
     pub(crate) fn publish_partner_turn_started(
         &self, session: &str, request: Option<crate::front_desk::Request>, escalated: bool,
+        update_proof: Option<String>,
     ) {
         let mut inner = self.inner.lock().unwrap();
+        inner.next_partner_generation += 1;
+        let generation = inner.next_partner_generation;
         inner.partner_started.insert(session.into(), PartnerTurn {
+            generation,
+            update_proof,
             observed: Observed::now(),
             request,
             request_revision: 0,
@@ -712,7 +732,11 @@ impl Hub {
         if let Some((session, running)) = activity {
             let was_idle = inner.running.is_empty();
             if running {
+                inner.next_partner_generation += 1;
+                let generation = inner.next_partner_generation;
                 inner.partner_started.entry(session.clone()).or_insert_with(|| PartnerTurn {
+                    generation,
+                    update_proof: None,
                     observed: Observed::now(), request: None, request_revision: 0, handoff: None, escalated: false,
                     external_approval_input: false,
                 });

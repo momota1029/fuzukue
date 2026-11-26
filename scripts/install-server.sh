@@ -788,10 +788,6 @@ def scheduled_update():
     command = ["/bin/sh", str(INSTALLER), "--automatic", "--channel", "beta", "--version", tag]
     server_tag = old_server.split("/")[0]
     try:
-        if semver(tag) > semver(server_tag):
-            subprocess.run(command, check=True)
-            installed = read_link(server, "current", "secretaire")
-            server_tag = installed.split("/")[0] if installed else None
         # A running desktop keeps its old image. Launch the new client only after
         # the corresponding server has passed its health check.
         client_tag = old_client.split("/")[0] if old_client else None
@@ -804,24 +800,6 @@ def scheduled_update():
         raise
     else:
         retry_path.unlink(missing_ok=True)
-
-
-def agent_idle(unit):
-    if unit is None or not unit.is_file():
-        return False
-    status = agent_status(unit, launch_domain()) or ""
-    pid = re.search(r"(?m)^\s*pid = ([1-9][0-9]*)$", status)
-    if not pid:
-        return False
-    config = plistlib.loads(unit.read_bytes())
-    port = int(config["EnvironmentVariables"]["FUZUKUE_ADDR"].split(":", 1)[1])
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        with opener.open(f"http://127.0.0.1:{port}/self-update/wait?package_idle=true", timeout=2) as response:
-            body = json.load(response)
-            return body.get("idle") is True and body.get("pid") == int(pid[1])
-    except (OSError, ValueError):
-        return False
 
 
 def switch_launchd(root, launcher, text, unit, new_unit, current, previous, candidate, backup, finish=None):
@@ -1022,6 +1000,9 @@ def main():
     require(not args.automatic or (macos and args.version and not args.fixture
                                    and args.repository == OFFICIAL_REPO),
             "Automatic updates require a macOS release from the official repository.")
+    # Older scheduler copies may still request an unattended server install.
+    if args.automatic and not args.client:
+        return
     if args.check_agents:
         require(not (args.client or args.install_agents or args.skip_agents),
                 "--check-agents reports server prerequisites only.")
@@ -1097,8 +1078,6 @@ def main():
                     or (TAG.fullmatch(active_tag) and semver(args.version) <= semver(active_tag))
                     or (rejected.is_file() and rejected.read_text(encoding="utf-8").strip() == args.version)):
                 return
-            if not args.client and not agent_idle(unit):
-                return
         with tempfile.TemporaryDirectory(prefix="fuzukue-download-") as directory:
             tag, commit, archive, checksum = download(
                 args, binary, platform, active_tag if active_tag and TAG.fullmatch(active_tag) else None,
@@ -1115,7 +1094,7 @@ def main():
             candidate = install_version(root, tag, binary, checksum, lambda dest: extract(archive, binary, dest))
         if not (args.client or args.automatic or args.skip_agents):
             check_agents(offer=True, explicit=args.install_agents)
-        if args.automatic and (off.exists() or (not args.client and not agent_idle(unit))):
+        if args.automatic and off.exists():
             return
         if args.automatic and args.client:
             if read_link(base / "server", "current", "secretaire") != f"{tag}/secretaire":

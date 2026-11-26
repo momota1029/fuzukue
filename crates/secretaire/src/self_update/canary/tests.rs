@@ -212,7 +212,7 @@ wait
             }),
         };
         self.update
-            .start_canary_with(self.app.clone(), build, network)
+            .start_canary_with(self.app.clone(), build, network, None)
             .await
     }
 
@@ -289,7 +289,7 @@ async fn fake_candidate_runs_and_replacement_reaps_the_old_process() -> Result<(
         "untouched"
     );
     assert!(!fixture.update.project.join("publish-log").exists());
-    assert!(fixture.update.start(fixture.app.clone(), false, None).is_err());
+    assert!(fixture.update.start(fixture.app.clone(), false, None, None).is_err());
 
     let old = fixture.directories()?.pop().unwrap();
     let pid = fs::read_to_string(old.join("pid"))?;
@@ -333,7 +333,6 @@ async fn fake_candidate_runs_and_replacement_reaps_the_old_process() -> Result<(
 #[tokio::test]
 async fn promote_refuses_moved_head_then_reuses_the_tested_binary() -> Result<()> {
     let fixture = Fixture::new().await?;
-    let hold = fixture.update.gate.read().await;
     fixture.start(true).await?;
     fixture.wait(Phase::Running).await?;
     let old = fixture.directories()?.pop().unwrap();
@@ -354,13 +353,23 @@ async fn promote_refuses_moved_head_then_reuses_the_tested_binary() -> Result<()
         ],
     )
     .await?;
-    let error = fixture.update.promote_canary(None).await.unwrap_err();
+    let error = fixture.update.promote_canary(&fixture.app, None, None).await.unwrap_err();
     assert!(error.to_string().contains("コミットが変わった"));
     assert_eq!(fixture.update.canary_phase(), Some(Phase::Running));
     assert!(!fixture.update.project.join("publish-log").exists());
     git(source, &["reset", "--hard", &fixture.commit]).await?;
 
-    fixture.update.promote_canary(None).await?;
+    let desk = fixture.app.select(None)?;
+    let session = desk.hub.edit_threads(|store| store.create(None))?;
+    let proof = crate::mail::session_key();
+    desk.hub.publish_partner_turn_started(&session, None, false, Some(proof.clone()));
+    let requester = RequestingTurn::capture(&desk, &session, &proof).unwrap();
+    let error = fixture.update.promote_canary(&fixture.app, None, None).await.unwrap_err();
+    assert!(error.to_string().contains("1 active turns"));
+    assert_eq!(fixture.update.canary_phase(), Some(Phase::Running));
+    assert!(!fixture.update.project.join("publish-log").exists());
+
+    fixture.update.promote_canary(&fixture.app, None, Some(requester)).await?;
     let mut status = fixture.update.subscribe();
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -392,7 +401,6 @@ async fn promote_refuses_moved_head_then_reuses_the_tested_binary() -> Result<()
         fs::read_to_string(fixture.update.project.join("publish-log"))?,
         "prebuild\n"
     );
-    drop(hold);
     Ok(())
 }
 

@@ -576,6 +576,7 @@ impl Tool {
                 json!({
                     "action": { "type": "string", "enum": ["status", "start", "canary", "promote", "discard"] },
                     "confirm": { "type": "boolean" },
+                    "turn_proof": { "type": "string", "description": harness_text!("Proof supplied in this turn's input. Required for start, canary, and promote.", "このターンの入力にある証明。start、canary、promote に必要。") },
                     "verbose": { "type": "boolean", "default": false },
                     "notify": { "type": "boolean", "default": false },
                 }),
@@ -1173,6 +1174,14 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
     let spill_owner = result_spill::Owner::thread(&q.session);
     let method = req["method"].as_str().unwrap_or("");
     let params = &req["params"];
+    let requester = if method == "tools/call" && params["name"] == Tool::SelfUpdate.name()
+        && (codex.is_some() || authorized.is_some() && authorized == claude.as_ref().and_then(|s| s.mcp_key()))
+    {
+        params["arguments"]["turn_proof"].as_str()
+            .and_then(|proof| crate::self_update::RequestingTurn::capture(&app, &q.session, proof))
+    } else {
+        None
+    };
     if method == "tools/call" && !planner {
         let name = params["name"].as_str().unwrap_or_default();
         if let Some(tool) = crate::recipes::Tool::ALL.into_iter().find(|tool| tool.name() == name) {
@@ -1192,6 +1201,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                 if let Some((codex, key)) = &codex {
                     codex.check_mcp(&q.session, key, false, false)?;
                 }
+                let _admission = if matches!(tool, crate::recipes::Tool::Run) { app.admit_work()? } else { None };
                 let caller = crate::recipes::Caller::new(&app.id, &q.session, q.job.as_deref());
                 let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
                 Ok::<_, anyhow::Error>(data_result(crate::recipes::call(tool, caller, &app.project_dir, storage, args).await?, false))
@@ -1273,7 +1283,7 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
         }
         "tools/call" if consult => {
             let result = if params["name"] == Tool::SearchLibrary.name() {
-                Box::pin(call_tool(&app, &q.session, None, None, params)).await
+                Box::pin(call_tool(&app, &q.session, None, None, None, params)).await
             } else {
                 Err(anyhow::anyhow!("Tool is not allowed for consultation"))
             };
@@ -1331,11 +1341,11 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                     Ok(text_result(crate::delegate::ask(&app, &q.session, job, args.question).await?, false))
                 }.await
             } else {
-                call_tool(&app, &q.session, None, None, params).await
+                call_tool(&app, &q.session, None, None, None, params).await
             };
             Ok(result.unwrap_or_else(|error| text_result(format!("{error:#}"), true)))
         }
-        "tools/call" => Ok(call_tool(&app, &q.session, claude.as_deref(), codex.as_ref().map(|(codex, key)| (codex.as_ref(), *key)), &req["params"])
+        "tools/call" => Ok(call_tool(&app, &q.session, claude.as_deref(), codex.as_ref().map(|(codex, key)| (codex.as_ref(), *key)), requester, &req["params"])
             .await
             .unwrap_or_else(|e| text_result(format!("{e:#}"), true))),
         _ => Err(json!({ "code": -32601, "message": format!("method not found: {method}") })),
@@ -1777,7 +1787,7 @@ async fn exec_front_turn(
     codex.exec_turn(session, key)
 }
 
-async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>, params: &Value) -> Result<Value> {
+async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>, requester: Option<crate::self_update::RequestingTurn>, params: &Value) -> Result<Value> {
     let name = params["name"].as_str().context("ツール名を指定する")?;
     let trusted = exec::trusted_session(app, session)
         && if let Some(claude) = claude {
@@ -2214,6 +2224,8 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 action: Action,
                 #[serde(default)]
                 confirm: bool,
+                #[serde(rename = "turn_proof")]
+                _turn_proof: Option<String>,
                 #[serde(default)]
                 verbose: bool,
                 #[serde(default)]
@@ -2222,11 +2234,12 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             #[derive(Deserialize)]
             #[serde(rename_all = "snake_case")]
             enum Action { Status, Start, Canary, Promote, Discard }
-            let Args { action, confirm, verbose, notify } = parse_args(args)?;
+            let Args { action, confirm, verbose, notify, .. } = parse_args(args)?;
             ensure!(!notify || matches!(action, Action::Status), "notify is only used with status");
             let registry = app.registry.upgrade().context("self-update unavailable")?;
             let update = registry.self_update.get().context("self-update unavailable")?;
             if matches!(action, Action::Start | Action::Canary | Action::Promote) {
+                ensure!(requester.is_some(), "Self-update request could not be verified against the current turn");
                 ensure!(confirm, harness_text!(
                     "Ask the user and set confirm=true for this update action.",
                     "利用者の了承を得てから confirm=true で実行してねぇ。",
@@ -2240,9 +2253,9 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                     }
                     return Ok(data_result(front_desk_light::update_status(update.refresh().await, verbose)?, false));
                 }
-                Action::Start => update.start(registry.clone(), false, Some(recipient()))?,
-                Action::Canary => update.start_canary(registry.clone()).await?,
-                Action::Promote => update.promote_canary(Some(recipient())).await?,
+                Action::Start => update.start(registry.clone(), false, Some(recipient()), requester)?,
+                Action::Canary => update.start_canary(registry.clone(), requester).await?,
+                Action::Promote => update.promote_canary(&registry, Some(recipient()), requester).await?,
                 Action::Discard => update.discard_canary().await?,
             }
             serde_json::to_value(update.refresh().await)?
@@ -2698,7 +2711,7 @@ fn mcp_dispatch_fits_default_worker_stack() -> Result<()> {
                     ("add_memo", json!({"text": "Dispatch test"}), "path"),
                 ] {
                     let params = json!({"name": name, "arguments": arguments});
-                    let tool_bytes = std::mem::size_of_val(&call_tool(&app, "test", None, None, &params));
+                    let tool_bytes = std::mem::size_of_val(&call_tool(&app, "test", None, None, None, &params));
                     assert!(tool_bytes < MAX_FUTURE_BYTES, "call_tool for {name}: {tool_bytes} bytes");
                     let request = dispatch(
                         app.clone(),
