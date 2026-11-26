@@ -289,7 +289,7 @@ async fn fake_candidate_runs_and_replacement_reaps_the_old_process() -> Result<(
         "untouched"
     );
     assert!(!fixture.update.project.join("publish-log").exists());
-    assert!(fixture.update.start(fixture.app.clone(), false).is_err());
+    assert!(fixture.update.start(fixture.app.clone(), false, None).is_err());
 
     let old = fixture.directories()?.pop().unwrap();
     let pid = fs::read_to_string(old.join("pid"))?;
@@ -354,13 +354,13 @@ async fn promote_refuses_moved_head_then_reuses_the_tested_binary() -> Result<()
         ],
     )
     .await?;
-    let error = fixture.update.promote_canary().await.unwrap_err();
+    let error = fixture.update.promote_canary(None).await.unwrap_err();
     assert!(error.to_string().contains("コミットが変わった"));
     assert_eq!(fixture.update.canary_phase(), Some(Phase::Running));
     assert!(!fixture.update.project.join("publish-log").exists());
     git(source, &["reset", "--hard", &fixture.commit]).await?;
 
-    fixture.update.promote_canary().await?;
+    fixture.update.promote_canary(None).await?;
     let mut status = fixture.update.subscribe();
     tokio::time::timeout(
         Duration::from_secs(10),

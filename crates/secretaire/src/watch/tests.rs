@@ -376,7 +376,7 @@ fn live_thread_append_is_idempotent_across_restarts() -> Result<()> {
     let item = enqueue(&app, &watch)?;
     // The process exits after writing the thread note but before acknowledging the outbox.
     app.hub
-        .deliver_watch_note(&thread, &item, "saved once".into())?;
+        .deliver_system_note(&thread, &item, "saved once".into())?;
     drop(app);
 
     let app = workspace(root.path());

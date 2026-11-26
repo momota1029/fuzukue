@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot, watch, OwnedMutexGuard};
 use tokio::time::Instant;
 
 use super::{
-    append_log, git, steps, supervisor, write_status, ProcessGroup, State, Step, Update, MAX_LOG,
+    append_log, git, steps, supervisor, ProcessGroup, Recipient, State, Step, Update, MAX_LOG,
 };
 
 const PORTS: std::ops::RangeInclusive<u16> = 7879..=7899;
@@ -37,7 +37,12 @@ pub(super) struct Control {
 #[derive(Clone)]
 struct Job {
     stop: watch::Sender<bool>,
-    promote: mpsc::Sender<oneshot::Sender<Result<()>>>,
+    promote: mpsc::Sender<Promotion>,
+}
+
+struct Promotion {
+    recipient: Option<Recipient>,
+    reply: oneshot::Sender<Result<()>>,
 }
 
 impl Control {
@@ -91,6 +96,7 @@ impl Update {
             .try_lock_owned()
             .context("サーバーの更新が進んでいるよ")?;
         let lock = self.lock_builds()?;
+        self.report_result(&app)?;
         self.status.send_modify(|status| {
             status.active = true;
             status.cancelled = false;
@@ -118,7 +124,7 @@ impl Update {
         Ok(())
     }
 
-    pub(crate) async fn promote_canary(&self) -> Result<()> {
+    pub(crate) async fn promote_canary(&self, recipient: Option<Recipient>) -> Result<()> {
         let _command = self.canary.commands.lock().await;
         self.canary.ensure_open()?;
         ensure!(
@@ -128,7 +134,7 @@ impl Update {
         let job = self.canary.job().context("試運転は終了したよ")?;
         let (result_tx, result) = oneshot::channel();
         job.promote
-            .send(result_tx)
+            .send(Promotion { recipient, reply: result_tx })
             .await
             .context("試運転は終了したよ")?;
         result.await.context("試運転は終了したよ")?
@@ -200,7 +206,7 @@ impl Update {
         run: OwnedMutexGuard<()>,
         lock: File,
         mut stop: watch::Receiver<bool>,
-        promote: mpsc::Receiver<oneshot::Sender<Result<()>>>,
+        promote: mpsc::Receiver<Promotion>,
         build: Command,
         network: Network,
     ) {
@@ -238,9 +244,11 @@ impl Update {
             }
         }
         drop(lock);
-        let mut job = self.canary.job.lock().unwrap();
-        *job = None;
+        *self.canary.job.lock().unwrap() = None;
         drop(run);
+        if !*self.swapping.borrow() {
+            self.report_result_with_retry(&app).await;
+        }
     }
 
     async fn canary_lifecycle(
@@ -248,7 +256,7 @@ impl Update {
         app: &crate::App,
         lock: &File,
         stop: &mut watch::Receiver<bool>,
-        mut promote: mpsc::Receiver<oneshot::Sender<Result<()>>>,
+        mut promote: mpsc::Receiver<Promotion>,
         build: Command,
         network: Network,
     ) -> Result<End> {
@@ -400,7 +408,7 @@ impl Update {
         &self,
         candidate: &mut Runtime,
         stop: &mut watch::Receiver<bool>,
-        promote: &mut mpsc::Receiver<oneshot::Sender<Result<()>>>,
+        promote: &mut mpsc::Receiver<Promotion>,
         expires: Instant,
         commit: &str,
     ) -> Result<Option<End>> {
@@ -412,7 +420,7 @@ impl Update {
                 _ = tokio::time::sleep_until(expires) => return Ok(Some(End::Discarded("制限時間に達したので、試運転を自動で破棄したよ。\n"))),
                 result = candidate.child.wait() => bail!("試運転のサーバーが終了したよ ({})", result?),
                 _ = tick.tick() => self.read_canary_log(candidate),
-                Some(reply) = promote.recv() => {
+                Some(Promotion { recipient, reply }) = promote.recv() => {
                     if let Err(error) = self.check_canary_commit(commit).await {
                         self.status.send_modify(|status| {
                             let message = format!("{error:#}");
@@ -426,12 +434,15 @@ impl Update {
                         let _ = reply.send(Err(anyhow::anyhow!("試運転の制限時間に達したよ")));
                         continue;
                     }
-                    self.status.send_modify(|status| {
-                        let canary = status.canary_status.as_mut().unwrap();
-                        canary.state = Phase::Promoting;
-                        append_log(&mut canary.log, "試運転で使った候補を本番へ昇格するよ。\n");
-                        status.error = None;
-                    });
+                    let mut status = self.status.borrow().clone();
+                    let canary = status.canary_status.as_mut().unwrap();
+                    canary.state = Phase::Promoting;
+                    append_log(&mut canary.log, "試運転で使った候補を本番へ昇格するよ。\n");
+                    status.error = None;
+                    if let Err(error) = self.begin_result(status, recipient, false) {
+                        let _ = reply.send(Err(error));
+                        continue;
+                    }
                     let _ = reply.send(Ok(()));
                     return Ok(None);
                 }
@@ -448,7 +459,7 @@ impl Update {
     }
 
     fn save_canary_status(&self) {
-        if let Err(error) = write_status(&self.root, &self.status.borrow()) {
+        if let Err(error) = self.save_status() {
             tracing::warn!("save canary status: {error:#}");
         }
     }

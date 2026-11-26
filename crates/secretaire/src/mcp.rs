@@ -572,11 +572,12 @@ impl Tool {
                 json!({}), &[],
             ),
             Self::SelfUpdate => (
-                harness_text!("Check update status. Set verbose=true for log tails and trial details. Obtain user approval before start, canary, or promote. Discard ends the trial.", "サーバーの更新状況を確認する。工程ログの末尾と試運転の詳細は verbose=true で読む。start、canary、promote は利用者の了承を得てから実行する。discard は試運転を終了する。"),
+                harness_text!("Check update status. Set verbose=true for log tails and trial details. Start and promote wake this desk when the result is ready. For an active update without a recipient, call status with notify=true to receive its result here. Obtain user approval before start, canary, or promote. Discard ends the trial.", "サーバーの更新状況を確認する。工程ログの末尾と試運転の詳細は verbose=true で読む。start と promote は結果が出るとこのスレッドの受付を起こす。通知先が未設定の更新は status で notify=true を指定すると、このスレッドで結果を受け取れる。start、canary、promote は利用者の了承を得てから実行する。discard は試運転を終了する。"),
                 json!({
                     "action": { "type": "string", "enum": ["status", "start", "canary", "promote", "discard"] },
                     "confirm": { "type": "boolean" },
                     "verbose": { "type": "boolean", "default": false },
+                    "notify": { "type": "boolean", "default": false },
                 }),
                 &["action"],
             ),
@@ -2215,11 +2216,14 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 confirm: bool,
                 #[serde(default)]
                 verbose: bool,
+                #[serde(default)]
+                notify: bool,
             }
             #[derive(Deserialize)]
             #[serde(rename_all = "snake_case")]
             enum Action { Status, Start, Canary, Promote, Discard }
-            let Args { action, confirm, verbose } = parse_args(args)?;
+            let Args { action, confirm, verbose, notify } = parse_args(args)?;
+            ensure!(!notify || matches!(action, Action::Status), "notify is only used with status");
             let registry = app.registry.upgrade().context("self-update unavailable")?;
             let update = registry.self_update.get().context("self-update unavailable")?;
             if matches!(action, Action::Start | Action::Canary | Action::Promote) {
@@ -2228,11 +2232,17 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                     "利用者の了承を得てから confirm=true で実行してねぇ。",
                 ));
             }
+            let recipient = || crate::self_update::Recipient::new(app, session);
             match action {
-                Action::Status => return Ok(data_result(front_desk_light::update_status(update.refresh().await, verbose)?, false)),
-                Action::Start => update.start(registry.clone(), false)?,
+                Action::Status => {
+                    if notify {
+                        update.watch_result(recipient())?;
+                    }
+                    return Ok(data_result(front_desk_light::update_status(update.refresh().await, verbose)?, false));
+                }
+                Action::Start => update.start(registry.clone(), false, Some(recipient()))?,
                 Action::Canary => update.start_canary(registry.clone()).await?,
-                Action::Promote => update.promote_canary().await?,
+                Action::Promote => update.promote_canary(Some(recipient())).await?,
                 Action::Discard => update.discard_canary().await?,
             }
             serde_json::to_value(update.refresh().await)?

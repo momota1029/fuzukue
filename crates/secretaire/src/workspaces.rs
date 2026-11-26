@@ -612,7 +612,7 @@ impl App {
                 crate::planner::protect_legacy_rollback(&workspace, &session)?;
                 let note = format!("Held work and checkpoints are in {}. Start a server with drain support to recover unclaimed work. Review claimed entries before retrying.",
                     workspace.state_dir.join("held-work.json").display());
-                workspace.hub.deliver_watch_note(&session, "legacy-rollback:held-work", note)?;
+                workspace.hub.deliver_system_note(&session, "legacy-rollback:held-work", note)?;
             }
         }
         Ok(())
@@ -739,6 +739,10 @@ impl App {
             None => tokio::task::spawn_blocking(move || self.load(&self.default)).await?,
             Some(id) => self.loaded(Some(&id)),
         }
+    }
+
+    pub(crate) fn has_workspace(&self, id: &str) -> bool {
+        self.entries.lock().unwrap().contains_key(id)
     }
 
     pub fn known_workspace(self: &Arc<Self>, id: &str) -> Result<Arc<Workspace>> {

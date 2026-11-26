@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CommandLine, PREBUILT, State, Status, Step, Update, WINDOWS_BUILD_STATE, WINDOWS_PUBLISH,
-    write_json, write_status,
+    write_json,
 };
 
 const DIRECTORY: &str = "client-registration";
@@ -146,7 +146,7 @@ impl Update {
                 self.step(Step::Publish, State::Passed);
                 self.status.send_modify(|status| status.active = false);
                 distribution.announce_release();
-                write_status(&self.root, &self.status.borrow())?;
+                self.save_status()?;
                 fs::remove_dir_all(directory)?;
             }
             Err(error) => {
@@ -158,7 +158,7 @@ impl Update {
                     status.active = false;
                     status.error = Some(message.clone());
                 });
-                write_status(&self.root, &self.status.borrow())?;
+                self.save_status()?;
                 anyhow::bail!("{message}");
             }
         }

@@ -433,7 +433,7 @@ async fn planner_work_replays_on_update_failure_or_cancel() -> Result<()> {
             assert!(update.subscribe().borrow().cancelled);
         } else {
             // The configured source is a fixture directory, so Check fails.
-            update.start(app.clone(), false)?;
+            update.start(app.clone(), false, None)?;
             assert!(update.planner_work_held());
             until(|| update.subscribe().borrow().error.is_some()).await?;
         }
@@ -442,6 +442,109 @@ async fn planner_work_replays_on_update_failure_or_cancel() -> Result<()> {
         assert_assignment_replayed(&workspace, &job, task).await?;
         assert_eq!(prompt_count(&workspace, "Resume test goal"), 1);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_failure_before_swap_wakes_only_its_requesting_thread() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let other = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let (_, mut events) = workspace.hub.subscribe(u64::MAX);
+
+    update.start(app, false, Some(Recipient::new(&workspace, &session)))?;
+    let (item, text) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await?;
+            if let ServerEvent::TextDelta { session: target, item, actor: Actor::System, text } = event.event {
+                if item.starts_with("server-update:") {
+                    assert_eq!(target, session);
+                    return Ok::<_, anyhow::Error>((item, text));
+                }
+            }
+        }
+    }).await??;
+
+    assert!(text.contains(r#""outcome":"failure""#));
+    assert!(text.contains(r#""failed_step":"check""#));
+    assert!(text.contains(BUILD_ID));
+    until(|| prompt_count(&workspace, "running_revision") == 1).await?;
+    assert!(!workspace.hub.read_threads(|threads| threads.has_item(&other, &item)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_result_survives_a_restart_and_a_replayed_request() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, default) = load(dir.path())?;
+    let project = dir.path().join("other");
+    fs::create_dir(&project)?;
+    let workspace_id = app.register(project.to_str().unwrap())?;
+    let workspace = app.select(Some(&workspace_id))?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let other = default.hub.edit_threads(|threads| threads.create(None))?;
+    let status_path = update.root.join(STATUS_FILE);
+    let has_request = || -> Result<bool> {
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&status_path)?)?;
+        Ok(saved.get("request").is_some())
+    };
+    let mut status = update.status.borrow().clone();
+    status.steps = steps(false);
+    status.steps.iter_mut().find(|step| step.kind == Step::Swap).unwrap().state = State::Running;
+
+    // A dashboard start stays quiet until a desk subscribes from its own thread.
+    update.begin_result(status.clone(), None, false)?;
+    assert!(workspace.drain.records(&workspace.state_dir)?.is_empty());
+    let recipient = Recipient::new(&workspace, &session);
+    update.watch_result(recipient.clone())?;
+    update.watch_result(recipient)?;
+    assert!(update.watch_result(Recipient::new(&default, &other)).is_err());
+    assert!(workspace.drain.records(&workspace.state_dir)?.is_empty());
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&status_path)?)?;
+    let item = saved["request"]["id"].as_str().context("missing update result id")?.to_owned();
+    assert_eq!(saved["request"]["recipient"]["workspace"], workspace_id);
+    assert_eq!(saved["request"]["recipient"]["thread"], session);
+
+    // The supervisor saves the rollback after the restored server is healthy.
+    fail(&mut status, "candidate failed its health check".into());
+    status.recovered = true;
+    write_status(&update.root, &status)?;
+    let saved_request = fs::read(&status_path)?;
+    drop((app, update, workspace, default));
+
+    let reopen = || -> Result<_> {
+        let app = crate::App::new(
+            dir.path().into(), dir.path().join("project"), dir.path().join("state"), "127.0.0.1:0".into(), None,
+        )?;
+        install_desk_fixture(&app, dir.path())?;
+        let update = Arc::new(Update::with_paths(
+            Config::default(), None, dir.path().into(), dir.path().join("builds"), PathBuf::new(),
+        ));
+        assert!(app.self_update.set(update.clone()).is_ok());
+        let workspace = app.known_workspace(&workspace_id)?;
+        Ok((app, update, workspace))
+    };
+
+    let (app, update, workspace) = reopen()?;
+    update.follow_handoff(None, app.clone());
+    until(|| {
+        !has_request().unwrap()
+            && prompt_count(&workspace, "candidate failed its health check") == 1
+            && workspace.drain.records(&workspace.state_dir).unwrap().is_empty()
+    }).await?;
+    assert!(workspace.hub.read_threads(|threads| threads.has_item(&session, &item)));
+    drop((app, update, workspace));
+
+    // Simulate losing power before the request removal finished syncing.
+    fs::write(&status_path, saved_request)?;
+    let (app, update, workspace) = reopen()?;
+    update.report_result(&app)?;
+    assert!(!has_request()?);
+    assert!(workspace.drain.records(&workspace.state_dir)?.is_empty());
+    assert!(!workspace.delegates.has_queued_desk_turn(&session));
+    assert_eq!(prompt_count(&workspace, "candidate failed its health check"), 1);
+    assert!(workspace.hub.read_threads(|threads| threads.has_item(&session, &item)));
     Ok(())
 }
 

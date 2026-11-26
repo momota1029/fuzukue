@@ -3,6 +3,7 @@
 mod build_cache;
 mod canary;
 pub(crate) mod drain;
+mod notice;
 mod prune;
 mod registration;
 mod retry;
@@ -32,6 +33,7 @@ use tokio::process::Command;
 use tokio::sync::{watch, OwnedRwLockReadGuard, RwLock, RwLockWriteGuard};
 
 pub(crate) use supervisor::{health, legacy_handoff, managed, ready, relocate_build_links, run as supervise, HEALTH_ROUTE};
+pub(crate) use notice::Recipient;
 pub(crate) const BUILD_ID: &str = env!("FUZUKUE_SERVER_BUILD_ID");
 const SOURCE_ENV: &str = "FUZUKUE_SELF_UPDATE_SOURCE";
 const STATUS_FILE: &str = "status.json";
@@ -172,6 +174,7 @@ pub(crate) struct Update {
     shutdown_signalled: std::sync::atomic::AtomicBool,
     trial_pending: std::sync::atomic::AtomicBool,
     run: Arc<tokio::sync::Mutex<()>>,
+    result_notice: std::sync::Mutex<()>,
     canary: canary::Control,
     server_config: String,
 }
@@ -287,6 +290,7 @@ impl Update {
             shutdown_signalled: false.into(),
             trial_pending: trial_pending.into(),
             run: Default::default(),
+            result_notice: Default::default(),
             canary: Default::default(),
             server_config: String::new(),
         };
@@ -344,6 +348,7 @@ impl Update {
             if let Err(error) = update.finish_registration(&app.distribution).await {
                 tracing::error!(%error, "complete client registration after server swap");
             }
+            update.report_result_with_retry(&app).await;
         });
     }
 
@@ -567,7 +572,9 @@ impl Update {
         });
     }
 
-    pub(crate) fn start(self: &Arc<Self>, app: Arc<crate::App>, rollback: bool) -> Result<()> {
+    pub(crate) fn start(
+        self: &Arc<Self>, app: Arc<crate::App>, rollback: bool, recipient: Option<Recipient>,
+    ) -> Result<()> {
         self.canary.ensure_open()?;
         drop(self.admit()?);
         ensure!(
@@ -591,19 +598,19 @@ impl Update {
             .context("self-update already running")?;
         let lock = self.lock_builds()?;
         let supervisor_lock = lock.try_clone()?;
-        self.status.send_modify(|status| {
-            status.active = true;
-            status.error = None;
-            status.recovered = false;
-            status.cancelled = false;
-            status.steps = steps(rollback);
-            status.canary_status = None;
-            status.planner_work_held = None;
-        });
+        self.report_result(&app)?;
+        let mut status = self.status.borrow().clone();
+        status.active = true;
+        status.error = None;
+        status.recovered = false;
+        status.cancelled = false;
+        status.steps = steps(rollback);
+        status.steps[0].state = State::Running;
+        status.canary_status = None;
+        status.planner_work_held = None;
+        self.begin_result(status, recipient, rollback)?;
         let update = self.clone();
         tokio::spawn(async move {
-            let _run = run;
-            let _lock = lock;
             let result = tokio::select! {
                 result = update.execute(&app, previous, supervisor_lock) => result,
                 _ = update.monitor_planner_queue(&app) => unreachable!(),
@@ -616,9 +623,20 @@ impl Update {
                         update.set_drain_progress(status.started_at, DrainProgress::Failed, Some(format!("{error:#}")));
                     }
                 }
-                if let Err(error) = write_status(&update.root, &update.status.borrow()) {
+            }
+            let launched = *update.swapping.borrow();
+            if !launched {
+                if update.status.borrow().active {
+                    update.fail("server swap ended before launch".into());
+                }
+                if let Err(error) = update.save_status() {
                     tracing::warn!("save self-update status: {error:#}");
                 }
+            }
+            drop(lock);
+            drop(run);
+            if !launched {
+                update.report_result_with_retry(&app).await;
             }
         });
         Ok(())
@@ -691,7 +709,7 @@ impl Update {
         if control.owner() != Some((wait.id, wait.reason)) {
             return Ok(SwapOutcome::Cancelled);
         }
-        write_status(&self.root, &self.status.borrow())?;
+        self.save_status()?;
         let registration = registration
             .map(|checkout| self.queue_registration(checkout, candidate))
             .transpose()?;
@@ -835,7 +853,7 @@ impl Update {
                             }
                         }
                     });
-                    write_status(&self.root, &self.status.borrow())?;
+                    self.save_status()?;
                 }
                 return Ok(WaitOutcome::Cancelled);
             }
@@ -874,7 +892,7 @@ impl Update {
                 status.wait = Some(SelfUpdateWait { started_at, elapsed_secs: elapsed_wait(started_at), reason, forcing });
                 true
             }) {
-                write_status(&self.root, &self.status.borrow())?;
+                self.save_status()?;
             }
             if let Some(start) = force_started {
                 let reap_at = start + WAIT_FORCE_GRACE;
@@ -1297,6 +1315,7 @@ impl Update {
                 step.state = state;
             }
         });
+        self.save_result_progress();
     }
 
     fn fail(&self, error: String) {
@@ -1455,14 +1474,11 @@ fn stage_binary(root: &Path, commit: &str, source: &Path) -> Result<PathBuf> {
 }
 
 fn read_status(root: &Path) -> Status {
-    fs::read(root.join(STATUS_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    notice::SavedStatus::read(root).unwrap_or_default().status
 }
 
 fn write_status(root: &Path, status: &Status) -> Result<()> {
-    write_json(&root.join(STATUS_FILE), status)
+    notice::SavedStatus::save(root, status)
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {

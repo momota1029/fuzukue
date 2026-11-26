@@ -165,9 +165,12 @@ fn builds_locked(root: &Path) -> bool {
 
 pub(super) fn waiting(ready: &Path) -> bool {
     // The lock is released if the transient unit is terminated unexpectedly.
-    ready.exists()
-        && (ready.file_name().is_none_or(|name| name != PENDING)
-            || ready.parent().is_some_and(builds_locked))
+    let root = if ready.ends_with(PENDING) {
+        ready.parent()
+    } else {
+        ready.parent().and_then(Path::parent)
+    };
+    ready.exists() && root.is_some_and(builds_locked)
 }
 
 pub(super) fn ready(root: &Path, addr: SocketAddr) -> Result<Option<PathBuf>> {
@@ -358,6 +361,20 @@ mod tests {
 
     const OLD_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const NEW_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn detached_ready_marker_requires_a_live_handoff_lock() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let trial = tempfile::tempdir_in(root.path())?;
+        let ready = trial.path().join("address");
+        File::create(&ready)?;
+        let lock = File::create(root.path().join("lock"))?;
+        lock.lock()?;
+        assert!(waiting(&ready));
+        drop(lock);
+        assert!(!waiting(&ready));
+        Ok(())
+    }
 
     struct Scripts {
         root: PathBuf,

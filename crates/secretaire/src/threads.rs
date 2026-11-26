@@ -2656,7 +2656,7 @@ impl Store {
         self.threads.get(id).is_some_and(|thread| thread.transcript.index.contains_key(item))
     }
 
-    pub(crate) fn watch_note(&mut self, id: &str, item: &str, text: String) -> Result<Option<ServerEvent>> {
+    pub(crate) fn system_note(&mut self, id: &str, item: &str, text: String) -> Result<Option<ServerEvent>> {
         let thread = self.threads.get_mut(id).context("Thread not found")?;
         if thread.transcript.index.contains_key(item) {
             return Ok(None);

@@ -974,10 +974,10 @@ impl Hub {
         Ok(())
     }
 
-    pub(crate) fn deliver_watch_note(&self, session: &str, item: &str, text: String) -> anyhow::Result<()> {
+    pub(crate) fn deliver_system_note(&self, session: &str, item: &str, text: String) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
-        if let Some(event) = threads.watch_note(session, item, text)? {
+        if let Some(event) = threads.system_note(session, item, text)? {
             let snapshot = threads.snapshot();
             self.broadcast_saved(&mut inner, event, snapshot);
         }

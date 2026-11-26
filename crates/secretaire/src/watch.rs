@@ -382,7 +382,7 @@ fn deliver(app: &Arc<Workspace>, store: &mut Store, watch: &Watch) -> Result<()>
                             || format!("`{}`", binding.previous),
                             |path| format!("[[file:{}|{}]]", path.display(), binding.previous),
                         );
-                    app.hub.deliver_watch_note(
+                    app.hub.deliver_system_note(
                         &thread,
                         &format!("watch:backlink:{}", watch.id),
                         format!(
@@ -394,7 +394,7 @@ fn deliver(app: &Arc<Workspace>, store: &mut Store, watch: &Watch) -> Result<()>
                 binding.creating = false;
                 store.edit(|state| state.runtime.insert(watch.id.clone(), runtime.clone()))?;
             }
-            app.hub.deliver_watch_note(&thread, &item, event.note())?;
+            app.hub.deliver_system_note(&thread, &item, event.note())?;
             crate::planner::goal_event(app, &thread, false);
         }
         let event = runtime.outbox.pop_front().unwrap();

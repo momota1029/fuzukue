@@ -2022,7 +2022,7 @@ async fn serve_workspace(
                     if let Some(update) = update {
                         use fuzukue_proto::SelfUpdateCanaryAction::*;
                         let result = match action {
-                            Promote => update.promote_canary().await,
+                            Promote => update.promote_canary(None).await,
                             Discard => update.discard_canary().await,
                         };
                         if let Err(error) = result {
@@ -2079,7 +2079,7 @@ async fn serve_workspace(
                         if matches!(msg, ClientMsg::SelfUpdateStatus) {
                             let status = update.refresh().await;
                             let _ = reply.send(ServerEvent::SelfUpdateStatus { status });
-                        } else if let Err(error) = update.start(registry.clone(), matches!(msg, ClientMsg::RollbackServer)) {
+                        } else if let Err(error) = update.start(registry.clone(), matches!(msg, ClientMsg::RollbackServer), None) {
                             let _ = reply.send(ServerEvent::SelfUpdateError { message: format!("{error:#}") });
                         }
                     }
@@ -3371,20 +3371,22 @@ async fn prompt_claude_turn(
     Ok(true)
 }
 
-async fn delegate_follow_up(app: &Arc<Workspace>, session: &str, prompt: String, delivery: Option<delegate::DeskDelivery>) -> anyhow::Result<()> {
+async fn delegate_follow_up(
+    app: &Arc<Workspace>, session: &str, prompt: String, kind: TurnKind, delivery: Option<delegate::DeskDelivery>,
+) -> anyhow::Result<()> {
     let settings = app.partner_turn_settings(session);
     let codex = AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex;
     let report = delivery.as_ref().filter(|delivery| delivery.report);
     let result = if codex {
-        prompt_codex_with_images(app, session.into(), settings, prompt, None, Vec::new(), TurnKind::Conversation, delivery.clone()).await
+        prompt_codex_with_images(app, session.into(), settings, prompt, None, Vec::new(), kind, delivery.clone()).await
     } else if let Some(report) = report {
-        prompt_claude_with_images(app, session, prompt, None, Vec::new(), TurnKind::Conversation, Some(report.id.clone()))
+        prompt_claude_with_images(app, session, prompt, None, Vec::new(), kind, Some(report.id.clone()))
             .await.and_then(|started| {
                 anyhow::ensure!(started, "Claude is busy");
                 Ok(())
             })
     } else {
-        prompt_claude(app, session, prompt, None).await
+        prompt_claude_with_images(app, session, prompt, None, Vec::new(), kind, None).await.map(|_| ())
     };
     if let Some(delivery) = delivery {
         match &result {

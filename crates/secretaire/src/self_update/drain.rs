@@ -75,7 +75,8 @@ pub(crate) struct GitHubHold {
 
 impl Work {
     fn tracks_submission(&self) -> bool {
-        matches!(self, Self::Desk(crate::delegate::DeskTurn::Report { .. }) | Self::Claude(_))
+        use crate::delegate::DeskTurn;
+        matches!(self, Self::Desk(DeskTurn::Report { .. } | DeskTurn::UpdateResult { .. }) | Self::Claude(_))
     }
 
     pub(crate) fn is_planner(&self) -> bool {
