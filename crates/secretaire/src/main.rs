@@ -619,11 +619,18 @@ async fn run_server() -> anyhow::Result<()> {
     }
 
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+    let log_filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
+        .from_env_lossy()
+        .add_directive(remote::AUDIT_DIRECTIVE.parse()?);
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let log_filter = if std::env::var_os("RUST_LOG").is_none() {
+        log_filter.add_directive("secretaire::server_memory=info".parse()?)
+    } else {
+        log_filter
+    };
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::builder()
-            .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
-            .from_env_lossy()
-            .add_directive(remote::AUDIT_DIRECTIVE.parse()?))
+        .with(log_filter)
         .with(tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::filter::filter_fn(|meta| {
             // Transport traces can contain IMAP credentials or GitHub request details.
             !meta.target().starts_with("async_imap") && !meta.target().starts_with("ureq")
@@ -671,7 +678,7 @@ async fn run_server() -> anyhow::Result<()> {
     });
     let app = App::with_delegate_config(home, project_dir, state_dir, local_addr.to_string(), mail, config.delegate)?;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    server_memory::start_trimming();
+    server_memory::start_trimming(&app);
     let _ = app.shutdown_drain_seconds.set(config.shutdown_drain_seconds);
     let _ = app.self_update.set(shutdown_control.clone());
     if let Some(update) = &update {

@@ -54,6 +54,17 @@ impl WorkspaceGraph {
         }
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn try_cache_size(&self) -> Option<(usize, usize)> {
+        let data = self.data.try_lock().ok()?;
+        Some(data.as_ref().map_or((0, 0), |(graph, _)| {
+            let cards = &graph.cache.cards;
+            let text_bytes = cards.values().filter_map(|card| card.data.as_ref())
+                .map(|card| card.search.field_capacity()).sum();
+            (cards.len(), text_bytes)
+        }))
+    }
+
     pub(crate) fn invalidate(&self) {
         let mut pending = self.pending.lock().unwrap();
         *pending = None;

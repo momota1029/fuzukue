@@ -821,6 +821,12 @@ impl Hub {
             .map(|store| store.library_thread_ids()).unwrap_or_default()
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn try_cache_size(&self) -> Option<(u64, crate::threads::CacheSize)> {
+        let inner = self.inner.try_lock().ok()?;
+        Some((inner.log.bytes, inner.threads.as_ref().map_or_else(Default::default, |store| store.cache_size())))
+    }
+
     pub(crate) fn trim_idle_transcripts(&self, idle: std::time::Duration) {
         if let Ok(mut inner) = self.inner.try_lock() {
             if let Some(threads) = &mut inner.threads {

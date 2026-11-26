@@ -510,6 +510,11 @@ impl App {
         self.entries.lock().unwrap().values().filter_map(|entry| entry.loaded.clone()).collect()
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn try_loaded_workspaces(&self) -> Option<Vec<Arc<Workspace>>> {
+        Some(self.entries.try_lock().ok()?.values().filter_map(|entry| entry.loaded.clone()).collect())
+    }
+
     pub(crate) fn held_planner_count(&self) -> usize {
         self.loaded_workspaces().iter()
             .filter(|workspace| workspace.hold_planner_during_update)

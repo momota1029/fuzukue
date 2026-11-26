@@ -1022,6 +1022,11 @@ pub(super) struct SearchText {
 }
 
 impl SearchText {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(super) fn field_capacity(&self) -> usize {
+        self.fields.iter().map(String::capacity).sum()
+    }
+
     fn score(&self, query: &str, tokens: &HashSet<String>) -> usize {
         let terms = tokens
             .iter()

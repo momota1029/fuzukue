@@ -1626,6 +1626,16 @@ fn damage_notice(file: String) -> ServerEvent {
     ServerEvent::Error { message: format!("スレッドファイルが破損している: {file}") }
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Default)]
+pub(crate) struct CacheSize {
+    pub loaded_transcripts: usize,
+    pub transcript_source_bytes: usize,
+    pub transcript_entries: usize,
+    pub history_pages: usize,
+    pub timeline_offset_capacity_bytes: usize,
+}
+
 pub struct Store {
     project: PathBuf,
     state_dir: PathBuf,
@@ -1781,6 +1791,21 @@ impl Store {
     pub(crate) fn damage_notices(&self) -> impl Iterator<Item = ServerEvent> + '_ {
         self.damaged_files.iter().map(|file| damage_notice(file.clone()))
             .chain(self.threads.keys().filter_map(|id| self.thread_damage(id)))
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn cache_size(&self) -> CacheSize {
+        let mut size = CacheSize {
+            history_pages: self.pages.borrow().len(),
+            timeline_offset_capacity_bytes: self.timeline.try_offset_capacity_bytes().unwrap_or(0),
+            ..CacheSize::default()
+        };
+        for transcript in self.threads.values().filter_map(|thread| thread.transcript.loaded.get()) {
+            size.loaded_transcripts += 1;
+            size.transcript_source_bytes += transcript.weight;
+            size.transcript_entries += transcript.value.items.len();
+        }
+        size
     }
 
     pub(crate) fn trim_transcripts(&mut self) {

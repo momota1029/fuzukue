@@ -25,6 +25,8 @@ pub(crate) struct Index {
     files: Files,
     decks: BTreeMap<String, DeckEntry>,
     last_used: Option<Instant>,
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) text_weight_bytes: usize,
 }
 
 type QueryMatch = (Vec<usize>, usize);
@@ -221,6 +223,10 @@ impl Index {
             .sum::<usize>();
         if bytes > BUDGET {
             *self = Self::default();
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            self.text_weight_bytes = if bytes > BUDGET { 0 } else { bytes };
         }
     }
 

@@ -271,6 +271,17 @@ impl Timeline {
         }))))
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn try_offset_capacity_bytes(&self) -> Option<usize> {
+        let journals = self.0.try_lock().ok()?;
+        Some(journals.iter().map(|journal| {
+            let index = &journal.index;
+            let records = index.tail.capacity() + index.recovery.capacity()
+                + index.threads.values().map(Vec::capacity).sum::<usize>();
+            records * std::mem::size_of::<Record>()
+        }).sum())
+    }
+
     pub(crate) fn restore(&self, mut visit: impl FnMut(Envelope, Option<u64>)) {
         for journal in self.0.lock().unwrap().iter() {
             let tail_start = journal.index.tail.front().map_or(u64::MAX, |record| record.0);
