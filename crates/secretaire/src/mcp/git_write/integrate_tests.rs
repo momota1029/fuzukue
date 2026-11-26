@@ -466,3 +466,57 @@ async fn privacy_override_requires_human_approval_and_pins_the_checked_patch() -
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn privacy_override_expires_and_cannot_be_approved_later() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let (app, session) = setup(&fixture, &modification("tracked.txt", "replacement"))?;
+    let mut request = args();
+    request["override_privacy"] = json!(true);
+
+    let (_, mut events) = app.hub.subscribe(u64::MAX);
+    let run = tokio::spawn({
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                &session,
+                crate::mcp::parse_args(&request)?,
+                Some(Actor::Claude),
+                None,
+                true,
+                async { Ok(()) },
+            )
+            .await
+        }
+    });
+    let id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let ServerEvent::ApprovalRequested { request_id, .. } = events.recv().await?.event {
+                return Ok::<_, anyhow::Error>(request_id);
+            }
+        }
+    })
+    .await??;
+    assert!(app.git_lock.try_lock().is_ok());
+
+    // Keep the clock real until the Git subprocesses have finished preparing the patch.
+    tokio::time::pause();
+    tokio::time::advance(PRIVACY_OVERRIDE_TIMEOUT).await;
+    let response = tokio::time::timeout(Duration::from_secs(1), run).await???;
+    assert_eq!(
+        response["structuredContent"]["error"]["code"],
+        "approval_timed_out"
+    );
+    assert!(matches!(events.try_recv()?.event,
+        ServerEvent::ApprovalResolved { request_id, decision, automatic: false }
+            if request_id == id && decision == "cancelled"
+    ));
+    assert!(!app.delegates.resolve_approval(&id, "accept", false)?);
+    assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD"])?, fixture.head);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("tracked.txt"))?,
+        "first\nsecond\n"
+    );
+    Ok(())
+}

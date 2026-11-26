@@ -1,10 +1,12 @@
 //! Integrate a checked worker patch into the front desk's checkout.
 
 use std::future::Future;
+use std::time::Duration;
 
 use fuzukue_proto::Actor;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
+use tokio::time::{sleep_until, Instant};
 
 use crate::mcp::{data_result, harness_candidates::sanitize, workspace_read::worktree_relative};
 use crate::mutations::Mutation;
@@ -20,6 +22,7 @@ const MAX_PATCH: usize = 768 * 1024;
 const MAX_DIFF: usize = 2 * 1024 * 1024;
 const MAX_INDEX: usize = 16 * 1024 * 1024;
 const MAX_LOCATIONS: usize = 40;
+const PRIVACY_OVERRIDE_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub(in crate::mcp) fn definition() -> Value {
     json!({
@@ -613,6 +616,8 @@ pub(in crate::mcp) async fn call(
     trusted: bool,
     recheck: impl Future<Output = Result<()>>,
 ) -> Result<Value> {
+    // Expire the override before a five-minute caller timeout, including preparation.
+    let override_deadline = Instant::now() + PRIVACY_OVERRIDE_TIMEOUT;
     let mutation = Mutation::new(app, session, "Git patch integration".into())?;
     let root = app.project_dir.canonicalize()?;
     let prepared = match mutation
@@ -675,15 +680,28 @@ pub(in crate::mcp) async fn call(
                 String::new()
             }
         );
-        let decision = crate::delegate::request_approval_with_full(
+        let approval = crate::delegate::request_approval_with_full(
             app,
             session,
             fuzukue_proto::GIT_APPROVAL,
             actor,
             details,
             full,
-        )
-        .await;
+        );
+        let decision = if args.override_privacy {
+            tokio::select! {
+                biased;
+                _ = sleep_until(override_deadline) => {
+                    return Ok(failure(
+                        "approval_timed_out",
+                        "Privacy override approval expired. Review the patch before requesting approval again.",
+                    ));
+                }
+                decision = approval => decision,
+            }
+        } else {
+            approval.await
+        };
         match decision {
             Ok(decision) if decision == "accept" => {}
             Ok(_) => {
