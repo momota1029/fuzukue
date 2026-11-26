@@ -853,6 +853,44 @@ async fn queued_delegation_resumes_once_after_cancel() -> Result<()> {
 }
 
 #[tokio::test]
+async fn shutdown_drain_checkpoints_a_memory_only_tool_result() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let session = workspace.hub.edit_threads(|threads| threads.create(None))?;
+    let item = "tool".to_owned();
+    workspace.hub.publish(ServerEvent::ToolCall {
+        session: session.clone(), item: item.clone(), actor: Actor::Claude,
+        name: "Read".into(), input: serde_json::json!({}),
+    });
+    let path = workspace.hub.thread_path(&session)?;
+    let payloads = path.parent().unwrap().join(fuzukue_proto::THREAD_SAVE_DIR).join("payloads");
+    fs::write(&payloads, "temporarily obstruct sidecar writes")?;
+    workspace.hub.disable_journal_writes(&workspace.state_dir)?;
+    let output = "synthetic output ".repeat(700);
+    workspace.hub.publish(ServerEvent::ToolResult {
+        session: session.clone(), item: item.clone(), ok: false, output: output.clone(),
+    });
+    workspace.hub.publish(ServerEvent::TurnActivity { session: session.clone(), running: false });
+
+    let lock = std::fs::File::open(payloads.parent().unwrap())?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+    update.request_shutdown(app.clone(), Duration::from_secs(5), false)?;
+    until(|| update.drain_status.borrow().as_ref().is_some_and(|status| {
+        status.message.as_deref().is_some_and(|message| message.contains("could not save dirty transcripts"))
+    })).await?;
+    assert!(!*update.shutdown_ready.borrow());
+    drop(lock);
+    fs::remove_file(payloads)?;
+    until(|| *update.shutdown_ready.borrow()).await?;
+
+    let no_journal = tempfile::tempdir()?;
+    let hub = crate::Hub::with_timeline(no_journal.path());
+    hub.load_threads(&workspace.project_dir, no_journal.path());
+    assert_eq!(hub.tool_detail(&session, &item).unwrap().output()?, Some(output));
+    Ok(())
+}
+
+#[tokio::test]
 async fn safe_close_reports_active_threads_and_force_commits_only_the_matching_shutdown() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (app, update, workspace) = load(dir.path())?;

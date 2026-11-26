@@ -40,6 +40,11 @@ internal data class PromptOutbox(
     val seenUserItems: Set<String>,
 )
 
+internal data class ToolPayloadSelection(
+    val session: String, val item: String, val request: ULong,
+    val details: ServerEvent.ThreadToolDetails? = null,
+)
+
 internal data class RemoteState(
     val phase: ConnectionPhase = ConnectionPhase.Disconnected,
     val workspace: String? = null,
@@ -60,6 +65,8 @@ internal data class RemoteState(
     val creatingThread: Boolean = false,
     val error: String? = null,
     val updateRequired: Boolean = false,
+    val toolDetailsSupported: Boolean = false,
+    val toolPayload: ToolPayloadSelection? = null,
 ) {
     val canSend: Boolean get() = phase == ConnectionPhase.Connected && !changingWorkspace
 
@@ -262,9 +269,22 @@ internal class RemoteRepository(
 
     fun selectThread(id: String?) {
         selectionToRestore = id
-        mutableState.value = state.value.copy(selection = id)
+        mutableState.value = state.value.copy(selection = id, toolPayload = null)
         requestSelectionTail()
         resumeOlderHistory()
+    }
+
+    fun requestToolPayload(session: String, item: String) {
+        val current = state.value
+        if (current.selection != session || !current.canSend || replaying || !current.toolDetailsSupported) return
+        if (current.toolPayload?.item == item) {
+            mutableState.value = current.copy(toolPayload = null)
+            return
+        }
+        val request = ++nextHistoryRequest
+        if (sendToWorkspace(ClientMessage.GetThreadToolDetails(session, item, request))) {
+            mutableState.value = current.copy(toolPayload = ToolPayloadSelection(session, item, request))
+        }
     }
 
     fun requestThreadJob(session: String, job: String, older: Boolean) {
@@ -615,6 +635,8 @@ internal class RemoteRepository(
             changingWorkspace = false, creatingThread = false, resolving = emptySet(),
             error = message,
             updateRequired = updateRequired,
+            toolDetailsSupported = false,
+            toolPayload = null,
         )
         if (retrying) {
             handler.postDelayed(retry, retryDelay)
@@ -701,6 +723,7 @@ internal class RemoteRepository(
                     return
                 }
                 serverProtocol = agreed
+                mutableState.value = state.value.copy(toolDetailsSupported = selectionScoped && agreed >= TOOL_DETAILS_PROTOCOL)
                 updateProtocol = updateRange
                 approvalQueueSupported = event.approvalQueue
                 welcomed = true
@@ -756,6 +779,7 @@ internal class RemoteRepository(
                         threads = if (changed) emptyList() else current.threads,
                         selection = current.selection.takeUnless { changed },
                         outboxes = current.outboxes,
+                        toolDetailsSupported = current.toolDetailsSupported,
                         drain = current.drain.takeIf { receivedDrainStatus },
                         heldConversations = current.heldConversations.takeIf { receivedDrainStatus }.orEmpty(),
                     )
@@ -873,28 +897,34 @@ internal class RemoteRepository(
                     acknowledgePrompt(next, echo, reconnectPromptLimit)
                 }
             }
+            is ServerEvent.ThreadToolDetails -> {
+                if (!selectionScoped || replaying || frame.workspace == null || frame.workspace != current.workspace) return
+                val pending = current.toolPayload ?: return
+                if (pending.session != event.session || pending.item != event.item || pending.request != event.request) return
+                current.copy(toolPayload = pending.copy(details = event))
+            }
             is ServerEvent.ThreadJobDetails -> {
                 if (!selectionScoped || replaying || frame.workspace == null || frame.workspace != current.workspace) return
                 val details = savedTranscriptEvents(event.session, event.events)
                 val timeline = details.filterIsInstance<ServerEvent.ApprovalRecorded>()
                     .fold(current.timeline(event.session)) { state, record -> state.recordApproval(record.receipt) }
-                current.withTimeline(event.session, timeline.updateJob(event.job) { job ->
-                    if (job.detailRequest != event.request) job else job.copy(
-                        details = details.mapNotNull { nested ->
-                            when (nested) {
-                                is ServerEvent.TextDelta -> nested.text
-                                is ServerEvent.UserPrompt -> nested.text
-                                is ServerEvent.ToolCall -> if (nested.item == event.job) null else "${nested.name}\n${nested.input}"
-                                is ServerEvent.ToolResult -> if (nested.item == event.job) {
-                                    runCatching { Protocol.json.decodeFromString<JobReport>(nested.output).text }.getOrNull()
-                                } else nested.output
-                                is ServerEvent.DelegateProgress -> nested.summary
-                                else -> null
-                            }?.takeIf { it.isNotBlank() }
-                        } + (if (event.before != null) job.details.orEmpty() else emptyList()),
-                        nextDetail = event.nextBefore, loadingDetails = false,
-                    )
-                })
+                var matched = false
+                val updated = timeline.updateJob(event.job) { job ->
+                    if (job.detailRequest != event.request) job else {
+                        matched = true
+                        if (event.error != null && details.isEmpty()) {
+                            job.copy(detailRequest = null, loadingDetails = false)
+                        } else {
+                            job.copy(
+                                details = jobDetailPage(details, event.job) +
+                                    (if (event.before != null) job.details.orEmpty() else emptyList()),
+                                nextDetail = event.nextBefore, loadingDetails = false,
+                            )
+                        }
+                    }
+                }
+                if (matched) current.withTimeline(event.session, updated).copy(error = event.error ?: current.error)
+                else current
             }
             is ServerEvent.ThreadJobs -> {
                 if (!selectionScoped || frame.workspace == null || frame.workspace != current.workspace ||

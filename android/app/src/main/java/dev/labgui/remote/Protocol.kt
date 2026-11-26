@@ -11,7 +11,8 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.decodeFromJsonElement
 
 internal const val JOB_SUMMARY_PROTOCOL = 74
-const val PROTOCOL_VERSION = JOB_SUMMARY_PROTOCOL
+internal const val TOOL_DETAILS_PROTOCOL = 75
+const val PROTOCOL_VERSION = TOOL_DETAILS_PROTOCOL
 internal const val MIN_PROTOCOL_VERSION = 18
 internal const val THREAD_HISTORY_PROTOCOL = 62
 internal const val FOLDER_ACCESS_REQUEST = "folder-access-"
@@ -42,6 +43,9 @@ sealed interface ClientMessage {
     data class GetThreadJob(
         val session: String, val job: String, val request: ULong? = null, val before: ULong? = null,
     ) : ClientMessage
+
+    @Serializable @SerialName("get_thread_tool_details")
+    data class GetThreadToolDetails(val session: String, val item: String, val request: ULong) : ClientMessage
 
     @Serializable @SerialName("get_thread_history")
     data class GetThreadHistory(
@@ -359,6 +363,11 @@ sealed interface ServerEvent {
     @Serializable data class ThreadJobDetails(
         val session: String, val job: String, val request: ULong, val events: List<JsonObject>,
         val before: ULong? = null, @SerialName("next_before") val nextBefore: ULong? = null,
+        val error: String? = null,
+    ) : ServerEvent
+    @Serializable data class ThreadToolDetails(
+        val session: String, val item: String, val request: ULong, val input: JsonElement? = null,
+        val output: String? = null, val unavailable: Boolean = false,
     ) : ServerEvent
     @Serializable data class ThreadJobActivity(
         override val session: String, val job: String, val tools: Int,
@@ -463,6 +472,7 @@ object Protocol {
             "thread_history_start" -> json.decodeFromJsonElement<ServerEvent.ThreadHistoryStart>(event)
             "thread_tail" -> json.decodeFromJsonElement<ServerEvent.ThreadTail>(event)
             "thread_job_details" -> json.decodeFromJsonElement<ServerEvent.ThreadJobDetails>(event)
+            "thread_tool_details" -> json.decodeFromJsonElement<ServerEvent.ThreadToolDetails>(event)
             "thread_job_activity" -> json.decodeFromJsonElement<ServerEvent.ThreadJobActivity>(event)
             "thread_jobs" -> json.decodeFromJsonElement<ServerEvent.ThreadJobs>(event)
             "thread_job_updated" -> json.decodeFromJsonElement<ServerEvent.ThreadJobUpdated>(event)

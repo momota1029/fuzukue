@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use fuzukue_proto::{Envelope, ServerEvent};
 use serde::{Deserialize, Serialize};
 
+use crate::threads::payloads::{Record as PayloadRecord, Refs};
+
 pub(crate) const BACKLOG: usize = 10_000;
 pub(crate) const BACKLOG_BYTES: u64 = 16 * 1024 * 1024;
 const CHECKPOINT_INTERVAL: u64 = 16 * 1024 * 1024;
@@ -224,14 +226,18 @@ impl Journal {
         })
     }
 
-    fn visit(&self, records: impl IntoIterator<Item = Record>, mut visit: impl FnMut(Envelope, u64)) {
-        let Ok(file) = File::open(&self.path) else { return };
-        let mut input = BufReader::with_capacity(128 * 1024, file);
+    fn visit(&self, records: impl IntoIterator<Item = Record>, visit: impl FnMut(&[u8], PayloadRecord)) {
+        Self::visit_records(&self.path, self.index.end, records, visit);
+    }
+
+    fn visit_records(path: &Path, end: u64, records: impl IntoIterator<Item = Record>, mut visit: impl FnMut(&[u8], PayloadRecord)) {
+        let Ok(file) = File::open(path).map(Arc::new) else { return };
+        let mut input = BufReader::with_capacity(128 * 1024, file.as_ref());
         let mut line = Vec::new();
         let mut offset = 0;
         for record in records {
-            if record.0 > record.1 || record.1 > self.index.end {
-                tracing::warn!(path=?self.path, "invalid timeline record offsets");
+            if record.0 > record.1 || record.1 > end {
+                tracing::warn!(?path, "invalid timeline record offsets");
                 break;
             }
             let result = (|| -> io::Result<()> {
@@ -247,12 +253,10 @@ impl Journal {
                 Ok(())
             })();
             if let Err(error) = result {
-                tracing::warn!(path=?self.path, %error, "could not read indexed timeline record");
+                tracing::warn!(?path, %error, "could not read indexed timeline record");
                 break;
             }
-            if let Ok(envelope) = serde_json::from_slice(&line) {
-                visit(envelope, record.len());
-            }
+            visit(&line, PayloadRecord { file: file.clone(), offset: record.0, len: line.len() });
         }
     }
 }
@@ -283,11 +287,24 @@ impl Timeline {
     }
 
     pub(crate) fn restore(&self, mut visit: impl FnMut(Envelope, Option<u64>)) {
+        fn replay(line: &[u8]) -> Option<(Envelope, u64)> {
+            let mut row: super::JournalLine = serde_json::from_slice(line).ok()?;
+            let size = if row.tool_payloads.is_empty() && crate::threads::payloads::bound_replay(&mut row.envelope.event) {
+                serde_json::to_vec(&row.envelope).expect("serializable preview").len() as u64 + 1
+            } else {
+                line.len() as u64
+            };
+            Some((row.envelope, size))
+        }
         for journal in self.0.lock().unwrap().iter() {
             let tail_start = journal.index.tail.front().map_or(u64::MAX, |record| record.0);
             journal.visit(journal.index.recovery.iter().copied().take_while(|record| record.0 < tail_start),
-                |env, _| visit(env, None));
-            journal.visit(journal.index.tail.iter().copied(), |env, len| visit(env, Some(len)));
+                |line, _| {
+                    if let Some((env, _)) = replay(line) { visit(env, None); }
+                });
+            journal.visit(journal.index.tail.iter().copied(), |line, _| {
+                if let Some((env, size)) = replay(line) { visit(env, Some(size)); }
+            });
         }
     }
 
@@ -297,6 +314,15 @@ impl Timeline {
         sessions.sort_unstable();
         sessions.dedup();
         sessions
+    }
+
+    pub(crate) fn journal_prefixes(&self) -> crate::threads::payloads::JournalPrefixes {
+        use std::os::unix::fs::MetadataExt;
+        let journals = self.0.lock().unwrap();
+        std::array::from_fn(|index| {
+            let metadata = journals[index].path.metadata().ok()?;
+            Some((metadata.dev(), metadata.ino(), metadata.len()))
+        })
     }
 
     pub(crate) fn session_stamp(&self, session: &str) -> [Option<(u64, u64)>; 2] {
@@ -317,11 +343,16 @@ impl Timeline {
             .flat_map(|journal| journal.index.snapshot_recovery.iter().cloned()).collect()
     }
 
-    pub(crate) fn visit_session(&self, session: &str, mut visit: impl FnMut(Envelope, u64)) {
-        for journal in self.0.lock().unwrap().iter() {
-            if let Some(records) = journal.index.threads.get(session) {
-                journal.visit(records.iter().copied(), &mut visit);
-            }
+    pub(crate) fn visit_session(&self, session: &str, mut visit: impl FnMut(Envelope, Refs, PayloadRecord)) {
+        let journals: Vec<_> = self.0.lock().unwrap().iter().filter_map(|journal| {
+            Some((journal.path.clone(), journal.index.end, journal.index.threads.get(session)?.clone()))
+        }).collect();
+        for (path, end, records) in journals {
+            Journal::visit_records(&path, end, records, |line, record| {
+                if let Ok(row) = serde_json::from_slice::<super::JournalLine>(line) {
+                    visit(row.envelope, row.tool_payloads, record);
+                }
+            });
         }
     }
 

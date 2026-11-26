@@ -1,5 +1,6 @@
 package dev.labgui.remote
 
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.decodeFromJsonElement
@@ -35,7 +36,10 @@ sealed interface TimelineRow {
     ) : TimelineRow
     data class Note(val text: String) : TimelineRow
     data class ApprovalDenial(val tool: String) : TimelineRow
-    data class Tool(val label: String, val ok: Boolean? = null, val name: String = label, val actor: Actor? = null) : TimelineRow
+    data class Tool(
+        val label: String, val ok: Boolean? = null, val name: String = label, val actor: Actor? = null,
+        val item: String = "", val input: JsonElement? = null, val output: String? = null,
+    ) : TimelineRow
     data class ToolRun(
         val tools: List<Pair<Tool, Int>>,
         val unlinkedApprovals: Int,
@@ -48,11 +52,55 @@ sealed interface TimelineRow {
         val ok: Boolean? = null,
         val report: JobReport? = null,
         val detailRequest: ULong? = null,
-        val details: List<String>? = null,
+        val details: List<JobDetail>? = null,
         val nextDetail: ULong? = null,
         val loadingDetails: Boolean = false,
         val wireSummary: JobSummary? = null,
     ) : TimelineRow
+}
+
+sealed interface JobDetail {
+    data class Text(val text: String) : JobDetail
+    data class Tool(val row: TimelineRow.Tool) : JobDetail
+}
+
+internal fun ServerEvent.ToolCall.toolRow(): TimelineRow.Tool {
+    val fields = input as? JsonObject
+    val detail = listOf("command", "file_path", "path", "file")
+        .firstNotNullOfOrNull { (fields?.get(it) as? JsonPrimitive)?.content }
+    val label = if (detail == null) name else name + " " + detail.lineSequence().first().take(120)
+    return TimelineRow.Tool(label, name = name, actor = actor, item = item, input = input)
+}
+
+internal fun jobDetailPage(events: List<ServerEvent>, job: String): List<JobDetail> {
+    val details = mutableListOf<JobDetail>()
+    val tools = mutableMapOf<String, Int>()
+    fun text(value: String?) {
+        if (!value.isNullOrBlank()) details += JobDetail.Text(value)
+    }
+    for (event in events) {
+        when (event) {
+            is ServerEvent.TextDelta -> text(event.text)
+            is ServerEvent.UserPrompt -> text(event.text)
+            is ServerEvent.DelegateProgress -> text(event.summary)
+            is ServerEvent.ToolCall -> if (event.item != job) {
+                tools[event.item] = details.size
+                details += JobDetail.Tool(event.toolRow())
+            }
+            is ServerEvent.ToolResult -> if (event.item == job) {
+                text(runCatching { Protocol.json.decodeFromString<JobReport>(event.output).text }.getOrNull())
+            } else {
+                val index = tools[event.item]
+                if (index == null) text(event.output)
+                else {
+                    val row = (details[index] as JobDetail.Tool).row
+                    details[index] = JobDetail.Tool(row.copy(ok = event.ok, output = event.output))
+                }
+            }
+            else -> Unit
+        }
+    }
+    return details
 }
 
 enum class HistoryEdge { Unknown, More, Loading, Start }
@@ -98,7 +146,7 @@ data class Timeline(
             event.actor.kind == "user" -> appendUser(event.item, event.text)
             event.actor.kind == "system" && event.item.startsWith("thread-plan:") ->
                 withRow(event.item, TimelineRow.Note(event.text))
-            childJob(event.item, event.actor) != null -> appendJobDetail(childJob(event.item, event.actor), event.text)
+            childJob(event.item, event.actor) != null -> appendJobDetail(childJob(event.item, event.actor), JobDetail.Text(event.text.take(32 * 1024)))
             else -> {
                 val previous = rows[event.item] as? TimelineRow.Message
                 val text = previous?.text.orEmpty() + event.text
@@ -129,23 +177,28 @@ data class Timeline(
                 }
             }
             childJob(event.item, event.actor) != null -> appendJobDetail(
-                childJob(event.item, event.actor), "${event.name}\n${event.input}",
+                childJob(event.item, event.actor), JobDetail.Tool(event.toolRow()),
             )
-            else -> {
-                val input = event.input as? JsonObject
-                val detail = listOf("command", "file_path", "path", "file")
-                    .firstNotNullOfOrNull { (input?.get(it) as? JsonPrimitive)?.content }
-                val label = if (detail == null) event.name else "${event.name} ${detail.lineSequence().first().take(120)}"
-                withRow(event.item, TimelineRow.Tool(label, name = event.name, actor = event.actor))
-            }
+            else -> withRow(event.item, event.toolRow())
         }
         is ServerEvent.ToolResult -> when (val previous = rows[event.item]) {
             is TimelineRow.Job -> {
                 val report = runCatching { Protocol.json.decodeFromString<JobReport>(event.output) }.getOrNull()
                 withRow(event.item, previous.copy(ok = event.ok, report = report))
             }
-            is TimelineRow.Tool -> withRow(event.item, previous.copy(ok = event.ok))
-            else -> appendJobDetail(childJob(event.item), event.output)
+            is TimelineRow.Tool -> withRow(event.item, previous.copy(ok = event.ok, output = event.output))
+            else -> {
+                val job = childJob(event.item)
+                if (job == null) this else updateJob(job) { row ->
+                    val details = row.details ?: return@updateJob row
+                    val index = details.indexOfLast { it is JobDetail.Tool && it.row.item == event.item }
+                    if (index < 0) row.copy(details = details.takeLast(127) + JobDetail.Text(event.output.take(32 * 1024)))
+                    else row.copy(details = details.toMutableList().apply {
+                        val tool = (this[index] as JobDetail.Tool).row
+                        this[index] = JobDetail.Tool(tool.copy(ok = event.ok, output = event.output))
+                    })
+                }
+            }
         }
         is ServerEvent.ReplySuperseded -> copy(
             rows = rows - event.items,
@@ -183,11 +236,11 @@ data class Timeline(
         return withRow(job, update(row))
     }
 
-    private fun appendJobDetail(job: String?, text: String): Timeline {
-        if (job == null || text.isBlank()) return this
+    private fun appendJobDetail(job: String?, detail: JobDetail): Timeline {
+        if (job == null || detail is JobDetail.Text && detail.text.isBlank()) return this
         return updateJob(job) { row ->
             val details = row.details ?: return@updateJob row
-            row.copy(details = details.takeLast(127) + text.take(32 * 1024))
+            row.copy(details = details.takeLast(127) + detail)
         }
     }
 

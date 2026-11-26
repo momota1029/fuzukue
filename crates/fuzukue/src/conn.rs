@@ -1034,7 +1034,7 @@ impl Worker {
                         }
                         if matches!(request, ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistoryFrom { .. }
                             | ClientMsg::GetThreadJob { .. } | ClientMsg::GetThreadJobs { .. }
-                            | ClientMsg::GetThreadJobReport { .. }
+                            | ClientMsg::GetThreadJobReport { .. } | ClientMsg::GetThreadToolDetails { .. }
                             | ClientMsg::GetThreadHistory { generation: Some(_), .. })
                             && !synced
                         {
@@ -1047,7 +1047,7 @@ impl Worker {
                                 | ClientMsg::ReviewReports { action: fuzukue_proto::ReviewReportsAction::List, .. }
                                 | ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { .. }
                                 | ClientMsg::GetThreadHistoryFrom { .. } | ClientMsg::GetThreadJob { .. } | ClientMsg::GetThreadJobs { .. }
-                                | ClientMsg::GetThreadJobReport { .. }
+                                | ClientMsg::GetThreadJobReport { .. } | ClientMsg::GetThreadToolDetails { .. }
                                  | ClientMsg::GitHubReport { action: fuzukue_proto::GitHubReportAction::Status, .. }
                                 | ClientMsg::Ledger { action: fuzukue_proto::LedgerAction::List, .. }
                                 | ClientMsg::History { request: fuzukue_proto::HistoryRequest::List { .. } | fuzukue_proto::HistoryRequest::Diff { .. }, .. }

@@ -507,6 +507,7 @@ struct ToolGroup {
 }
 
 struct ToolCall {
+    item: String,
     name: String,
     summary: String,
     input: Value,
@@ -514,6 +515,27 @@ struct ToolCall {
     input_open: bool,
     result: Option<ToolResult>,
     result_open: bool,
+    detail: ToolDetail,
+}
+
+#[derive(Default)]
+struct ToolDetail {
+    request: Option<u64>,
+    input: Option<Value>,
+    output: Option<String>,
+    unavailable: bool,
+}
+
+impl ToolDetail {
+    fn status(&self) -> Option<&'static str> {
+        if self.request.is_some() {
+            Some(tr!("chat-tool-details-loading"))
+        } else if self.unavailable {
+            Some(tr!("chat-tool-details-unavailable"))
+        } else {
+            None
+        }
+    }
 }
 
 struct ToolResult {
@@ -1126,7 +1148,7 @@ impl Chat {
         let job = delegate_job(&item, &actor);
         if let Some(job) = job {
             if let Some((row, entry)) = self.delegate_entry(job, &item, || {
-                DelegateEntry::Tool(ToolCall::new(name, summary.clone(), input.clone()))
+                DelegateEntry::Tool(ToolCall::new(&item, name, summary.clone(), input.clone()))
             }) {
                 if let DelegateEntry::Tool(call) = entry {
                     call.summary = summary;
@@ -1154,7 +1176,7 @@ impl Chat {
                 });
             }
         }
-        let call = ToolCall::new(name, summary, input);
+        let call = ToolCall::new(&item, name, summary, input);
         let (row, joined) = self.tool_group(actor, false);
         if let Content::Tools(group) = &mut self.rows[row].content {
             self.by_tool.insert(item, (row, group.calls.len()));
@@ -1554,13 +1576,7 @@ impl Chat {
                 .get_or_insert(show_worker_messages),
             (Content::Delegate(block), Disclosure::DelegateTools) => &mut block.tools_open,
             (Content::Delegate(block), Disclosure::DelegateEarlierTools) => &mut block.earlier_tools_open,
-            (Content::Delegate(block), Disclosure::DelegateTool(index)) => {
-                let DelegateEntry::Tool(call) = &mut block.progress[index] else { return };
-                &mut call.input_open
-            }
             (Content::Tools(group), Disclosure::Group) => &mut group.open,
-            (Content::Tools(group), Disclosure::Input(call)) => &mut group.calls[call].input_open,
-            (Content::Tools(group), Disclosure::Result(call)) => &mut group.calls[call].result_open,
             (Content::Tools(group), Disclosure::DecidedApprovals) => &mut group.decided_open,
             (Content::Tools(group), Disclosure::ApprovalDetails(index)) => &mut group.approvals[index].details_open,
             _ => return,
@@ -1671,11 +1687,16 @@ fn is_worker_message(actor: &Actor, item: Option<&str>) -> bool {
 }
 
 impl ToolCall {
-    fn new(name: &str, summary: String, input: Value) -> Self {
+    fn new(item: &str, name: &str, summary: String, input: Value) -> Self {
         Self {
-            name: name.to_owned(), summary, input, started: Instant::now(),
-            input_open: false, result: None, result_open: false,
+            item: item.into(), name: name.into(), summary, input, started: Instant::now(),
+            input_open: false, result: None, result_open: false, detail: ToolDetail::default(),
         }
+    }
+
+    fn pretty_input(&self) -> String {
+        let input = self.detail.input.as_ref().unwrap_or(&self.input);
+        serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
     }
 
     fn batch_failure_summary(&self) -> Option<&str> {
@@ -1953,6 +1974,54 @@ fn chat_transcript_id(session: &str) -> ElementId {
 }
 
 impl Workbench {
+    fn toggle_tool_payload(&mut self, session: &str, row: usize, part: Disclosure, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(session) else { return };
+        let call = match (chat.rows.get_mut(row).map(|row| &mut row.content), part) {
+            (Some(Content::Tools(group)), Disclosure::Input(i) | Disclosure::Result(i)) => group.calls.get_mut(i),
+            (Some(Content::Delegate(job)), Disclosure::DelegateTool(i)) => match job.progress.get_mut(i) {
+                Some(DelegateEntry::Tool(call)) => Some(call),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(call) = call else { return };
+        let open = if matches!(part, Disclosure::Result(_)) { &mut call.result_open } else { &mut call.input_open };
+        *open = !*open;
+        let wants_output = matches!(part, Disclosure::Result(_) | Disclosure::DelegateTool(_)) && call.result.is_some();
+        if !call.input_open && !call.result_open {
+            call.detail = ToolDetail::default();
+        } else if self.protocol >= fuzukue_proto::TOOL_DETAILS_PROTOCOL && self.transcripts.scoped
+            && call.detail.request.is_none()
+            && (call.detail.input.is_none() || wants_output && call.detail.output.is_none())
+        {
+            let request = chat_history::next_request();
+            if self.out.send(ClientMsg::GetThreadToolDetails {
+                session: session.into(), item: call.item.clone(), request,
+            }).is_ok() {
+                call.detail.request = Some(request);
+                call.detail.unavailable = false;
+            }
+        }
+        chat.remeasure(row, cx);
+    }
+
+    pub(super) fn finish_tool_payload(&mut self, event: ServerEvent, cx: &mut Context<Self>) {
+        let ServerEvent::ThreadToolDetails { session, item, request, input, output, unavailable } = event else { return };
+        let Some(chat) = self.chats.get_mut(&session) else { return };
+        let (row, call) = if let Some(&(row, index)) = chat.by_tool.get(&item) {
+            let Content::Tools(group) = &mut chat.rows[row].content else { return };
+            (row, &mut group.calls[index])
+        } else if let Some(&(row, index)) = chat.delegate_items.get(&item) {
+            let Content::Delegate(job) = &mut chat.rows[row].content else { return };
+            let DelegateEntry::Tool(call) = &mut job.progress[index] else { return };
+            (row, call)
+        } else { return };
+        if call.detail.request == Some(request) {
+            call.detail = ToolDetail { request: None, input, output, unavailable };
+            chat.remeasure(row, cx);
+        }
+    }
+
     fn toggle_thread_job(&mut self, session: &str, row: usize, cx: &mut Context<Self>) {
         let Some(chat) = self.chats.get_mut(session) else { return };
         let Some(Row { content: Content::Delegate(block), .. }) = chat.rows.get_mut(row) else { return };
@@ -1995,7 +2064,7 @@ impl Workbench {
     }
 
     pub(crate) fn finish_thread_job(&mut self, event: ServerEvent, cx: &mut Context<Self>) {
-        let ServerEvent::ThreadJobDetails { session, job, request, through, before, next_before, events } = event
+        let ServerEvent::ThreadJobDetails { session, job, request, through, before, next_before, events, error } = event
             else { unreachable!() };
         let Some(chat) = self.chats.get_mut(&session) else { return };
         let Some(&row) = chat.by_item.get(&job) else { return };
@@ -2005,8 +2074,17 @@ impl Workbench {
             return;
         }
         deferred.request = None;
-        deferred.next_before = next_before;
+        if error.is_none() || !events.is_empty() {
+            deferred.next_before = next_before;
+        }
         let buffered = std::mem::take(&mut deferred.pending);
+        if let Some(message) = error.as_ref() {
+            chat.push_error(message.clone(), cx);
+            if events.is_empty() {
+                chat.replay_updates(buffered.into_iter().map(|(_, event)| event), cx);
+                return;
+            }
+        }
         if before.is_some() {
             chat.prepend_job_details(&job, events, cx);
         } else {
@@ -2360,6 +2438,8 @@ impl Workbench {
                     disclosure_row(id, open, &label, color, press, cx, move |cx| {
                         entity.update(cx, |this, cx| {
                             match part {
+                                Disclosure::Input(_) | Disclosure::Result(_) | Disclosure::DelegateTool(_) =>
+                                    this.toggle_tool_payload(&session, target, part, cx),
                                 Disclosure::DelegateDetails => this.toggle_thread_job(&session, ix, cx),
                                 Disclosure::MoreDelegateDetails => this.request_older_job_details(&session, ix),
                                 _ => if let Some(chat) = this.chats.get_mut(&session) {
@@ -2659,12 +2739,11 @@ impl Workbench {
                                             .text_color(theme.muted_foreground),
                                     );
                                     if call.input_open {
-                                        body = body.child(code(&format!("worker-input-{index}"),
-                                            &serde_json::to_string_pretty(&call.input)
-                                                .unwrap_or_else(|_| call.input.to_string()),
-                                        ));
+                                        body = body.child(code(&format!("worker-input-{index}"), &call.pretty_input()))
+                                            .children(call.detail.status().map(|status| div().text_xs().child(status)));
                                         if let Some(result) = &call.result {
-                                            body = body.child(code(&format!("worker-output-{index}"), &result.output));
+                                            body = body.child(code(&format!("worker-output-{index}"),
+                                                call.detail.output.as_deref().unwrap_or(&result.output)));
                                         }
                                     }
                                 }
@@ -2844,10 +2923,7 @@ impl Workbench {
                                         .font(this.appearance.code_font.clone()),
                                     )
                                     .children(call.input_open.then(|| {
-                                        code(&format!("input-{row}-{i}"),
-                                            &serde_json::to_string_pretty(&call.input)
-                                                .unwrap_or_else(|_| call.input.to_string()),
-                                        )
+                                        code(&format!("input-{row}-{i}"), &call.pretty_input())
                                     }))
                                     .children(run.and_then(|run| run.attached.get(&(row, i))).map(|_| {
                                         div().pl_3().text_xs().text_color(theme.muted_foreground)
@@ -2884,11 +2960,14 @@ impl Workbench {
                                                 toggle
                                             })
                                             .children(
-                                                call.result_open.then(|| code(&format!("output-{row}-{i}"), &result.output)),
+                                                call.result_open.then(|| code(&format!("output-{row}-{i}"),
+                                                    call.detail.output.as_deref().unwrap_or(&result.output))),
                                             ),
                                     );
                                 }
-                                body = body.child(tool.pl_3());
+                                body = body.child(tool.pl_3().children(
+                                    call.detail.status().map(|status| div().text_xs().child(status))
+                                ));
                             }
                             if let Some(count) = run.map(|run| run.unlinked).filter(|count| *count > 0) {
                                 body = body.child(div().pl_3().text_xs().text_color(theme.muted_foreground)
@@ -5506,6 +5585,58 @@ mod composer_draft_tests {
                 window.draw(cx).clear(cx);
                 assert!(window.shot_element_bounds("chat-composer-notice").is_none());
             }).unwrap();
+            cx.spawn(async move |cx| {
+                let _ = cx.update(|cx| cx.quit());
+            }).detach();
+        });
+    }
+
+    #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+    #[test]
+    fn tool_disclosure_requests_full_output_and_drops_it_on_close() {
+        use gpui_kit::AppContext as _;
+
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(|cx| {
+            gpui_kit::init(cx);
+            math::init(cx);
+            let (_, view) = gpui_kit::open_window(gpui_kit::component::TitleBar::window_options(),
+                cx, |window, cx| cx.new(|cx| Workbench::new_with_target(window, cx, Some(Err("Fixture"))))).unwrap();
+            let (out, sent) = std::sync::mpsc::channel();
+            view.update(cx, |view, cx| {
+                view.out = out.into();
+                view.protocol = fuzukue_proto::TOOL_DETAILS_PROTOCOL;
+                view.transcripts.scoped = true;
+                let session = "thread-test";
+                let item = "read";
+                let input = serde_json::json!({"path": "test.md"});
+                view.on_event(ServerEvent::ToolCall {
+                    session: session.into(), item: item.into(), actor: Actor::Claude, name: "Read".into(), input: input.clone(),
+                }, cx);
+                view.on_event(ServerEvent::ToolResult {
+                    session: session.into(), item: item.into(), ok: true, output: "preview…".into(),
+                }, cx);
+                let (row, index) = view.chats[session].by_tool[item];
+                assert!(sent.try_iter().all(|message| !matches!(message, ClientMsg::GetThreadToolDetails { .. })));
+
+                view.toggle_tool_payload(session, row, Disclosure::Result(index), cx);
+                let request = sent.try_iter().find_map(|message| match message {
+                    ClientMsg::GetThreadToolDetails { item: id, request, .. } if id == item => Some(request),
+                    _ => None,
+                }).expect("opening a tool requests its detail");
+                let reply = |request| ServerEvent::ThreadToolDetails {
+                    session: session.into(), item: item.into(), request,
+                    input: Some(input.clone()), output: Some("full output".into()), unavailable: false,
+                };
+                view.finish_tool_payload(reply(request + 1), cx);
+                let Content::Tools(group) = &view.chats[session].rows[row].content else { panic!("missing tool group") };
+                assert!(group.calls[index].detail.output.is_none());
+                view.finish_tool_payload(reply(request), cx);
+                let Content::Tools(group) = &view.chats[session].rows[row].content else { panic!("missing tool group") };
+                assert_eq!(group.calls[index].detail.output.as_deref(), Some("full output"));
+                view.toggle_tool_payload(session, row, Disclosure::Result(index), cx);
+                let Content::Tools(group) = &view.chats[session].rows[row].content else { panic!("missing tool group") };
+                assert!(group.calls[index].detail.output.is_none());
+            });
             cx.spawn(async move |cx| {
                 let _ = cx.update(|cx| cx.quit());
             }).detach();

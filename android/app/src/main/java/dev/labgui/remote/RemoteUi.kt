@@ -103,6 +103,7 @@ internal fun RemoteApp(
     onNewThread: () -> Unit = {},
     onOlderHistory: (ConversationTarget) -> Unit = {},
     onRequestJob: (String, String, Boolean) -> Unit = { _, _, _ -> },
+    onToolPayload: (String, String) -> Unit = { _, _ -> },
     onSend: (String, String) -> Boolean = { _, _ -> false },
     onStopTurn: (String) -> Unit = {},
     onStopWorker: (String, String) -> Unit = { _, _ -> },
@@ -216,7 +217,7 @@ internal fun RemoteApp(
                                 val target = ConversationTarget(state.workspace.orEmpty(), selected)
                                 Conversation(
                                     state, selected, onSend, onStopTurn, onStopWorker, onResolve, onRememberShellApproval,
-                                    Modifier.weight(1f), showPlanAboveConversation, openPlan, attachments, attachmentView, onOlderHistory, onRequestJob,
+                                    Modifier.weight(1f), showPlanAboveConversation, openPlan, attachments, attachmentView, onOlderHistory, onRequestJob, onToolPayload,
                                     openApprovalDock = openApprovalDock?.takeIf { it.first == target }?.second,
                                     onDecideQueuedApprovals = { requests, accept -> onDecideQueuedApprovals(target, requests, accept) },
                                     onDismissQueuedDecision = { onDismissQueuedDecision(target) },
@@ -627,6 +628,7 @@ private fun Conversation(
     attachments: Attachments?, attachmentView: AttachmentView,
     onOlderHistory: (ConversationTarget) -> Unit,
     onRequestJob: (String, String, Boolean) -> Unit,
+    onToolPayload: (String, String) -> Unit,
     openApprovalDock: Int?,
     onDecideQueuedApprovals: (List<QueuedApproval>, Boolean) -> Unit, onDismissQueuedDecision: () -> Unit,
     onRetryApprovalQueue: () -> Unit,
@@ -711,12 +713,16 @@ private fun Conversation(
                                 onRememberShellApproval.takeIf { state.shellApprovalRules != null })
                         }
                         items(visibleRows, key = { "event/${it.key}" }) { entry ->
+                            val payload = state.toolPayload?.takeIf { it.session == session }
+                            val openTool: ((String) -> Unit)? = if (state.toolDetailsSupported && state.canSend) {
+                                { item -> onToolPayload(session, item) }
+                            } else null
                             when (val row = entry.value) {
                                 is TimelineRow.Message -> MessageBubble(row, target, attachmentView.sent)
                                 is TimelineRow.Job -> {
                                     val receipts = timeline.approvalReceipts.values.filter { it.workerJob == entry.key }
                                     Column {
-                                        JobPanel(row, timeline.jobSummaries[entry.key] ?: row.wireSummary) { older ->
+                                        JobPanel(row, timeline.jobSummaries[entry.key] ?: row.wireSummary, payload, openTool) { older ->
                                             onRequestJob(session, entry.key, older)
                                         }
                                         for (receipt in receipts.filter { it.state == ApprovalQueueState.Denied }) {
@@ -733,8 +739,8 @@ private fun Conversation(
                                 is TimelineRow.ApprovalDenial -> ApprovalDenialRow(row.tool)
                                 is TimelineRow.Note -> Text(row.text, color = colors.onSurfaceVariant,
                                     style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 8.dp))
-                                is TimelineRow.Tool -> ToolLine(row)
-                                is TimelineRow.ToolRun -> ToolRunPanel(row)
+                                is TimelineRow.Tool -> ToolLine(row, payload, openTool)
+                                is TimelineRow.ToolRun -> ToolRunPanel(row, payload, openTool)
                             }
                         }
                         if (visibleRows.isEmpty() && approvals.isEmpty() && pending.isEmpty()) item {
@@ -1039,18 +1045,57 @@ private fun jobStatusLabel(status: JobStatus) = stringResource(when (status) {
 })
 
 @Composable
-private fun ToolLine(tool: TimelineRow.Tool) {
+private fun ToolLine(
+    tool: TimelineRow.Tool, payload: ToolPayloadSelection?, onTool: ((String) -> Unit)?,
+) {
     val status = when (tool.ok) {
         true -> stringResource(R.string.job_done_suffix)
         false -> stringResource(R.string.job_failed_suffix)
         null -> ""
     }
-    Text(tool.label + status, Modifier.padding(horizontal = 8.dp),
+    val selected = payload?.takeIf { it.item == tool.item }
+    val toggle = if (onTool != null && tool.item.isNotEmpty()) {
+        Modifier.clickable { onTool(tool.item) }
+    } else Modifier
+    val disclosure = if (onTool == null) "" else if (selected == null) "▸ " else "▾ "
+    Text(disclosure + tool.label + status, toggle.padding(horizontal = 8.dp, vertical = 4.dp),
         style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    if (selected != null) {
+        val detail = selected.details
+        if (detail == null || detail.unavailable) {
+            Text(stringResource(if (detail == null) R.string.tool_details_loading else R.string.tool_details_unavailable),
+                Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.labelSmall)
+        }
+        val input = (detail?.input ?: tool.input)?.toString()
+        val output = detail?.output ?: tool.output
+        for (text in listOfNotNull(input, output).filter(String::isNotEmpty)) {
+            ToolPayloadText(text)
+        }
+    }
 }
 
 @Composable
-private fun ToolRunPanel(run: TimelineRow.ToolRun) {
+private fun ToolPayloadText(text: String) {
+    val chunkSize = 4096
+    fun boundary(offset: Int): Int =
+        if (offset in 1 until text.length && text[offset].isLowSurrogate() && text[offset - 1].isHighSurrogate()) {
+            offset + 1
+        } else offset
+    SelectionContainer {
+        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 240.dp).padding(horizontal = 12.dp)) {
+            items((text.length - 1) / chunkSize + 1) { index ->
+                val start = boundary(index * chunkSize)
+                val end = boundary((start + chunkSize - start % chunkSize).coerceAtMost(text.length))
+                Text(text.substring(start, end), style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ToolRunPanel(
+    run: TimelineRow.ToolRun, payload: ToolPayloadSelection?, onTool: ((String) -> Unit)?,
+) {
     val count = stringResource(R.string.tool_automatic_approval_count, run.approvalCount)
     if (run.tools.isEmpty()) {
         Text(count, Modifier.padding(horizontal = 8.dp),
@@ -1070,7 +1115,7 @@ private fun ToolRunPanel(run: TimelineRow.ToolRun) {
             style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (expanded) {
             for ((tool, approvals) in run.tools) {
-                ToolLine(tool)
+                ToolLine(tool, payload, onTool)
                 if (approvals > 0) {
                     Text(stringResource(R.string.tool_automatic_approval_count, approvals),
                         Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelSmall)
@@ -1085,7 +1130,10 @@ private fun ToolRunPanel(run: TimelineRow.ToolRun) {
 }
 
 @Composable
-private fun JobPanel(job: TimelineRow.Job, summary: JobSummary?, onRequest: (older: Boolean) -> Unit) {
+private fun JobPanel(
+    job: TimelineRow.Job, summary: JobSummary?, payload: ToolPayloadSelection?,
+    onTool: ((String) -> Unit)?, onRequest: (older: Boolean) -> Unit,
+) {
     val info = summary?.job ?: job.info
     val state = summary?.status ?: when (job.ok) {
         true -> JobStatus.Succeeded
@@ -1118,7 +1166,21 @@ private fun JobPanel(job: TimelineRow.Job, summary: JobSummary?, onRequest: (old
                     Text(stringResource(R.string.job_earlier_activity))
                 }
             }
-            job.details?.forEach { Text(it, style = MaterialTheme.typography.bodyMedium) }
+            job.details?.forEach {
+                when (it) {
+                    is JobDetail.Text -> {
+                        if (it.text.length > 4096) ToolPayloadText(it.text)
+                        else Text(it.text, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    is JobDetail.Tool -> {
+                        ToolLine(it.row, payload, onTool)
+                        if (onTool == null) {
+                            val preview = listOfNotNull(it.row.input?.toString(), it.row.output).joinToString("\n")
+                            if (preview.isNotEmpty()) ToolPayloadText(preview)
+                        }
+                    }
+                }
+            }
         }
         return
     }

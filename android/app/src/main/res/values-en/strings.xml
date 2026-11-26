@@ -191,4 +191,6 @@
     <string name="attachment_share_thread">Choose a conversation for the shared content.</string>
     <string name="attachment_share_dismiss">Discard shared content</string>
     <string name="allow_folder_one_hour">Allow for 1 hour</string>
+    <string name="tool_details_loading">Loading full tool details…</string>
+    <string name="tool_details_unavailable">Full tool details are unavailable.</string>
 </resources>

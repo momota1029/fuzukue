@@ -37,6 +37,20 @@ class ProtocolTest {
         )
     }
 
+    @Test fun toolDetailsAreRequestedByItemAndDecodeSeparatelyFromHistory() {
+        assertMessage(
+            """{"type":"get_thread_tool_details","session":"s","item":"delegate:j:read","request":25}""",
+            ClientMessage.GetThreadToolDetails("s", "delegate:j:read", 25uL),
+        )
+        val details = decodeEvent(
+            """{"type":"thread_tool_details","session":"s","item":"delegate:j:read","request":25,"input":{"path":"notes.md"},"output":"full output"}""",
+        ) as ServerEvent.ThreadToolDetails
+        assertEquals("delegate:j:read", details.item)
+        assertEquals(25uL, details.request)
+        assertEquals("full output", details.output)
+        assertFalse(details.unavailable)
+    }
+
     @Test fun compactJobUsesSeparatePagedDetails() {
         val job = decodeEvent(
             """{"type":"tool_call","session":"s","item":"delegate:j","actor":{"kind":"system"},"name":"delegate","input":{"model":"fixture","title":"Synthetic job","tool_count":500,"details_deferred":true}}""",

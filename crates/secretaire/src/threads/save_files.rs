@@ -4,7 +4,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File},
     io::{self, BufWriter, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -25,32 +25,16 @@ pub(super) struct SaveFiles {
 
 impl SaveFiles {
     pub(super) fn open(threads: &Path) -> Result<Self> {
-        let dir = threads.join(THREAD_SAVE_DIR);
-        durable::create_dir_all(&dir)?;
-        let lock = File::from(open(
-            &dir,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        flock(&lock, FlockOperation::LockExclusive)?;
+        Self::open_with(threads, private_dir)
+    }
 
-        // Install the ignore rule before creating any save artifacts. The
-        // wildcard also ignores this .gitignore in an otherwise clean repo.
-        let ignore = dir.join(".gitignore");
-        if regular_file(&ignore)? {
-            let rule = fs::read(&ignore)?;
-            ensure!(GIT_IGNORE.starts_with(&rule), "unexpected thread save ignore rule");
-            if rule != GIT_IGNORE {
-                let mut file = File::options().write(true).open(&ignore)?;
-                file.write_all(GIT_IGNORE)?;
-                file.sync_all()?;
-            }
-        } else {
-            let mut file = File::create_new(ignore)?;
-            file.write_all(GIT_IGNORE)?;
-            file.sync_all()?;
-            durable::sync_dir(&dir)?;
-        }
+    pub(super) fn try_open(threads: &Path) -> Result<Self> {
+        Self::open_with(threads, try_private_dir)
+    }
+
+    fn open_with(threads: &Path, lock: impl FnOnce(&Path) -> Result<File>) -> Result<Self> {
+        let dir = threads.join(THREAD_SAVE_DIR);
+        let lock = lock(&dir)?;
 
         // Only one writer can stage a save at a time. A crash can leave
         // at most these two files, which the next writer or startup removes.
@@ -75,9 +59,13 @@ impl SaveFiles {
         file.sync_all()?;
         before_replace()?;
         fs::rename(staged, path)?;
+        Ok(file)
+    }
+
+    pub(super) fn sync_replacement(&self, path: &Path) -> Result<()> {
         durable::sync_dir(path.parent().expect("thread has a parent directory"))?;
         durable::sync_dir(&self.dir)?;
-        Ok(file)
+        Ok(())
     }
 
     pub(super) fn preserve_previous(&self, file: &mut File, path: &Path) -> Result<()> {
@@ -105,6 +93,48 @@ impl SaveFiles {
         durable::sync_dir(&self.dir)?;
         Ok(())
     }
+}
+
+/// Share the directory lock and ignore rule with older servers.
+pub(super) fn private_dir(dir: &Path) -> Result<File> {
+    open_private_dir(dir, FlockOperation::LockExclusive)
+}
+
+pub(super) fn try_private_dir(dir: &Path) -> Result<File> {
+    open_private_dir(dir, FlockOperation::NonBlockingLockExclusive)
+}
+
+fn open_private_dir(dir: &Path, operation: FlockOperation) -> Result<File> {
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => durable::sync_dir(dir.parent().expect("thread directory"))?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let lock = File::from(open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    flock(&lock, operation)?;
+
+    // Install the ignore rule before creating any save artifacts. The
+    // wildcard also ignores this .gitignore in an otherwise clean repo.
+    let ignore = dir.join(".gitignore");
+    if regular_file(&ignore)? {
+        let rule = fs::read(&ignore)?;
+        ensure!(GIT_IGNORE.starts_with(&rule), "unexpected thread save ignore rule");
+        if rule != GIT_IGNORE {
+            let mut file = File::options().write(true).open(&ignore)?;
+            file.write_all(GIT_IGNORE)?;
+            file.sync_all()?;
+        }
+    } else {
+        let mut file = File::create_new(ignore)?;
+        file.write_all(GIT_IGNORE)?;
+        file.sync_all()?;
+        durable::sync_dir(dir)?;
+    }
+    Ok(lock)
 }
 
 pub(super) fn reconcile(threads: &Path) -> Result<()> {

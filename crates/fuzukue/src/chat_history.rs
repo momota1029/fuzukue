@@ -1334,7 +1334,7 @@ mod tests {
                 }).expect("expansion requested details");
                 deliver(view, window, cx, 0, ServerEvent::ThreadJobDetails {
                     session: A.into(), job: job.into(), request: detail, through: 10,
-                    before: None, next_before: None,
+                    before: None, next_before: None, error: None,
                     events: vec![ServerEvent::TextDelta {
                         session: A.into(), item: format!("{job}:detail"), text: "Synthetic activity".into(),
                         actor: Actor::Codex { thread_id: "fixture".into(), parent_tool_use: Some(job.into()) },

@@ -166,6 +166,7 @@ class MainActivity : ComponentActivity() {
                     onThread = remote::selectThread,
                     onOlderHistory = remote::requestOlderHistory,
                     onRequestJob = remote::requestThreadJob,
+                    onToolPayload = remote::requestToolPayload,
                     onNewThread = remote::newThread,
                     onSend = remote::prompt,
                     onStopTurn = remote::interrupt,

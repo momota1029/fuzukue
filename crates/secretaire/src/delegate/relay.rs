@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuzukue_proto::{Envelope, ServerEvent};
+use fuzukue_proto::ServerEvent;
+use crate::hub::WorkerEvent;
 use tokio::time::Instant;
 
 use super::{activity, enqueue_desk, Activity, App, DeskTurn};
@@ -190,7 +191,10 @@ impl Batch {
         }
     }
 
-    fn observe(&mut self, event: &ServerEvent, session: &str, job: &str, now: Instant, digest: &mut Digest) {
+    fn observe(
+        &mut self, event: &ServerEvent, session: &str, job: &str, now: Instant, digest: &mut Digest,
+        artifact_paths: Option<&[String]>, failure_tail: Option<&str>,
+    ) {
         match activity(event, session, job) {
             Some(Activity::Prose { item, text }) if !item.starts_with("plan:") && !item.contains(":summary:") => {
                 if self.prose_item != item {
@@ -224,13 +228,23 @@ impl Batch {
             }
             if let Some((name, input)) = self.calls.remove(item) {
                 if *ok {
-                    digest.paths.extend(crate::thread_artifacts::tool_paths(&name, Some(&input), Some(output))
-                        .into_iter().filter(|path| !path.trim().is_empty()));
+                    let fallback;
+                    let paths = match artifact_paths {
+                        Some(paths) => paths,
+                        None => {
+                            fallback = crate::thread_artifacts::tool_paths(&name, Some(&input), Some(output));
+                            &fallback
+                        }
+                    };
+                    digest.paths.extend(paths.iter().filter(|path| !path.trim().is_empty()).cloned());
                 } else {
-                    let line = output.lines().find(|line| {
+                    let useful = |line: &&str| {
                         let line = line.trim();
                         !line.is_empty() && line != "null"
-                    });
+                    };
+                    let line = failure_tail.filter(|tail| !output.ends_with(tail))
+                        .and_then(|tail| tail.lines().rev().find(useful))
+                        .or_else(|| output.lines().find(useful));
                     let failure: String = line.unwrap_or(&name).chars().take(FAILURE_LIMIT).collect();
                     if self.seen_failures.insert(failure.trim().into()) {
                         digest.failures.push_back(failure);
@@ -242,7 +256,7 @@ impl Batch {
 }
 
 pub(super) async fn relay_progress(
-    app: Arc<App>, session: String, job: String, mut events: tokio::sync::broadcast::Receiver<Envelope>,
+    app: Arc<App>, session: String, job: String, mut events: tokio::sync::broadcast::Receiver<WorkerEvent>,
 ) {
     let mut batch = Batch::default();
     loop {
@@ -250,7 +264,7 @@ pub(super) async fn relay_progress(
         let deadline = batch.prose_deadline;
         tokio::select! {
             event = events.recv() => match event {
-                Ok(event) => batch.observe(&event.event, &session, &job, Instant::now(), &mut digest),
+                Ok(event) => batch.observe(&event.event, &session, &job, Instant::now(), &mut digest, event.artifact_paths.as_deref(), event.failure_tail.as_deref()),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => return,
             },
@@ -343,7 +357,7 @@ mod tests {
             let mut digest = Digest::default();
             let now = Instant::now();
             for event in events {
-                batch.observe(&event, SESSION, JOB, now, &mut digest);
+                batch.observe(&event, SESSION, JOB, now, &mut digest, None, None);
             }
             batch.finish_prose(&mut digest);
             assert_eq!(digest.is_empty(), want.is_empty(), "{name}");

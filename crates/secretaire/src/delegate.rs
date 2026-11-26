@@ -269,9 +269,11 @@ impl Workers {
                     Err(_) => return status,
                 },
             };
-            let Some((input, ok, report)) = store.delegate_record(&session, &id) else { return status };
+            let Some((input, ok, _)) = store.delegate_record(&session, &id) else { return status };
             let mut status = status.unwrap_or_else(|_| {
-                let report = report.and_then(|report| serde_json::from_str::<DelegateReport>(report).ok());
+                let report = store.tool_detail(&session, &id).and_then(|detail| {
+                    serde_json::from_str::<DelegateReport>(&detail.output().ok()??).ok()
+                });
                 let mut status = json!({
                     "id": id, "thread": session, "session": session, "title": input["title"], "agent": input["agent"],
                     "state": if ok == Some(true) { "finished" } else { "failed" },
@@ -1149,7 +1151,7 @@ async fn launch_assignment(
             let launch = WorkerLaunch { execution, instructions, mcp_url, key, tools, scope: Some(scope) };
             let relay_active = relay::enabled();
             let progress = if relay_active {
-                let (_, events) = app.hub.subscribe(u64::MAX);
+                let events = app.hub.subscribe_worker();
                 Some(tokio::spawn(relay::relay_progress(app.clone(), session.clone(), job.clone(), events)))
             } else if !cfg!(test) {
                 let (_, events) = app.hub.subscribe(u64::MAX);
@@ -1186,7 +1188,7 @@ async fn launch_assignment(
                         turn: exec_turn.id.clone(),
                     });
                 }
-                let (_, events) = app.hub.subscribe(u64::MAX);
+                let events = app.hub.subscribe_worker();
                 let on_model = |observed: &RunMetadata| {
                     if observed.model.is_none() && observed.effort.is_none() {
                         return;
@@ -1223,7 +1225,9 @@ async fn launch_assignment(
                 let (mut result, transcript) = monitor_attempt(
                     run, &cancel, &attempt_cancel, events, &session, &job,
                     AttemptWatch::new(Duration::from_secs(crate::capture::worker_tool_timeout(&launch.tools)), |kind| processes.usage(kind)),
-                    |event| record.lock().unwrap().observe(event, jobs::now()),
+                    |event| record.lock().unwrap().observe(
+                        &event.event, jobs::now(), event.artifact_paths.as_deref(),
+                    ),
                 ).await;
                 drop(exec_turn);
                 processes.stop();
@@ -1359,7 +1363,7 @@ async fn launch_assignment(
                 job_record.selection.clone_from(&attempt.selection);
                 job_record.tier = attempt.tier;
             }
-            job_record.final_report = Some(report.clone());
+            job_record.record_report(&report);
             (text, report)
         };
         app.delegates.jobs.prune();
@@ -2074,8 +2078,8 @@ struct TestEvidence {
 }
 
 impl TestEvidence {
-    fn observe(&mut self, event: &ServerEvent, session: &str, job: &str) {
-        match event {
+    fn observe(&mut self, event: &crate::hub::WorkerEvent, session: &str, job: &str) {
+        match &event.event {
             ServerEvent::ToolCall { session: id, item, actor, name, input }
                 if id == session && belongs_to_job(item, actor, job) && matches!(name.as_str(), "exec" | "Bash") =>
             {
@@ -2083,12 +2087,12 @@ impl TestEvidence {
                     self.calls.insert(item.clone(), command);
                 }
             }
-            ServerEvent::ToolResult { session: id, item, ok, output } if id == session => {
+            ServerEvent::ToolResult { session: id, item, ok, .. } if id == session => {
                 if let Some(command) = self.calls.remove(item) {
                     if *ok {
                         self.failures.remove(&command);
                     } else {
-                        self.failures.insert(command, output.chars().rev().take(600).collect::<Vec<_>>().into_iter().rev().collect());
+                        self.failures.insert(command, event.failure_tail.as_deref().unwrap_or_default().to_owned());
                     }
                 }
             }
@@ -2153,11 +2157,11 @@ async fn monitor_attempt(
     run: impl std::future::Future<Output = Result<String>>,
     cancel: &Cancellation,
     attempt_cancel: &Cancellation,
-    mut events: tokio::sync::broadcast::Receiver<fuzukue_proto::Envelope>,
+    mut events: tokio::sync::broadcast::Receiver<crate::hub::WorkerEvent>,
     session: &str,
     job: &str,
     mut watch: AttemptWatch<impl FnMut(CommandKind) -> UsageSample>,
-    mut observe: impl FnMut(&ServerEvent),
+    mut observe: impl FnMut(&crate::hub::WorkerEvent),
 ) -> (Result<String>, String) {
     let mut idle_until = AttemptInstant::now() + WORKER_IDLE;
     tokio::pin!(run);
@@ -2199,8 +2203,8 @@ async fn monitor_attempt(
                         }
                         _ => {}
                     }
-                    observe(&event.event);
-                    tests.observe(&event.event, session, job);
+                    observe(&event);
+                    tests.observe(&event, session, job);
                     if let Some(activity) = activity(&event.event, session, job) {
                         if let Activity::Tool { item, name, .. } = &activity {
                             watch.start(item, name, now);
@@ -2227,8 +2231,8 @@ async fn monitor_attempt(
         }
     };
     while let Ok(event) = events.try_recv() {
-        observe(&event.event);
-        tests.observe(&event.event, session, job);
+        observe(&event);
+        tests.observe(&event, session, job);
         if let Some(activity) = activity(&event.event, session, job) {
             activity.append_to(&mut notes);
         }
@@ -2743,7 +2747,7 @@ mod tier_retry_tests {
         let cancel = Cancellation::default();
         let attempt_cancel = Cancellation::default();
         let hub = crate::Hub::new();
-        let (_, events) = hub.subscribe(u64::MAX);
+        let events = hub.subscribe_worker();
         let started = AttemptInstant::now();
         let (result, _) = monitor_attempt(
             std::future::pending(), &cancel, &attempt_cancel, events, "test", JOB,
@@ -2760,7 +2764,7 @@ mod tier_retry_tests {
         let cancel = Cancellation::default();
         let attempt_cancel = Cancellation::default();
         let hub = crate::Hub::new();
-        let (_, events) = hub.subscribe(u64::MAX);
+        let events = hub.subscribe_worker();
         let started = AttemptInstant::now();
         let (result, notes) = monitor_attempt(async {
             tool_call(&hub, "Bash");
@@ -2781,7 +2785,7 @@ mod tier_retry_tests {
             let cancel = Cancellation::default();
             let attempt_cancel = Cancellation::default();
             let hub = crate::Hub::new();
-            let (_, events) = hub.subscribe(u64::MAX);
+            let events = hub.subscribe_worker();
             let started = AttemptInstant::now();
             let (result, _) = monitor_attempt(async {
                 tool_call(&hub, "exec");
@@ -2824,7 +2828,7 @@ mod tier_retry_tests {
         let cancel = Cancellation::default();
         let attempt_cancel = Cancellation::default();
         let hub = crate::Hub::new();
-        let (_, events) = hub.subscribe(u64::MAX);
+        let events = hub.subscribe_worker();
         let started = AttemptInstant::now();
         let timeout = WORKER_IDLE * 2 + Duration::from_secs(45);
         let (result, _) = monitor_attempt(async {
@@ -2839,7 +2843,7 @@ mod tier_retry_tests {
     async fn an_in_flight_capture_suspends_the_worker_idle_deadline() {
         let cancel = Cancellation::default();
         let hub = crate::Hub::new();
-        let (_, events) = hub.subscribe(u64::MAX);
+        let events = hub.subscribe_worker();
         let (result, _) = monitor_attempt(async {
             hub.publish(ServerEvent::ToolCall {
                 session: "test".into(), actor: Actor::Claude, item: "delegate:work:shot".into(),
@@ -2914,7 +2918,7 @@ wait
         let hub = crate::Hub::new();
         let job = "delegate:work";
         for pass_on_retry in [false, true] {
-            let (_, events) = hub.subscribe(u64::MAX);
+            let events = hub.subscribe_worker();
             let cancel = Cancellation::default();
             let (result, _) = monitor_attempt(async {
                 for ok in std::iter::once(false).chain(pass_on_retry.then_some(true)) {

@@ -510,7 +510,6 @@ impl App {
         self.entries.lock().unwrap().values().filter_map(|entry| entry.loaded.clone()).collect()
     }
 
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     pub(crate) fn try_loaded_workspaces(&self) -> Option<Vec<Arc<Workspace>>> {
         Some(self.entries.try_lock().ok()?.values().filter_map(|entry| entry.loaded.clone()).collect())
     }
@@ -648,6 +647,32 @@ impl App {
     pub(crate) async fn prepare_drain(&self, wait: i64, reason: fuzukue_proto::DrainReason) {
         self.notify_drain(wait, reason, false).await;
         self.retry_drain_saves();
+    }
+
+    pub(crate) async fn flush_dirty_transcripts(&self) -> Result<()> {
+        let workspaces = self.try_loaded_workspaces().context("workspace registry is busy")?;
+        tokio::task::spawn_blocking(move || {
+            let errors: Vec<_> = workspaces.into_iter().filter_map(|workspace| {
+                workspace.hub.flush_dirty_transcripts(false).err()
+                    .map(|error| format!("{}: {error:#}", workspace.id))
+            }).collect();
+            ensure!(errors.is_empty(), "{}", errors.join("\n"));
+            Ok(())
+        }).await?
+    }
+
+    pub(crate) async fn finish_transcript_flush(&self) -> Result<()> {
+        let flush = async {
+            for _ in 0..2 {
+                if self.flush_dirty_transcripts().await.is_ok() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            self.flush_dirty_transcripts().await
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), flush).await
+            .context("timed out saving dirty transcripts at shutdown")?
     }
 
     pub(crate) fn retry_drain_saves(&self) {

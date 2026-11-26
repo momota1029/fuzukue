@@ -12,6 +12,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use fuzukue_proto::Envelope;
+use crate::threads::payloads::Refs;
 use serde::{Deserialize, Serialize};
 
 #[path = "timeline_index.rs"]
@@ -99,6 +100,15 @@ fn read_events(path: &Path, mut visit: impl FnMut(Envelope)) {
     }
 }
 
+/// Optional local metadata is ignored by servers that read an ordinary Envelope.
+#[derive(Deserialize)]
+pub(crate) struct JournalLine {
+    #[serde(flatten)]
+    pub(crate) envelope: Envelope,
+    #[serde(default)]
+    pub(crate) tool_payloads: Refs,
+}
+
 pub struct TimelineWriter {
     file: std::fs::File,
     timeline: Timeline,
@@ -139,8 +149,36 @@ impl TimelineWriter {
         !self.append_failed
     }
 
+    pub(crate) fn last_record(&mut self, len: u64) -> Option<crate::threads::payloads::Record> {
+        if self.repair_tail { return None; }
+        Some(crate::threads::payloads::Record {
+            offset: self.file.stream_position().ok()?.checked_sub(len)?,
+            len: usize::try_from(len).ok()?,
+            file: std::sync::Arc::new(self.file.try_clone().ok()?),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disable_writes(&mut self, dir: &Path) -> std::io::Result<()> {
+        self.file = std::fs::File::open(dir.join(TIMELINE))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn append(&mut self, env: &Envelope) -> u64 {
-        let mut line = serde_json::to_vec(env).expect("serializable timeline envelope");
+        self.append_with_payloads(env, &Refs::default())
+    }
+
+    pub(crate) fn append_with_payloads(&mut self, env: &Envelope, refs: &Refs) -> u64 {
+        #[derive(Serialize)]
+        struct Line<'a> {
+            #[serde(flatten)]
+            envelope: &'a Envelope,
+            #[serde(skip_serializing_if = "Refs::is_empty")]
+            tool_payloads: &'a Refs,
+        }
+        let mut line = serde_json::to_vec(&Line { envelope: env, tool_payloads: refs })
+            .expect("serializable timeline envelope");
         line.push(b'\n');
         let len = line.len() as u64;
         let result = (|| -> std::io::Result<()> {

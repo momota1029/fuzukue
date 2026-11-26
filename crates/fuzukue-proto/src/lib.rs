@@ -73,7 +73,8 @@ pub const LAZY_DECK_PROTOCOL: u32 = 71;
 pub const WORKSPACE_REQUEST_RECOVERY_PROTOCOL: u32 = 72;
 pub const THREAD_WINDOW_PROTOCOL: u32 = 73;
 pub const JOB_SUMMARY_PROTOCOL: u32 = 74;
-pub const PROTOCOL_VERSION: u32 = JOB_SUMMARY_PROTOCOL;
+pub const TOOL_DETAILS_PROTOCOL: u32 = 75;
+pub const PROTOCOL_VERSION: u32 = TOOL_DETAILS_PROTOCOL;
 pub const DECK_PAGE_BYTES: usize = 1024 * 1024;
 pub const CARD_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1287,6 +1288,8 @@ pub enum ClientMsg {
     /// Request chat-wide job summaries independently of transcript pagination.
     GetThreadJobs { session: String },
     GetThreadJobReport { session: String, job: String, request: u64 },
+    /// Fetch one tool's full payloads for an open disclosure.
+    GetThreadToolDetails { session: String, item: String, request: u64 },
     /// Fetch whole transcript entries starting at this inclusive ordinal.
     GetThreadHistoryFrom { session: String, request: u64, start: u64, generation: u64 },
     /// Subscribe to a worker while its details are expanded, or unsubscribe on collapse.
@@ -2530,6 +2533,19 @@ pub enum ServerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_before: Option<u64>,
         events: Vec<ServerEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    ThreadToolDetails {
+        session: String,
+        item: String,
+        request: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unavailable: bool,
     },
     ThreadJobActivity { session: String, job: String, tools: usize },
     /// A job list snapshot at the same journal position for every row.
@@ -2923,6 +2939,7 @@ impl ServerEvent {
             | Self::ThreadHistoryStart { .. } | Self::ThreadHistoryPage { .. }
             | Self::ThreadJobDetails { .. } | Self::ThreadJobActivity { .. }
             | Self::ThreadJobs { .. } | Self::ThreadJobUpdated { .. } | Self::ThreadJobReport { .. }
+            | Self::ThreadToolDetails { .. }
             | Self::ThreadHistoryFrom { .. } | Self::ThreadHistoryFailed { .. } | Self::ThreadTail { .. } | Self::ThreadSync { .. })
             || matches!(self, Self::LocalNotice { item, .. } if item == COMPOSER_NOTICE_ITEM)
     }

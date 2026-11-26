@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn worker_activity_keeps_the_error_visible_when_details_are_collapsed() {
-        let mut tool = ToolCall::new("Read", "Read README.md".into(), Value::Null);
+        let mut tool = ToolCall::new("read", "Read", "Read README.md".into(), Value::Null);
         tool.result = Some(ToolResult {
             ok: false,
             output: String::new(),

@@ -500,6 +500,14 @@ impl Workspace {
                 tick.tick().await;
                 let Some(workspace) = workspace.upgrade() else { break };
                 workspace.trim_idle_caches(Duration::from_secs(2 * 60));
+                workspace.hub.migrate_idle_payloads(Duration::from_secs(2 * 60)).await;
+                let hub = workspace.hub.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = hub.flush_dirty_transcripts(true) {
+                        tracing::warn!(%error, "idle transcript flush deferred");
+                    }
+                    hub.recover_thread_metadata(None);
+                }).await;
                 {
                     let mut slot = workspace.codex.lock().await;
                     if slot.as_ref().is_some_and(|codex| Arc::strong_count(codex) == 1 && codex.idle_for(IDLE))
@@ -753,7 +761,9 @@ async fn run_server() -> anyhow::Result<()> {
     if let Some(update) = &update {
         let _ = tokio::time::timeout(Duration::from_secs(5), update.shutdown_canary()).await;
     }
+    let saved = app.finish_transcript_flush().await;
     signal_task.abort();
+    saved?;
     result?;
     tracing::info!("shutting down");
     Ok(())
@@ -1230,6 +1240,18 @@ fn wire_event(env: &Envelope, protocol: u32, workspace: Option<&str>, locale: fu
             request: *request,
             outcome: CardSaveOutcome::Error { message: "Card save response exceeds the WebSocket size limit. Reload the card for the latest content.".into() },
         },
+        ServerEvent::ThreadToolDetails { session, item, request, .. } => ServerEvent::ThreadToolDetails {
+            session: session.clone(), item: item.clone(), request: *request,
+            input: None, output: None, unavailable: true,
+        },
+        ServerEvent::ThreadJobDetails { session, job, request, through, before, .. } => ServerEvent::ThreadJobDetails {
+            session: session.clone(), job: job.clone(), request: *request, through: *through, before: *before,
+            next_before: None, events: Vec::new(),
+            error: Some("Worker details exceed the WebSocket size limit.".into()),
+        },
+        ServerEvent::ThreadJobReport { session, job, request, .. } => ServerEvent::ThreadJobReport {
+            session: session.clone(), job: job.clone(), request: *request, result: None,
+        },
         ServerEvent::ReviewFindings { deck, .. } if deck.len() <= 4096 => ServerEvent::ReviewFindings {
             deck: deck.clone(),
             outcome: fuzukue_proto::ReviewFindingsOutcome::Error { message: "Review findings exceed the WebSocket size limit.".into() },
@@ -1254,6 +1276,34 @@ fn wire_event(env: &Envelope, protocol: u32, workspace: Option<&str>, locale: fu
     bounded_wire(&Wire { seq: env.seq, workspace, event: &fallback }, budget)
         .or_else(|| bounded_wire(&Wire { seq: env.seq, workspace: None, event: &fallback }, budget))
         .expect("size fallback is bounded")
+}
+
+#[cfg(test)]
+#[test]
+fn oversized_details_finish_the_original_requests() {
+    let output = "a".repeat(12 * 1024 * 1024);
+    let event = ServerEvent::ThreadToolDetails {
+        session: "thread-test".into(), item: "tool".into(), request: 31,
+        input: None, output: Some(output.clone()), unavailable: false,
+    };
+    let round_trip = |event| -> ServerEvent {
+        let wire = wire_event(&snapshot(event), fuzukue_proto::PROTOCOL_VERSION, Some("test"), fuzukue_i18n::Locale::JAPANESE);
+        let envelope: Envelope = serde_json::from_str(&wire.into_text().unwrap()).unwrap();
+        assert_eq!(envelope.workspace.as_deref(), Some("test"));
+        envelope.event
+    };
+    assert!(matches!(round_trip(event), ServerEvent::ThreadToolDetails {
+        request: 31, unavailable: true, output: None, ..
+    }));
+    let job = "delegate:test".to_owned();
+    let event = ServerEvent::ThreadJobDetails {
+        session: "thread-test".into(), job: job.clone(), request: 32, through: 5,
+        before: None, next_before: None, error: None,
+        events: vec![ServerEvent::ToolResult { session: "thread-test".into(), item: job, ok: true, output }],
+    };
+    assert!(matches!(round_trip(event), ServerEvent::ThreadJobDetails {
+        request: 32, error: Some(_), ..
+    }));
 }
 
 fn bounded_wire(value: &impl serde::Serialize, budget: usize) -> Option<Message> {
@@ -2697,7 +2747,20 @@ async fn serve_workspace(
                     }
                 }
                 Ok(ClientMsg::GetThreadJobReport { session, job, request }) if job_summaries && workspace_request => {
-                    let _ = reply.send(app.hub.thread_job_report(session, job, request));
+                    let app = app.clone();
+                    let reply = reply.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = reply.send(app.hub.thread_job_report(session, job, request));
+                    });
+                }
+                Ok(ClientMsg::GetThreadToolDetails { session, item, request })
+                    if scoped && workspace_request && protocol >= fuzukue_proto::TOOL_DETAILS_PROTOCOL =>
+                {
+                    let app = app.clone();
+                    let reply = reply.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = reply.send(app.hub.thread_tool_details(session, item, request));
+                    });
                 }
                 Ok(ClientMsg::GetThreadTail { session, request }) if scoped && workspace_request => {
                     let _ = reply.send(app.hub.thread_tail_mode(session, request, compact_jobs));
@@ -2724,14 +2787,22 @@ async fn serve_workspace(
                         }
                     }
                     if let Some(request) = request {
-                        let _ = reply.send(app.hub.thread_job_details(session, job, request, before));
+                        let app = app.clone();
+                        let reply = reply.clone();
+                        let full_report = protocol >= fuzukue_proto::TOOL_DETAILS_PROTOCOL;
+                        tokio::task::spawn_blocking(move || {
+                            let _ = reply.send(app.hub.thread_job_details(session, job, request, before, full_report));
+                        });
                     }
                 }
                 Ok(ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistory { .. }
                     | ClientMsg::GetThreadHistoryFrom { .. } | ClientMsg::GetThreadJobs { .. }
-                    | ClientMsg::GetThreadJobReport { .. } | ClientMsg::GetThreadJob { .. }) => {}
+                    | ClientMsg::GetThreadJobReport { .. } | ClientMsg::GetThreadJob { .. }
+                    | ClientMsg::GetThreadToolDetails { .. }) => {}
                 Ok(ClientMsg::GetThreadArtifacts { session }) if protocol >= 6 => {
-                    let paths = app.hub.thread_artifacts(&session);
+                    let hub = app.hub.clone();
+                    let thread = session.clone();
+                    let paths = tokio::task::spawn_blocking(move || hub.thread_artifacts(&thread)).await.unwrap_or_default();
                     let artifacts = thread_artifacts::describe(&app.project_dir, paths).await;
                     let _ = reply.send(ServerEvent::ThreadArtifacts { session, artifacts });
                 }
@@ -3654,6 +3725,7 @@ async fn handle_from_client(
         ClientMsg::FileInbox { .. } | ClientMsg::SearchDecks { .. } | ClientMsg::Git { .. } | ClientMsg::History { .. } | ClientMsg::BranchReview { .. } | ClientMsg::ApplyComments { .. } | ClientMsg::CompactSession { .. } | ClientMsg::GetThreadArtifacts { .. } | ClientMsg::GetThreadJobs { .. } | ClientMsg::ArchiveThread { .. } | ClientMsg::PinThread { .. }
         | ClientMsg::GetLeanReadingCards { .. } | ClientMsg::LookupSymbol { .. } | ClientMsg::ReviewReports { .. } | ClientMsg::SearchLibrary { .. } | ClientMsg::AddMemo { .. } | ClientMsg::MoveMemo { .. } | ClientMsg::Ledger { .. } | ClientMsg::SaveSource { .. } | ClientMsg::EditorClosed { .. } | ClientMsg::SaveCard { .. } | ClientMsg::SelectPaper { .. } | ClientMsg::GetPaperPdfMap { .. }
         | ClientMsg::RecordSourceFingerprint { .. } | ClientMsg::GetThreadHistory { .. } | ClientMsg::GetThreadTail { .. } | ClientMsg::GetThreadHistoryFrom { .. } | ClientMsg::GetThreadJob { .. } | ClientMsg::GetThreadJobReport { .. }
+        | ClientMsg::GetThreadToolDetails { .. }
         | ClientMsg::ListExtensions | ClientMsg::GrantExtension { .. } | ClientMsg::SetExtensionEnabled { .. }
         | ClientMsg::UpdateExtension { .. } | ClientMsg::RenderExtension { .. } | ClientMsg::ExtensionUiEvent { .. }
         | ClientMsg::Hello { .. } | ClientMsg::SetLocale { .. } | ClientMsg::ListWorkspaces | ClientMsg::OpenWorkspace { .. } | ClientMsg::SwitchWorkspace { .. } | ClientMsg::CompleteWorkspacePath { .. } | ClientMsg::BrowseWorkspace { .. } | ClientMsg::ListFiles { .. } | ClientMsg::FindFiles { .. } | ClientMsg::ResolveFile { .. } | ClientMsg::CreateWorkspace { .. } | ClientMsg::InWorkspace { .. } | ClientMsg::NewThread | ClientMsg::NewAttachedThread { .. } | ClientMsg::UploadAttachment { .. } | ClientMsg::FolderAttachment { .. } | ClientMsg::CancelAttachment { .. } => {}

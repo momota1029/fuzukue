@@ -552,7 +552,10 @@ impl Update {
         // Close admission before flushing records and committing to exit.
         app.mutations.interrupt().await;
         app.retry_drain_saves();
-        self.set_drain_progress(id, DrainProgress::Ready, None);
+        match app.finish_transcript_flush().await {
+            Ok(()) => self.set_drain_progress(id, DrainProgress::Ready, None),
+            Err(error) => self.set_drain_progress(id, DrainProgress::Failed, Some(format!("{error:#}"))),
+        }
         self.shutdown_ready.send_replace(true);
         Ok(())
     }
@@ -772,7 +775,19 @@ impl Update {
             let ready = gate.is_some() && reason.threads.iter().all(|thread| {
                 !thread.running && !thread.worker && !thread.checking
             }) && !reason.checking_sessions && !reason.gate_held;
-            let errors = app.drain_errors(&mut reason);
+            let mut errors = app.drain_errors(&mut reason);
+            let awaiting_reply = reason.blockers.iter().any(|blocker| matches!(blocker.kind,
+                fuzukue_proto::SelfUpdateBlockerKind::Approval | fuzukue_proto::SelfUpdateBlockerKind::Question));
+            if ready && errors.is_empty() && !awaiting_reply {
+                // The drain holds the admission gate while saving the last
+                // transcripts. A failed checkpoint keeps a swap from proceeding.
+                let deadline = stop_by.or(stall_by).unwrap_or_else(|| Instant::now() + WAIT_FORCE_LIMIT);
+                match tokio::time::timeout_at(deadline, app.flush_dirty_transcripts()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(format!("{error:#}")),
+                    Err(_) => errors.push("Timed out saving dirty transcripts".into()),
+                }
+            }
             let jobs = app.drain_job_count(&reason);
             let now = Instant::now();
             if stall_by.is_some() {
@@ -791,8 +806,6 @@ impl Update {
                 last_errors = errors.len();
                 last_blockers.clone_from(&reason.blockers);
             }
-            let awaiting_reply = reason.blockers.iter().any(|blocker| matches!(blocker.kind,
-                fuzukue_proto::SelfUpdateBlockerKind::Approval | fuzukue_proto::SelfUpdateBlockerKind::Question));
             let ready = ready && errors.is_empty() && !awaiting_reply;
             let expired = stop_by.is_some_and(|stop_by| tokio::time::Instant::now() >= stop_by);
             let cancelled = {

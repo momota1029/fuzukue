@@ -703,7 +703,11 @@ fn thread_transcript_restores_from_journal_and_project_markdown() -> Result<()> 
     hub.publish(ServerEvent::ToolCall {
         session: id.clone(), item: "tool:1".into(), actor: Actor::Claude, name: "Read".into(), input: json!({"path":"paper.md"}),
     });
-    hub.publish(ServerEvent::ToolResult { session: id.clone(), item: "tool:1".into(), ok: true, output: "large output".into() });
+    let tool_output = format!("{}full-only output marker{}last failure line",
+        "large output ".repeat(100), "more output ".repeat(100));
+    hub.publish(ServerEvent::ToolResult {
+        session: id.clone(), item: "tool:1".into(), ok: true, output: tool_output.clone(),
+    });
     hub.publish(ServerEvent::TurnEnded { session: id.clone(), actor: Actor::Claude });
     hub.edit_threads(|store| store.rename(&id, "続きの研究"))?;
     // A second reply has reached the journal but not the end-of-turn Markdown write.
@@ -717,7 +721,8 @@ fn thread_transcript_restores_from_journal_and_project_markdown() -> Result<()> 
     assert!(markdown.contains("## User\n\n\n質問から題を作る\n続き"));
     assert!(markdown.contains("- <code>inbox/2026-11-19/証明 &amp; notes.pdf</code>"));
     assert!(markdown.contains("- Claude called `Read` (success)"));
-    assert!(!markdown.contains("large output"));
+    assert!(markdown.contains("large output"));
+    assert!(!markdown.contains("full-only output marker"));
 
     for (state_dir, recovered) in [(state.path().to_path_buf(), true), (project.path().join("missing-state"), false)] {
         let hub = Hub::with_timeline(&state_dir);
@@ -741,7 +746,9 @@ fn thread_transcript_restores_from_journal_and_project_markdown() -> Result<()> 
             ServerEvent::ToolResult { ok: true, output, .. } => Some(output.as_str()),
             _ => None,
         });
-        assert_eq!(output, Some(if recovered { "large output" } else { "" }));
+        let preview = output.expect("saved tool output has a preview");
+        assert!(preview.starts_with("large output") && preview.ends_with("last failure line"));
+        assert_eq!(hub.tool_detail(&id, "tool:1").unwrap().output()?, Some(tool_output.clone()));
 
     }
     Ok(())

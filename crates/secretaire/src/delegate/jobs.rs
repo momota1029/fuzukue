@@ -131,6 +131,22 @@ impl Timeline {
 }
 
 impl Job {
+    pub(super) fn record_report(&mut self, report: &DelegateReport) {
+        // Status views already display only these prefixes. The full report
+        // is attached to the thread's tool result.
+        let report = DelegateReport {
+            text: prefix(&report.text, 4001).into(),
+            changes: prefix(&report.changes, 4001).into(),
+            elapsed_ms: report.elapsed_ms,
+            interrupted: report.interrupted,
+            attempts: report.attempts.clone(),
+            tool_activity: report.tool_activity.clone(),
+            files: report.files.clone(),
+        };
+        self.final_report = Some(report);
+        self.activity.tools.clear();
+    }
+
     pub(super) fn state(&self) -> State {
         if self.finished_at.is_some() {
             if self.start_error.is_some() || self.finish_error.is_some() {
@@ -145,7 +161,7 @@ impl Job {
         }
     }
 
-    pub(super) fn observe(&mut self, event: &ServerEvent, now: i64) {
+    pub(super) fn observe(&mut self, event: &ServerEvent, now: i64, artifact_paths: Option<&[String]>) {
         let line = match activity(event, &self.session, &self.id) {
             Some(Activity::Prose { item, text }) if !text.trim().is_empty() => {
                 if let Some(last) = self
@@ -222,13 +238,17 @@ impl Job {
                 }
                 self.activity.had_error |= !ok;
                 if *ok {
-                    self.activity.changed_files.extend(
-                        crate::thread_artifacts::tool_paths(&name, Some(&input), Some(output))
-                            .iter()
-                            .filter_map(|path| {
-                                crate::thread_artifacts::relative_path(&self.worktree, path)
-                            }),
-                    );
+                    let fallback;
+                    let paths = match artifact_paths {
+                        Some(paths) => paths,
+                        None => {
+                            fallback = crate::thread_artifacts::tool_paths(&name, Some(&input), Some(output));
+                            &fallback
+                        }
+                    };
+                    self.activity.changed_files.extend(paths.iter().filter_map(|path| {
+                        crate::thread_artifacts::relative_path(&self.worktree, path)
+                    }));
                 }
             }
         }
@@ -368,6 +388,10 @@ pub(crate) fn limit_status(mut status: Value) -> Value {
         !value.is_array() && !value.is_object()
     });
     status
+}
+
+fn prefix(text: &str, chars: usize) -> &str {
+    text.char_indices().nth(chars).map_or(text, |(end, _)| &text[..end])
 }
 
 fn truncate(text: &str, chars: usize) -> String {
@@ -641,7 +665,7 @@ mod tests {
                 name: "Edit".into(),
                 input: json!({}),
             },
-            now - QUIET_MS - 10,
+            now - QUIET_MS - 10, None,
         );
         running.observe(
             &ServerEvent::ToolResult {
@@ -650,7 +674,7 @@ mod tests {
                 ok: false,
                 output: "failed".into(),
             },
-            now - QUIET_MS - 9,
+            now - QUIET_MS - 9, None,
         );
         running.observe(
             &ServerEvent::TextDelta {
@@ -659,7 +683,7 @@ mod tests {
                 actor: Actor::Claude,
                 text,
             },
-            now - QUIET_MS - 1,
+            now - QUIET_MS - 1, None,
         );
         inventory.insert(running);
 

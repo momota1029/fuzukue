@@ -7,6 +7,7 @@ use std::fs::{self, File, Metadata};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::time::{Instant, SystemTime};
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
@@ -20,7 +21,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{durable, state, workspace};
 
+pub(crate) mod payloads;
+pub(crate) mod payload_migration;
 mod save_files;
+use payloads::{Blobs, Record, Refs, Source};
 use save_files::SaveFiles;
 
 use fuzukue_proto::{AgentBackend, AgentSelection, ChatSettings, DelegateJob, DelegateReport, DelegateSettings, JobStatus, JobSummary};
@@ -38,6 +42,8 @@ pub fn prompt() -> &'static str {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Front {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    preview_payloads: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff: Option<crate::handoff::Received>,
     #[serde(default, skip_serializing_if = "ThreadGitHub::is_default")]
@@ -162,17 +168,86 @@ struct ToolSummary {
     output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     progress: Option<String>,
+    #[serde(default, skip_serializing_if = "Refs::is_empty")]
+    payloads: Refs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovered_input: Option<Box<payloads::JournalPrefixes>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovered_output: Option<Box<payloads::JournalPrefixes>>,
+    #[serde(skip)]
+    input_source: Option<Source>,
+    #[serde(skip)]
+    output_source: Option<Source>,
 }
 
 impl ToolSummary {
-    fn artifact_paths(&self, project: &Path) -> Vec<String> {
-        if self.ok != Some(true) {
+    fn preview_inline(&mut self, record: Record, delegate: bool) {
+        if let Some(input) = self.input.as_mut().filter(|_| self.payloads.input.is_none()) {
+            if let Some(encoded) = payloads::oversized_input(input) {
+                *input = payloads::input_preview(input, &encoded, delegate);
+                self.input_source = Some(Source::Inline(record.clone()));
+            }
+        }
+        if let Some(output) = &mut self.output {
+            if self.payloads.output.is_some() {
+                // Older sidecar-backed records can carry larger previews.
+                if !delegate {
+                    *output = payloads::output_preview(output, false);
+                }
+            } else if payloads::needs_output_preview(output) {
+                *output = payloads::output_preview(output, delegate);
+                self.output_source = Some(Source::Inline(record));
+            }
+        }
+    }
+
+    fn full_input(&self, blobs: &Blobs) -> Result<Option<serde_json::Value>> {
+        match (&self.payloads.input, &self.input_source) {
+            (Some(digest), _) => Ok(Some(blobs.input(digest)?)),
+            (_, Some(source)) => Ok(Some(source.input()?)),
+            _ => self.input.clone().map(Some).context("tool input was not saved"),
+        }
+    }
+
+    fn full_output(&self, blobs: &Blobs) -> Result<Option<String>> {
+        match (&self.payloads.output, &self.output_source) {
+            (Some(digest), _) => Ok(Some(blobs.output(digest)?)),
+            (_, Some(source)) => Ok(Some(source.output()?)),
+            _ if self.output.is_none() && self.ok.is_some() => anyhow::bail!("tool output was not saved"),
+            _ => Ok(self.output.clone()),
+        }
+    }
+
+    fn artifact_paths(&self, project: &Path, blobs: &Blobs) -> Vec<String> {
+        if self.ok != Some(true) || !crate::thread_artifacts::may_record_path(&self.name) {
             return Vec::new();
         }
-        crate::thread_artifacts::tool_paths(&self.name, self.input.as_ref(), self.output.as_deref())
+        let input = self.full_input(blobs).ok().flatten();
+        let output = if crate::thread_artifacts::has_structured_result(&self.name) {
+            self.full_output(blobs).ok().flatten()
+        } else {
+            None
+        };
+        crate::thread_artifacts::tool_paths(&self.name, input.as_ref(), output.as_deref())
             .into_iter()
             .filter_map(|path| crate::thread_artifacts::relative_path(project, &path))
             .collect()
+    }
+}
+
+/// A preview and its stable data sources, usable after the Hub lock is released.
+pub(crate) struct ToolDetail {
+    blobs: Blobs,
+    tool: ToolSummary,
+}
+
+impl ToolDetail {
+    pub(crate) fn input(&self) -> Result<Option<serde_json::Value>> {
+        self.tool.full_input(&self.blobs)
+    }
+
+    pub(crate) fn output(&self) -> Result<Option<String>> {
+        self.tool.full_output(&self.blobs)
     }
 }
 
@@ -268,7 +343,10 @@ impl Transcript {
         let root = self.items[position].meta.tool.as_ref().filter(|tool| tool.name == "delegate")?;
         let mut metadata: DelegateJob = serde_json::from_value(root.input.as_ref()?.clone()).ok()?;
         metadata.touches = None;
-        let report = root.output.as_deref().and_then(|output| serde_json::from_str::<DelegateReport>(output).ok());
+        let wire_report = root.output.as_deref().and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok());
+        let preview_changed = wire_report.as_ref().and_then(|report| report["preview_changed_file_count"].as_u64())
+            .and_then(|count| usize::try_from(count).ok());
+        let report = wire_report.and_then(|report| serde_json::from_value::<DelegateReport>(report).ok());
         if let Some(attempt) = report.as_ref().and_then(|report| report.attempts.last()) {
             metadata.selection = Some(attempt.selection.clone());
             let reason = metadata.routing.take().map(|route| route.reason).unwrap_or_default();
@@ -318,7 +396,9 @@ impl Transcript {
                 .or_else(|| latest_message.as_deref().and_then(|text| text.lines().next())
                     .map(|line| summary_preview(line, 280))),
             last_tool, latest_message,
-            changed_file_count: report.as_ref().and_then(|report| report.files.as_ref()?.changed_files.as_ref()).map(Vec::len),
+            changed_file_count: preview_changed.or_else(|| {
+                report.as_ref().and_then(|report| report.files.as_ref()?.changed_files.as_ref()).map(Vec::len)
+            }),
         })
     }
 
@@ -412,6 +492,8 @@ impl Transcript {
                             input: Some(input.clone()),
                             output: None,
                             progress: None,
+                            payloads: Refs::default(), recovered_input: None, recovered_output: None,
+                            input_source: None, output_source: None,
                         }),
                     },
                     text: String::new(),
@@ -423,6 +505,9 @@ impl Transcript {
                         .is_some_and(|report| report.interrupted) {
                         tool.ok = None;
                         tool.output = None;
+                        tool.payloads.output = None;
+                        tool.output_source = None;
+                        tool.recovered_output = None;
                     }
                     let mut input = input.clone();
                     if let Some(previous) = &tool.input {
@@ -456,7 +541,6 @@ impl Transcript {
             ServerEvent::ToolResult { item, ok, output, .. } => {
                 if let Some(&index) = self.index.get(item) {
                     let meta = &mut self.items[index].meta;
-                    let delegated = meta.is_delegated();
                     let Some(tool) = &mut meta.tool else { return };
                     if let Some(job) = fuzukue_proto::delegate_job_id(item, &meta.actor) {
                         if let Some(facts) = self.job_facts.get_mut(job) {
@@ -465,9 +549,7 @@ impl Transcript {
                         }
                     }
                     tool.ok = Some(*ok);
-                    if delegated || *ok && crate::thread_artifacts::has_structured_result(&tool.name) {
-                        tool.output = Some(output.clone());
-                    }
+                    tool.output = Some(output.clone());
                 }
             }
             ServerEvent::CommentApplication { application, .. } => {
@@ -507,7 +589,53 @@ impl Transcript {
         }
     }
 
-    fn restore_tool(&mut self, event: ServerEvent) {
+    fn capture_sources(&mut self, event: &ServerEvent, refs: Refs, source: Option<Source>, force: bool) {
+        let item = match event {
+            ServerEvent::ToolCall { item, .. } | ServerEvent::ToolResult { item, .. } => item,
+            _ => return,
+        };
+        let Some(&index) = self.index.get(item) else { return };
+        let entry = &mut self.items[index];
+        let delegated_call = entry.meta.is_delegated();
+        let Some(tool) = &mut entry.meta.tool else { return };
+        let recovered = match &source {
+            Some(Source::Memory(record)) => Some(Box::new(record.journal_prefixes)),
+            _ => None,
+        };
+        match event {
+            ServerEvent::ToolCall { input, .. }
+                if (force || delegated_call || tool.input.as_ref() == Some(input))
+                    && (!force || tool.payloads.input.is_none()) =>
+            {
+                tool.payloads.input = refs.input;
+                tool.recovered_input = recovered;
+                tool.input_source = source;
+            }
+            ServerEvent::ToolResult { .. } if !force || tool.payloads.output.is_none() => {
+                tool.payloads.output = refs.output;
+                tool.recovered_output = recovered;
+                tool.output_source = source;
+            }
+            _ => {}
+        }
+    }
+
+    // A checkpoint can include a result whose journal append failed. Older
+    // records for that item must not overwrite it when replaying the journal.
+    fn supersedes_journal_payload(&self, event: &ServerEvent, record: &Record) -> bool {
+        let (item, input) = match event {
+            ServerEvent::ToolCall { item, .. } => (item, true),
+            ServerEvent::ToolResult { item, .. } => (item, false),
+            _ => return false,
+        };
+        let Some(tool) = self.index.get(item).and_then(|&position| self.items[position].meta.tool.as_ref()) else {
+            return false;
+        };
+        let prefixes = if input { &tool.recovered_input } else { &tool.recovered_output };
+        prefixes.as_ref().is_some_and(|prefixes| record.in_prefixes(prefixes))
+    }
+
+    fn restore_tool(&mut self, event: &ServerEvent) {
         let item = match &event {
             ServerEvent::ToolCall { item, .. } | ServerEvent::ToolResult { item, .. } => item,
             _ => return,
@@ -520,10 +648,10 @@ impl Transcript {
             return;
         };
         match event {
-            ServerEvent::ToolCall { input, .. } => tool.input = Some(input),
-            ServerEvent::ToolResult { ok, output, .. } => {
-                tool.ok = Some(ok);
-                tool.output = Some(output);
+            ServerEvent::ToolCall { input, .. } if tool.payloads.input.is_none() => tool.input = Some(input.clone()),
+            ServerEvent::ToolResult { ok, output, .. } if tool.payloads.output.is_none() => {
+                tool.ok = Some(*ok);
+                tool.output = Some(output.clone());
             }
             _ => {}
         }
@@ -596,6 +724,29 @@ impl Transcript {
                                 preserve_delegate_metadata(previous, input);
                             }
                             incoming.progress = incoming.progress.or_else(|| tool.progress.take());
+                            // A legacy journal has no sidecar references and may
+                            // replay the same call or result over a saved checkpoint.
+                            if incoming.input.is_none() || incoming.payloads.input.is_none()
+                                && tool.payloads.input.is_some() && tool.recovered_input.is_none()
+                            {
+                                let mut input = tool.input.take();
+                                if let (Some(replayed), Some(saved)) = (&incoming.input, &mut input) {
+                                    preserve_delegate_metadata(replayed, saved);
+                                }
+                                incoming.input = input;
+                                incoming.payloads.input = tool.payloads.input.take();
+                                incoming.input_source = tool.input_source.take();
+                                incoming.recovered_input = tool.recovered_input.take();
+                            }
+                            if incoming.payloads.output.is_none() && tool.payloads.output.is_some()
+                                && tool.recovered_output.is_none()
+                            {
+                                incoming.ok = tool.ok;
+                                incoming.output = tool.output.take();
+                                incoming.payloads.output = tool.payloads.output.take();
+                                incoming.output_source = tool.output_source.take();
+                                incoming.recovered_output = tool.recovered_output.take();
+                            }
                             *tool = incoming;
                         } else if incoming.progress.is_some() {
                             tool.progress = incoming.progress;
@@ -623,17 +774,21 @@ impl Transcript {
 
     fn write_markdown(&self, mut body: impl Write) -> Result<()> {
         for entry in &self.items {
-            let meta = if let Some(tool) = entry.meta.tool.as_ref().filter(|_| !entry.meta.is_delegated()) {
-                // 通常のツール詳細は従来どおりジャーナルに残す。
-                serde_json::to_string(&EntryMeta {
-                    tool: Some(ToolSummary {
-                        name: tool.name.clone(), ok: tool.ok, input: None, output: None, progress: None,
-                    }),
-                    ..entry.meta.clone()
-                })?
-            } else {
-                serde_json::to_string(&entry.meta)?
-            };
+            let mut meta = std::borrow::Cow::Borrowed(&entry.meta);
+            if let Some(tool) = entry.meta.tool.as_ref() {
+                if !tool.payloads.is_empty() {
+                    tool.payloads.write_marker(&mut meta.to_mut().attachments);
+                }
+                // Without a sidecar, write through the full source so this
+                // checkpoint can be opened without its local journal.
+                if let Some(source) = tool.input_source.as_ref().filter(|_| tool.payloads.input.is_none()) {
+                    meta.to_mut().tool.as_mut().unwrap().input = Some(source.input()?);
+                }
+                if let Some(source) = tool.output_source.as_ref().filter(|_| tool.payloads.output.is_none()) {
+                    meta.to_mut().tool.as_mut().unwrap().output = Some(source.output()?);
+                }
+            }
+            let meta = serde_json::to_string(&meta)?;
             // HTML コメントの中で "-->" が始まらないようにする。
             writeln!(body, "{ENTRY}{} -->", meta.replace('>', "\\u003e"))?;
             let role = match entry.meta.actor {
@@ -667,34 +822,24 @@ impl Transcript {
         Ok(())
     }
 
-    fn read(body: &str) -> Result<Self> {
-        ensure!(!body.as_bytes().contains(&0), "NUL bytes in transcript");
-        let mut transcript = Self::default();
-        let Some(body) = body.strip_prefix(ENTRY) else {
-            ensure!(body.is_empty(), "missing transcript entry");
-            return Ok(transcript);
-        };
-        let body = body
-            .strip_suffix("\n\n")
-            .context("missing transcript separator")?;
-        for part in body.split("\n\n<!-- labo-thread ") {
-            transcript.push(Self::decode_entry(part)?);
-        }
-        Ok(transcript)
-    }
-
-    fn read_buffered(input: &mut impl BufRead) -> Result<Self> {
+    fn read_buffered(input: &mut BufReader<&File>, file: &Arc<File>, mut offset: u64) -> Result<Self> {
         let mut transcript = Self::default();
         let mut line = String::new();
         let mut entry = String::new();
-        while input.read_line(&mut line)? != 0 {
+        let mut header_record = None;
+        loop {
+            let len = input.read_line(&mut line)?;
+            if len == 0 { break; }
+            let line_offset = offset;
+            offset += len as u64;
             ensure!(!line.as_bytes().contains(&0), "NUL bytes in transcript");
             if let Some(header) = line.strip_prefix(ENTRY) {
                 if entry.is_empty() || entry.ends_with("\n\n") {
                     if !entry.is_empty() {
-                        transcript.push(Self::decode_entry(&entry[..entry.len() - 2])?);
+                        transcript.push(Self::decode_buffered_entry(&entry[..entry.len() - 2], header_record.take().unwrap())?);
                     }
                     entry.clear();
+                    header_record = Some(Record { offset: line_offset, file: file.clone(), len });
                     entry.push_str(header);
                     line.clear();
                     continue;
@@ -706,14 +851,25 @@ impl Transcript {
         }
         if !entry.is_empty() {
             let part = entry.strip_suffix("\n\n").context("missing transcript separator")?;
-            transcript.push(Self::decode_entry(part)?);
+            transcript.push(Self::decode_buffered_entry(part, header_record.unwrap())?);
         }
         Ok(transcript)
     }
 
+    fn decode_buffered_entry(part: &str, record: Record) -> Result<Entry> {
+        let mut entry = Self::decode_entry(part)?;
+        if let Some(tool) = &mut entry.meta.tool {
+            tool.preview_inline(record, tool.name == "delegate");
+        }
+        Ok(entry)
+    }
+
     fn decode_entry(part: &str) -> Result<Entry> {
         let (header, content) = part.split_once(" -->\n").context("broken transcript header")?;
-        let meta: EntryMeta = serde_json::from_str(header)?;
+        let mut meta: EntryMeta = serde_json::from_str(header)?;
+        if let Some(tool) = &mut meta.tool {
+            tool.payloads.restore_marker(&mut meta.attachments);
+        }
         let mut text = String::new();
         if meta.tool.is_none() {
             let (_, content) = content.split_once("\n\n").context("missing transcript heading")?;
@@ -1024,9 +1180,11 @@ struct TranscriptSlot {
     source: Option<TranscriptSource>,
     loaded: OnceCell<LoadedTranscript>,
     dirty: Cell<bool>,
+    volatile_payloads: bool,
     accessed: Cell<Instant>,
 }
 
+#[derive(Clone)]
 struct TranscriptSource {
     path: PathBuf,
     session: String,
@@ -1038,15 +1196,16 @@ struct TranscriptSource {
 struct LoadedTranscript {
     value: Transcript,
     error: Option<String>,
-    weight: usize,
+    weight: Cell<Option<usize>>,
 }
 
 impl TranscriptSlot {
     fn new(value: Transcript) -> Self {
         Self {
             source: None,
-            loaded: OnceCell::from(LoadedTranscript { value, error: None, weight: 0 }),
+            loaded: OnceCell::from(LoadedTranscript { value, error: None, weight: Cell::new(None) }),
             dirty: Cell::new(false),
+            volatile_payloads: false,
             accessed: Cell::new(Instant::now()),
         }
     }
@@ -1056,6 +1215,7 @@ impl TranscriptSlot {
             source: Some(source),
             loaded: OnceCell::new(),
             dirty: Cell::new(false),
+            volatile_payloads: false,
             accessed: Cell::new(Instant::now()),
         }
     }
@@ -1065,10 +1225,10 @@ impl TranscriptSlot {
         self.loaded.get_or_init(|| {
             let source = self.source.as_ref().expect("unloaded transcript has a source");
             match source.read() {
-                Ok((value, weight)) => LoadedTranscript { value, weight, error: None },
+                Ok(value) => LoadedTranscript { value, weight: Cell::new(None), error: None },
                 Err(error) => {
                     tracing::warn!(path=?source.path, %error, "could not open transcript");
-                    LoadedTranscript { value: Transcript::default(), weight: 0, error: Some(format!("{error:#}")) }
+                    LoadedTranscript { value: Transcript::default(), weight: Cell::new(None), error: Some(format!("{error:#}")) }
                 }
             }
         })
@@ -1083,15 +1243,41 @@ impl TranscriptSlot {
 
     fn cache_weight(&self) -> Option<usize> {
         let data = self.loaded.get()?;
-        (self.source.is_some() && !self.dirty.get()).then(|| {
-            let weight = data.value.items.iter().fold(0usize, |total, entry| {
-                total.saturating_add(std::mem::size_of::<Entry>() + 256)
-                    .saturating_add(entry.text.capacity())
-                    .saturating_add(entry.meta.tool.as_ref()
-                        .and_then(|tool| tool.output.as_ref()).map_or(0, String::capacity))
-            });
-            data.weight.max(weight)
-        })
+        (self.source.is_some() && !self.dirty.get()).then(|| data.preview_weight())
+    }
+}
+
+impl LoadedTranscript {
+    fn preview_weight(&self) -> usize {
+        fn json_heap(value: &serde_json::Value) -> usize {
+            match value {
+                serde_json::Value::String(text) => text.capacity(),
+                serde_json::Value::Array(items) => items.capacity() * std::mem::size_of::<serde_json::Value>()
+                    + items.iter().map(json_heap).sum::<usize>(),
+                serde_json::Value::Object(fields) => fields.iter().map(|(key, value)| {
+                    64 + key.capacity() + json_heap(value)
+                }).sum(),
+                _ => 0,
+            }
+        }
+
+        if let Some(weight) = self.weight.get() {
+            return weight;
+        }
+        let weight = self.value.items.iter().map(|entry| {
+            std::mem::size_of::<Entry>() + 256 + entry.text.capacity()
+                + entry.meta.tool.as_ref().map_or(0, |tool| {
+                    tool.input.as_ref().map_or(0, json_heap)
+                        + tool.output.as_ref().map_or(0, String::capacity)
+                        + tool.progress.as_ref().map_or(0, String::capacity)
+                        + tool.payloads.input.as_ref().map_or(0, String::capacity)
+                        + tool.payloads.output.as_ref().map_or(0, String::capacity)
+                })
+        }).sum();
+        if !self.value.items.is_empty() {
+            self.weight.set(Some(weight));
+        }
+        weight
     }
 }
 
@@ -1107,29 +1293,21 @@ impl DerefMut for TranscriptSlot {
     fn deref_mut(&mut self) -> &mut Transcript {
         self.get();
         self.dirty.set(true);
-        &mut self.loaded.get_mut().unwrap().value
+        let loaded = self.loaded.get_mut().unwrap();
+        loaded.weight.set(None);
+        &mut loaded.value
     }
 }
 
 impl TranscriptSource {
-    fn read(&self) -> Result<(Transcript, usize)> {
-        let mut input = BufReader::new(std::fs::File::open(&self.path)?);
-        let mut weight = input.get_ref().metadata()?.len() as usize;
-        let mut line = String::new();
-        input.read_line(&mut line)?;
-        ensure!(matches!(line.as_str(), "---\n" | "---\r\n"), "missing thread front matter");
-        loop {
-            line.clear();
-            ensure!(input.read_line(&mut line)? != 0, "unterminated thread front matter");
-            if matches!(line.as_str(), "---" | "---\n" | "---\r\n") {
-                break;
-            }
-        }
-        let mut transcript = Transcript::read_buffered(&mut input)?;
+    fn read(&self) -> Result<Transcript> {
+        let file = Arc::new(File::open(&self.path)?);
+        let mut input = BufReader::new(file.as_ref());
+        let (_, offset) = read_front(&mut input)?;
+        let mut transcript = Transcript::read_buffered(&mut input, &file, offset)?;
         let mut recovered = Transcript::default();
-        self.timeline.visit_session(&self.session, |env, bytes| {
-            if env.seq > self.after {
-                weight = weight.saturating_add(bytes as usize);
+        self.timeline.visit_session(&self.session, |mut env, refs, record| {
+            if env.seq > self.after && !transcript.supersedes_journal_payload(&env.event, &record) {
                 // A journal tail may begin with an update to a checkpointed tool or job.
                 let existing = match &env.event {
                     ServerEvent::ToolResult { item, .. } => Some(item),
@@ -1142,25 +1320,30 @@ impl TranscriptSource {
                         recovered.push(transcript.items[position].clone());
                     }
                 }
+                let source = (refs.is_empty() && payloads::bound_replay(&mut env.event))
+                    .then_some(Source::Journal(record));
                 recovered.observe(&env.event);
+                recovered.capture_sources(&env.event, refs, source, false);
             }
         });
         transcript.merge(recovered);
         if let Some(legacy) = &self.legacy {
-            self.timeline.visit_session(legacy, |env, bytes| {
-                if env.seq > self.after {
-                    weight = weight.saturating_add(bytes as usize);
-                    transcript.restore_tool(env.event);
+            self.timeline.visit_session(legacy, |mut env, refs, record| {
+                if env.seq > self.after && !transcript.supersedes_journal_payload(&env.event, &record) {
+                    let source = (refs.is_empty() && payloads::bound_replay(&mut env.event))
+                        .then_some(Source::Journal(record));
+                    transcript.restore_tool(&env.event);
+                    transcript.capture_sources(&env.event, refs, source, true);
                 }
             });
         }
         transcript.rebuild_job_facts();
         transcript.hide_saved_blank_replies();
-        Ok((transcript, weight))
+        Ok(transcript)
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FileVersion {
     length: u64,
     modified: SystemTime,
@@ -1193,19 +1376,36 @@ struct Thread {
     suggestions: Vec<fuzukue_proto::DeckRoute>,
 }
 
+fn read_front(input: &mut impl BufRead) -> Result<(Front, u64)> {
+    let mut text = String::new();
+    input.read_line(&mut text)?;
+    ensure!(matches!(text.as_str(), "---\n" | "---\r\n"), "missing thread front matter");
+    loop {
+        let start = text.len();
+        ensure!(input.read_line(&mut text)? != 0, "unterminated thread front matter");
+        if matches!(&text[start..], "---" | "---\n" | "---\r\n") {
+            break;
+        }
+    }
+    ensure!(!text.as_bytes().contains(&0), "NUL bytes in thread front matter");
+    let (front, _) = fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
+    Ok((serde_yaml::from_str(front)?, text.len() as u64))
+}
+
 impl Thread {
+    fn blobs(&self) -> Blobs {
+        Blobs::new(self.path.parent().expect("thread directory"))
+    }
+
     fn read(path: PathBuf) -> Result<Self> {
-        let mut file = File::open(&path)?;
-        let mut text = String::new();
-        file.read_to_string(&mut text)?;
-        ensure!(!text.as_bytes().contains(&0), "NUL bytes in thread");
-        let (front, body) =
-            fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
+        let file = Arc::new(File::open(&path)?);
+        let mut input = BufReader::new(file.as_ref());
+        let (front, offset) = read_front(&mut input)?;
         Ok(Self {
             path,
             file_version: RefCell::new(Some(FileVersion::read(file.metadata()?)?)),
-            front: serde_yaml::from_str(front)?,
-            transcript: TranscriptSlot::new(Transcript::read(body)?),
+            front,
+            transcript: TranscriptSlot::new(Transcript::read_buffered(&mut input, &file, offset)?),
             page_revision: 0,
             library_revision: 0,
             library_updated: 0,
@@ -1217,21 +1417,8 @@ impl Thread {
     fn read_lazy(path: PathBuf, timeline: &state::Timeline) -> Result<Self> {
         let mut input = BufReader::new(File::open(&path)?);
         let file_version = FileVersion::read(input.get_ref().metadata()?)?;
-        ensure!(input.fill_buf()?.starts_with(b"---\n") || input.fill_buf()?.starts_with(b"---\r\n"),
-            "missing thread front matter");
-        let mut text = String::new();
-        input.read_line(&mut text)?;
-        loop {
-            let start = text.len();
-            ensure!(input.read_line(&mut text)? != 0, "unterminated thread front matter");
-            if matches!(&text[start..], "---" | "---\n" | "---\r\n") {
-                break;
-            }
-        }
-        ensure!(!text.as_bytes().contains(&0), "NUL bytes in thread front matter");
-        let (front, _) = fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
-        let front: Front = serde_yaml::from_str(front)?;
-        if file_version.length > text.len() as u64 {
+        let (front, offset) = read_front(&mut input)?;
+        if file_version.length > offset {
             let mut last = [0; 2];
             input.seek(SeekFrom::End(-2))?;
             input.read_exact(&mut last)?;
@@ -1248,10 +1435,43 @@ impl Thread {
         })
     }
 
-    fn save(&self) -> Result<()> {
+    fn save(&mut self) -> Result<()> {
+        self.save_with(SaveFiles::open)
+    }
+
+    fn save_with(&mut self, open: impl FnOnce(&Path) -> Result<SaveFiles>) -> Result<()> {
         self.transcript.check().with_context(|| format!("Thread file {}", self.path.display()))?;
         let dir = self.path.parent().context("missing thread directory")?;
-        let files = SaveFiles::open(dir)?;
+        let files = open(dir)?;
+        if self.front.preview_payloads {
+            let blobs = self.blobs();
+            let loaded = self.transcript.loaded.get_mut().unwrap();
+            loaded.weight.set(None);
+            // A converted checkpoint must keep full journal and memory payloads
+            // in sidecars, even when they are newer than the staged Markdown.
+            for tool in loaded.value.items.iter_mut().filter_map(|entry| entry.meta.tool.as_mut()) {
+                if let Some(source) = &tool.input_source {
+                    match blobs.put_locked(&serde_json::to_vec(&source.input()?)?) {
+                        Ok(digest) => {
+                            tool.payloads.input = Some(digest);
+                            tool.input_source = None;
+                        }
+                        Err(error) if matches!(source, Source::Journal(_)) => return Err(error),
+                        Err(_) => {} // The portable Markdown can still hold the full fallback.
+                    }
+                }
+                if let Some(source) = &tool.output_source {
+                    match blobs.put_locked(source.output()?.as_bytes()) {
+                        Ok(digest) => {
+                            tool.payloads.output = Some(digest);
+                            tool.output_source = None;
+                        }
+                        Err(error) if matches!(source, Source::Journal(_)) => return Err(error),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
         let file = files.replace(
             &self.path,
             |output| {
@@ -1275,8 +1495,12 @@ impl Thread {
                 }
             },
         )?;
+        // Even when directory sync fails, the live path now names this file.
+        // Keep the transcript dirty and let the next retry recognize our inode.
         self.file_version.replace(Some(FileVersion::read(file.metadata()?)?));
+        files.sync_replacement(&self.path)?;
         self.transcript.dirty.set(false);
+        self.transcript.volatile_payloads = false;
         Ok(())
     }
 
@@ -1305,14 +1529,6 @@ impl Thread {
                 start: self.front.session_start,
             }),
         }
-    }
-
-    fn recover_artifacts(&mut self, project: &Path) -> bool {
-        let paths = self.transcript.items.iter()
-            .filter_map(|entry| entry.meta.tool.as_ref())
-            .flat_map(|tool| tool.artifact_paths(project))
-            .collect();
-        self.add_artifacts(paths)
     }
 
     fn finish_interrupted_applications(&mut self) -> bool {
@@ -1636,6 +1852,32 @@ pub(crate) struct CacheSize {
     pub timeline_offset_capacity_bytes: usize,
 }
 
+pub(crate) struct MetadataRecovery {
+    id: String,
+    source: TranscriptSource,
+    project: PathBuf,
+    version: FileVersion,
+    page_revision: u64,
+}
+
+pub(crate) struct RecoveredMetadata {
+    candidate: MetadataRecovery,
+    paths: Vec<String>,
+    transcript: Option<Transcript>,
+}
+
+impl MetadataRecovery {
+    pub(crate) fn read(self) -> Result<RecoveredMetadata> {
+        let transcript = self.source.read()?;
+        let blobs = Blobs::new(self.source.path.parent().context("missing thread directory")?);
+        let paths = transcript.items.iter().filter_map(|entry| entry.meta.tool.as_ref())
+            .flat_map(|tool| tool.artifact_paths(&self.project, &blobs)).collect();
+        let interrupted = transcript.items.iter().filter_map(|entry| entry.meta.application.as_ref())
+            .any(|application| matches!(application.state, CommentApplicationState::Running));
+        Ok(RecoveredMetadata { candidate: self, paths, transcript: interrupted.then_some(transcript) })
+    }
+}
+
 pub struct Store {
     project: PathBuf,
     state_dir: PathBuf,
@@ -1645,6 +1887,7 @@ pub struct Store {
     migrations: HashMap<String, String>,
     restored_generations: HashMap<String, u64>,
     pages: RefCell<VecDeque<(PageKey, HistoryPage)>>,
+    pending_metadata: BTreeSet<String>,
     pub partner_default: ChatSettings,
     pub worker_default: DelegateSettings,
     pub worker_default_configured: bool,
@@ -1674,6 +1917,7 @@ impl Store {
             damaged_files: Vec::new(),
             restored_generations: HashMap::new(),
             pages: RefCell::new(VecDeque::new()),
+            pending_metadata: BTreeSet::new(),
             migrations: std::fs::read(state_dir.join("removed-thread-migrations.json")).ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default(),
             partner_default: state::load_partner_default(state_dir),
@@ -1744,10 +1988,13 @@ impl Store {
             for session in migrations {
                 let mut transcript = Transcript::default();
                 let mut last = 0;
-                store.timeline.visit_session(&session, |env, _| {
+                store.timeline.visit_session(&session, |mut env, refs, record| {
                     last = env.seq;
+                    let source = (refs.is_empty() && payloads::bound_replay(&mut env.event))
+                        .then_some(Source::Journal(record));
                     transcript.observe(&env.event);
-                    transcript.restore_tool(env.event);
+                    transcript.restore_tool(&env.event);
+                    transcript.capture_sources(&env.event, refs, source, true);
                 });
                 transcript.rebuild_job_facts();
                 transcript.hide_saved_blank_replies();
@@ -1758,26 +2005,11 @@ impl Store {
                 }
             }
         }
-        // Artifact and comment-application recovery updates metadata advertised
-        // in the workspace snapshot. Inspect just the sessions that can need it.
-        let recovery_sessions = store.timeline.snapshot_recovery_sessions();
-        for session in recovery_sessions {
-            let id = store.migrated_thread(&session).unwrap_or(&session).to_owned();
-            let Some(thread) = store.threads.get_mut(&id) else { continue };
-            if thread.transcript.check().is_err() {
-                continue;
-            }
-            let recovered = thread.recover_artifacts(project);
-            let interrupted = thread.finish_interrupted_applications();
-            if recovered || interrupted {
-                if let Err(error) = thread.save() {
-                    tracing::warn!("could not upgrade {}: {error:#}", thread.path.display());
-                }
-            } else {
-                thread.transcript.dirty.set(false);
-            }
-            store.trim_transcripts();
-        }
+        // Capture the startup candidates without loading their transcripts.
+        store.pending_metadata = store.timeline.snapshot_recovery_sessions().into_iter()
+            .map(|session| store.migrated_thread(&session).unwrap_or(&session).to_owned())
+            .filter(|id| store.threads.contains_key(id))
+            .collect();
         store
     }
 
@@ -1802,7 +2034,7 @@ impl Store {
         };
         for transcript in self.threads.values().filter_map(|thread| thread.transcript.loaded.get()) {
             size.loaded_transcripts += 1;
-            size.transcript_source_bytes += transcript.weight;
+            size.transcript_source_bytes += transcript.preview_weight();
             size.transcript_entries += transcript.value.items.len();
         }
         size
@@ -1821,10 +2053,26 @@ impl Store {
         let mut total: usize = 0;
         for (rank, (_, weight, transcript)) in cached.into_iter().enumerate() {
             total = total.saturating_add(weight);
-            if rank >= CACHE_THREADS || total > CACHE_BYTES {
+            // Keep the last accessed transcript until the idle timeout, even
+            // when its entries alone exceed the shared cache budget.
+            if rank > 0 && (rank >= CACHE_THREADS || total > CACHE_BYTES) {
                 transcript.loaded.take();
             }
         }
+    }
+
+    pub(crate) fn flush_dirty_transcripts(&mut self, idle_only: bool) -> Result<()> {
+        let mut errors = Vec::new();
+        for thread in self.threads.values_mut().filter(|thread| {
+            thread.transcript.dirty.get()
+                && (!idle_only || !thread.active || thread.transcript.volatile_payloads)
+        }) {
+            if let Err(error) = thread.save_with(SaveFiles::try_open) {
+                errors.push(format!("{}: {error:#}", thread.path.display()));
+            }
+        }
+        ensure!(errors.is_empty(), "could not save dirty transcripts: {}", errors.join("\n"));
+        Ok(())
     }
 
     pub(crate) fn trim_idle_transcripts(&mut self, idle: std::time::Duration) {
@@ -1836,6 +2084,66 @@ impl Store {
                 transcript.loaded.take();
             }
         }
+    }
+
+    pub(crate) fn payload_candidate(
+        &self, idle: std::time::Duration, busy: impl Fn(&str) -> bool,
+    ) -> Option<payload_migration::Candidate> {
+        let thread = self.threads.values().filter(|thread| {
+            !thread.front.preview_payloads && !thread.active
+                && thread.transcript.accessed.get().elapsed() >= idle && !busy(&thread.front.id)
+        }).max_by_key(|thread| thread.file_version.borrow().as_ref().map_or(0, |version| version.length))?;
+        // Wait an idle interval before retrying a failed or superseded attempt.
+        thread.transcript.accessed.set(Instant::now());
+        Some(payload_migration::Candidate {
+            id: thread.front.id.clone(), path: thread.path.clone(),
+            version: thread.file_version.borrow().clone()?,
+        })
+    }
+
+    pub(crate) fn publish_payloads(&mut self, staged: &mut payload_migration::Staged) -> Result<bool> {
+        let Some(thread) = self.threads.get_mut(&staged.candidate.id) else { return Ok(false) };
+        if thread.active || thread.front.preview_payloads
+            || thread.file_version.borrow().as_ref() != Some(&staged.candidate.version)
+        {
+            return Ok(false);
+        }
+        let dirty = thread.transcript.dirty.get();
+        let mut refs = std::mem::take(&mut staged.refs);
+        if let Some(data) = thread.transcript.loaded.get().filter(|_| dirty) {
+            // An idle worker may have left a newer, journaled result in memory.
+            // Keep pending entries and switch only the old inline locations.
+            for entry in &data.value.items {
+                let Some(tool) = &entry.meta.tool else { continue };
+                let refs = refs.get(&entry.meta.item);
+                if matches!(tool.input_source, Some(Source::Inline(_))) && refs.and_then(|refs| refs.input.as_ref()).is_none()
+                    || matches!(tool.output_source, Some(Source::Inline(_))) && refs.and_then(|refs| refs.output.as_ref()).is_none()
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        let version = staged.exchange()?;
+        thread.file_version.replace(Some(version));
+        thread.front.preview_payloads = true;
+        if let Some(data) = thread.transcript.loaded.get_mut().filter(|_| dirty) {
+            data.weight.set(None);
+            for entry in &mut data.value.items {
+                let Some(tool) = &mut entry.meta.tool else { continue };
+                let Some(refs) = refs.remove(&entry.meta.item) else { continue };
+                if matches!(tool.input_source, Some(Source::Inline(_))) {
+                    tool.input_source = None;
+                    tool.payloads.input = refs.input;
+                }
+                if matches!(tool.output_source, Some(Source::Inline(_))) {
+                    tool.output_source = None;
+                    tool.payloads.output = refs.output;
+                }
+            }
+        } else {
+            thread.transcript.loaded.take();
+        }
+        Ok(true)
     }
 
     fn migrated_thread(&self, session: &str) -> Option<&str> {
@@ -2342,7 +2650,8 @@ impl Store {
             .filter(|entry| entry.meta.item != job && entry.meta.item.starts_with(fuzukue_proto::DELEGATE_JOB))
             .filter_map(|entry| entry.meta.tool.as_ref())
             .find(|tool| tool.name == "delegate")?;
-        serde_json::from_value(previous.input.as_ref()?.get("touches")?.clone()).ok()
+        let input = previous.full_input(&thread.blobs()).ok()??;
+        serde_json::from_value(input.get("touches")?.clone()).ok()
     }
 
     pub(crate) fn hidden_replay_event(&self, event: &ServerEvent) -> bool {
@@ -2774,6 +3083,7 @@ impl Store {
             path,
             file_version: RefCell::new(None),
             front: Front {
+                preview_payloads: true,
                 handoff: None,
                 github: ThreadGitHub::default(),
                 github_pending: Vec::new(),
@@ -2902,7 +3212,7 @@ impl Store {
             }
             if let Some(tool) = &entry.meta.tool {
                 if tool.ok == Some(true) {
-                    paths.extend(tool.artifact_paths(&self.project));
+                    paths.extend(tool.artifact_paths(&self.project, &thread.blobs()));
                     if tool.name.eq_ignore_ascii_case("read") {
                         paths.extend(tool.input.as_ref()
                             .and_then(|input| input["file_path"].as_str())
@@ -3235,6 +3545,44 @@ impl Store {
         false
     }
 
+    pub(crate) fn metadata_recovery(&mut self, id: Option<&str>) -> Option<MetadataRecovery> {
+        let id = match id {
+            Some(id) if self.pending_metadata.remove(id) => id.to_owned(),
+            Some(_) => return None,
+            None => self.pending_metadata.pop_first()?,
+        };
+        let thread = self.threads.get(&id)?;
+        Some(MetadataRecovery {
+            id, source: thread.transcript.source.clone()?, project: self.project.clone(),
+            version: thread.file_version.borrow().clone()?, page_revision: thread.page_revision,
+        })
+    }
+
+    pub(crate) fn apply_metadata_recovery(&mut self, recovered: RecoveredMetadata) -> Result<bool> {
+        let RecoveredMetadata { candidate, paths, transcript } = recovered;
+        let Some(thread) = self.threads.get_mut(&candidate.id) else { return Ok(false) };
+        let changed = thread.add_artifacts(paths);
+        // A live change may have started or finished an application after
+        // this snapshot. Only normalize interrupted applications in that snapshot.
+        if let Some(value) = transcript {
+            if !thread.active && candidate.page_revision == 0 && thread.page_revision == 0
+                && !thread.transcript.dirty.get()
+                && thread.file_version.borrow().as_ref() == Some(&candidate.version)
+            {
+                if thread.transcript.loaded.get().is_none() {
+                    let _ = thread.transcript.loaded.set(LoadedTranscript {
+                        value, error: None, weight: Cell::new(None),
+                    });
+                }
+                if thread.finish_interrupted_applications() {
+                    thread.page_revision = thread.page_revision.wrapping_add(1);
+                    thread.save()?;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn artifacts(&self, id: &str) -> Vec<String> {
         self.threads.get(id).map(|thread| thread.front.artifacts.clone()).unwrap_or_default()
     }
@@ -3268,6 +3616,37 @@ impl Store {
         (items, summary)
     }
 
+    pub(crate) fn event_artifact_paths(&self, event: &ServerEvent) -> Option<Vec<String>> {
+        let ServerEvent::ToolResult { session, item, ok: true, output } = event else { return None };
+        let thread = self.threads.get(session)?;
+        let &index = thread.transcript.index.get(item)?;
+        let tool = thread.transcript.items[index].meta.tool.as_ref()?;
+        if !crate::thread_artifacts::may_record_path(&tool.name) {
+            return Some(Vec::new());
+        }
+        let input = tool.full_input(&thread.blobs()).ok().flatten();
+        Some(crate::thread_artifacts::tool_paths(&tool.name, input.as_ref(), Some(output)))
+    }
+
+    pub(crate) fn journal_prefixes(&self) -> payloads::JournalPrefixes {
+        self.timeline.journal_prefixes()
+    }
+
+    pub(crate) fn event_blobs(&self, event: &ServerEvent) -> Option<Blobs> {
+        let session = match event {
+            ServerEvent::ToolCall { session, .. } | ServerEvent::ToolResult { session, .. } => session,
+            _ => return None,
+        };
+        Some(self.threads.get(session)?.blobs())
+    }
+
+    pub(crate) fn tool_detail(&self, session: &str, item: &str) -> Option<ToolDetail> {
+        let thread = self.threads.get(session).filter(|thread| thread.path.is_file())?;
+        let &index = thread.transcript.index.get(item)?;
+        let tool = thread.transcript.items[index].meta.tool.as_ref()?.clone();
+        Some(ToolDetail { blobs: thread.blobs(), tool })
+    }
+
     pub(crate) fn prepare_event(&self, event: &ServerEvent) {
         let Some(thread) = history_session(event).and_then(|id| self.threads.get(id)) else { return };
         // Load before append so this event reaches the transcript exactly once.
@@ -3278,10 +3657,19 @@ impl Store {
 
     #[cfg(test)]
     pub fn observe(&mut self, event: &ServerEvent, completed: bool) -> Result<bool> {
-        self.observe_persisted(event, completed, false)
+        let paths = self.event_artifact_paths(event);
+        let mut event = event.clone();
+        let refs = match self.event_blobs(&event) {
+            Some(blobs) => blobs.compact(&mut event)?,
+            None => Refs::default(),
+        };
+        self.observe_persisted(&event, refs, None, completed, false, paths.as_deref())
     }
 
-    pub(crate) fn observe_persisted(&mut self, event: &ServerEvent, completed: bool, journaled: bool) -> Result<bool> {
+    pub(crate) fn observe_persisted(
+        &mut self, event: &ServerEvent, refs: Refs, source: Option<Source>, completed: bool, journaled: bool,
+        artifact_paths: Option<&[String]>,
+    ) -> Result<bool> {
         let Some(thread) = history_session(event).and_then(|id| self.threads.get_mut(id)) else {
             return Ok(false);
         };
@@ -3317,7 +3705,9 @@ impl Store {
             thread.library_revision = thread.library_revision.wrapping_add(1);
             thread.library_updated = Utc::now().timestamp_millis();
         }
+        thread.transcript.volatile_payloads |= matches!(source, Some(Source::Memory(_)));
         thread.transcript.observe(event);
+        thread.transcript.capture_sources(event, refs, source, false);
         match event {
             ServerEvent::TextDelta { item, actor: Actor::System, .. }
                 if item.starts_with(crate::workshop::REPORT_ITEM) =>
@@ -3341,10 +3731,9 @@ impl Store {
                 }
                 return Ok(false);
             }
-            ServerEvent::ToolResult { item, ok: true, .. } => {
-                let paths = thread.transcript.index.get(item)
-                    .and_then(|&i| thread.transcript.items[i].meta.tool.as_ref())
-                    .into_iter().flat_map(|tool| tool.artifact_paths(&self.project)).collect();
+            ServerEvent::ToolResult { ok: true, .. } => {
+                let paths = artifact_paths.unwrap_or_default().iter()
+                    .filter_map(|path| crate::thread_artifacts::relative_path(&self.project, path)).collect();
                 if thread.add_artifacts(paths) {
                     thread.save()?;
                     return Ok(true);
@@ -3693,6 +4082,192 @@ mod archive_tests {
         reopened.load_threads(project.path(), state.path());
         assert!(reopened.read_threads(|threads|
             matches!(threads.delegate_record(&session, &item), Some((_, Some(true), Some("done"))))));
+        Ok(())
+    }
+
+
+    #[test]
+    fn payload_survives_when_both_sidecar_and_journal_writes_fail() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let hub = crate::hub::Hub::with_timeline(state.path());
+        hub.load_threads(project.path(), state.path());
+        let session = hub.edit_threads(|threads| threads.create(None))?;
+        let item = "tool".to_owned();
+        hub.publish(ServerEvent::ToolCall {
+            session: session.clone(), item: item.clone(), actor: Actor::Claude,
+            name: "Read".into(), input: serde_json::json!({}),
+        });
+        hub.publish(ServerEvent::ToolResult {
+            session: session.clone(), item: item.clone(), ok: true, output: "old journal result".into(),
+        });
+        let path = hub.thread_path(&session)?;
+        fs::write(Blobs::new(path.parent().unwrap()).dir(), "obstruct sidecars")?;
+        hub.disable_journal_writes(state.path())?;
+
+        let output = format!("{}hidden{}end of failure", "a".repeat(5000), "b".repeat(5000));
+        hub.publish(ServerEvent::ToolResult { session: session.clone(), item: item.clone(), ok: false, output: output.clone() });
+        assert_eq!(hub.tool_detail(&session, &item).unwrap().output()?, Some(output.clone()));
+        // A competing writer prevents the retry from checkpointing. The full
+        // payload remains readable until an idle pass can flush it.
+        let lock = save_files::private_dir(&path.parent().unwrap().join(fuzukue_proto::THREAD_SAVE_DIR))?;
+        assert!(hub.flush_dirty_transcripts(true).is_err());
+        assert_eq!(hub.tool_detail(&session, &item).unwrap().output()?, Some(output.clone()));
+        drop(lock);
+        hub.flush_dirty_transcripts(true)?;
+        drop(hub);
+
+        let reopened = crate::hub::Hub::with_timeline(state.path());
+        reopened.load_threads(project.path(), state.path());
+        assert_eq!(reopened.tool_detail(&session, &item).unwrap().output()?, Some(output));
+        reopened.publish(ServerEvent::ToolResult {
+            session: session.clone(), item: item.clone(), ok: true, output: "new journal result".into(),
+        });
+        drop(reopened);
+        let reopened = crate::hub::Hub::with_timeline(state.path());
+        reopened.load_threads(project.path(), state.path());
+        assert_eq!(
+            reopened.tool_detail(&session, &item).unwrap().output()?.as_deref(),
+            Some("new journal result"),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn old_artifacts_recover_on_request_without_loading_transcripts_at_startup() -> Result<()> {
+        use fuzukue_proto::Envelope;
+
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let hub = crate::hub::Hub::with_timeline(state.path());
+        hub.load_threads(project.path(), state.path());
+        let session = hub.edit_threads(|threads| threads.create(None))?;
+        drop(hub);
+
+        let item = "tool".to_owned();
+        let mut journal = crate::state::TimelineWriter::open(state.path())?;
+        journal.append(&Envelope { workspace: None, seq: 1, event: ServerEvent::ToolCall {
+            session: session.clone(), item: item.clone(), actor: Actor::Claude,
+            name: "mcp__fuzukue__file_inbox".into(), input: serde_json::json!({}),
+        } });
+        journal.append(&Envelope { workspace: None, seq: 2, event: ServerEvent::ToolResult {
+            session: session.clone(), item, ok: true,
+            output: serde_json::json!({"data": "test output".repeat(1000), "path": "inbox/example.md"}).to_string(),
+        } });
+        drop(journal);
+
+        let hub = crate::hub::Hub::with_timeline(state.path());
+        hub.load_threads(project.path(), state.path());
+        hub.edit_threads(|store| {
+            assert!(store.threads[&session].transcript.loaded.get().is_none());
+            assert!(store.artifacts(&session).is_empty());
+            Ok(())
+        })?;
+        assert_eq!(hub.thread_artifacts(&session), ["inbox/example.md"]);
+        Ok(())
+    }
+
+    #[test]
+    fn preview_cache_does_not_charge_the_legacy_journal_record() -> Result<()> {
+        use fuzukue_proto::Envelope;
+
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let mut store = Store::load(project.path(), state.path(), &BTreeMap::new());
+        let session = store.create(None)?;
+        drop(store);
+
+        let item = "tool".to_owned();
+        let mut journal = crate::state::TimelineWriter::open(state.path())?;
+        journal.append(&Envelope { workspace: None, seq: 1, event: ServerEvent::ToolCall {
+            session: session.clone(), item: item.clone(), actor: Actor::Claude,
+            name: "Read".into(), input: serde_json::json!({}),
+        } });
+        journal.append(&Envelope { workspace: None, seq: 2, event: ServerEvent::ToolResult {
+            session: session.clone(), item: item.clone(), ok: true, output: "x".repeat(25 * 1024 * 1024),
+        } });
+        drop(journal);
+
+        let mut store = Store::load(project.path(), state.path(), &BTreeMap::new());
+        assert!(store.tool_detail(&session, &item).is_some());
+        store.trim_transcripts();
+        let transcript = &store.threads[&session].transcript;
+        assert!(transcript.loaded.get().is_some());
+        assert!(transcript.cache_weight().unwrap() < 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn workers_receive_artifact_paths_and_failure_tail_from_the_original() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let hub = crate::hub::Hub::with_timeline(state.path());
+        hub.load_threads(project.path(), state.path());
+        let session = hub.edit_threads(|threads| threads.create(None))?;
+        let item = "delegate:job:tool".to_owned();
+        let mut worker = hub.subscribe_worker();
+        hub.publish(ServerEvent::ToolCall {
+            session: session.clone(), item: item.clone(), actor: Actor::Claude,
+            name: "mcp__fuzukue__file_inbox".into(), input: serde_json::json!({}),
+        });
+        worker.try_recv()?;
+        let output = serde_json::json!({"data": "a".repeat(5000), "path": "inbox/deliverable.md"}).to_string();
+        hub.publish(ServerEvent::ToolResult {
+            session: session.clone(), item: item.clone(), ok: true, output,
+        });
+        let result = worker.try_recv()?;
+        assert_eq!(result.artifact_paths.as_deref(), Some(["inbox/deliverable.md".to_owned()].as_slice()));
+        assert!(matches!(result.event, ServerEvent::ToolResult { output, .. }
+            if serde_json::from_str::<serde_json::Value>(&output).is_err()));
+        let output = format!("{}\nerror: failed at the end", "a".repeat(5000));
+        hub.publish(ServerEvent::ToolResult { session, item, ok: false, output });
+        let result = worker.try_recv()?;
+        assert!(result.failure_tail.as_deref().unwrap().ends_with("error: failed at the end"));
+        assert!(matches!(result.event, ServerEvent::ToolResult { output, .. }
+            if output.starts_with("aaaa") && output.ends_with("error: failed at the end")));
+        Ok(())
+    }
+
+    #[test]
+    fn live_tool_payloads_stay_out_of_the_journal_and_recover_on_demand() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let hub = crate::hub::Hub::with_timeline(state.path());
+        hub.load_threads(project.path(), state.path());
+        let session = hub.edit_threads(|threads| threads.create(None))?;
+        let path = hub.thread_path(&session)?;
+        let item = "tool".to_owned();
+        let input = serde_json::json!({"text": format!("{}input sentinel", "あ".repeat(2500))});
+        let output = format!("start{}output sentinel{}end", "あ".repeat(1250), "い".repeat(1250));
+        let before = fs::read(&path)?;
+        hub.publish(ServerEvent::ToolCall {
+            session: session.clone(), item: item.clone(), actor: Actor::Claude, name: "Read".into(),
+            input: input.clone(),
+        });
+        hub.publish(ServerEvent::ToolResult { session: session.clone(), item: item.clone(), ok: false, output: output.clone() });
+        assert_eq!(fs::read(&path)?, before);
+        let journal = fs::read_to_string(state.path().join("thread-timeline.jsonl"))?;
+        assert!(!journal.contains("sentinel"));
+        assert_eq!(journal.lines().filter(|line| line.contains("tool_payloads")).count(), 2);
+        // The old journal decoder sees the same tool events with previews.
+        let last: fuzukue_proto::Envelope = serde_json::from_str(journal.lines().last().unwrap())?;
+        assert!(matches!(last.event, ServerEvent::ToolResult { output, .. } if output.len() <= 1029 && output.starts_with("start") && output.ends_with("end")));
+        drop(hub);
+
+        let hub = crate::hub::Hub::with_timeline(state.path());
+        hub.load_threads(project.path(), state.path());
+        let details = |hub: &crate::hub::Hub| hub.thread_tool_details(session.clone(), item.clone(), 1);
+        assert!(matches!(details(&hub), ServerEvent::ThreadToolDetails {
+            input: Some(saved_input), output: Some(saved_output), unavailable: false, ..
+        } if saved_input == input && saved_output == output));
+
+        hub.publish(ServerEvent::TurnEnded { session: session.clone(), actor: Actor::Claude });
+        let markdown = fs::read_to_string(&path)?;
+        assert!(markdown.contains("payloads"));
+        assert!(!markdown.contains("sentinel"));
+        let saved = Thread::read(path)?;
+        let tool = saved.transcript.items[0].meta.tool.as_ref().unwrap();
+        assert_eq!(tool.full_output(&saved.blobs())?, Some(output));
         Ok(())
     }
 

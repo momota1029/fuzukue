@@ -17,6 +17,7 @@ mod approval_queue;
 pub(crate) mod approval_store;
 
 use crate::state::{BACKLOG, BACKLOG_BYTES};
+use crate::threads::payloads::{self, Refs, Source};
 const HANDOFF_LIMIT: usize = 3;
 const HANDOFF_WINDOW: Duration = Duration::from_secs(60 * 60);
 
@@ -29,6 +30,7 @@ pub(crate) struct TranscriptResume {
 pub struct Hub {
     inner: Mutex<Inner>,
     tx: broadcast::Sender<Envelope>,
+    worker_events: broadcast::Sender<WorkerEvent>,
     epoch: String,
     approval_queue: std::sync::OnceLock<approval_store::Queue>,
 }
@@ -88,10 +90,10 @@ impl ReplayLog {
     }
 }
 
-fn append_timeline(writer: &mut Option<crate::state::TimelineWriter>, env: &Envelope) -> u64 {
+fn append_timeline(writer: &mut Option<crate::state::TimelineWriter>, env: &Envelope, refs: &Refs) -> u64 {
     writer.as_mut().map_or_else(
         || serde_json::to_vec(env).expect("serializable timeline envelope").len() as u64 + 1,
-        |writer| writer.append(env),
+        |writer| writer.append_with_payloads(env, refs),
     )
 }
 
@@ -146,6 +148,13 @@ impl Observed {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct WorkerEvent {
+    pub(crate) event: ServerEvent,
+    pub(crate) artifact_paths: Option<Arc<[String]>>,
+    pub(crate) failure_tail: Option<Arc<str>>,
+}
+
 struct WorkerActivity {
     started_at: Option<i64>,
     title: Option<String>,
@@ -178,10 +187,21 @@ pub(crate) fn worker_approval(request_id: &str, actor: &Actor) -> bool {
 impl Hub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
+        let (worker_events, _) = broadcast::channel(1024);
         Self { inner: Mutex::new(Inner { next_seq: 1, log: ReplayLog::default(), writer: None, threads: None, folder_grants: None, partner_started: Default::default(), handoffs_ready: HashSet::new(), recent_handoffs: HashMap::new(), last_partner_progress: None, running: HashSet::new(), github_auth_requests: HashMap::new(), compactions: HashMap::new(), workers: BTreeMap::new(), background: BTreeMap::new(), chat_pauses: HashMap::new(), notifications: Default::default(), activity: None, approvals: HashMap::new(), resolved_approvals: HashSet::new(), questions: HashMap::new(), question_clients: 0, question_clients_offline_since: Instant::now() }), tx,
+            worker_events,
             epoch: format!("{:032x}", rand::random::<u128>()),
             approval_queue: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disable_journal_writes(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.inner.lock().unwrap().writer.as_mut().unwrap().disable_writes(dir)
+    }
+
+    pub(crate) fn subscribe_worker(&self) -> broadcast::Receiver<WorkerEvent> {
+        self.worker_events.subscribe()
     }
 
     /// ディスクの記録から始める。以後のイベントもそこへ追記する。
@@ -730,7 +750,22 @@ impl Hub {
         }
         self.bind_approval_tool(inner, &event);
         let replayable = retain_replay_event(&mut event);
-        let env = Envelope { workspace: None, seq: if replayable { inner.next_seq } else { 0 }, event };
+        let artifact_paths = inner.threads.as_ref().and_then(|threads| threads.event_artifact_paths(&event));
+        let worker_listening = self.worker_events.receiver_count() != 0;
+        let failure_tail = match &event {
+            ServerEvent::ToolResult { ok: false, output, .. } if worker_listening => {
+                let start = output.char_indices().rev().nth(599).map_or(0, |(i, _)| i);
+                Some(Arc::from(&output[start..]))
+            }
+            _ => None,
+        };
+        let mut env = Envelope { workspace: None, seq: if replayable { inner.next_seq } else { 0 }, event };
+        let stored = inner.threads.as_ref().and_then(|threads| threads.event_blobs(&env.event))
+            .map_or_else(|| Ok(Refs::default()), |blobs| blobs.compact(&mut env.event));
+        let (refs, sidecar_error) = match stored {
+            Ok(refs) => (refs, None),
+            Err(error) => (Refs::default(), Some(error)),
+        };
         let notice = notifications::before_publish(inner, &env.event);
         observe_approval(inner, &env, waiter);
         observe_question(&mut inner.questions, &env);
@@ -740,16 +775,46 @@ impl Hub {
         if let Some(threads) = inner.threads.as_ref() {
             threads.prepare_event(&env.event);
         }
+        let mut payload_source = None;
         if replayable {
             inner.next_seq += 1;
-            let size = append_timeline(&mut inner.writer, &env);
+            let mut size = append_timeline(&mut inner.writer, &env, &refs);
+            if sidecar_error.is_some() {
+                // Store the original journal record if the sidecar volume is full.
+                let journal = inner.writer.as_mut().and_then(|writer| writer.last_record(size));
+                let mut preview = env.event.clone();
+                payloads::bound_replay(&mut preview);
+                let original = std::mem::replace(&mut env.event, preview);
+                payload_source = Some(match journal {
+                    Some(record) => {
+                        tracing::warn!(error=?sidecar_error, "preserved tool payload in journal after sidecar write failed");
+                        Source::Journal(record)
+                    }
+                    None => {
+                        tracing::error!(error=?sidecar_error, "retaining unsaved tool payload in memory");
+                        Source::Memory(Arc::new(payloads::MemoryRecord {
+                            event: original,
+                            journal_prefixes: inner.threads.as_ref().map_or([None; 2], crate::threads::Store::journal_prefixes),
+                        }))
+                    }
+                });
+                size = serde_json::to_vec(&env).expect("serializable preview").len() as u64 + 1;
+            }
             inner.log.push(env.clone(), size);
         }
         // 送信は lock を握ったまま行い、backlog と live の順序を揃える。
         let journal_done_at = timing.as_ref().map(|_| Instant::now());
         let journaled = replayable && inner.writer.as_ref().is_some_and(|writer| writer.appends_synced());
         let saved = inner.threads.as_mut().map(|threads| {
-            let saved = threads.observe_persisted(&env.event, completed_session.is_some(), journaled);
+            let unsaved = matches!(payload_source, Some(Source::Memory(_)));
+            let saved = threads.observe_persisted(&env.event, refs, payload_source, completed_session.is_some(), journaled, artifact_paths.as_deref())
+                .and_then(|saved| {
+                    if let Some(error) = sidecar_error.filter(|_| unsaved) {
+                        Err(error.context("tool payload retained in memory after storage failed"))
+                    } else {
+                        Ok(saved)
+                    }
+                });
             if matches!(env.event, ServerEvent::TurnEnded { .. }) {
                 threads.trim_transcripts();
             }
@@ -757,6 +822,14 @@ impl Hub {
         });
         let transcript_done_at = timing.as_ref().map(|_| Instant::now());
         let seq = env.seq;
+        if worker_listening && matches!(env.event, ServerEvent::TextDelta { .. }
+            | ServerEvent::ToolCall { .. } | ServerEvent::ToolResult { .. }
+            | ServerEvent::ApprovalRequested { .. } | ServerEvent::ApprovalResolved { .. })
+        {
+            let _ = self.worker_events.send(WorkerEvent {
+                event: env.event.clone(), artifact_paths: artifact_paths.map(Arc::from), failure_tail,
+            });
+        }
         let _ = self.tx.send(env);
         if let Some((timing, locked_at)) = timing {
             timing.stages = Some(crate::send_latency::Stages {
@@ -827,12 +900,62 @@ impl Hub {
         Some((inner.log.bytes, inner.threads.as_ref().map_or_else(Default::default, |store| store.cache_size())))
     }
 
+    pub(crate) fn flush_dirty_transcripts(&self, idle_only: bool) -> anyhow::Result<()> {
+        let mut inner = self.inner.try_lock()
+            .map_err(|_| anyhow::anyhow!("transcript store is busy"))?;
+        inner.threads.as_mut().map_or(Ok(()), |threads| threads.flush_dirty_transcripts(idle_only))
+    }
+
     pub(crate) fn trim_idle_transcripts(&self, idle: std::time::Duration) {
         if let Ok(mut inner) = self.inner.try_lock() {
             if let Some(threads) = &mut inner.threads {
                 threads.trim_idle_transcripts(idle);
             }
         }
+    }
+
+    pub(crate) async fn migrate_idle_payloads(self: &Arc<Self>, idle: Duration) {
+        let candidate = {
+            let Ok(inner) = self.inner.try_lock() else { return };
+            inner.threads.as_ref().and_then(|threads| threads.payload_candidate(idle, |id| {
+                inner.running.contains(id) || inner.compactions.contains_key(id)
+                    || inner.workers.keys().any(|(session, _)| session == id)
+            }))
+        };
+        let Some(candidate) = candidate else { return };
+        let hub = self.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut staged = candidate.stage()?;
+            let Ok(mut inner) = hub.inner.try_lock() else { return Ok(()) };
+            let id = &staged.candidate.id;
+            if inner.running.contains(id) || inner.compactions.contains_key(id)
+                || inner.workers.keys().any(|(session, _)| session == id)
+            {
+                return Ok(());
+            }
+            let published = match &mut inner.threads {
+                Some(threads) => threads.publish_payloads(&mut staged)?,
+                None => false,
+            };
+            drop(inner);
+            if published {
+                staged.finish();
+            }
+            Ok(())
+        }).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "idle thread payload conversion deferred"),
+            Err(error) => tracing::warn!(%error, "idle thread payload conversion did not finish"),
+        }
+    }
+
+    pub(crate) fn tool_detail(&self, session: &str, item: &str) -> Option<crate::threads::ToolDetail> {
+        let mut inner = self.inner.lock().unwrap();
+        let threads = inner.threads.as_mut()?;
+        let detail = threads.tool_detail(session, item);
+        threads.trim_transcripts();
+        detail
     }
 
     pub(crate) fn library_thread(
@@ -902,7 +1025,26 @@ impl Hub {
         (store.partner_default.clone(), store.worker_default.clone())
     }
 
+    pub(crate) fn recover_thread_metadata(&self, id: Option<&str>) {
+        let candidate = self.inner.lock().unwrap().threads.as_mut()
+            .and_then(|threads| threads.metadata_recovery(id));
+        let Some(candidate) = candidate else { return };
+        let result = candidate.read().and_then(|recovered| {
+            let mut inner = self.inner.lock().unwrap();
+            let Some(threads) = &mut inner.threads else { return Ok(()) };
+            if threads.apply_metadata_recovery(recovered)? {
+                let _ = self.tx.send(Envelope { workspace: None, seq: 0, event: threads.snapshot() });
+            }
+            threads.trim_transcripts();
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not recover saved thread metadata");
+        }
+    }
+
     pub fn thread_artifacts(&self, id: &str) -> Vec<String> {
+        self.recover_thread_metadata(Some(id));
         self.inner.lock().unwrap().threads.as_ref().map(|store| store.artifacts(id)).unwrap_or_default()
     }
 
@@ -1000,7 +1142,7 @@ impl Hub {
     fn broadcast_saved(&self, inner: &mut Inner, event: ServerEvent, snapshot: ServerEvent) {
         let env = Envelope { workspace: None, seq: inner.next_seq, event };
         inner.next_seq += 1;
-        let size = append_timeline(&mut inner.writer, &env);
+        let size = append_timeline(&mut inner.writer, &env, &Refs::default());
         inner.log.push(env.clone(), size);
         let _ = self.tx.send(env);
         let _ = self.tx.send(Envelope { workspace: None, seq: 0, event: snapshot });
@@ -1111,13 +1253,44 @@ impl Hub {
         }
     }
 
-    pub(crate) fn thread_job_details(&self, session: String, job: String, request: u64, before: Option<u64>) -> ServerEvent {
-        let mut inner = self.inner.lock().unwrap();
-        let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
-        let (events, next_before) = threads.job_details(&session, &job, before);
-        threads.trim_transcripts();
-        let events = self.history_with_approval_receipts(&session, events);
-        ServerEvent::ThreadJobDetails { session, job, request, through: inner.next_seq - 1, before, next_before, events }
+    pub(crate) fn thread_tool_details(&self, session: String, item: String, request: u64) -> ServerEvent {
+        let detail = self.tool_detail(&session, &item);
+        let input = detail.as_ref().map(|detail| detail.input()).transpose();
+        let output = detail.as_ref().map(|detail| detail.output()).transpose();
+        let unavailable = detail.is_none() || input.is_err() || output.is_err();
+        ServerEvent::ThreadToolDetails {
+            session, item, request, input: input.ok().flatten().flatten(),
+            output: output.ok().flatten().flatten(), unavailable,
+        }
+    }
+
+    pub(crate) fn thread_job_details(
+        &self, session: String, job: String, request: u64, before: Option<u64>, full_report: bool,
+    ) -> ServerEvent {
+        let (mut events, next_before, through, detail) = {
+            let mut inner = self.inner.lock().unwrap();
+            let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
+            let (events, next_before) = threads.job_details(&session, &job, before);
+            let detail = (before.is_none() && full_report).then(|| threads.tool_detail(&session, &job)).flatten();
+            threads.trim_transcripts();
+            (self.history_with_approval_receipts(&session, events), next_before, inner.next_seq - 1, detail)
+        };
+        let mut error = None;
+        if let Some(detail) = detail {
+            match detail.output() {
+                Ok(Some(full)) => {
+                    if let Some(output) = events.iter_mut().find_map(|event| match event {
+                        ServerEvent::ToolResult { item, output, .. } if *item == job => Some(output),
+                        _ => None,
+                    }) {
+                        *output = full;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => error = Some("The full worker report is unavailable.".into()),
+            }
+        }
+        ServerEvent::ThreadJobDetails { session, job, request, through, before, next_before, events, error }
     }
 
     pub(crate) fn thread_job_summary(&self, event: &ServerEvent) -> Option<(String, u64, fuzukue_proto::JobSummary)> {
@@ -1138,12 +1311,15 @@ impl Hub {
     }
 
     pub(crate) fn thread_job_report(&self, session: String, job: String, request: u64) -> ServerEvent {
-        let mut inner = self.inner.lock().unwrap();
-        let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
-        let result = threads.delegate_record(&session, &job).and_then(|(_, ok, output)| {
-            Some((ok?, serde_json::from_str(output?).ok()?))
-        });
-        threads.trim_transcripts();
+        let result = {
+            let mut inner = self.inner.lock().unwrap();
+            let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
+            let ok = threads.delegate_record(&session, &job).and_then(|(_, ok, _)| ok);
+            let detail = ok.and_then(|_| threads.tool_detail(&session, &job));
+            threads.trim_transcripts();
+            ok.zip(detail)
+        }.and_then(|(ok, detail)| Some((ok, serde_json::from_str(&detail.output().ok()??).ok()?)));
+
         ServerEvent::ThreadJobReport { session, job, request, result }
     }
 

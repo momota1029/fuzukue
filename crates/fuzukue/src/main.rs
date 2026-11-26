@@ -1487,6 +1487,9 @@ impl Workbench {
                         event @ ServerEvent::ThreadHistoryFrom { .. } if self.transcripts.scoped && env.workspace.is_some() => {
                             self.finish_thread_history_from(event, cx);
                         }
+                        event @ ServerEvent::ThreadToolDetails { .. } if self.transcripts.scoped && env.workspace.is_some() => {
+                            self.finish_tool_payload(event, cx);
+                        }
                         event @ ServerEvent::ThreadJobDetails { .. } if self.transcripts.scoped && env.workspace.is_some() => {
                             self.finish_thread_job(event, cx);
                         }
