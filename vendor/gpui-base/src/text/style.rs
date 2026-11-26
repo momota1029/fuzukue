@@ -5,6 +5,20 @@ use gpui::{Font, Global, HighlightStyle, Hsla, Rems, StyleRefinement, rems};
 
 use crate::ColorTokens;
 
+/// Application palette for rich-text table body fills and grid lines.
+/// Header styling and row hover are supplied by [`TextViewStyle`].
+#[derive(Clone, Copy)]
+pub struct TableColors {
+    /// Fill beneath ordinary body rows.
+    pub background: Hsla,
+    /// Fill for alternating body rows.
+    pub stripe: Hsla,
+    /// Color of the frame and row and column dividers.
+    pub border: Hsla,
+}
+
+impl Global for TableColors {}
+
 /// Application typography for code in rich-text views.
 #[derive(Clone, PartialEq)]
 pub struct CodeTypography {

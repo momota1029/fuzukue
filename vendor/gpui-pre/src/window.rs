@@ -3114,6 +3114,14 @@ impl Window {
         self.rendered_frame.scene.quads.clone()
     }
 
+    /// Returns the bounds and colors of the most recently painted text glyphs.
+    #[cfg(feature = "shot-element-bounds")]
+    pub fn painted_glyphs(&self) -> impl Iterator<Item = (Bounds<ScaledPixels>, Hsla)> + '_ {
+        let scene = &self.rendered_frame.scene;
+        scene.monochrome_sprites.iter().map(|sprite| (sprite.bounds, sprite.color))
+            .chain(scene.subpixel_sprites.iter().map(|sprite| (sprite.bounds, sprite.color)))
+    }
+
     /// Returns the underlines in the most recently rendered frame's scene.
     #[cfg(any(test, feature = "test-support"))]
     pub fn painted_underlines(&self) -> Vec<Underline> {

@@ -36,7 +36,7 @@ use crate::{
 };
 
 use super::{
-    SelectionFormat, TextViewStyle,
+    SelectionFormat, TableColors, TextViewStyle,
     selection_adapter::SourceHit,
     utils::{data_url_image, list_item_prefix, ordered_list_ordinal},
 };
@@ -4633,14 +4633,25 @@ impl BlockNode {
             })
             .collect();
 
-        let rows = Self::render_table_rows(table, &columns, node_cx, window, cx);
+        let surface_override = style.table_background();
+        let colors = TableColors {
+            background: surface_override.unwrap_or(cx.theme().tokens.colors.surface),
+            stripe: gpui::transparent_black(),
+            border: style.border(),
+        };
+        // Keep the inherited treatment on inverted surfaces, where a solid
+        // table fill from the page palette would clash with the adapted text.
+        let colors = if surface_override.is_none() {
+            cx.try_global::<TableColors>().copied().unwrap_or(colors)
+        } else {
+            colors
+        };
+        let rows = Self::render_table_rows(table, &columns, colors, node_cx, window, cx);
         let frame = StyleRefinement::default()
             .text_size(text_size)
-            .bg(style
-                .table_background()
-                .unwrap_or(cx.theme().tokens.colors.surface))
+            .bg(colors.background)
             .border_1()
-            .border_color(style.border())
+            .border_color(colors.border)
             .refine_style(style.table());
         let body = if scroll {
             let scroll_handle = window
@@ -4749,6 +4760,7 @@ impl BlockNode {
     fn render_table_rows(
         table: &Table,
         columns: &[TableColumn],
+        colors: TableColors,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -4774,7 +4786,7 @@ impl BlockNode {
                 .flex_basis(px(0.))
                 .flex_grow(grow)
                 .flex_shrink(0.)
-                .border_color(style.border())
+                .border_color(colors.border)
                 .refine_style(&slack_style)
         };
 
@@ -4847,7 +4859,10 @@ impl BlockNode {
                     .id(("row", row_ix))
                     .w_full()
                     .when(row_ix < row_count - 1, |this| this.border_b_1())
-                    .border_color(style.border())
+                    .border_color(colors.border)
+                    .when(row_ix > 0 && row_ix % 2 == 0 && colors.stripe.a > 0., |this| {
+                        this.bg(colors.stripe)
+                    })
                     .flex()
                     .flex_row()
                     // The first row is the header, as everywhere else that

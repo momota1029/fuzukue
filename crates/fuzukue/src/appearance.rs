@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::base::text::CodeTypography;
+use gpui_kit::base::text::{CodeTypography, TableColors};
 use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
@@ -412,7 +412,6 @@ fn desktop_palette(
     colors.input = surfaces.outline;
 
     colors.foreground = foreground;
-    colors.muted_foreground = muted;
     colors.sidebar_foreground = foreground;
     colors.secondary_foreground = foreground;
     colors.popover_foreground = foreground;
@@ -459,6 +458,8 @@ fn desktop_palette(
     let readable_text = |color| adjust_lightness(color, dark, |color| {
         text_surfaces.into_iter().all(|surface| contrast_ratio(color, surface) >= 4.5)
     });
+    let muted = readable_text(muted);
+    colors.muted_foreground = muted;
     let [link, link_hover, link_active] = links.map(readable_text);
     colors.link = link;
     colors.link_hover = link_hover;
@@ -482,14 +483,14 @@ fn desktop_palette(
     colors.tab_active_foreground = foreground;
     colors.table = surfaces.background;
     colors.table_even = surfaces.chat;
-    colors.table_head = surfaces.chrome;
-    colors.table_foot = surfaces.chrome;
+    colors.table_head = if dark { surfaces.raised } else { surfaces.chrome };
+    colors.table_foot = colors.table_head;
     colors.table_head_foreground = foreground;
     colors.table_foot_foreground = foreground;
     colors.table_active = colors.accent;
     colors.table_active_border = primary;
-    colors.table_hover = surfaces.chat;
-    colors.table_row_border = surfaces.divider;
+    colors.table_hover = if dark { surfaces.chrome } else { surfaces.raised };
+    colors.table_row_border = surfaces.outline;
     colors.status_bar = surfaces.chrome;
     colors.status_bar_border = surfaces.divider;
     colors.scrollbar_thumb = surfaces.outline;
@@ -960,6 +961,12 @@ impl Appearance {
                 theme.highlight_theme = highlight;
             });
         }
+        let theme = cx.theme();
+        cx.set_global(TableColors {
+            background: theme.table,
+            stripe: theme.table_even,
+            border: theme.table_row_border,
+        });
         let code_typography = CodeTypography {
             font: self.code_font.clone(),
             size_scale: self.settings.code_font_scale(),
@@ -1895,14 +1902,27 @@ mod accent_tests {
 
     #[test]
     fn every_theme_and_accent_keeps_text_controls_and_highlights_readable() {
+        gpui_kit::platform::headless().run(|cx| {
+            gpui_kit::init(cx);
+            check_resolved_contrast(cx);
+            cx.spawn(async move |cx| { let _ = cx.update(|cx| cx.quit()); }).detach();
+        });
+    }
+
+    fn check_resolved_contrast(cx: &mut App) {
         for preset in ThemePreset::ALL {
             for dark in [false, true] {
                 let surfaces = ThemeSurfaces::for_preset(preset, dark);
+                Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
                 let accents = std::iter::once(AccentChoice::default())
                     .chain(ACCENT_SWATCHES.iter().map(|swatch| AccentChoice::Preset(swatch.preset)))
-                    .chain([AccentChoice::Custom("#777777".into())]);
+                    .chain(["#000000", "#ffffff", "#777777", "#ff0000", "#00ff00", "#0000ff"]
+                        .map(|value| AccentChoice::Custom(value.into())));
                 for accent in accents {
-                    let colors = desktop_palette(ThemeColor::default(), preset, &accent, dark);
+                    Theme::update(cx, |theme| {
+                        theme.colors = desktop_palette(theme.colors, preset, &accent, dark);
+                    });
+                    let colors = cx.theme().colors;
                     let check = |name, foreground, background, minimum| {
                         let ratio = contrast_ratio(foreground, background);
                         assert!(
@@ -1928,14 +1948,40 @@ mod accent_tests {
                     }
                     check("list search", colors.list_highlight_foreground, colors.list_active, 4.5);
                     check("popup text", colors.popover_foreground, colors.popover, 4.5);
+                    for background in [colors.table, colors.table_even, colors.table_hover, colors.table_active] {
+                        check("table body", colors.foreground, background, 4.5);
+                    }
+                    check("table header", colors.table_head_foreground, colors.table_head, 4.5);
+                    check("table footer", colors.table_foot_foreground, colors.table_foot, 4.5);
+                    for background in [colors.table, colors.table_even, colors.table_hover, colors.table_head] {
+                        check("table muted text", colors.muted_foreground, background, 4.5);
+                        check("table link", colors.link, background, 4.5);
+                        check("table border", colors.table_row_border, background, 3.);
+                    }
+                    for (name, foreground, background) in [
+                        ("sidebar", colors.sidebar_foreground, colors.sidebar),
+                        ("sidebar selected", colors.sidebar_accent_foreground, colors.sidebar_accent),
+                        ("secondary", colors.secondary_foreground, colors.secondary),
+                        ("popover secondary", colors.muted_foreground, colors.popover),
+                        ("list header", colors.muted_foreground, colors.list_head),
+                        ("tab", colors.tab_foreground, colors.tab),
+                        ("active tab", colors.tab_active_foreground, colors.tab_active),
+                        ("button", colors.button_foreground, colors.button),
+                        ("secondary button", colors.button_secondary_foreground, colors.button_secondary),
+                    ] {
+                        check(name, foreground, background, 4.5);
+                    }
                     let pdf = desktop_pdf_style(colors);
                     check("PDF header", pdf.header_fg, pdf.bg, 4.5);
                     check("PDF header secondary", pdf.header_muted, pdf.bg, 4.5);
                     check("PDF placeholder", pdf.placeholder_fg, pdf.placeholder_bg, 4.5);
 
                     assert_eq!(colors.primary, colors.button_primary);
-                    assert_ne!(colors.primary, colors.primary_hover);
-                    assert_ne!(colors.primary, colors.primary_active);
+                    // The hover and active shifts clip at black and white.
+                    if colors.primary.l > 0. && colors.primary.l < 1. {
+                        assert_ne!(colors.primary, colors.primary_hover);
+                        assert_ne!(colors.primary, colors.primary_active);
+                    }
                     for fill in [colors.primary, colors.primary_hover, colors.primary_active] {
                         check("button label", colors.primary_foreground, fill, 4.5);
                         for surface in surfaces.text_surfaces() {

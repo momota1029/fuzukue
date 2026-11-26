@@ -124,6 +124,7 @@ enum Step {
         title: String,
     },
     SeedThreadSwitch,
+    SeedChatReply { text: String },
     AssertThreadSwitch {
         session: String,
         restore: bool,
@@ -763,6 +764,23 @@ impl Runner {
                 })??;
             }
             Step::SeedThreadSwitch => self.update(cx, |view, _, cx| seed_thread_switch(view, cx))?,
+            Step::SeedChatReply { text } => {
+                ensure!(!self.read_only, "seed_chat_reply needs an isolated fixture");
+                self.update(cx, |view, _, cx| {
+                    let session = String::from("chat-reply-fixture");
+                    let actor = fuzukue_proto::Actor::Claude;
+                    view.protocol = fuzukue_proto::PROTOCOL_VERSION;
+                    view.threads_loaded = true;
+                    view.switch_session(session.clone(), cx);
+                    view.on_event(ServerEvent::TextDelta {
+                        session: session.clone(),
+                        item: "fixture-reply".into(),
+                        actor: actor.clone(),
+                        text,
+                    }, cx);
+                    view.on_event(ServerEvent::TurnEnded { session, actor }, cx);
+                })?;
+            }
             Step::AssertThreadSwitch { session, restore } => self.assert_thread_switch(cx, &session, restore)?,
             Step::AssertActiveThread { title } => {
                 self.update(cx, |view, _, _| {
@@ -2001,10 +2019,82 @@ mod tests {
     }
 
     #[test]
+    fn table_colors_scenario_paints_the_resolved_theme() {
+        use fuzukue_view::appearance::ThemePreset;
+        use gpui_kit::component::ActiveTheme as _;
+
+        let (result, completed) = std::sync::mpsc::channel();
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+            gpui_kit::init(cx);
+            math::init(cx);
+            let (handle, view) = open_workbench_at_size(cx, 1360., 860.).unwrap();
+            cx.spawn(async move |cx| {
+                let mut runner = Runner {
+                    handle, view, target: None, output: PathBuf::new(), read_only: false, seen: HashMap::new(),
+                };
+                let outcome: Result<()> = async {
+                    let settings = tempfile::tempdir()?;
+                    runner.update(cx, |view, _, _| {
+                        view.appearance.isolate_shot_settings(settings.path().join("settings.toml"));
+                    })?;
+                    let scenario: Scenario = serde_json::from_str(include_str!("../../../tests/shots/table-colors.json"))?;
+                    for step in scenario.steps {
+                        let Step::Screenshot { name } = step else {
+                            runner.step(step, cx).await?;
+                            continue;
+                        };
+                        runner.frame(cx)?;
+                        runner.update(cx, |view, window, cx| {
+                            let (preset, dark) = match name.as_str() {
+                                "table-classic-dark" => (ThemePreset::Classic, true),
+                                "table-parchment-light" => (ThemePreset::Parchment, false),
+                                _ => bail!("unexpected table capture {name}"),
+                            };
+                            let theme = cx.theme();
+                            assert_eq!(view.appearance.settings.theme.preset, preset);
+                            assert_eq!(theme.is_dark(), dark);
+                            let bubble = window.shot_element_bounds("chat-message-bubble-0")
+                                .context("missing reply")?.scale(window.scale_factor());
+                            let quads = window.painted_quads();
+                            let find_fill = |color| quads.iter().find(|quad| {
+                                quad.bounds.intersects(&bubble)
+                                    && quad.background.as_solid() == Some(color)
+                                    && quads.iter().any(|border| {
+                                        border.bounds == quad.bounds
+                                            && border.border_color == theme.table_row_border
+                                            && border.border_widths != Default::default()
+                                    })
+                            });
+                            let frame = find_fill(theme.table).context("missing table frame and body fill")?;
+                            let head = find_fill(theme.table_head).context("missing header fill and divider")?;
+                            let stripe = find_fill(theme.table_even).context("missing alternating row and divider")?;
+                            assert!(frame.bounds.intersects(&head.bounds) && frame.bounds.intersects(&stripe.bounds));
+                            for (row, foreground) in [(head, theme.table_head_foreground), (stripe, theme.foreground)] {
+                                let glyphs = window.painted_glyphs()
+                                    .filter(|(bounds, _)| row.bounds.intersects(bounds))
+                                    .map(|(_, color)| color)
+                                    .collect::<Vec<_>>();
+                                assert!(!glyphs.is_empty(), "missing table glyphs in {name}");
+                                assert!(glyphs.iter().all(|color| *color == foreground), "unexpected glyph colors in {name}: {glyphs:?}");
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        })??;
+                    }
+                    Ok(())
+                }.await;
+                result.send(outcome).unwrap();
+                cx.update(|cx| cx.quit());
+            }).detach();
+        });
+        completed.recv().unwrap().unwrap();
+    }
+
+    #[test]
     fn checked_in_scenarios_are_valid_json_steps() {
         for scenario in [
             include_str!("../../../tests/shots/chat.json"),
             include_str!("../../../tests/shots/chat-live.json"),
+            include_str!("../../../tests/shots/table-colors.json"),
             include_str!("../../../tests/shots/thread-switch.json"),
             include_str!("../../../tests/shots/trash.json"),
             include_str!("../../../tests/shots/rewrite.json"),

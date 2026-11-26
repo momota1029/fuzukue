@@ -1,0 +1,19 @@
+{
+  "steps": [
+    {"action": "size", "width": 1360, "height": 860},
+    {"action": "theme", "theme": "dark"},
+    {"action": "click", "id": "title-bar-settings"},
+    {"action": "wait_element", "id": "theme-preset-classic"},
+    {"action": "click", "id": "theme-preset-classic"},
+    {"action": "click", "id": "close-settings"},
+    {"action": "seed_chat_reply", "text": "| 起こりうること | 重さ |\n| --- | --- |\n| 説明が伝わらない | 高い |\n| 読むのに時間がかかる | 低い |\n| 追加の確認が必要になる | 中くらい |"},
+    {"action": "wait_element", "id": "chat-message-bubble-0"},
+    {"action": "screenshot", "name": "table-classic-dark"},
+    {"action": "theme", "theme": "light"},
+    {"action": "click", "id": "title-bar-settings"},
+    {"action": "wait_element", "id": "theme-preset-parchment"},
+    {"action": "click", "id": "theme-preset-parchment"},
+    {"action": "click", "id": "close-settings"},
+    {"action": "screenshot", "name": "table-parchment-light"}
+  ]
+}
