@@ -6205,14 +6205,22 @@ mod tests {
     }
 
     fn test_pdf(label: &str) -> Vec<u8> {
-        let content = format!("BT /F1 14 Tf 80 1840 Td ({label}) Tj ET");
-        let objects = [
+        test_pdf_pages(&[(label, 2100, 1840)])
+    }
+
+    fn test_pdf_pages(pages: &[(&str, u32, u32)]) -> Vec<u8> {
+        let kids = (0..pages.len()).map(|i| format!("{} 0 R", 4 + 2 * i)).collect::<Vec<_>>().join(" ");
+        let mut objects = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".into(),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 2100] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".into(),
-            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()),
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
         ];
+        for (index, &(label, height, baseline)) in pages.iter().enumerate() {
+            let stream = 5 + 2 * index;
+            objects.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 {height}] /Contents {stream} 0 R /Resources << /Font << /F1 3 0 R >> >> >>"));
+            let content = format!("BT /F1 14 Tf 80 {baseline} Td ({label}) Tj ET");
+            objects.push(format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()));
+        }
         let mut pdf = "%PDF-1.4\n".to_owned();
         let mut xref = "0000000000 65535 f \n".to_owned();
         for (index, body) in objects.iter().enumerate() {
@@ -6220,7 +6228,8 @@ mod tests {
             pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
         }
         let offset = pdf.len();
-        pdf.push_str(&format!("xref\n0 6\n{xref}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{offset}\n%%EOF\n"));
+        let size = objects.len() + 1;
+        pdf.push_str(&format!("xref\n0 {size}\n{xref}trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{offset}\n%%EOF\n"));
         pdf.into_bytes()
     }
 
@@ -6326,7 +6335,7 @@ mod tests {
             point(area.center().x, area.bottom() - px(12.))
         })?;
         runner.click(cx, ClickTarget::Coordinates { x: outside.x.into(), y: outside.y.into() })?;
-        assert!(runner.update(cx, |view, _, _| view.paper_pdf.popup.is_none())?);
+        runner.wait_for(cx, "dismissed PDF card", TIMEOUT_MS, |view, _| view.paper_pdf.popup.is_none()).await?;
         let (from, to) = runner.update(cx, |view, _, cx| {
             view.receive_paper_pdf_map(view.deck.clone(), path, format!("{:x}", Sha256::digest(&updated)),
                 map, true, cx);
@@ -6335,14 +6344,110 @@ mod tests {
             (at(0.132), at(0.23))
         })?;
         runner.drag(cx, from, to)?;
-        runner.wait_for(cx, "PDF text selection popup", TIMEOUT_MS, |view, _| view.paper_pdf.popup.is_some()).await?;
-        runner.step(Step::Click { id: Some("comment-pdf-card".into()), x: None, y: None }, cx).await?;
+        runner.wait_for(cx, "PDF selection comment", TIMEOUT_MS, |view, _| view.paper_pdf.selection_comment.is_some()).await?;
+        runner.frame(cx)?;
+        let assert_comment_only = |view: &Workbench, window: &Window| {
+            assert!(view.paper_pdf.popup.is_none());
+            assert!(window.shot_element_bounds("pdf-card-popup").is_none());
+            assert!(window.shot_element_bounds("open-pdf-card").is_none());
+            assert!(window.shot_element_bounds("edit-pdf-card").is_none());
+            assert!(window.shot_element_bounds("comment-pdf-selection").is_some());
+        };
+        runner.update(cx, |view, window, cx| {
+            assert_comment_only(view, window);
+            let image = window.shot_element_bounds("pdf-page-image-0").unwrap();
+            let pdf = view.pdf.as_ref().unwrap().1.read(cx);
+            let page = pdf.page_screen_bounds(0, (0., 0., 1., 1.)).unwrap()
+                .intersect(&window.shot_element_bounds("pdf-scroll").unwrap());
+            assert!((image.origin.x - page.origin.x).abs() < px(0.6), "{image:?} vs {page:?}");
+            assert!((image.origin.y - page.origin.y).abs() < px(0.6), "{image:?} vs {page:?}");
+            assert!((image.size.width - page.size.width).abs() < px(1.1), "{image:?} vs {page:?}");
+            assert!((image.size.height - page.size.height).abs() < px(1.1), "{image:?} vs {page:?}");
+            let text = gpui_pdf::extract_page_text(&gpui_pdf::parse(updated.into()).unwrap(), 0).unwrap();
+            let r = text.locate("Updated", 0)[0];
+            let expected = pdf.page_screen_bounds(0, (r.x, r.y, r.w, r.h)).unwrap();
+            let actual = window.shot_element_bounds("pdf-selection-0-0").unwrap();
+            assert!((actual.origin.x - expected.origin.x).abs() < px(0.6));
+            assert!((actual.origin.y - expected.origin.y).abs() < px(0.6));
+            assert!((actual.size.width - expected.size.width).abs() < px(1.1));
+            assert!((actual.size.height - expected.size.height).abs() < px(1.1));
+        })?;
+        runner.step(Step::Click { id: Some("comment-pdf-selection".into()), x: None, y: None }, cx).await?;
         runner.update(cx, |view, _, _| {
             let target = view.comment_target.as_ref().expect("PDF comment target");
             assert_eq!(target.card, "lemma");
             assert_eq!(target.quote.as_ref().unwrap().split_whitespace().collect::<String>(), "Updated");
-            assert!(view.paper_pdf.popup.is_some());
+            assert!(view.paper_pdf.popup.is_none());
         })?;
+
+        // Consecutive clicks select a word or line. The initial single click must
+        // never open the card preview when it turns into a multi-click gesture.
+        for clicks in [2, 3] {
+            let position = runner.update(cx, |view, _, cx| {
+                let page = view.pdf.as_ref().unwrap().1.read(cx);
+                page.page_screen_bounds(0, (0.155, 0.122, 0., 0.)).unwrap().origin
+            })?;
+            cx.update_window(runner.handle, |_, window, cx| {
+                window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position, ..Default::default() }), cx);
+                for click_count in 1..=clicks {
+                    window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent { position, click_count, ..Default::default() }), cx);
+                    window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent { position, click_count, ..Default::default() }), cx);
+                }
+            })?;
+            runner.wait_for(cx, "PDF multi-click comment", TIMEOUT_MS, |view, _| view.paper_pdf.selection_comment.is_some()).await?;
+            pause(cx, 550).await;
+            runner.frame(cx)?;
+            runner.update(cx, |view, window, _| assert_comment_only(view, window))?;
+        }
+        check_pdf_cross_page_drag(runner, cx).await?;
+        Ok(())
+    }
+
+    async fn check_pdf_cross_page_drag(runner: &Runner, cx: &mut AsyncApp) -> Result<()> {
+        runner.update(cx, |view, _, cx| {
+            let (_, pdf) = view.pdf.as_ref().unwrap();
+            pdf.update(cx, |pdf, cx| {
+                pdf.replace_bytes(test_pdf_pages(&[("First tail", 1000, 860), ("Second head", 1000, 930)]), cx);
+                pdf.set_zoom(0.75, cx);
+                pdf.go_to_page(0, cx);
+            });
+        })?;
+        runner.wait_for_with_context(cx, "two-page test PDF", TIMEOUT_MS, |view, _, cx| {
+            let pdf = view.pdf.as_ref().unwrap().1.read(cx);
+            pdf.page_ready(0) && pdf.page_screen_bounds(1, (0., 0., 1., 1.)).is_some()
+        }).await?;
+        let (start, edge) = runner.update(cx, |view, window, cx| {
+            let pdf = view.pdf.as_ref().unwrap().1.read(cx);
+            let start = pdf.page_screen_bounds(0, (0.131, 0.135, 0., 0.)).unwrap().origin;
+            let viewport = window.shot_element_bounds("pdf-scroll").unwrap();
+            assert!(viewport.contains(&start));
+            (start, point(start.x, viewport.bottom() - px(2.0)))
+        })?;
+        cx.update_window(runner.handle, |_, window, cx| {
+            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: start, ..Default::default() }), cx);
+            window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent { position: start, click_count: 1, ..Default::default() }), cx);
+            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: edge, pressed_button: Some(gpui_kit::MouseButton::Left), ..Default::default() }), cx);
+        })?;
+        let end_point = |view: &Workbench, cx: &Context<Workbench>| {
+            let pdf = view.pdf.as_ref().unwrap().1.read(cx);
+            pdf.page_screen_bounds(1, (0.30, 0.065, 0., 0.)).unwrap().origin
+        };
+        // Hold the pointer still. Only drag auto-scroll can make the second
+        // page's text visible from this starting position.
+        runner.wait_for_with_context(cx, "PDF drag auto-scroll", TIMEOUT_MS, |view, window, cx| {
+            end_point(view, cx).y < window.shot_element_bounds("pdf-scroll").unwrap().bottom() - px(40.)
+        }).await?;
+        let end = runner.update(cx, |view, window, cx| {
+            let end = end_point(view, cx);
+            assert!(window.shot_element_bounds("pdf-scroll").unwrap().contains(&end));
+            end
+        })?;
+        cx.update_window(runner.handle, |_, window, cx| {
+            window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent { position: end, click_count: 1, ..Default::default() }), cx);
+        })?;
+        runner.wait_for_with_context(cx, "two-page PDF copy", TIMEOUT_MS, |view, _, cx| {
+            view.pdf.as_ref().unwrap().1.read(cx).selected_text().as_deref() == Some("First tail\n\nSecond head")
+        }).await?;
         Ok(())
     }
 

@@ -28,13 +28,13 @@ pub(super) struct PaperPdf {
     selected_paths: HashMap<String, String>,
     requested: HashSet<String>,
     pub(super) popup: Option<PdfPopup>,
+    pub(super) selection_comment: Option<(CommentTarget, Point<Pixels>)>,
 }
 
 pub(super) struct PdfPopup {
     pub(super) card: String,
     proof: bool,
     position: Point<Pixels>,
-    quote: Option<String>,
 }
 
 impl Workbench {
@@ -60,6 +60,7 @@ impl Workbench {
             self.notice = None;
         } else {
             self.paper_pdf.decks.remove(&self.deck);
+            self.paper_pdf.selection_comment = None;
         }
         cx.notify();
     }
@@ -207,6 +208,7 @@ impl Workbench {
                     .read(cx)
                     .loaded_bytes()
                     .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+                self.paper_pdf.selection_comment = None;
                 self.highlight_pdf_popup(cx);
             }
             PdfEvent::PageClicked {
@@ -214,35 +216,52 @@ impl Workbench {
                 x,
                 y,
                 position,
+                secondary: false,
+                click_count: 1,
                 ..
             } if self.paper_pdf_visible() => {
                 if self.paper_pdf.popup.is_some() {
                     self.dismiss_pdf_popup(cx);
                 } else if view.read(cx).page_ready(*page) {
-                    self.open_pdf_popup(*page, *x, *y, *position, None, cx);
+                    self.open_pdf_popup(*page, *x, *y, *position, cx);
                 }
             }
             PdfEvent::ViewportClicked if self.paper_pdf_visible() => self.dismiss_pdf_popup(cx),
+            PdfEvent::SelectionCleared => {
+                if self.paper_pdf.selection_comment.take().is_some() {
+                    cx.notify();
+                }
+            }
             PdfEvent::PageTextSelected {
                 page,
                 x,
                 y,
                 position,
                 text,
-            } if self.paper_pdf_visible()
-                && self.paper_pdf.popup.is_none()
-                && view.read(cx).page_ready(*page) =>
-            {
-                self.open_pdf_popup(*page, *x, *y, *position, Some(text.clone()), cx);
+            } if self.paper_pdf_visible() && self.pdf_path.as_deref() == Some(path) => {
+                // Preserve the draft if the card editor was already open.
+                let editing_popup = self.paper_pdf.popup.as_ref().is_some_and(|popup| {
+                    self.card_editor(&popup.card, false).is_some()
+                        || self.card_editor(&popup.card, true).is_some()
+                });
+                if !editing_popup {
+                    self.dismiss_pdf_popup(cx);
+                }
+                if let Some((card, proof)) = self.pdf_card_at(*page, *x, *y) {
+                    let quote = text.replace('\\', "\\\\").replace('$', "\\$");
+                    let target = CommentTarget { card, proof, quote: Some(quote), source: None };
+                    self.paper_pdf.selection_comment = Some((target, *position));
+                    cx.notify();
+                }
             }
             PdfEvent::PageClicked {
                 page,
                 x,
                 y,
-                secondary,
-                click_count,
+                secondary: true,
+                click_count: 1,
                 ..
-            } if self.right == RightPane::Pdf && (*secondary || *click_count >= 2) => {
+            } if self.right == RightPane::Pdf => {
                 let _ = self.out.send(ClientMsg::LocatePdf {
                     pdf: path.into(),
                     page: *page,
@@ -254,17 +273,8 @@ impl Workbench {
         }
     }
 
-    fn open_pdf_popup(
-        &mut self,
-        page: usize,
-        x: f32,
-        y: f32,
-        position: Point<Pixels>,
-        quote: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let hit = self
-            .pdf_regions()
+    fn pdf_card_at(&self, page: usize, x: f32, y: f32) -> Option<(String, bool)> {
+        self.pdf_regions()
             .into_iter()
             .flatten()
             .filter(|region| {
@@ -275,21 +285,29 @@ impl Workbench {
                     && self.cards.iter().any(|card| card.id == region.card)
             })
             .min_by(|a, b| (a.rect[2] * a.rect[3]).total_cmp(&(b.rect[2] * b.rect[3])))
-            .map(|region| (region.card.clone(), region.proof));
-        if let Some((card, proof)) = hit {
+            .map(|region| (region.card.clone(), region.proof))
+    }
+
+    fn open_pdf_popup(
+        &mut self,
+        page: usize,
+        x: f32,
+        y: f32,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((card, proof)) = self.pdf_card_at(page, x, y) {
             self.load_card_content(card.clone(), cx);
-            self.paper_pdf.popup = Some(PdfPopup {
-                card,
-                proof,
-                position,
-                quote,
-            });
+            self.paper_pdf.popup = Some(PdfPopup { card, proof, position });
             self.highlight_pdf_popup(cx);
             cx.notify();
         }
     }
 
     pub(super) fn dismiss_pdf_popup(&mut self, cx: &mut Context<Self>) {
+        if self.paper_pdf.selection_comment.take().is_some() {
+            cx.notify();
+        }
         let Some(popup) = self.paper_pdf.popup.take() else {
             return;
         };
@@ -372,6 +390,23 @@ impl Workbench {
         if !self.paper_pdf_visible() {
             return None;
         }
+        if let Some((target, position)) = &self.paper_pdf.selection_comment {
+            let target = target.clone();
+            let viewport = window.viewport_size();
+            let x = (position.x + px(8.)).clamp(px(8.), (viewport.width - px(128.)).max(px(8.)));
+            let y = (position.y + px(8.)).clamp(px(8.), (viewport.height - px(40.)).max(px(8.)));
+            return Some(deferred(anchored().position(point(x, y)).child(
+                div().id("pdf-selection-comment").occlude().child(
+                    Button::new("comment-pdf-selection")
+                        .small()
+                        .label(tr!("paper-comment"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.paper_pdf.selection_comment = None;
+                            this.start_comment(target.clone(), window, cx);
+                        })),
+                ),
+            )).with_priority(1));
+        }
         let popup = self.paper_pdf.popup.as_ref()?;
         let id = &popup.card;
         let proof = popup.proof;
@@ -443,10 +478,7 @@ impl Workbench {
         );
         let target = CommentTarget {
             card: id.clone(),
-            quote: popup
-                .quote
-                .as_ref()
-                .map(|quote| quote.replace('\\', "\\\\").replace('$', "\\$")),
+            quote: None,
             source: None,
             proof,
         };
@@ -512,3 +544,5 @@ impl Workbench {
         Some(deferred(anchored().position(point(x, y)).child(panel)).with_priority(1))
     }
 }
+#[cfg(test)]
+mod selection_tests;

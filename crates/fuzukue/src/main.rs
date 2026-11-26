@@ -2481,7 +2481,9 @@ impl Workbench {
         } else if self.right == RightPane::Files && !self.settings_open {
             self.close_file_browser(window, cx);
         } else if self.history.close() {
-        } else if self.paper_pdf_visible() && self.paper_pdf.popup.is_some() {
+        } else if self.paper_pdf_visible()
+            && (self.paper_pdf.popup.is_some() || self.paper_pdf.selection_comment.is_some())
+        {
             self.dismiss_pdf_popup(cx);
         } else if self.settings_open {
             self.settings_open = false;

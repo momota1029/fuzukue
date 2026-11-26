@@ -15,7 +15,8 @@ use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
     InterpreterCache, InterpreterSettings, SoftMask, TransformExt, interpret_page,
 };
-use kurbo::{BezPath, Point, Rect, Shape};
+use hayro::hayro_syntax::page::Rotation;
+use kurbo::{Affine, BezPath, Point, Rect, Shape, Vec2};
 
 use crate::Document;
 
@@ -37,8 +38,15 @@ impl NormRect {
     fn bottom(&self) -> f32 {
         self.y + self.h
     }
-    fn center_y(&self) -> f32 {
-        self.y + self.h / 2.0
+    fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        Self {
+            x,
+            y,
+            w: self.right().max(other.right()) - x,
+            h: self.bottom().max(other.bottom()) - y,
+        }
     }
 }
 
@@ -59,26 +67,30 @@ pub struct Selection {
     pub rects: Vec<NormRect>,
 }
 
-/// Squared distance from a normalized point to a rect (0 if inside).
-fn dist2(p: NormPoint, r: NormRect) -> f32 {
-    let dx = (r.x - p.x).max(p.x - r.right()).max(0.0);
-    let dy = (r.y - p.y).max(p.y - r.bottom()).max(0.0);
-    dx * dx + dy * dy
+/// How a pointer gesture expands its endpoints.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum SelectionKind {
+    #[default]
+    Drag,
+    Word,
+    Line,
 }
 
-/// One extracted glyph cluster: its text (usually one char; a ligature may be
-/// several) and its bounding rect on the page.
+/// A glyph cluster, with its visible ink and its baseline in unrotated page points.
 struct Run {
     text: String,
     rect: NormRect,
+    reading_x: f32,
+    reading_right: f32,
+    baseline: f32,
+    em: f32,
 }
 
-/// A device that ignores everything except glyphs, recording each one's unicode text
-/// and normalized bounding rect — the entire text layer in one interpret pass.
 struct Collector {
     runs: Vec<Run>,
-    page_w: f32,
-    page_h: f32,
+    width: f32,
+    height: f32,
+    rotation: Rotation,
 }
 
 impl<'a> Device<'a> for Collector {
@@ -93,356 +105,615 @@ impl<'a> Device<'a> for Collector {
         &mut self,
         run: &GlyphRun<'_, 'a>,
         props: DrawProps<'a>,
-        // Note: we record *all* glyphs, including `Invisible` ones — that's the
-        // searchable text layer over scanned/OCR'd page images.
+        // Invisible glyphs can be the OCR layer over a scanned page.
         _draw_mode: &DrawMode,
     ) {
         for glyph in run.glyphs() {
-            // Mirrors hayro's own renderer: text space → device.
             self.glyph(glyph, props.transform * glyph.transform());
         }
     }
 }
 
 impl Collector {
-    fn glyph(&mut self, glyph: &Glyph<'_>, m: kurbo::Affine) {
+    fn reading_point(&self, p: Point) -> Point {
+        let (w, h) = (f64::from(self.width), f64::from(self.height));
+        match self.rotation {
+            Rotation::None => p,
+            Rotation::Horizontal => Point::new(p.y, w - p.x),
+            Rotation::Flipped => Point::new(w - p.x, h - p.y),
+            Rotation::FlippedHorizontal => Point::new(h - p.y, p.x),
+        }
+    }
+
+    fn glyph(&mut self, glyph: &Glyph<'_>, transform: Affine) {
         let text = match glyph.as_unicode() {
             Some(BfString::Char(c)) => c.to_string(),
             Some(BfString::String(s)) => s,
-            None => return, // no unicode → can't match against a quote; skip
+            None => return,
         };
-        // On-page bbox: the glyph outline transformed by `m`. Device space here is
-        // page points with a top-left origin (we run at scale 1 with
-        // `initial_transform(true)`).
-        // Keep the PDF's own whitespace glyphs (normalized to one space): they mark
-        // real word boundaries, so words aren't run together and — crucially — a font's
-        // intra-word letter-spacing isn't mistaken for a space. They have no outline,
-        // so use a thin box at the pen origin.
+        let origin = transform.translation().to_point();
+        let baseline = self.reading_point(origin);
+        // Hayro places glyph outlines in 1000-unit font space.
+        let em = (transform * Point::new(0.0, 1000.0) - origin).hypot() as f32;
         let (text, bbox) = if text.chars().all(char::is_whitespace) {
-            let p = m.translation();
-            (" ".to_string(), Rect::new(p.x, p.y, p.x + 1.0, p.y + 1.0))
+            // Spaces carry word boundaries even though they have no outline.
+            (" ".to_owned(), Rect::from_origin_size(origin, (1.0, 1.0)))
         } else {
             let bbox = match glyph {
-                Glyph::Outline(o) => {
-                    // Transform the glyph-space bbox corners by `m`, take their extent.
-                    let gb = o.outline().bounding_box();
-                    let corners = [
-                        m * Point::new(gb.x0, gb.y0),
-                        m * Point::new(gb.x1, gb.y0),
-                        m * Point::new(gb.x1, gb.y1),
-                        m * Point::new(gb.x0, gb.y1),
-                    ];
-                    let mut min = corners[0];
-                    let mut max = corners[0];
-                    for c in &corners[1..] {
-                        min.x = min.x.min(c.x);
-                        min.y = min.y.min(c.y);
-                        max.x = max.x.max(c.x);
-                        max.y = max.y.max(c.y);
-                    }
-                    Rect::new(min.x, min.y, max.x, max.y)
+                Glyph::Outline(outline) => {
+                    transform.transform_rect_bbox(outline.outline().bounding_box())
                 }
-                // Type3 glyphs (rare: procedural/bitmap) — point box at the pen origin.
-                Glyph::Type3(_) => {
-                    let p = m.translation();
-                    Rect::new(p.x, p.y - 1.0, p.x + 1.0, p.y)
-                }
+                Glyph::Type3(_) => Rect::from_origin_size(origin - Vec2::new(0.0, 1.0), (1.0, 1.0)),
             };
             (text, bbox)
         };
-        if self.page_w <= 0.0 || self.page_h <= 0.0 {
-            return;
-        }
-        let rect = NormRect {
-            x: (bbox.x0 as f32 / self.page_w).clamp(0.0, 1.0),
-            y: (bbox.y0 as f32 / self.page_h).clamp(0.0, 1.0),
-            w: ((bbox.x1 - bbox.x0) as f32 / self.page_w).clamp(0.0, 1.0),
-            h: ((bbox.y1 - bbox.y0) as f32 / self.page_h).clamp(0.0, 1.0),
-        };
-        self.runs.push(Run { text, rect });
+        let x0 = (bbox.x0 as f32).clamp(0.0, self.width);
+        let x1 = (bbox.x1 as f32).clamp(0.0, self.width);
+        let y0 = (bbox.y0 as f32).clamp(0.0, self.height);
+        let y1 = (bbox.y1 as f32).clamp(0.0, self.height);
+        let a = self.reading_point(Point::new(x0.into(), y0.into()));
+        let b = self.reading_point(Point::new(x1.into(), y1.into()));
+        self.runs.push(Run {
+            text,
+            rect: NormRect {
+                x: x0 / self.width,
+                y: y0 / self.height,
+                w: (x1 - x0) / self.width,
+                h: (y1 - y0) / self.height,
+            },
+            reading_x: a.x.min(b.x) as f32,
+            reading_right: a.x.max(b.x) as f32,
+            baseline: baseline.y as f32,
+            em,
+        });
     }
 }
 
-/// Extract the text layer of page `index` (0-based). Runs a non-rasterizing
-/// interpret pass — cheaper than rendering, but still parses the page, so a host
-/// should cache the result. Returns `None` if the page doesn't exist.
+/// Extract the text layer of page `index` (0-based) without rasterizing it.
 pub fn extract_page_text(doc: &Document, index: usize) -> Option<PageText> {
     let page = doc.pages().get(index)?;
-    let (page_w, page_h) = page.render_dimensions();
-    // Scale 1 + `initial_transform(true)` → device space is page points, top-left
-    // origin, which we normalize by the page size.
-    let initial = page.initial_transform(true).to_kurbo();
+    let (width, height) = page.render_dimensions();
     let cache = InterpreterCache::new();
     let mut ctx = Context::new(
-        initial,
-        Rect::new(0.0, 0.0, page_w as f64, page_h as f64),
+        page.initial_transform(true).to_kurbo(),
+        Rect::new(0.0, 0.0, width.into(), height.into()),
         &cache,
         page.xref(),
         InterpreterSettings::default(),
     );
     let mut collector = Collector {
         runs: Vec::new(),
-        page_w,
-        page_h,
+        width,
+        height,
+        rotation: page.rotation(),
     };
     interpret_page(page, &mut ctx, &mut collector);
-    Some(PageText::new(collector.runs))
+    let reading_width = match page.rotation() {
+        Rotation::Horizontal | Rotation::FlippedHorizontal => height,
+        _ => width,
+    };
+    Some(PageText::with_dimensions(
+        collector.runs,
+        reading_width,
+        width / height,
+    ))
 }
 
-/// A page's extracted text: the runs in draw order, plus a whitespace-stripped,
-/// lowercased index for robust quote matching.
-pub struct PageText {
-    runs: Vec<Run>,
-    /// Lowercased, whitespace-removed concatenation of every run's text — what
-    /// [`locate`](PageText::locate) searches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Left,
+    Right,
+    Spanning,
+}
+
+struct Line {
+    runs: Vec<usize>,
+    column: Column,
+}
+
+struct Row {
+    runs: Vec<usize>,
+    baseline: f32,
+    em: f32,
+}
+
+fn reading_lines(runs: &[Run], page_width: f32) -> Vec<Line> {
+    let mut visible: Vec<_> = (0..runs.len())
+        .filter(|&id| runs[id].rect.w > 0.0 && runs[id].rect.h > 0.0)
+        .collect();
+    visible.sort_by(|&a, &b| runs[a].baseline.total_cmp(&runs[b].baseline));
+
+    // Group by baseline, allowing small baseline shifts for scripts in math.
+    // Use the largest font as the reference so a tall union of ink cannot absorb
+    // the next row and a tiny superscript does not become the row's baseline.
+    let mut rows: Vec<Row> = Vec::new();
+    for id in visible {
+        let glyph = &runs[id];
+        if let Some(row) = rows.last_mut() {
+            if (row.baseline - glyph.baseline).abs() <= row.em.max(glyph.em) * 0.46 {
+                row.runs.push(id);
+                if glyph.em > row.em {
+                    row.baseline = glyph.baseline;
+                    row.em = glyph.em;
+                }
+                continue;
+            }
+        }
+        rows.push(Row {
+            runs: vec![id],
+            baseline: glyph.baseline,
+            em: glyph.em,
+        });
+    }
+
+    // First split rows at large horizontal gaps. A recurring gap in the body
+    // identifies a column gutter. Each candidate is scored against all gap intervals.
+    let mut gaps = Vec::new();
+    let mut previous_ink: Option<(f32, f32, f32, f32)> = None;
+    for row in &mut rows {
+        row.runs.sort_by(|&a, &b| {
+            runs[a]
+                .reading_x
+                .total_cmp(&runs[b].reading_x)
+                .then(a.cmp(&b))
+        });
+        let min_gap = (row.em * 2.5).max(page_width * 0.025);
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        for &id in &row.runs {
+            let glyph = &runs[id];
+            if glyph.text == " " {
+                continue;
+            }
+            if is_gutter(right, glyph.reading_x, min_gap, page_width) {
+                gaps.push((right, glyph.reading_x));
+            }
+            left = left.min(glyph.reading_x);
+            right = right.max(glyph.reading_right);
+        }
+        // Two columns can have different leading. Nearby rows with disjoint ink
+        // give the same evidence as two fragments on one shared baseline.
+        if let Some((old_left, old_right, baseline, em)) = previous_ink
+            && row.baseline - baseline <= 1.6 * row.em.max(em)
+        {
+            let (end, start) = if old_left < left {
+                (old_right, left)
+            } else {
+                (right, old_left)
+            };
+            if is_gutter(end, start, min_gap, page_width) {
+                gaps.push((end, start));
+            }
+        }
+        if left < right {
+            previous_ink = Some((left, right, row.baseline, row.em));
+        }
+    }
+    let gutter = column_gutter(&gaps, page_width);
+
+    // Read down each column until a spanning row or a large vertical break,
+    // then resume column-by-column below it.
+    let mut lines = Vec::new();
+    let mut right_column = Vec::new();
+    let mut previous: Option<(f32, f32)> = None;
+    for row in rows {
+        if previous.is_some_and(|(baseline, em)| row.baseline - baseline > 2.5 * em.max(row.em)) {
+            lines.append(&mut right_column);
+        }
+        previous = Some((row.baseline, row.em));
+        if let Some(x) = gutter {
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            for &id in &row.runs {
+                if runs[id].reading_x < x {
+                    left.push(id);
+                } else {
+                    right.push(id);
+                }
+            }
+            // A row with ink on both sides but no gutter-sized break crosses it.
+            let left_end = left
+                .iter()
+                .filter(|&&id| runs[id].text != " ")
+                .map(|&id| runs[id].reading_right)
+                .reduce(f32::max);
+            let right_start = right
+                .iter()
+                .find(|&&id| runs[id].text != " ")
+                .map(|&id| runs[id].reading_x);
+            let crosses = match (left_end, right_start) {
+                (Some(end), Some(start)) => start - end < (row.em * 2.5).max(page_width * 0.025),
+                (Some(end), None) => end >= x,
+                _ => false,
+            };
+            if !crosses {
+                if left_end.is_some() {
+                    lines.push(Line {
+                        runs: left,
+                        column: Column::Left,
+                    });
+                }
+                if right_start.is_some() {
+                    right_column.push(Line {
+                        runs: right,
+                        column: Column::Right,
+                    });
+                }
+                continue;
+            }
+        }
+        lines.append(&mut right_column);
+        lines.push(Line {
+            runs: row.runs,
+            column: Column::Spanning,
+        });
+    }
+    lines.append(&mut right_column);
+    lines
+}
+
+fn column_gutter(gaps: &[(f32, f32)], page_width: f32) -> Option<f32> {
+    // Sweep the gap endpoints so a gutter can be found even between lines
+    // with very different ink widths. Prefer the page center on ties.
+    let mut edges: Vec<_> = gaps.iter().flat_map(|&(a, b)| [(a, 1), (b, -1)]).collect();
+    edges.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+    let mut active = 0;
+    let mut best = None;
+    for pair in edges.windows(2) {
+        let [(start, delta), (end, _)] = [pair[0], pair[1]];
+        active += delta;
+        if active < 2 || start >= end {
+            continue;
+        }
+        let inset = page_width * 0.01;
+        let x = if end - start > 2.0 * inset {
+            (page_width * 0.5).clamp(start + inset, end - inset)
+        } else {
+            (start + end) * 0.5
+        };
+        let score = (active, -(x - page_width * 0.5).abs());
+        if best.is_none_or(|(previous, _)| score > previous) {
+            best = Some((score, x));
+        }
+    }
+    best.map(|(_, x)| x)
+}
+
+fn is_gutter(left_end: f32, right_start: f32, min_gap: f32, width: f32) -> bool {
+    right_start - left_end >= min_gap && left_end > width * 0.16 && right_start < width * 0.84
+}
+
+#[derive(Clone)]
+struct TextIndex {
     letters: String,
-    /// `owner[b]` is the run index that produced byte `b` of `letters` (byte-aligned,
-    /// so byte offsets from `find` / slicing map straight to runs, even across
-    /// multi-byte chars).
+    // One entry per byte. Match offsets are always at UTF-8 boundaries.
     owner: Vec<usize>,
 }
 
-impl PageText {
-    fn new(runs: Vec<Run>) -> Self {
+impl TextIndex {
+    fn new(runs: &[Run], ids: impl IntoIterator<Item = usize>) -> Self {
         let mut letters = String::new();
         let mut owner = Vec::new();
-        for (ri, run) in runs.iter().enumerate() {
-            for ch in run.text.chars() {
-                if ch.is_whitespace() {
-                    continue;
-                }
-                for lc in ch.to_lowercase() {
-                    let before = letters.len();
-                    letters.push(lc);
-                    // One owner entry per *byte*, so byte indices from `find` /
-                    // slicing line up with `owner` even for multi-byte (non-ASCII)
-                    // chars — otherwise a byte index can land mid-char and panic.
-                    for _ in before..letters.len() {
-                        owner.push(ri);
-                    }
-                }
+        for id in ids {
+            letters.extend(
+                runs[id]
+                    .text
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .flat_map(char::to_lowercase),
+            );
+            owner.resize(letters.len(), id);
+        }
+        Self { letters, owner }
+    }
+
+    fn matches<'a>(&'a self, key: &'a str) -> impl Iterator<Item = Vec<usize>> + 'a {
+        let mut from = 0;
+        std::iter::from_fn(move || {
+            if key.is_empty() {
+                return None;
+            }
+            let start = from + self.letters.get(from..)?.find(key)?;
+            from = start + self.letters[start..].chars().next()?.len_utf8();
+            let mut ids = self.owner[start..start + key.len()].to_vec();
+            ids.dedup();
+            Some(ids)
+        })
+    }
+}
+
+fn search_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Extracted glyphs and their visual reading order, with a separate index for
+/// matching stored quotes in the original PDF stream order.
+pub struct PageText {
+    runs: Vec<Run>,
+    lines: Vec<Line>,
+    layout_order: Vec<(usize, usize)>,
+    run_lines: Vec<Option<usize>>,
+    stream_index: TextIndex,
+    aspect: f32,
+}
+
+impl PageText {
+    #[cfg(test)]
+    fn new(runs: Vec<Run>) -> Self {
+        Self::with_dimensions(runs, 1.0, 1.0)
+    }
+
+    fn with_dimensions(runs: Vec<Run>, width: f32, aspect: f32) -> Self {
+        let lines = reading_lines(&runs, width);
+        let mut layout_order = Vec::new();
+        let mut run_lines = vec![None; runs.len()];
+        for (line, row) in lines.iter().enumerate() {
+            for &id in &row.runs {
+                layout_order.push((line, id));
+                run_lines[id] = Some(line);
             }
         }
+        let stream_index = TextIndex::new(&runs, 0..runs.len());
         Self {
             runs,
-            letters,
-            owner,
+            lines,
+            layout_order,
+            run_lines,
+            stream_index,
+            aspect,
         }
     }
 
-    /// Whether the page has any extractable text (false for pure scans with no OCR
-    /// layer — the host should then fall back to area markup).
+    /// Whether the visible page has selectable text.
     pub fn is_empty(&self) -> bool {
-        self.runs.is_empty()
+        self.layout_order
+            .iter()
+            .all(|&(_, id)| self.runs[id].text == " ")
     }
 
-    /// The whitespace-stripped, lowercased search key for `s` — the same normalization
-    /// `letters` is built with, so a key produced here matches against it.
-    fn search_key(s: &str) -> String {
-        s.chars()
-            .filter(|c| !c.is_whitespace())
-            .flat_map(|c| c.to_lowercase())
-            .collect()
-    }
-
-    /// A readable reconstruction of the page text (spaces inserted on horizontal
-    /// gaps, newlines on baseline changes). For search / display — `locate` uses the
-    /// whitespace-insensitive index instead.
+    /// Reconstruct the page text in reading order.
     pub fn text(&self) -> String {
-        Self::join_runs(&self.runs, true)
+        self.join_runs(&self.layout_order, '\n')
     }
 
-    /// Walk `runs`, appending each run's text with a break inserted between two *real*
-    /// glyphs (the PDF's own space glyphs carry word breaks, so spaces are excluded from
-    /// the compare — an unreliable space rect mustn't force a break). With `newlines`, a
-    /// baseline change becomes a newline and a horizontal gap a space (the readable
-    /// reconstruction); without it, either one becomes a single space (the one-line join).
-    fn join_runs(runs: &[Run], newlines: bool) -> String {
+    fn join_runs(&self, order: &[(usize, usize)], line_break: char) -> String {
         let mut out = String::new();
-        let mut prev: Option<&Run> = None;
-        for run in runs {
-            if let Some(p) = prev
-                && run.text != " "
-                && p.text != " "
-            {
-                let line_h = run.rect.h.max(p.rect.h).max(0.001);
-                let new_line = (run.rect.center_y() - p.rect.center_y()).abs() > line_h * 0.6;
-                let gap = run.rect.x - p.rect.right() > line_h * 0.6;
-                if newlines {
-                    if new_line {
-                        out.push('\n');
-                    } else if gap && !out.ends_with(|c: char| c.is_whitespace()) {
-                        out.push(' ');
-                    }
-                } else if new_line || gap {
+        let mut previous: Option<(usize, &Run)> = None;
+        for &(line, id) in order {
+            let run = &self.runs[id];
+            if let Some((prev_line, prev)) = previous {
+                if prev_line != line {
+                    out.truncate(out.trim_end().len());
+                    out.push(line_break);
+                } else if Self::word_gap(prev, run) {
                     out.push(' ');
                 }
             }
-            out.push_str(&run.text);
-            prev = Some(run);
-        }
-        out
-    }
-
-    /// Locate the `occurrence`-th (0-based) case- and whitespace-insensitive match of
-    /// `needle` on the page and return one normalized rect per line it spans (so a
-    /// wrapped quote highlights as multiple line boxes). Empty if not found.
-    pub fn locate(&self, needle: &str, occurrence: usize) -> Vec<NormRect> {
-        let key = Self::search_key(needle);
-        if key.is_empty() {
-            return Vec::new();
-        }
-        // Find the nth occurrence's byte range in `letters`.
-        let mut from = 0;
-        let mut hit = None;
-        for _ in 0..=occurrence {
-            match self.letters[from..].find(&key) {
-                Some(rel) => {
-                    let start = from + rel;
-                    hit = Some(start);
-                    from = start + 1;
-                }
-                None => {
-                    hit = None;
-                    break;
-                }
+            if run.text != " " || (!out.is_empty() && !out.ends_with(char::is_whitespace)) {
+                out.push_str(&run.text);
             }
+            previous = Some((line, run));
         }
-        let Some(start) = hit else {
-            return Vec::new();
-        };
-        let end = start + key.len();
-        // Map the matched byte range to the set of runs it covers (in order).
-        let mut run_ids: Vec<usize> = self.owner[start..end].to_vec();
-        run_ids.dedup();
-        self.group_lines(&run_ids)
-    }
-
-    /// Every (non-overlapping) case- and whitespace-insensitive match of `needle` on
-    /// the page, each as one normalized rect per line it spans (for find-in-PDF).
-    /// Matches are returned in reading order. (`search` feature.)
-    #[cfg(feature = "search")]
-    pub fn find_matches(&self, needle: &str) -> Vec<Vec<NormRect>> {
-        let key = Self::search_key(needle);
-        if key.is_empty() {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        let mut from = 0;
-        while let Some(rel) = self.letters[from..].find(&key) {
-            let start = from + rel;
-            let end = start + key.len();
-            let mut run_ids: Vec<usize> = self.owner[start..end].to_vec();
-            run_ids.dedup();
-            out.push(self.group_lines(&run_ids));
-            from = end; // non-overlapping
-        }
+        out.truncate(out.trim_end().len());
         out
     }
 
-    /// Merge a set of run indices into one rect per text line (runs sharing a
-    /// baseline), so a multi-line match yields one box per line.
-    fn group_lines(&self, run_ids: &[usize]) -> Vec<NormRect> {
-        let mut rects: Vec<NormRect> = run_ids.iter().map(|&i| self.runs[i].rect).collect();
-        // Reading order: top-to-bottom, then left-to-right.
-        rects.sort_by(|a, b| {
-            a.y.partial_cmp(&b.y)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        let mut lines: Vec<NormRect> = Vec::new();
-        for r in rects {
-            if let Some(last) = lines.last_mut() {
-                let line_h = last.h.max(r.h).max(0.001);
-                if (r.center_y() - last.center_y()).abs() <= line_h * 0.6 {
-                    // Same line — extend the union.
-                    let x = last.x.min(r.x);
-                    let y = last.y.min(r.y);
-                    let right = last.right().max(r.right());
-                    let bottom = last.bottom().max(r.bottom());
-                    *last = NormRect {
-                        x,
-                        y,
-                        w: right - x,
-                        h: bottom - y,
-                    };
+    fn word_gap(a: &Run, b: &Run) -> bool {
+        a.text != " " && b.text != " " && b.reading_x - a.reading_right > 0.32 * a.em.max(b.em)
+    }
+
+    // Append reading-order matches after stream-order matches. Any occurrence
+    // already stored by the viewer still addresses the same PDF glyphs.
+    fn anchor_indices(&self) -> impl Iterator<Item = std::borrow::Cow<'_, TextIndex>>
+    where
+        TextIndex: Clone,
+    {
+        use std::borrow::Cow;
+        std::iter::once(Cow::Borrowed(&self.stream_index)).chain(
+            [None, Some(Column::Left), Some(Column::Right)]
+                .into_iter()
+                .map(|column| {
+                    Cow::Owned(TextIndex::new(
+                        &self.runs,
+                        self.layout_order
+                            .iter()
+                            .filter(|&&(line, _)| self.in_column(line, column))
+                            .map(|&(_, id)| id),
+                    ))
+                }),
+        )
+    }
+
+    /// Locate a saved quote by its occurrence, preserving PDF stream-order anchors.
+    pub fn locate(&self, needle: &str, occurrence: usize) -> Vec<NormRect> {
+        self.find_anchor(&search_key(needle), |i, _| i == occurrence)
+            .map_or_else(Vec::new, |(_, ids)| self.rects_for_runs(ids))
+    }
+
+    fn find_anchor(
+        &self,
+        key: &str,
+        mut accepts: impl FnMut(usize, &[usize]) -> bool,
+    ) -> Option<(usize, Vec<usize>)> {
+        if key.is_empty() {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut occurrence = 0;
+        for (stream, index) in self.anchor_indices().enumerate() {
+            for ids in index.matches(key) {
+                if stream != 0 && seen.contains(&ids) {
                     continue;
                 }
+                if accepts(occurrence, &ids) {
+                    return Some((occurrence, ids));
+                }
+                seen.insert(ids);
+                occurrence += 1;
             }
-            lines.push(r);
         }
-        lines
+        None
     }
 
-    /// The index of the run nearest a normalized point (0 distance if inside it).
+    /// Every case- and whitespace-insensitive match in reading order.
+    #[cfg(feature = "search")]
+    pub fn find_matches(&self, needle: &str) -> Vec<Vec<NormRect>> {
+        let key = search_key(needle);
+        if key.is_empty() {
+            return Vec::new();
+        }
+        let index = TextIndex::new(&self.runs, self.layout_order.iter().map(|&(_, id)| id));
+        index
+            .letters
+            .match_indices(&key)
+            .map(|(start, _)| {
+                self.rects_for_runs(index.owner[start..start + key.len()].iter().copied())
+            })
+            .collect()
+    }
+
+    fn rects_for_runs(&self, ids: impl IntoIterator<Item = usize>) -> Vec<NormRect> {
+        let mut by_line = std::collections::BTreeMap::<usize, NormRect>::new();
+        for id in ids {
+            let run = &self.runs[id];
+            if let Some(line) = self.run_lines[id].filter(|_| run.text != " ") {
+                by_line
+                    .entry(line)
+                    .and_modify(|r| *r = r.union(run.rect))
+                    .or_insert(run.rect);
+            }
+        }
+        by_line.into_values().collect()
+    }
+
+    fn distance(&self, p: NormPoint, r: NormRect) -> f32 {
+        let dx = (r.x - p.x).max(p.x - r.right()).max(0.0) * self.aspect;
+        let dy = (r.y - p.y).max(p.y - r.bottom()).max(0.0);
+        dx * dx + dy * dy
+    }
+
     fn nearest_run(&self, p: NormPoint) -> Option<usize> {
-        self.runs
+        self.layout_order
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                dist2(p, a.rect)
-                    .partial_cmp(&dist2(p, b.rect))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            .filter(|&(_, &(_, id))| self.runs[id].text != " ")
+            .min_by(|&(_, &(_, a)), &(_, &(_, b))| {
+                self.distance(p, self.runs[a].rect)
+                    .total_cmp(&self.distance(p, self.runs[b].rect))
             })
             .map(|(i, _)| i)
     }
 
-    /// The text of runs `lo..=hi` joined into one line (gaps and line breaks become
-    /// spaces), suitable for storing as a one-line quote.
-    fn runs_text(&self, lo: usize, hi: usize) -> String {
-        let out = Self::join_runs(&self.runs[lo..=hi], false);
-        // Collapse recorded + inserted spaces to single spaces, trim.
-        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    fn in_column(&self, line: usize, column: Option<Column>) -> bool {
+        column.is_none_or(|c| {
+            matches!(self.lines[line].column, Column::Spanning) || self.lines[line].column == c
+        })
     }
 
-    /// Which occurrence (0-based) of `quote` on the page the run at `lo` begins — so
-    /// the stored highlight re-locates to the right match.
-    fn occurrence_at(&self, lo: usize, quote: &str) -> usize {
-        let key = Self::search_key(quote);
-        if key.is_empty() {
-            return 0;
+    fn selection_runs(
+        &self,
+        from: Option<NormPoint>,
+        to: Option<NormPoint>,
+        kind: SelectionKind,
+    ) -> Vec<(usize, usize)> {
+        let Some(last_index) = self.layout_order.len().checked_sub(1) else {
+            return Vec::new();
+        };
+        let a = from.and_then(|p| self.nearest_run(p)).unwrap_or(0);
+        let b = to.and_then(|p| self.nearest_run(p)).unwrap_or(last_index);
+        let mut start = a.min(b);
+        let mut end = a.max(b);
+        let first = self.layout_order[start].0;
+        let last = self.layout_order[end].0;
+        let column =
+            (from.is_some() && to.is_some() && self.lines[first].column == self.lines[last].column)
+                .then_some(self.lines[first].column)
+                .filter(|&column| column != Column::Spanning);
+        while start > 0 && self.expands_across(start - 1, start, kind) {
+            start -= 1;
         }
-        let start = self.owner.iter().position(|&r| r == lo).unwrap_or(0);
-        self.letters
-            .get(..start)
-            .map_or(0, |s| s.matches(&key).count())
+        while end + 1 < self.layout_order.len() && self.expands_across(end, end + 1, kind) {
+            end += 1;
+        }
+        self.layout_order[start..=end]
+            .iter()
+            .copied()
+            .filter(|&(line, _)| self.in_column(line, column))
+            .collect()
     }
 
-    /// The text a drag from `from` to `to` covers, for copying: line breaks kept,
-    /// each line's spaces collapsed. `None` if there's no text there.
+    fn expands_across(&self, a: usize, b: usize, kind: SelectionKind) -> bool {
+        let (line_a, id_a) = self.layout_order[a];
+        let (line_b, id_b) = self.layout_order[b];
+        if line_a != line_b {
+            return false;
+        }
+        let (a, b) = (&self.runs[id_a], &self.runs[id_b]);
+        match kind {
+            SelectionKind::Drag => false,
+            SelectionKind::Line => true,
+            SelectionKind::Word => word_cluster(a) && word_cluster(b) && !Self::word_gap(a, b),
+        }
+    }
+
+    /// Text covered by the drag, preserving line breaks for the clipboard.
     pub fn selected_text(&self, from: NormPoint, to: NormPoint) -> Option<String> {
-        let i0 = self.nearest_run(from)?;
-        let i1 = self.nearest_run(to)?;
-        let raw = Self::join_runs(&self.runs[i0.min(i1)..=i0.max(i1)], true);
-        let text = raw
-            .lines()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        (!text.trim().is_empty()).then_some(text)
+        self.selection_text(Some(from), Some(to), SelectionKind::Drag)
     }
 
-    /// Resolve a drag from `from` to `to` into a [`Selection`]: the run range between
-    /// the nearest glyphs (draw order ≈ reading order), its one-line quote, the
-    /// occurrence index, and the rects to draw. `None` if there's no text or the
-    /// selection is empty.
+    pub(crate) fn selection_text(
+        &self,
+        from: Option<NormPoint>,
+        to: Option<NormPoint>,
+        kind: SelectionKind,
+    ) -> Option<String> {
+        let text = self.join_runs(&self.selection_runs(from, to, kind), '\n');
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub(crate) fn selection_rects(
+        &self,
+        from: Option<NormPoint>,
+        to: Option<NormPoint>,
+        kind: SelectionKind,
+    ) -> Vec<NormRect> {
+        self.rects_for_runs(
+            self.selection_runs(from, to, kind)
+                .into_iter()
+                .map(|(_, id)| id),
+        )
+    }
+
+    /// Resolve a drag to its one-line quote, saved occurrence and highlight rectangles.
     pub fn select(&self, from: NormPoint, to: NormPoint) -> Option<Selection> {
-        let i0 = self.nearest_run(from)?;
-        let i1 = self.nearest_run(to)?;
-        let (lo, hi) = (i0.min(i1), i0.max(i1));
-        let quote = self.runs_text(lo, hi);
-        if quote.trim().is_empty() {
+        let order = self.selection_runs(Some(from), Some(to), SelectionKind::Drag);
+        let quote = self.join_runs(&order, ' ');
+        if quote.is_empty() {
             return None;
         }
-        let occurrence = self.occurrence_at(lo, &quote);
-        let ids: Vec<usize> = (lo..=hi).collect();
-        let rects = self.group_lines(&ids);
+        let key = search_key(&quote);
+        let ids: Vec<_> = order
+            .into_iter()
+            .map(|(_, id)| id)
+            .filter(|&id| self.runs[id].text != " ")
+            .collect();
+        let (occurrence, _) = self.find_anchor(&key, |_, matched| matched == ids)?;
         Some(Selection {
             quote,
             occurrence,
-            rects,
+            rects: self.rects_for_runs(ids),
         })
     }
+}
+
+fn word_cluster(run: &Run) -> bool {
+    run.text.chars().all(|c| {
+        // One click cluster for scripts normally written without word spaces.
+        c.is_alphanumeric() && !matches!(c, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}')
+    })
 }
 
 #[cfg(test)]
@@ -453,6 +724,10 @@ mod tests {
         Run {
             text: text.to_string(),
             rect: NormRect { x, y, w, h },
+            reading_x: x,
+            reading_right: x + w,
+            baseline: y + h,
+            em: h * 2.0,
         }
     }
 
@@ -535,7 +810,7 @@ mod tests {
                 0.02,
             ));
         }
-        runs.push(run(" ", 0.30, 0.125, 0.002, 0.002));
+        runs.push(run(" ", 0.30, 0.118, 0.002, 0.002));
         for (i, c) in "for".chars().enumerate() {
             runs.push(run(
                 &c.to_string(),

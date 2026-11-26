@@ -38,7 +38,7 @@ use gpui::{
     AnyView, App, AppContext, Context, EventEmitter, FocusHandle, Hsla, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, RenderImage,
     ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, div, hsla, img, point,
-    px,
+    px, relative, ObjectFit, StyledImage,
 };
 // Forms and page markup map normalized rectangles to window space.
 #[cfg(any(feature = "forms", feature = "markup"))]
@@ -49,7 +49,9 @@ use hayro::hayro_syntax::{DecryptionError, LoadPdfError, Pdf};
 use image::{Frame, RgbaImage};
 
 #[cfg(feature = "markup")]
-use gpui::{MouseMoveEvent, Point, deferred};
+use gpui::{MouseMoveEvent, MouseUpEvent, Point, deferred};
+#[cfg(feature = "markup")]
+use text::SelectionKind;
 
 #[cfg(feature = "markup")]
 mod text;
@@ -155,12 +157,19 @@ pub fn page_dims(doc: &Document) -> Vec<(f32, f32)> {
 /// scale = sharper but more memory; [`PdfView`] picks `scale` from the display's
 /// pixel ratio, zoom, and quality so pages are crisp without wasting memory.
 pub fn render_page(doc: &Document, idx: usize, scale: f32) -> Result<Arc<RenderImage>, String> {
-    let pixmaps = hayro::render_pdf(doc, scale, InterpreterSettings::default(), Some(idx..=idx))
-        .ok_or_else(|| format!("render page {idx}"))?;
-    let pixmap = pixmaps
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("no page {idx}"))?;
+    let page = doc.pages().get(idx).ok_or_else(|| format!("no page {idx}"))?;
+    let (width, height) = page.render_dimensions();
+    let pixmap = hayro::render(
+        page,
+        &hayro::RenderCache::new(),
+        &InterpreterSettings::default(),
+        &hayro::RenderSettings::default(),
+        &hayro::PixmapSettings {
+            x_scale: raster_scale(width, scale),
+            y_scale: raster_scale(height, scale),
+            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+        },
+    );
 
     let (w, h) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
     let src = pixmap.data_as_u8_slice(); // premultiplied RGBA8, row-major
@@ -181,6 +190,14 @@ pub fn render_page(doc: &Document, idx: usize, scale: f32) -> Result<Arc<RenderI
     }
     let buf = RgbaImage::from_raw(w, h, bgra).ok_or_else(|| "bad pixel buffer".to_string())?;
     Ok(Arc::new(RenderImage::new(vec![Frame::new(buf)])))
+}
+
+fn raster_scale(points: f32, scale: f32) -> f32 {
+    let pixels = (points * scale).round().clamp(1.0, f32::from(u16::MAX));
+    let adjusted = pixels / points;
+    // Hayro truncates points * scale to allocate its target. Keep the transform
+    // and pixel buffer on the same extent even when the product rounds down.
+    if points * adjusted < pixels { adjusted.next_up() } else { adjusted }
 }
 
 /// True if a link/image `src` points at a PDF (by extension, case-insensitive).
@@ -425,6 +442,74 @@ fn norm_rect_between(a: NormPoint, b: NormPoint) -> NormRect {
     }
 }
 
+#[cfg(feature = "markup")]
+fn page_point(bounds: Bounds<Pixels>, pos: Point<Pixels>) -> Option<NormPoint> {
+    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+    (w > 0.0 && h > 0.0).then(|| NormPoint {
+        x: (f32::from(pos.x - bounds.origin.x) / w).clamp(0.0, 1.0),
+        y: (f32::from(pos.y - bounds.origin.y) / h).clamp(0.0, 1.0),
+    })
+}
+
+#[cfg(feature = "markup")]
+fn selection_motion(from: Point<Pixels>, to: Point<Pixels>) -> bool {
+    (from.x - to.x).abs() >= px(4.0) || (from.y - to.y).abs() >= px(4.0)
+}
+
+#[cfg(feature = "markup")]
+fn plain_pointer_click(event: &gpui::ClickEvent) -> bool {
+    match event {
+        gpui::ClickEvent::Mouse(event) => event.up.click_count == 1
+            && !selection_motion(event.down.position, event.up.position),
+        _ => true,
+    }
+}
+
+#[cfg(feature = "markup")]
+fn multi_click_interval() -> std::time::Duration {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetDoubleClickTime() -> u32;
+        }
+        // User32 returns the same system setting GPUI uses to count clicks.
+        std::time::Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }))
+    }
+    #[cfg(not(target_os = "windows"))]
+    std::time::Duration::from_millis(500)
+}
+
+#[cfg(feature = "markup")]
+#[derive(Clone, Copy, PartialEq)]
+struct PagePosition {
+    page: usize,
+    point: NormPoint,
+}
+
+#[cfg(feature = "markup")]
+#[derive(Clone, Copy)]
+struct TextSpan {
+    start: PagePosition,
+    end: PagePosition,
+    kind: SelectionKind,
+}
+
+#[cfg(feature = "markup")]
+impl TextSpan {
+    fn ordered(self) -> (PagePosition, PagePosition) {
+        if self.start.page <= self.end.page { (self.start, self.end) } else { (self.end, self.start) }
+    }
+
+    fn on_page(self, page: usize) -> Option<(Option<NormPoint>, Option<NormPoint>)> {
+        let (start, end) = self.ordered();
+        (start.page..=end.page).contains(&page).then(|| (
+            (page == start.page).then_some(start.point),
+            (page == end.page).then_some(end.point),
+        ))
+    }
+}
+
 /// Invoked from the load-failure pane's "Open in system viewer" button, so the
 /// host can hand the file to the OS default app — the viewer itself stays
 /// host-agnostic (no process spawning). Set via [`PdfView::set_on_open_external`];
@@ -480,7 +565,11 @@ pub enum PdfEvent {
     /// Click on the scrollable surface between pages.
     #[cfg(feature = "markup")]
     ViewportClicked,
-    /// Text selected in copy mode, with the first selected line as a page anchor.
+    /// A new pointer gesture cleared the previous copy selection.
+    #[cfg(feature = "markup")]
+    SelectionCleared,
+    /// Text on the first selected page with selectable glyphs, with the first
+    /// selected line as a page anchor. The clipboard can span multiple pages.
     #[cfg(feature = "markup")]
     PageTextSelected {
         page: usize,
@@ -548,6 +637,7 @@ pub struct PdfView {
     /// The quality multiplier the pages were last rendered at; compared against the
     /// `quality` source each frame to detect a host setting change.
     last_quality: f32,
+    last_scale_factor: f32,
     /// Bumped whenever the render scale changes (zoom or quality). Visible pages with
     /// an older `image_gen` re-render; in-flight renders from an older generation are
     /// discarded so a stale-scale bitmap never lands.
@@ -591,17 +681,25 @@ pub struct PdfView {
     /// "Highlight mode": dragging over text selects + creates a highlight (markup).
     #[cfg(feature = "markup")]
     selecting: bool,
-    /// In-progress drag selection: (page, start, current) in normalized coords.
+    /// In-progress drag in normalized page coordinates.
     #[cfg(feature = "markup")]
-    sel_drag: Option<(usize, NormPoint, NormPoint)>,
+    sel_drag: Option<TextSpan>,
     #[cfg(feature = "markup")]
     viewport_press: Option<Point<Pixels>>,
     #[cfg(feature = "markup")]
     selection_release: Option<Point<Pixels>>,
-    /// A finished drag outside highlight mode: text selected for ⌘C. Cleared by
-    /// the next mouse-down.
+    /// Text selected for copying. Cleared by the next mouse-down.
     #[cfg(feature = "markup")]
-    text_sel: Option<(usize, NormPoint, NormPoint)>,
+    text_sel: Option<TextSpan>,
+    /// A click awaits the platform's multi-click interval before host lookup.
+    #[cfg(feature = "markup")]
+    pending_page_click: Option<gpui::Task<()>>,
+    #[cfg(feature = "markup")]
+    drag_moved: bool,
+    #[cfg(feature = "markup")]
+    drag_pointer: Option<Point<Pixels>>,
+    #[cfg(feature = "markup")]
+    drag_scroll: Option<gpui::Task<()>>,
     /// Called when a drag-selection finishes, so the host stores the note (markup).
     #[cfg(feature = "markup")]
     on_create: Option<CreateHighlightFn>,
@@ -733,6 +831,7 @@ impl PdfView {
             fit_viewport: (0.0, 0.0),
             zoom: 1.0,
             last_quality,
+            last_scale_factor: 0.0,
             generation: 0,
             pending_drops: Vec::new(),
             page_input: None,
@@ -761,6 +860,14 @@ impl PdfView {
             sel_drag: None,
             #[cfg(feature = "markup")]
             viewport_press: None,
+            #[cfg(feature = "markup")]
+            pending_page_click: None,
+            #[cfg(feature = "markup")]
+            drag_moved: false,
+            #[cfg(feature = "markup")]
+            drag_pointer: None,
+            #[cfg(feature = "markup")]
+            drag_scroll: None,
             #[cfg(feature = "markup")]
             selection_release: None,
             #[cfg(feature = "markup")]
@@ -826,6 +933,10 @@ impl PdfView {
             self.text_sel = None;
             self.sel_drag = None;
             self.viewport_press = None;
+            self.pending_page_click = None;
+            self.drag_moved = false;
+            self.drag_pointer = None;
+            self.drag_scroll = None;
             self.selection_release = None;
         }
         self.locked = false;
@@ -849,7 +960,7 @@ impl PdfView {
         page: usize,
         nrect: (f32, f32, f32, f32),
     ) -> Option<Bounds<Pixels>> {
-        let cb = self.scroll.bounds_for_item(page)?;
+        let cb = self.page_window_bounds(page)?;
         let (nx, ny, nw, nh) = nrect;
         let w = f32::from(cb.size.width);
         let h = f32::from(cb.size.height);
@@ -859,10 +970,17 @@ impl PdfView {
         Some(Bounds::new(
             point(
                 cb.origin.x + px(nx * w),
-                cb.origin.y + self.scroll.offset().y + px(ny * h),
+                cb.origin.y + px(ny * h),
             ),
             gpui::size(px(nw * w), px(nh * h)),
         ))
+    }
+
+    #[cfg(any(feature = "forms", feature = "markup"))]
+    fn page_window_bounds(&self, page: usize) -> Option<Bounds<Pixels>> {
+        let mut bounds = self.scroll.bounds_for_item(page)?;
+        bounds.origin += self.scroll.offset();
+        Some(bounds)
     }
 
     /// The document's form fields, as enumerated at load — for a host driving
@@ -1070,7 +1188,7 @@ impl PdfView {
     pub fn toggle_select_mode(&mut self, cx: &mut Context<Self>) {
         self.selecting = !self.selecting;
         self.area_mode = false;
-        self.sel_drag = None;
+        self.end_drag();
         // Turning highlight mode on pops the color picker down; off hides it.
         self.palette_open = self.selecting && !self.palette.is_empty();
         cx.notify();
@@ -1090,7 +1208,7 @@ impl PdfView {
             self.selecting = true;
             self.area_mode = true;
         }
-        self.sel_drag = None;
+        self.end_drag();
         self.palette_open = self.selecting && !self.palette.is_empty();
         cx.notify();
     }
@@ -1355,27 +1473,101 @@ impl PdfView {
     /// unscrolled frame, so the cursor is shifted by the scroll offset to match.
     /// (`markup` feature.)
     #[cfg(feature = "markup")]
-    fn point_to_page(&self, pos: gpui::Point<gpui::Pixels>) -> Option<(usize, NormPoint)> {
-        let probe = f32::from(pos.y) - f32::from(self.scroll.offset().y);
+    fn point_to_page(&self, pos: Point<Pixels>) -> Option<PagePosition> {
+        if !self.scroll.bounds().contains(&pos) {
+            return None;
+        }
         for i in 0..self.dims.len() {
-            let Some(cb) = self.scroll.bounds_for_item(i) else {
+            let Some(bounds) = self.page_window_bounds(i) else {
                 continue;
             };
-            let top = f32::from(cb.origin.y);
-            let h = f32::from(cb.size.height);
-            if h > 0.0 && probe >= top && probe < top + h {
-                let left = f32::from(cb.origin.x);
-                let w = f32::from(cb.size.width).max(1.0);
-                return Some((
-                    i,
-                    NormPoint {
-                        x: ((f32::from(pos.x) - left) / w).clamp(0.0, 1.0),
-                        y: ((probe - top) / h).clamp(0.0, 1.0),
-                    },
-                ));
+            if bounds.contains(&pos) {
+                return page_point(bounds, pos).map(|point| PagePosition { page: i, point });
             }
         }
         None
+    }
+
+    #[cfg(feature = "markup")]
+    fn drag_endpoint(&self, start: PagePosition, pos: Point<Pixels>) -> Option<PagePosition> {
+        let viewport = self.scroll.bounds();
+        let pos = pos.max(&viewport.origin).min(&viewport.bottom_right());
+        let (page, bounds) = if self.selecting {
+            // Stored markup has one page per anchor.
+            (start.page, self.page_window_bounds(start.page)?)
+        } else {
+            // Ignore the horizontal margin during a drag. In a gap, use the
+            // nearest page edge so the endpoint moves continuously across pages.
+            let vertical_distance = |bounds: &Bounds<Pixels>| {
+                f32::from((bounds.top() - pos.y).max(pos.y - bounds.bottom()).max(px(0.)))
+            };
+            (0..self.dims.len()).filter_map(|page| Some((page, self.page_window_bounds(page)?)))
+                .min_by(|(_, a), (_, b)| vertical_distance(a).total_cmp(&vertical_distance(b)))?
+        };
+        page_point(bounds, pos).map(|point| PagePosition { page, point })
+    }
+
+    #[cfg(feature = "markup")]
+    fn update_drag_endpoint(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(mut span) = self.sel_drag
+            && let Some(end) = self.drag_endpoint(span.start, position)
+            && span.end != end
+        {
+            span.end = end;
+            self.sel_drag = Some(span);
+            if !self.selecting || !self.area_mode {
+                self.ensure_page_text(end.page, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    #[cfg(feature = "markup")]
+    fn end_drag(&mut self) {
+        self.sel_drag = None;
+        self.viewport_press = None;
+        self.drag_pointer = None;
+        self.drag_scroll = None;
+    }
+
+    #[cfg(feature = "markup")]
+    fn begin_drag_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.drag_scroll.is_some() || self.drag_pointer.is_none_or(|p| self.drag_scroll_offset(p).is_none()) {
+            return;
+        }
+        self.drag_scroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+                let scrolling = this.update(cx, |this, cx| {
+                    if let Some(pos) = this.drag_pointer
+                        && let Some(offset) = this.drag_scroll_offset(pos)
+                    {
+                        this.scroll.set_offset(offset);
+                        this.update_drag_endpoint(pos, cx);
+                        cx.notify();
+                        return true;
+                    }
+                    if let Some(task) = this.drag_scroll.take() {
+                        task.detach();
+                    }
+                    false
+                }).unwrap_or(false);
+                if !scrolling { break; }
+            }
+        }));
+    }
+
+    #[cfg(feature = "markup")]
+    fn drag_scroll_offset(&self, pos: Point<Pixels>) -> Option<Point<Pixels>> {
+        let viewport = self.scroll.bounds();
+        let band = px(28.).min(viewport.size.height / 3.);
+        let above = (viewport.top() + band - pos.y).clamp(px(0.), band);
+        let below = (pos.y - (viewport.bottom() - band)).clamp(px(0.), band);
+        let mut offset = self.scroll.offset();
+        let next = (offset.y + (above - below) * 0.6).clamp(-self.scroll.max_offset().y, px(0.));
+        if next == offset.y { return None; }
+        offset.y = next;
+        Some(offset)
     }
 
     /// Extract `page`'s text layer off-thread (cached), so its highlights can be
@@ -1432,24 +1624,117 @@ impl PdfView {
 
     #[cfg(feature = "markup")]
     fn emit_text_selection(&mut self, cx: &mut Context<Self>) {
-        let Some((page, a, b)) = self.text_sel else {
+        let Some(span) = self.text_sel else {
             return;
         };
-        let Some(TextSlot::Ready(pt)) = self.page_text.get(&page) else {
+        let Some(position) = self.selection_release else {
             return;
         };
-        if let Some(position) = self.selection_release.take()
-            && let Some(text) = pt.selected_text(a, b)
-            && let Some(rect) = pt.select(a, b).and_then(|sel| sel.rects.first().copied())
-        {
-            cx.emit(PdfEvent::PageTextSelected {
-                page,
-                x: rect.x + rect.w * 0.5,
-                y: rect.y + rect.h * 0.5,
-                position,
-                text,
-            });
+        let (first, last) = span.ordered();
+        for page in first.page..=last.page {
+            let pt = match self.page_text.get(&page) {
+                Some(TextSlot::Ready(pt)) => pt,
+                Some(TextSlot::Failed) => continue,
+                _ => return,
+            };
+            let (a, b) = span.on_page(page).unwrap();
+            if let Some(text) = pt.selection_text(a, b, span.kind)
+                && let Some(rect) = pt.selection_rects(a, b, span.kind).first().copied()
+            {
+                // A comment targets the first selected page with text. The
+                // clipboard still includes the full selection across pages.
+                cx.emit(PdfEvent::PageTextSelected {
+                    page,
+                    x: rect.x + rect.w * 0.5,
+                    y: rect.y + rect.h * 0.5,
+                    position,
+                    text,
+                });
+                break;
+            }
         }
+        self.selection_release = None;
+    }
+
+    #[cfg(feature = "markup")]
+    fn finish_page_gesture(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(press) = self.viewport_press.take() else { return };
+        let moved = std::mem::take(&mut self.drag_moved) || selection_motion(press, event.position);
+        self.drag_pointer = None;
+        self.drag_scroll = None;
+        let inside = self.scroll.bounds().contains(&event.position);
+        let Some(mut span) = self.sel_drag.take() else {
+            if inside && !moved {
+                cx.emit(PdfEvent::ViewportClicked);
+            }
+            return;
+        };
+        let secondary = event.modifiers.secondary(cx);
+        span.kind = if moved {
+            SelectionKind::Drag
+        } else if inside && !self.selecting && !secondary && event.click_count >= 2 {
+            if event.click_count == 2 { SelectionKind::Word } else { SelectionKind::Line }
+        } else {
+            if inside && event.click_count == 1 {
+                let click = PdfEvent::PageClicked {
+                    page: span.start.page,
+                    x: span.start.point.x,
+                    y: span.start.point.y,
+                    position: event.position,
+                    secondary,
+                    click_count: event.click_count,
+                };
+                self.pending_page_click = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(multi_click_interval()).await;
+                    let _ = this.update(cx, |_, cx| cx.emit(click));
+                }));
+            }
+            cx.notify();
+            return;
+        };
+        if moved && let Some(end) = self.drag_endpoint(span.start, event.position) {
+            span.end = end;
+        }
+        let page = span.start.page;
+        if !self.selecting {
+            let (first, last) = span.ordered();
+            for page in first.page..=last.page {
+                self.ensure_page_text(page, cx);
+            }
+            self.text_sel = Some(span);
+            self.selection_release = Some(event.position);
+            self.emit_text_selection(cx);
+        } else if self.area_mode {
+            if let Some(create) = self.on_create_area.clone() {
+                create(page, norm_rect_between(span.start.point, span.end.point), self.active_color_name(), window, cx);
+            }
+        } else if let Some(TextSlot::Ready(text)) = self.page_text.get(&page)
+            && let Some(selection) = text.select(span.start.point, span.end.point)
+            && let Some(create) = self.on_create.clone()
+        {
+            create(page, selection.quote, selection.occurrence, self.active_color_name(), window, cx);
+        }
+        cx.notify();
+    }
+
+    #[cfg(feature = "markup")]
+    /// Text selected for copying, in document order, with blank lines between pages.
+    /// Returns `None` while a selected page's text layer is loading.
+    pub fn selected_text(&self) -> Option<String> {
+        let span = self.text_sel?;
+        let (start, end) = span.ordered();
+        let mut text = Vec::new();
+        for page in start.page..=end.page {
+            match self.page_text.get(&page) {
+                Some(TextSlot::Ready(pt)) => {
+                    let (a, b) = span.on_page(page)?;
+                    text.extend(pt.selection_text(a, b, span.kind));
+                }
+                Some(TextSlot::Failed) => {}
+                _ => return None,
+            }
+        }
+        (!text.is_empty()).then(|| text.join("\n\n"))
     }
 
     /// Free every rasterized page — CPU pixel buffer (by dropping the `Arc`s) *and*
@@ -1457,6 +1742,11 @@ impl PdfView {
     /// paint and only frees it via `drop_image`; a raw `ImageSource::Render` is never
     /// auto-evicted, so call this before dropping the view or the textures leak.
     pub fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "markup")]
+        {
+            self.end_drag();
+            self.pending_page_click = None;
+        }
         for arc in std::mem::take(&mut self.pending_drops) {
             cx.drop_image(arc, Some(window));
         }
@@ -1676,15 +1966,16 @@ impl PdfView {
             return; // not loaded yet (still reading/parsing)
         }
 
-        // A host quality change invalidates every bitmap (new scale), like a zoom.
+        // A quality or monitor-scale change invalidates bitmaps, like a zoom.
         let quality = (self.quality)().clamp(MIN_QUALITY, MAX_QUALITY);
-        if (quality - self.last_quality).abs() > 0.01 {
+        let scale_factor = window.scale_factor();
+        if (quality - self.last_quality).abs() > 0.01 || scale_factor != self.last_scale_factor {
             self.last_quality = quality;
+            self.last_scale_factor = scale_factor;
             self.generation = self.generation.wrapping_add(1);
         }
 
         let page_width = self.page_width();
-        let scale_factor = window.scale_factor();
         let scroll_y = f32::from(-self.scroll.offset().y);
         let viewport_h = f32::from(self.scroll.bounds().size.height);
         let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
@@ -1706,6 +1997,9 @@ impl PdfView {
                 .collect();
             if self.selecting && !self.area_mode {
                 pages.extend(start..=end);
+            } else if let Some(span) = self.sel_drag.filter(|_| self.drag_moved) {
+                let (first, last) = span.ordered();
+                pages.extend(start.max(first.page)..=end.min(last.page));
             }
             pages.sort_unstable();
             pages.dedup();
@@ -1883,11 +2177,15 @@ impl Render for PdfView {
                 .w(px(page_width))
                 .h(px(disp_h))
                 .rounded(px(2.0))
-                .border_1()
-                .border_color(style.border)
                 .overflow_hidden();
             let slot = match self.pages.get(i).and_then(|s| s.image.as_ref()) {
-                Some(image) => slot.child(img(image.clone()).w(px(page_width)).h(px(disp_h))),
+                Some(image) => slot.child(
+                    div()
+                        .id(SharedString::from(format!("pdf-page-image-{i}")))
+                        .absolute()
+                        .size_full()
+                        .child(img(image.clone()).absolute().size_full().object_fit(ObjectFit::Fill)),
+                ),
                 // No bitmap yet: a sized placeholder so layout is stable; it fills in
                 // once rasterized.
                 None => slot
@@ -1931,15 +2229,15 @@ impl Render for PdfView {
                                 h.id
                             )))
                             .absolute()
-                            .left(px(r.x * page_width))
-                            .top(px(r.y * disp_h))
-                            .w(px(r.w * page_width))
-                            .h(px(r.h * disp_h))
+                            .left(relative(r.x))
+                            .top(relative(r.y))
+                            .w(relative(r.w))
+                            .h(relative(r.h))
                             .rounded(px(1.0))
                             .bg(fill)
                             .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(cb) = this.on_highlight.clone() {
+                            .on_click(cx.listener(move |this, event, window, cx| {
+                                if plain_pointer_click(event) && let Some(cb) = this.on_highlight.clone() {
                                     cb(id, window, cx);
                                 }
                             }));
@@ -1951,26 +2249,26 @@ impl Render for PdfView {
                 }
                 // Live drag feedback: the raw box in area mode, the text
                 // selection's line rects otherwise (also a finished copy selection).
-                if let Some((pg, a, b)) = self.sel_drag.or(self.text_sel)
-                    && pg == i
+                let active = self.sel_drag.filter(|_| self.drag_moved).or(self.text_sel);
+                if let Some(span) = active
+                    && let Some((a, b)) = span.on_page(i)
                 {
                     let rects: Vec<NormRect> = if self.selecting && self.area_mode {
-                        vec![norm_rect_between(a, b)]
-                    } else if let Some(TextSlot::Ready(pt)) = self.page_text.get(&i)
-                        && let Some(sel) = pt.select(a, b)
-                    {
-                        sel.rects
+                        vec![norm_rect_between(span.start.point, span.end.point)]
+                    } else if let Some(TextSlot::Ready(pt)) = self.page_text.get(&i) {
+                        pt.selection_rects(a, b, span.kind)
                     } else {
                         Vec::new()
                     };
-                    for r in rects {
+                    for (ri, r) in rects.into_iter().enumerate() {
                         slot = slot.child(
                             div()
+                                .id(SharedString::from(format!("pdf-selection-{i}-{ri}")))
                                 .absolute()
-                                .left(px(r.x * page_width))
-                                .top(px(r.y * disp_h))
-                                .w(px(r.w * page_width))
-                                .h(px(r.h * disp_h))
+                                .left(relative(r.x))
+                                .top(relative(r.y))
+                                .w(relative(r.w))
+                                .h(relative(r.h))
                                 .rounded(px(1.0))
                                 .bg(hsla(0.58, 0.9, 0.55, 0.3)),
                         );
@@ -1987,10 +2285,10 @@ impl Render for PdfView {
                     for r in &m.rects {
                         let mut b = div()
                             .absolute()
-                            .left(px(r.x * page_width))
-                            .top(px(r.y * disp_h))
-                            .w(px(r.w * page_width))
-                            .h(px(r.h * disp_h))
+                            .left(relative(r.x))
+                            .top(relative(r.y))
+                            .w(relative(r.w))
+                            .h(relative(r.h))
                             .rounded(px(1.0))
                             .bg(fill);
                         if current {
@@ -2012,16 +2310,22 @@ impl Render for PdfView {
                         div()
                             .id(SharedString::from(format!("pdf-link-{i}-{li}")))
                             .absolute()
-                            .left(px(link.x * page_width))
-                            .top(px(link.y * disp_h))
-                            .w(px(link.w * page_width))
-                            .h(px(link.h * disp_h))
+                            .left(relative(link.x))
+                            .top(relative(link.y))
+                            .w(relative(link.w))
+                            .h(relative(link.h))
                             .rounded(px(2.0))
                             .cursor_pointer()
                             .hover(|h| h.bg(hsla(0.58, 0.9, 0.55, 0.12)))
-                            .on_click(cx.listener(move |this, _, _window, cx| match &target {
-                                LinkTarget::Page(p) => this.go_to_page(*p, cx),
-                                LinkTarget::Uri(u) => cx.open_url(u),
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                #[cfg(feature = "markup")]
+                                if !plain_pointer_click(_event) {
+                                    return;
+                                }
+                                match &target {
+                                    LinkTarget::Page(p) => this.go_to_page(*p, cx),
+                                    LinkTarget::Uri(u) => cx.open_url(u),
+                                }
                             })),
                     );
                 }
@@ -2065,7 +2369,10 @@ impl Render for PdfView {
                     );
                 }
             }
-            slots.push(slot.into_any_element());
+            // Paint the frame over the page without insetting its image or overlays.
+            slots.push(slot.child(
+                div().absolute().size_full().rounded(px(2.0)).border_1().border_color(style.border)
+            ).into_any_element());
         }
 
         // Click-to-edit page counter: shows "N / total", or the typed digits while
@@ -2337,7 +2644,13 @@ impl Render for PdfView {
                     window.focus(&this.focus, cx);
                     #[cfg(feature = "markup")]
                     {
-                        this.text_sel = None;
+                        if this.text_sel.take().is_some() {
+                            cx.emit(PdfEvent::SelectionCleared);
+                        }
+                        this.pending_page_click = None;
+                        this.drag_moved = false;
+                        this.drag_pointer = None;
+                        this.drag_scroll = None;
                         this.selection_release = None;
                         this.sel_drag = None;
                         this.viewport_press = this
@@ -2345,12 +2658,14 @@ impl Render for PdfView {
                             .bounds()
                             .contains(&_ev.position)
                             .then_some(_ev.position);
-                        if let Some((pg, n)) = this
+                        if let Some(start) = this
                             .viewport_press
                             .and_then(|point| this.point_to_page(point))
                         {
-                            this.ensure_page_text(pg, cx);
-                            this.sel_drag = Some((pg, n, n));
+                            if !this.selecting || !this.area_mode {
+                                this.ensure_page_text(start.page, cx);
+                            }
+                            this.sel_drag = Some(TextSpan { start, end: start, kind: SelectionKind::Drag });
                         }
                         cx.notify();
                     }
@@ -2464,9 +2779,7 @@ impl Render for PdfView {
                 #[cfg(feature = "markup")]
                 if secondary
                     && key == "c"
-                    && let Some((pg, a, b)) = this.text_sel
-                    && let Some(TextSlot::Ready(pt)) = this.page_text.get(&pg)
-                    && let Some(text) = pt.selected_text(a, b)
+                    && let Some(text) = this.selected_text()
                 {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
                     return;
@@ -2488,81 +2801,23 @@ impl Render for PdfView {
         #[cfg(feature = "markup")]
         let root = root
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
-                let Some((pg, start, _)) = this.sel_drag else {
+                if this.sel_drag.is_none() || ev.pressed_button != Some(MouseButton::Left) {
                     return;
-                };
-                if let Some((p, n)) = this.point_to_page(ev.position)
-                    && p == pg
-                {
-                    this.sel_drag = Some((pg, start, n));
-                    cx.notify();
+                }
+                this.drag_moved |= this.viewport_press.is_some_and(|p| selection_motion(p, ev.position));
+                if this.drag_moved {
+                    this.drag_pointer = Some(ev.position);
+                    this.update_drag_endpoint(ev.position, cx);
+                    this.begin_drag_scroll(cx);
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _ev: &gpui::MouseUpEvent, window, cx| {
-                    let press = this.viewport_press.take();
-                    let Some((pg, a, b)) = this.sel_drag.take() else {
-                        if let Some(press) = press
-                            && this.scroll.bounds().contains(&_ev.position)
-                            && (press.x - _ev.position.x).abs() < px(4.)
-                            && (press.y - _ev.position.y).abs() < px(4.)
-                        {
-                            cx.emit(PdfEvent::ViewportClicked);
-                        }
-                        return;
-                    };
-                    // Require a real drag: a bare click (or tiny jitter) must not create a
-                    // highlight. Threshold is in normalized page coords (~a few pixels).
-                    const MIN_DRAG: f32 = 0.005;
-                    if (a.x - b.x).abs() < MIN_DRAG
-                        && (a.y - b.y).abs() < MIN_DRAG
-                        && this.scroll.bounds().contains(&_ev.position)
-                        && press.is_some_and(|point| {
-                            (point.x - _ev.position.x).abs() < px(4.)
-                                && (point.y - _ev.position.y).abs() < px(4.)
-                        })
-                    {
-                        // labo-gui の追加: クリックを host に知らせる（synctex の逆引きに使う）。
-                        cx.emit(PdfEvent::PageClicked {
-                            page: pg,
-                            x: a.x,
-                            y: a.y,
-                            position: _ev.position,
-                            secondary: _ev.modifiers.secondary(cx),
-                            click_count: _ev.click_count,
-                        });
-                        cx.notify();
-                        return;
-                    }
-                    // Outside highlight mode the drag just selects text to copy.
-                    if !this.selecting {
-                        this.text_sel = Some((pg, a, b));
-                        this.selection_release = Some(_ev.position);
-                        this.emit_text_selection(cx);
-                        cx.notify();
-                        return;
-                    }
-                    if this.area_mode {
-                        if let Some(cb) = this.on_create_area.clone() {
-                            let color = this.active_color_name();
-                            cb(pg, norm_rect_between(a, b), color, window, cx);
-                        }
-                        cx.notify();
-                        return;
-                    }
-                    let sel = match this.page_text.get(&pg) {
-                        Some(TextSlot::Ready(pt)) => pt.select(a, b),
-                        _ => None,
-                    };
-                    if let Some(sel) = sel
-                        && let Some(cb) = this.on_create.clone()
-                    {
-                        let color = this.active_color_name();
-                        cb(pg, sel.quote, sel.occurrence, color, window, cx);
-                    }
-                    cx.notify();
-                }),
+                cx.listener(Self::finish_page_gesture),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(Self::finish_page_gesture),
             );
 
         // Find bar overlay (search): a floating bar with the query, match count, and
