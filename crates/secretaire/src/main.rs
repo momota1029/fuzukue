@@ -189,6 +189,7 @@ pub struct Workspace {
     library: std::sync::Mutex<library::Index>,
     extensions: extensions::Extensions,
     lean_check: Mutex<()>,
+    lean_check_started: std::sync::OnceLock<()>,
     /// Lean の宣言ごとの状態（最後に確かめた結果）
     lean_status: std::sync::Mutex<Vec<(String, String)>>,
     lean_doc_findings: std::sync::Mutex<Vec<fuzukue_proto::LeanDocFinding>>,
@@ -259,6 +260,7 @@ impl Workspace {
             library: Default::default(),
             extensions: Default::default(),
             lean_check: Mutex::new(()),
+            lean_check_started: Default::default(),
             lean_status: std::sync::Mutex::new(Vec::new()),
             lean_doc_findings: std::sync::Mutex::new(Vec::new()),
             comment_edit: Mutex::new(()),
@@ -341,7 +343,6 @@ impl Workspace {
         self.hub.watch_approval_expiry();
         watch::start(self);
         handoff::watch(self);
-        self.check_lean();
         planner::restore(self);
         if fuzukue_proto::compat::env("FUZUKUE_APPROVALS").map(|v| v != "ask").unwrap_or(true) {
             auto_approve(self.clone());
@@ -500,7 +501,16 @@ impl Workspace {
         });
     }
 
+    #[cfg(not(test))]
+    fn check_lean_on_open(self: &Arc<Self>) {
+        // A workspace with no editor attached does not need to build Lean packages.
+        if !canary() && self.lean_check_started.set(()).is_ok() {
+            self.check_lean();
+        }
+    }
+
     fn check_lean(self: &Arc<Self>) -> tokio::task::JoinHandle<anyhow::Result<Vec<(String, String)>>> {
+        let _ = self.lean_check_started.set(());
         let app = self.clone();
         tokio::spawn(async move {
             let _check = app.lean_check.lock().await;
@@ -646,6 +656,7 @@ async fn run_server() -> anyhow::Result<()> {
     let _ = app.shutdown_drain_seconds.set(config.shutdown_drain_seconds);
     let _ = app.self_update.set(shutdown_control.clone());
     if let Some(update) = &update {
+        job_process::start_cache_reclaim();
         let macos_package = cfg!(target_os = "macos")
             && std::env::var_os("FUZUKUE_MACOS_PACKAGE").as_deref() == Some(std::ffi::OsStr::new("1"));
         service::start_project(app.clone(), update.clone(), macos_package);
@@ -1506,6 +1517,8 @@ async fn serve_workspace(
     })
     .await
     {
+        #[cfg(not(test))]
+        app.check_lean_on_open();
         let issues = app.last_issues.lock().unwrap().clone();
         let lean = ServerEvent::LeanStatus { decls: app.lean_status.lock().unwrap().clone(), running: false, doc_findings: app.lean_doc_findings.lock().unwrap().clone() };
         let comments = ServerEvent::Comments { items: comments::load(&app.project_dir.join(&deck)), deck };

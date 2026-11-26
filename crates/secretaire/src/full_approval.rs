@@ -159,6 +159,8 @@ pub(crate) fn registration(
     Registration {
         owner,
         thread_auto: false,
+        tool_item: None,
+        anchor_item: None,
         risk,
         unattended: ApprovalUnattended::DeferAndContinue,
         reason: "Full approval requested for an eligible operation".into(),
@@ -189,8 +191,11 @@ pub(crate) fn authorize_worker(
     tool: &str,
     request: &str,
     input: &Value,
+    item: Option<&str>,
 ) -> Result<FullAuthorization> {
-    hub.authorize_full_approval(worker_registration(session, job, backend, tool, request, input))
+    let mut registration = worker_registration(session, job, backend, tool, request, input);
+    registration.tool_item = item.map(|id| worker_tool_item(job, backend, id));
+    hub.authorize_full_approval(registration)
 }
 
 pub(crate) fn worker_registration(
@@ -207,16 +212,21 @@ pub(crate) fn worker_registration(
 
 /// Backends using their native bypass mode report tool starts instead of approval RPCs.
 pub(crate) fn observe_worker_tool(hub: &Hub, session: &str, job: &str, backend: &str, tool: &str, id: &str) {
-    let request = registration(
+    let mut request = registration(
         ApprovalOwner { thread: session.into(), job: job.into(), requester: backend.into() },
         tool,
         ApprovalRisk::High,
         json!({"item": id}),
         json!({"backend": backend, "native": true}),
     );
+    request.tool_item = Some(worker_tool_item(job, backend, id));
     if let Err(error) = hub.authorize_full_approval(request) {
         tracing::warn!(%error, %job, %tool, "Could not record native full approval");
     }
+}
+
+pub(crate) fn worker_tool_item(job: &str, backend: &str, id: &str) -> String {
+    if backend == "claude" { format!("{job}:{id}") } else { id.to_owned() }
 }
 
 /// Keep raw operation arguments out of the durable approval record.

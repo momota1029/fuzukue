@@ -23,6 +23,7 @@ chat-attached-deck = Attached to { $kind } “{ $title }”
 chat-attachments-are-limited-to-50-mib-per-file = Attachments are limited to 50 MiB per file
 chat-automatic-review = Automatic review
 chat-automatically-allowed = Automatically allowed
+chat-auto-approved-count = { $count } automatically allowed
 chat-automatically-declined = Automatically declined
 chat-worker-approval-selection = Worker: { $policy }
 chat-worker-approval-help = Who decides eligible worker approvals in this workspace. Other requests always go to you.

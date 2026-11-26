@@ -469,7 +469,7 @@ internal class RemoteRepository(
         }
     }
 
-    private fun applyQueuedApproval(current: RemoteState, approval: QueuedApproval, decidedHere: Boolean = false): RemoteState {
+    private fun applyQueuedApproval(current: RemoteState, approval: QueuedApproval): RemoteState {
         if (approval.workspace != current.workspace) return current
         val dock = current.approvalDock
         val next = dock.update(approval)
@@ -487,7 +487,10 @@ internal class RemoteRepository(
             approvalDock = next,
             approvals = current.approvals - approval.id,
             resolving = current.resolving - approval.id,
-        ).withTimeline(approval.thread, current.timeline(approval.thread).recordApproval(approval, decidedHere))
+        ).withTimeline(approval.thread, current.timeline(approval.thread).recordApproval(ApprovalReceipt(
+            approval.id, approval.job, approval.action.tool, approval.toolItem, approval.anchorItem,
+            approval.state, approval.automatic, approval.updatedAt,
+        )))
     }
 
     private fun finishQueuedDecision(current: RemoteState, event: ServerEvent.ApprovalDecisionResult): RemoteState {
@@ -505,7 +508,7 @@ internal class RemoteRepository(
         }
         val progress = entry.value.complete(event.request, error)
         val next = current.copy(approvalDock = dock.copy(decisions = dock.decisions + (entry.key to progress)))
-        return if (approval == null) next else applyQueuedApproval(next, approval, decidedHere = true)
+        return if (approval == null) next else applyQueuedApproval(next, approval)
     }
 
     fun resolveNotification(approval: ApprovalNotice, accept: Boolean) {
@@ -872,10 +875,12 @@ internal class RemoteRepository(
             }
             is ServerEvent.ThreadJobDetails -> {
                 if (!selectionScoped || replaying || frame.workspace == null || frame.workspace != current.workspace) return
-                val timeline = current.timeline(event.session)
+                val details = savedTranscriptEvents(event.session, event.events)
+                val timeline = details.filterIsInstance<ServerEvent.ApprovalRecorded>()
+                    .fold(current.timeline(event.session)) { state, record -> state.recordApproval(record.receipt) }
                 current.withTimeline(event.session, timeline.updateJob(event.job) { job ->
                     if (job.detailRequest != event.request) job else job.copy(
-                        details = savedTranscriptEvents(event.session, event.events).mapNotNull { nested ->
+                        details = details.mapNotNull { nested ->
                             when (nested) {
                                 is ServerEvent.TextDelta -> nested.text
                                 is ServerEvent.UserPrompt -> nested.text

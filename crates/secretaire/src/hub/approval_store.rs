@@ -51,6 +51,8 @@ pub(crate) struct Action {
 pub(crate) struct Registration {
     pub owner: ApprovalOwner,
     pub thread_auto: bool,
+    pub tool_item: Option<String>,
+    pub anchor_item: Option<String>,
     pub risk: ApprovalRisk,
     pub unattended: ApprovalUnattended,
     /// Safe to display to clients.
@@ -122,6 +124,7 @@ impl Record {
 
     fn grant_automatic(&mut self, now: i64, principal: &str, mode_id: &str) {
         self.summary.state = ApprovalState::Granted;
+        self.summary.automatic = true;
         self.summary.grant_scope = Some(ApprovalGrantScope::Once);
         self.summary.updated_at = now;
         self.audit(now, principal, None, AuditEvent::Granted {
@@ -229,8 +232,11 @@ impl Queue {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Store::default()),
             Err(error) => return Err(error).context("could not read the approval queue"),
         };
-        let store: Store =
+        let mut store: Store =
             serde_json::from_slice(&bytes).context("could not decode the approval queue")?;
+        for record in &mut store.records {
+            record.summary.automatic |= record.was_granted_by_full_mode();
+        }
         ensure!(
             store
                 .records
@@ -497,6 +503,7 @@ impl Queue {
     }
 
     /// Grant and claim the exact operation of a live caller in one durable mutation.
+    #[cfg(test)]
     pub(crate) fn authorize_full(&self, request: Registration) -> Result<FullAuthorization> {
         self.authorize_automatic(request, true, false, None)
     }
@@ -508,7 +515,7 @@ impl Queue {
     }
 
     fn register_inner(
-        &self, request: Registration, live: bool, full: bool, thread: bool, legacy_id: Option<&str>,
+        &self, mut request: Registration, live: bool, full: bool, thread: bool, legacy_id: Option<&str>,
     ) -> Result<(String, FullAuthorization)> {
         self.with_store(now, |store, now| {
             ensure!(
@@ -578,6 +585,12 @@ impl Queue {
                 self.commit(store, next, changed)?;
                 return Ok((id, authorization));
             }
+            if request.action.tool.starts_with("mcp/") && request.tool_item.is_some()
+                && store.records.iter().any(|record| record.summary.owner == request.owner
+                    && record.summary.tool_item == request.tool_item)
+            {
+                request.tool_item = None;
+            }
             let approval_id = legacy_id.map(str::to_owned).unwrap_or_else(|| loop {
                 let id = format!("apr_{:032x}", rand::random::<u128>());
                 if next.records.iter().all(|record| record.summary.approval_id != id) {
@@ -616,6 +629,9 @@ impl Queue {
                 state: ApprovalState::Pending,
                 grant_scope: None,
                 consumed_at: None,
+                automatic: false,
+                tool_item: request.tool_item,
+                anchor_item: request.anchor_item,
                 action: ApprovalDisplayAction {
                     tool: request.action.tool.clone(),
                     args: request.display_args,
@@ -630,6 +646,40 @@ impl Queue {
     }
 
     /// Take the snapshot and subscribe at the same point in the mutation order.
+    pub(super) fn transcript_receipts(&self, session: &str) -> Result<Vec<fuzukue_proto::ApprovalReceipt>> {
+        self.with_store(now, |store, _| Ok(store.records.iter()
+            .filter(|record| record.summary.owner.thread == session)
+            .filter_map(|record| record.summary.receipt())
+            .collect()))
+    }
+
+    pub(super) fn bind_mcp_tool(
+        &self, thread: &str, job: &str, name: &str, input: &Value, item: &str, previous: Option<&str>,
+    ) -> Result<()> {
+        let Some(previous) = previous else { return Ok(()) };
+        let fingerprint = crate::full_approval::fingerprint(input);
+        self.with_store(now, |store, _| {
+            if store.records.iter().any(|record| record.summary.owner.thread == thread
+                && record.summary.tool_item.as_deref() == Some(item))
+            {
+                return Ok(());
+            }
+            let Some(index) = store.records.iter().position(|record| {
+                let summary = &record.summary;
+                summary.owner.thread == thread && summary.owner.job == job
+                    && summary.tool_item.is_none() && summary.anchor_item.as_deref() == Some(previous)
+                    && summary.state == ApprovalState::Granted
+                    && record.action.tool.starts_with("mcp/")
+                    && record.action.args["fingerprint"].as_str() == Some(fingerprint.as_str())
+                    && fuzukue_view::chat::approval_matches_tool(&record.action.tool, name)
+            }) else { return Ok(()) };
+            let mut next = store.clone();
+            next.records[index].summary.tool_item = Some(item.into());
+            let summary = next.records[index].summary.clone();
+            self.commit(store, next, [summary])
+        })
+    }
+
     pub(crate) fn pending(
         &self,
     ) -> Result<(Vec<ApprovalSummary>, broadcast::Receiver<ApprovalSummary>)> {

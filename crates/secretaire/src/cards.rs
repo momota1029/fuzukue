@@ -759,9 +759,9 @@ fn graph_change(project: &Path, path: &Path) -> bool {
             || path.is_dir())
 }
 
-async fn refresh_graph(app: &Arc<Workspace>) {
-    let app = app.clone();
-    let _ = tokio::task::spawn_blocking(move || app.graph.refresh(&app.project_dir, &app.state_dir)).await;
+fn is_review_findings_change(project: &Path, path: &Path) -> bool {
+    !is_ignored(project, path)
+        && path.file_name().is_some_and(|name| name == crate::review_findings::FILE)
 }
 
 /// 変更を見張り、落ち着いたら（300ms）スナップショットを配り直す。
@@ -846,7 +846,11 @@ pub fn watch(
                 if !graph_paths.is_empty() {
                     graph_app.graph.invalidate_paths(&graph_paths);
                 }
-                if !graph_paths.is_empty() || ev.paths.iter().any(|p| is_card_change(&root, p) || is_pdf(&root, p) || is_source_change(&root, p)) {
+                if !graph_paths.is_empty() || ev.paths.iter().any(|p| {
+                    is_card_change(&root, p) || is_pdf(&root, p)
+                        || is_source_change(&root, p) || is_review_findings_change(&root, p)
+                })
+                {
                     let _ = tx.send((ev.kind, ev.paths));
                 }
             }
@@ -869,10 +873,14 @@ pub fn watch(
     }
     let history = app.history.clone();
     tokio::spawn(async move {
+        let mut startup = true;
         loop {
             let history = history.clone();
             if let Ok(Err(error)) = tokio::task::spawn_blocking(move || history.observe()).await {
                 tracing::warn!("project history watcher: {error:#}");
+            }
+            if std::mem::take(&mut startup) {
+                crate::job_process::request_cache_reclaim();
             }
             history_changes.notified().await;
             tokio::time::sleep(Duration::from_millis(350)).await;
@@ -946,7 +954,6 @@ pub fn watch(
     });
     tokio::spawn(async move {
         let _watcher = watcher; // タスクが生きている間は見張り続ける
-        refresh_graph(&app).await;
         while let Some(first) = rx.recv().await {
             let mut pending = Pending::default();
             let mut note = |(kind, paths): (notify::EventKind, Vec<PathBuf>)| {
@@ -961,9 +968,7 @@ pub fn watch(
                             || matches!(kind, notify::EventKind::Modify(notify::event::ModifyKind::Name(_)));
                         pending.pdf_set |= set_changed;
                         pending.pdfs.insert(p);
-                    } else if !is_ignored(&project, &p)
-                        && p.file_name().is_some_and(|name| name == crate::review_findings::FILE)
-                    {
+                    } else if is_review_findings_change(&project, &p) {
                         pending.findings.insert(p);
                     }
                 }
@@ -975,7 +980,10 @@ pub fn watch(
                 note(ev);
             }
             if app.graph.is_dirty() {
-                refresh_graph(&app).await;
+                let app = app.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    app.graph.refresh_loaded(&app.project_dir, &app.state_dir);
+                }).await;
             }
             let hub = &app.hub;
             if pending.cards {

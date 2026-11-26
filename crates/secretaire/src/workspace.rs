@@ -198,7 +198,13 @@ pub fn scan(project: &Path, pdfs: &[String]) -> Vec<TabView> {
         let mut paper_paths: BTreeMap<PathBuf, usize> = BTreeMap::new();
         let mut lean: BTreeSet<String> = BTreeSet::new();
         let mut notes = Vec::new();
-        for entry in walkdir::WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        for entry in walkdir::WalkDir::new(&dir).into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || (
+                !crate::cards::is_ignored(project, entry.path())
+                    && !entry.file_name().to_str().is_some_and(|name| matches!(name, "build" | "_build" | "dist"))
+            ))
+            .filter_map(Result::ok)
+        {
             let p = entry.path();
             if !entry.file_type().is_file() || p.extension().is_none_or(|e| e != "md") {
                 continue;

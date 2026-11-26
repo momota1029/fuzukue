@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use fuzukue_i18n::Locale;
 use fuzukue_proto::{
     ApprovalDecision, ApprovalGrantScope, ApprovalRisk, ApprovalState, ApprovalSummary,
-    ApprovalUnattended, ClientMsg, NotificationKind, ServerEvent,
+    ApprovalUnattended, ClientMsg, NotificationKind,
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
@@ -27,7 +27,7 @@ pub(super) struct ApprovalDock {
     queue_error: Option<String>,
     // The server supplies registration order, including ties in created_at.
     pending: Vec<ApprovalSummary>,
-    notices: HashMap<String, Vec<Resolution>>,
+    resolved: HashMap<(String, String), (ApprovalState, i64)>,
     collapsed: bool,
     detail: Option<String>,
     selected: HashSet<String>,
@@ -37,15 +37,6 @@ pub(super) struct ApprovalDock {
     scroll: ScrollHandle,
     focus: HashMap<(String, &'static str), FocusHandle>,
     last_focus: Option<FocusHandle>,
-}
-
-struct Resolution {
-    id: String,
-    thread: String,
-    tool: String,
-    state: ApprovalState,
-    updated_at: i64,
-    local: bool,
 }
 
 struct Review {
@@ -149,7 +140,7 @@ impl ApprovalDock {
         true
     }
 
-    fn resolve(&mut self, approval: ApprovalSummary, local: bool) -> bool {
+    fn resolve(&mut self, approval: ApprovalSummary) -> bool {
         let id = &approval.approval_id;
         self.pending.retain(|item| &item.approval_id != id);
         self.selected.remove(id);
@@ -157,20 +148,13 @@ impl ApprovalDock {
         if self.detail.as_ref() == Some(id) {
             self.detail = None;
         }
-        let notices = self.notices.entry(approval.workspace).or_default();
-        if let Some(previous) = notices.iter().rev().find(|notice| &notice.id == id) {
-            if previous.state == approval.state || previous.updated_at > approval.updated_at {
-                return false;
-            }
+        let key = (approval.workspace, approval.approval_id);
+        if self.resolved.get(&key).is_some_and(|&(state, updated_at)| {
+            state == approval.state || updated_at > approval.updated_at
+        }) {
+            return false;
         }
-        notices.push(Resolution {
-            id: approval.approval_id,
-            thread: approval.owner.thread,
-            tool: approval.action.tool,
-            state: approval.state,
-            updated_at: approval.updated_at,
-            local,
-        });
+        self.resolved.insert(key, (approval.state, approval.updated_at));
         true
     }
 
@@ -236,31 +220,6 @@ fn expiry(item: &ApprovalSummary) -> String {
         .unwrap_or_else(|| item.expires_at.to_string())
 }
 
-impl Resolution {
-    fn event(&self) -> ServerEvent {
-        let state = match self.state {
-            ApprovalState::Granted => tr!("approval-dock-allowed"),
-            ApprovalState::Denied => tr!("approval-dock-denied"),
-            ApprovalState::Withdrawn => tr!("approval-dock-withdrawn"),
-            ApprovalState::Expired => tr!("approval-dock-expired"),
-            ApprovalState::Pending => unreachable!(),
-        };
-        let text = tr!(
-            "approval-dock-resolution",
-            state = state,
-            actor = if self.local { "you" } else { "other" },
-            tool = self.tool.as_str(),
-            id = self.id.as_str(),
-        );
-        ServerEvent::LocalNotice {
-            session: self.thread.clone(),
-            item: format!("approval-dock:{}:{:?}", self.id, self.state),
-            text,
-            localized: None,
-        }
-    }
-}
-
 impl Workbench {
     pub(super) fn refresh_approvals(&mut self) {
         if !self.approvals.available || self.workspaces.active.is_none() {
@@ -280,7 +239,7 @@ impl Workbench {
     }
 
     pub(super) fn approval_changed(
-        &mut self, approval: ApprovalSummary, local: bool, window: &Window, cx: &mut Context<Self>,
+        &mut self, approval: ApprovalSummary, window: &Window, cx: &mut Context<Self>,
     ) {
         if !self.approvals.ready || self.workspaces.active.as_ref() != Some(&approval.workspace) {
             return;
@@ -293,21 +252,12 @@ impl Workbench {
             }
             return;
         }
-        let workspace = approval.workspace.clone();
-        if self.approvals.resolve(approval, local) && self.chats.contains_key(&thread) {
-            let notice = self.approvals.notices[&workspace].last().unwrap().event();
-            self.on_chat_event(notice, cx);
+        if let Some(receipt) = approval.receipt() {
+            if let Some(chat) = self.chats.get_mut(&thread) {
+                chat.record_approval_receipt(receipt, cx);
+            }
         }
-    }
-
-    pub(super) fn restore_approval_notices(&mut self, thread: &str, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspaces.active.as_ref() else { return };
-        let Some(notices) = self.approvals.notices.get(workspace) else { return };
-        let events: Vec<_> = notices.iter().filter(|notice| notice.thread == thread)
-            .map(Resolution::event).collect();
-        for event in events {
-            self.on_chat_event(event, cx);
-        }
+        self.approvals.resolve(approval);
     }
 
     pub(super) fn approval_result(
@@ -329,7 +279,7 @@ impl Workbench {
             self.approvals.feedback.insert(submission.thread, submission.feedback);
         }
         if let Ok(approval) = result {
-            self.approval_changed(approval, true, window, cx);
+            self.approval_changed(approval, window, cx);
         }
     }
 

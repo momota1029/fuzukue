@@ -597,14 +597,15 @@ impl DeckConfig {
 
 /// `root` の下で `deck.toml` を持つディレクトリを探す（.git や target などは見ない）。
 pub fn find_decks(root: &Path) -> Vec<PathBuf> {
-    const SKIP: &[&str] = &[".git", "target", ".lake", "node_modules", ".temp"];
+    const SKIP: &[&str] = &[".git", "target", ".lake", "node_modules", ".temp", ".corpus"];
     let mut out: Vec<PathBuf> = walkdir::WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
             !fuzukue_proto::is_thread_save_artifact(e.path())
                 && !e.path().strip_prefix(root).is_ok_and(fuzukue_proto::is_inbox_upload_path)
                 && !e.file_name().to_str().is_some_and(|s| SKIP.contains(&s)
-                    || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-"))
+                    || s.starts_with(".fuzukue-research-") || s.starts_with(".fuzukue-book-import-")
+                    || e.depth() > 0 && e.file_type().is_dir() && matches!(s, "build" | "_build" | "dist"))
         })
         .filter_map(Result::ok)
         // deck.toml のほか、writing-harness の論文（harness.toml）と古い cards.toml も

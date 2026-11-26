@@ -20,6 +20,7 @@ chat-attached-deck = { $kind }「{ $title }」に付けた
 chat-attachments-are-limited-to-50-mib-per-file = 添付は 1 ファイル 50 MiB までです
 chat-automatic-review = 自動査読
 chat-automatically-allowed = 自動で許可
+chat-auto-approved-count = 自動許可 { $count } 件
 chat-automatically-declined = 自動で拒否
 chat-worker-approval-selection = 作業役：{ $policy }
 chat-worker-approval-help = このワークスペースで作業役からの対象の承認を誰が判断するかを選びます。それ以外は利用者が確認します。

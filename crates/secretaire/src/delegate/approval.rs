@@ -132,16 +132,16 @@ where
 }
 
 pub(super) async fn request(
-    app: &Workspace, owner: Owner, tool: &str, input: &Value, human_only: bool,
+    app: &Workspace, owner: Owner, tool: &str, input: &Value, human_only: bool, item: Option<&str>,
 ) -> anyhow::Result<String> {
     let session = owner.session.clone();
-    request_with(app, owner, tool, input, human_only, |data| async move {
+    request_with(app, owner, tool, input, human_only, item, |data| async move {
         crate::planner::worker_approval(app, &session, &data, RULES, Duration::from_secs(12)).await
     }).await
 }
 
 async fn request_with<Fut>(
-    app: &Workspace, owner: Owner, tool: &str, input: &Value, human_only: bool,
+    app: &Workspace, owner: Owner, tool: &str, input: &Value, human_only: bool, item: Option<&str>,
     advise: impl FnOnce(Value) -> Fut,
 ) -> anyhow::Result<String>
 where
@@ -155,6 +155,7 @@ where
     let mut full = crate::full_approval::worker_registration(
         &owner.session, &owner.job, "claude", tool, &owner.backend_id, input,
     );
+    full.tool_item = item.map(|id| crate::full_approval::worker_tool_item(&owner.job, "claude", id));
     let trusted = app.delegates.worker_approval_trusted(&owner.session, &owner.job);
     if !trusted {
         full.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
@@ -288,7 +289,7 @@ mod tests {
         let (_temp, app) = fixture(WorkerApprovalPolicy::Ask)?;
         let owner = Owner::new(SESSION, JOB, "native-rpc");
         let input = json!({"command": "printf fixture"});
-        let waiting = request(&app, owner, "Bash", &input, true);
+        let waiting = request(&app, owner, "Bash", &input, true, None);
         tokio::pin!(waiting);
         assert!(poll!(waiting.as_mut()).is_pending());
         let id = pending(&app);
@@ -437,7 +438,7 @@ sys.stdin.readline()
         let root = &app.project_dir;
         let scope = crate::worker_scope::Scope::open(root, root, root)?;
         let shell = |command: &str| {
-            super::super::request_shell_approval(&app, SESSION, JOB, "backend", &scope, json!({"command": command}))
+            super::super::request_shell_approval(&app, SESSION, JOB, "backend", &scope, json!({"command": command}), None)
         };
         let rejected = shell("rm README.md");
         tokio::pin!(rejected);
@@ -514,7 +515,7 @@ sys.stdin.readline()
                 for (advisor_outcome, answer) in replies {
                     let calls = std::cell::Cell::new(0);
                     let request = request_with(&app, Owner::new(SESSION, JOB, "backend-request"),
-                        tool, input, human_only, |data| {
+                        tool, input, human_only, None, |data| {
                             calls.set(calls.get() + 1);
                             assert_eq!(data["operation"], "Read");
                             async move {
@@ -579,7 +580,7 @@ sys.stdin.readline()
         let (_temp, app) = fixture(WorkerApprovalPolicy::Advisor)?;
         let read = json!({"file_path":"README.md"});
         let (release, advisor) = tokio::sync::oneshot::channel();
-        let first = request_with(&app, Owner::new(SESSION, JOB, "backend-id"), "Read", &read, false, |_| async {
+        let first = request_with(&app, Owner::new(SESSION, JOB, "backend-id"), "Read", &read, false, None, |_| async {
             Ok(advisor.await?)
         });
         tokio::pin!(first);
@@ -590,7 +591,7 @@ sys.stdin.readline()
         assert_eq!(first.await?, "accept");
 
         let (release, advisor) = tokio::sync::oneshot::channel();
-        let second = request_with(&app, Owner::new(SESSION, JOB, "backend-id"), "Read", &read, false, |data| async move {
+        let second = request_with(&app, Owner::new(SESSION, JOB, "backend-id"), "Read", &read, false, None, |data| async move {
             assert_eq!(data["declared_touches"], json!(["README.md"]));
             Ok(advisor.await?)
         });
@@ -629,7 +630,7 @@ sys.stdin.readline()
         let (_temp, app) = fixture(WorkerApprovalPolicy::Advisor)?;
         let read = json!({"file_path": "README.md"});
         let (release, advisor) = tokio::sync::oneshot::channel();
-        let request = request_with(&app, Owner::new(SESSION, JOB, "read"), "Read", &read, false, |_| async {
+        let request = request_with(&app, Owner::new(SESSION, JOB, "read"), "Read", &read, false, None, |_| async {
             Ok(advisor.await?)
         });
         tokio::pin!(request);

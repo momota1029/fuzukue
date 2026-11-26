@@ -23,7 +23,7 @@ pub(crate) fn sources(project: &Path) -> Vec<PathBuf> {
             if kind.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
                 if !matches!(
                     entry.file_name().to_str(),
-                    Some("target" | "node_modules" | "build")
+                    Some("target" | "node_modules" | "build" | "_build" | "dist")
                 ) {
                     walk(&entry.path(), out);
                 }
@@ -65,6 +65,14 @@ fn finding(path: &str, decl: &Declaration, code: &'static str) -> LeanDocFinding
 }
 
 pub(crate) async fn doc_check(project: &Path) -> Result<DocCheck> {
+    let paths = sources(project);
+    let mut result = DocCheck {
+        findings: Vec::new(),
+        incomplete: Vec::new(),
+    };
+    if paths.is_empty() {
+        return Ok(result);
+    }
     let repo = Repo::open(project).await.ok();
     let mut base = None;
     let mut renames = BTreeMap::new();
@@ -91,11 +99,7 @@ pub(crate) async fn doc_check(project: &Path) -> Result<DocCheck> {
             }
         }
     }
-    let mut result = DocCheck {
-        findings: Vec::new(),
-        incomplete: Vec::new(),
-    };
-    for path in sources(project) {
+    for path in paths {
         let label = path.strip_prefix(project)?.to_string_lossy();
         let Ok(source) = std::fs::read_to_string(&path) else {
             result.incomplete.push(label.into_owned());

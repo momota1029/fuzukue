@@ -36,11 +36,3 @@ approval-dock-risk-mid = 中リスク
 approval-dock-risk-high = 高リスク
 approval-dock-allow = 許可
 approval-dock-deny = 拒否
-approval-dock-allowed = 許可
-approval-dock-denied = 拒否
-approval-dock-withdrawn = 撤回
-approval-dock-expired = 期限切れ
-approval-dock-resolution = { $actor ->
-    [you] { $state }（あなた） · { $tool } · { $id }
-   *[other] { $state } · { $tool } · { $id }
-}

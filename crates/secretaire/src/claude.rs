@@ -1504,11 +1504,12 @@ impl ClaudeSession {
                 if eligible {
                     use crate::hub::approval_store::FullAuthorization::*;
                     let tool_id = request.get("tool_use_id").and_then(Value::as_str).unwrap_or(&id);
-                    let request = crate::full_approval::desk_registration(&self.id, "claude", &audit_tool, tool_id, &input);
+                    let mut registration = crate::full_approval::desk_registration(&self.id, "claude", &audit_tool, tool_id, &input);
+                    registration.tool_item = request["tool_use_id"].as_str().map(str::to_owned);
                     let session = Arc::downgrade(self);
                     let resume_id = id.clone();
                     let runtime = tokio::runtime::Handle::current();
-                    match self.hub.publish_sweepable_approval(event, Arc::downgrade(&alive), request, move |granted| {
+                    match self.hub.publish_sweepable_approval(event, Arc::downgrade(&alive), registration, move |granted| {
                         runtime.spawn(async move {
                             if let Some(session) = session.upgrade() {
                                 let _turns = session.state.lock().await;
@@ -1565,7 +1566,8 @@ impl ClaudeSession {
                                     && self.app.upgrade().is_some_and(|app| crate::mcp::exec::trusted_session(&app, &self.id))
                                 {
                                     if let Some(id) = block["id"].as_str() {
-                                        let request = crate::full_approval::desk_registration(&self.id, "claude", name, id, &block["input"]);
+                                        let mut request = crate::full_approval::desk_registration(&self.id, "claude", name, id, &block["input"]);
+                                        request.tool_item = Some(id.to_owned());
                                         if let Err(error) = self.hub.authorize_full_approval(request) {
                                             tracing::warn!(%error, "Could not audit native Claude edit");
                                         }
@@ -1882,7 +1884,8 @@ pub(crate) async fn run_worker(
                             use crate::hub::approval_store::FullAuthorization::*;
                             let trusted = app.delegates.worker_approval_trusted(session, job);
                             let authorization = if trusted {
-                                crate::full_approval::authorize_worker(&app.hub, session, job, "claude", tool, backend_id, &request["input"])
+                                crate::full_approval::authorize_worker(&app.hub, session, job, "claude", tool, backend_id,
+                                    &request["input"], request["tool_use_id"].as_str())
                             } else {
                                 Ok(Human)
                             };
@@ -1928,12 +1931,13 @@ pub(crate) async fn run_worker(
                         let (abort, registration) = AbortHandle::new_pair();
                         pending_approvals.insert(backend_id.into(), abort);
                         let (backend_id, tool, input) = (backend_id.to_owned(), tool.to_owned(), request["input"].clone());
+                        let item = request["tool_use_id"].as_str().map(str::to_owned);
                         approvals.push(Abortable::new(async move {
                             let response = if can_remember_shell {
-                                crate::delegate::request_shell_approval(app, session, job, &backend_id, scope, input).await
+                                crate::delegate::request_shell_approval(app, session, job, &backend_id, scope, input, item.as_deref()).await
                             } else {
                                 crate::delegate::request_worker_approval(
-                                    app, session, job, &backend_id, &tool, &input, human_only,
+                                    app, session, job, &backend_id, &tool, &input, human_only, item.as_deref(),
                                 ).await.map(|decision| (decision == "accept").then_some(input))
                             };
                             (backend_id, response)

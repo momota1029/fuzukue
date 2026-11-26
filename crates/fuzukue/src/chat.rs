@@ -30,13 +30,14 @@ use gpui_kit::component::{
 use gpui_kit::{
     canvas, div, fill, linear_color_stop, linear_gradient, list_with_optional_items, point, prelude::*, px, relative, rems,
     Anchor, Animation, AnimationExt, AnyElement, Context,
-    ElementId, Entity, EntityInputHandler as _, ExternalPaths, Focusable as _, FollowMode, ListAlignment, ListState,
-    PathPromptOptions, Pixels, Point, Rems, SharedString, Task, Window,
+    ElementId, Entity, EntityInputHandler as _, ExternalPaths, Focusable as _, FollowMode,
+    HoverListenerMode, ListAlignment, ListState, PathPromptOptions, Pixels, Point, Rems,
+    SharedString, Task, Window,
 };
 use fuzukue_i18n::STATUS_SEPARATOR;
 use fuzukue_proto::{
     Actor, AgentBackend, AgentSelection, ChatSettings, ClientMsg, CommentApplication, CommentApplicationState, MathMacro, PermissionMode, ServerEvent, ATTACHMENT_CHUNK_BYTES,
-    BackgroundCommand, BackgroundCommandState,
+    ApprovalReceipt, ApprovalState, BackgroundCommand, BackgroundCommandState,
     ChatWaitReason, ChatWaiting, DeckRoute, GoalTail, InboxProposal, ThreadView, CLAUDE_MODELS, DelegateJob, DelegateReport, DELEGATE_JOB, MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES,
     JobStatus, JobSummary, WorkerApprovalPolicy,
 };
@@ -71,6 +72,9 @@ mod chat_history;
 pub(super) use chat_history::Transcripts;
 #[path = "chat_transcript.rs"]
 mod chat_transcript;
+#[path = "chat_tool_runs.rs"]
+mod chat_tool_runs;
+use chat_tool_runs::ToolRuns;
 
 use chat_activity::{status_row, status_speech, STATUS_OPTICAL_OFFSET};
 use chat_transcript::{MarkdownPart, RowEstimate, TranscriptRows, TranscriptStyle, TranscriptView};
@@ -123,6 +127,7 @@ pub(super) struct Chat {
     jobs: chat_history::JobSummaries,
     by_item: HashMap<String, usize>,
     by_tool: HashMap<String, (usize, usize)>,
+    approval_receipts: HashMap<String, ApprovalReceipt>,
     by_approval: HashMap<String, (usize, usize)>,
     delegate_items: HashMap<String, (usize, usize)>,
     pending_delegates: HashSet<String>,
@@ -143,7 +148,7 @@ pub(super) struct Chat {
     pub(super) settings: ChatSettings,
     attachments: Vec<DraftAttachment>,
     inbox: BTreeMap<String, InboxEntry>,
-    hovered_message_row: Option<usize>,
+    hovered_message_row: Option<(usize, u64)>,
     quote_position: Option<Point<Pixels>>,
     disclosure_press: Rc<Cell<Option<Point<Pixels>>>>,
     math_macros: Vec<MathMacro>,
@@ -214,6 +219,7 @@ struct Row {
     id: u64,
     actor: Actor,
     content: Content,
+    ends_tool_run: bool,
     at_ms: Option<u64>,
     estimate: RowEstimate,
 }
@@ -224,7 +230,7 @@ impl Row {
         let estimate = RowEstimate::for_content(&actor, &content);
         Self {
             id: NEXT_ROW_ID.fetch_add(1, Ordering::Relaxed),
-            actor, content, at_ms: Some(unix_millis()), estimate,
+            actor, content, ends_tool_run: false, at_ms: Some(unix_millis()), estimate,
         }
     }
 
@@ -556,6 +562,7 @@ impl Chat {
             jobs: Default::default(),
             by_item: HashMap::new(),
             by_tool: HashMap::new(),
+            approval_receipts: HashMap::new(),
             by_approval: HashMap::new(),
             delegate_items: HashMap::new(),
             pending_delegates: HashSet::new(),
@@ -670,7 +677,7 @@ impl Chat {
                 turn.update_phase(|turn| turn.pending_approvals.push(request_id.clone()));
             }
         }
-        let (row, joined) = self.tool_group(actor);
+        let (row, joined) = self.tool_group(actor, true);
         if let Content::Tools(group) = &mut self.rows[row].content {
             let shell = summary.fallback.starts_with("Bash:")
                 || summary.localized.as_ref().is_some_and(|message| message.key == "approval-run-command");
@@ -831,9 +838,34 @@ impl Chat {
         self.push_system_row(item.clone(), Content::GitHub { item, events, open }, cx);
     }
 
-    fn local_notice(
+    fn row_for_approval_anchor(&self, item: &str) -> Option<usize> {
+        self.by_item.get(item).copied().or_else(|| self.by_tool.get(item).map(|&(row, _)| row))
+    }
+
+    pub(super) fn record_approval_receipt(&mut self, receipt: ApprovalReceipt, cx: &mut Context<Workbench>) {
+        let previous = self.approval_receipts.get(&receipt.id);
+        if previous.is_some_and(|old| old == &receipt || old.updated_at > receipt.updated_at
+            || (old.updated_at == receipt.updated_at && old.tool_item.is_some() && receipt.tool_item.is_none()))
+        {
+            return;
+        }
+        let old_row = previous.and_then(|old| old.history_anchor())
+            .and_then(|item| self.row_for_approval_anchor(item));
+        let row = receipt.job().or_else(|| receipt.history_anchor())
+            .and_then(|item| self.row_for_approval_anchor(item));
+        self.approval_receipts.insert(receipt.id.clone(), receipt);
+        for row in old_row.into_iter().chain(row) {
+            self.remeasure(row, cx);
+        }
+    }
+
+    pub(super) fn local_notice(
         &mut self, item: String, text: String, localized: Option<fuzukue_proto::LocalizedMessage>, cx: &mut Context<Workbench>,
     ) {
+        if let Some(receipt) = localized.as_ref().and_then(ApprovalReceipt::from_message) {
+            self.record_approval_receipt(receipt, cx);
+            return;
+        }
         if item == fuzukue_proto::COMPOSER_NOTICE_ITEM {
             if self.composer_notice.as_deref() != Some(&text) {
                 self.composer_notice = Some(text);
@@ -1123,7 +1155,7 @@ impl Chat {
             }
         }
         let call = ToolCall::new(name, summary, input);
-        let (row, joined) = self.tool_group(actor);
+        let (row, joined) = self.tool_group(actor, false);
         if let Content::Tools(group) = &mut self.rows[row].content {
             self.by_tool.insert(item, (row, group.calls.len()));
             group.calls.push(call);
@@ -1131,12 +1163,15 @@ impl Chat {
         self.update_tool_group(row, joined, cx);
     }
 
-    fn tool_group(&mut self, actor: Actor) -> (usize, bool) {
+    fn tool_group(&mut self, actor: Actor, approval: bool) -> (usize, bool) {
         let placement = self.grouping.push(&actor, true);
-        if !placement.join_tools {
+        let joined = placement.join_tools && self.rows.last().is_some_and(|row| {
+            matches!(&row.content, Content::Tools(group) if group.approvals.is_empty() != approval)
+        });
+        if !joined {
             self.rows.push(Row::new(actor, Content::Tools(ToolGroup::default())));
         }
-        (self.rows.len() - 1, placement.join_tools)
+        (self.rows.len() - 1, joined)
     }
 
     fn update_tool_group(&mut self, row: usize, joined: bool, cx: &mut Context<Workbench>) {
@@ -1218,6 +1253,12 @@ impl Chat {
 
     pub(super) fn end_turn(&mut self, actor: &Actor, cx: &mut Context<Workbench>) {
         self.grouping.end_turn(actor);
+        if let Some(row) = self.rows.last_mut().filter(|row| {
+            &row.actor == actor && matches!(row.content, Content::Tools(_))
+        }) {
+            row.ends_tool_run = true;
+            self.transcript.rows.borrow_mut().take();
+        }
         if is_partner(actor) {
             self.delegate_anchor = None;
         }
@@ -1487,6 +1528,19 @@ impl Chat {
     }
 
     fn toggle(&mut self, row: usize, disclosure: Disclosure, show_worker_messages: bool, cx: &mut Context<Workbench>) {
+        if matches!(disclosure, Disclosure::Group) {
+            let runs = ToolRuns::new(self);
+            if let Some(run) = runs.at(row) {
+                let open = !run.open(&self.rows);
+                for &index in &run.rows {
+                    if let Content::Tools(group) = &mut self.rows[index].content {
+                        group.open = open;
+                    }
+                }
+                self.remeasure(row, cx);
+                return;
+            }
+        }
         let Some(row_data) = self.rows.get_mut(row) else {
             return;
         };
@@ -2201,8 +2255,10 @@ impl Workbench {
         let geometry = {
             let mut cached = chat.transcript.rows.borrow_mut();
             if cached.as_ref().is_none_or(|rows| rows.show_worker_messages != show_worker_messages) {
-                let kinds: Vec<_> = chat.rows.iter().map(|row| {
+                let tool_runs = ToolRuns::new(chat);
+                let kinds: Vec<_> = chat.rows.iter().enumerate().map(|(index, row)| {
                     match &row.content {
+                        _ if tool_runs.hides(index) => RowKind::Hidden,
                         Content::AutoAttached(route) if thread.is_none_or(|thread| !thread.auto_attached.contains(route)) => {
                             RowKind::Hidden
                         }
@@ -2217,7 +2273,12 @@ impl Workbench {
                     }
                 });
                 *cached = Some(Rc::new(TranscriptRows {
-                    estimates: chat.rows.iter().map(|row| row.estimate).collect(),
+                    estimates: chat.rows.iter().enumerate().map(|(index, row)| {
+                        tool_runs.at(index).filter(|run| run.root() == index && run.open(&chat.rows)).map_or(row.estimate, |run| {
+                            RowEstimate::Disclosure(1 + run.calls.len() + usize::from(run.unlinked > 0))
+                        })
+                    }).collect(),
+                    tool_runs,
                     first_visible: kinds.iter().position(|&kind| kind != RowKind::Hidden),
                     last_visible: kinds.iter().rposition(|&kind| kind != RowKind::Hidden),
                     groups: assistant_groups(kinds.iter().zip(&chat.rows).map(|(&kind, row)| (kind, row.at_ms))),
@@ -2233,9 +2294,16 @@ impl Workbench {
         let estimates = geometry.clone();
         let chat_id = chat_transcript_id(&session);
         let quote_region = chat_id.clone();
+        // The list holds a mutable borrow of its layout state while rendering items.
+        let hovered_row = chat.hovered_message_row.and_then(|(index, id)| {
+            (chat.rows.get(index)?.id == id).then_some(index)
+        }).and_then(|index| {
+            let bounds = scroller.bounds_for_item(index)?.intersect(&scroller.viewport_bounds());
+            Some((index, bounds))
+        });
         let rows = list_with_optional_items(
             scroller.clone(),
-            move |ix, _, cx| {
+            move |ix, window, cx| {
                 let TranscriptRows { kinds, groups, first_visible, last_visible, .. } = &*geometry;
                 let (first_visible, last_visible) = (*first_visible, *last_visible);
                 let latest_message = geometry.latest_message;
@@ -2250,18 +2318,25 @@ impl Workbench {
                 let row = &chat.rows[ix];
                 let group = groups.get(groups.partition_point(|group| group.last < ix))
                     .filter(|group| group.first <= ix);
-                let group_hovered = chat.hovered_message_row.is_some_and(|hovered| {
-                    group.map_or(hovered == ix, |group| (group.first..=group.last).contains(&hovered))
+                let pointer = window.mouse_position();
+                let covered = this.screenshots.preview_open();
+                let keyboard_focus = !covered && window.last_input_was_keyboard();
+                let group_hovered = !covered && hovered_row.is_some_and(|(hovered, bounds)| {
+                    bounds.contains(&pointer)
+                        && group.map_or(hovered == ix, |group| (group.first..=group.last).contains(&hovered))
                 });
                 let hovered_chat = entity.downgrade();
                 let hovered_session = session.clone();
-                let list_row = div().id(("chat-row", row.id)).w_full().group("chat-message-row")
+                let row_id = row.id;
+                let hover_group: SharedString = format!("chat-message-row-{row_id}").into();
+                let list_row = div().id(("chat-row", row_id)).w_full().group(hover_group.clone())
+                    .hover_listener_mode(HoverListenerMode::InputModalityIndependent)
                     .on_hover(move |&hovered, _, cx| {
                         let _ = hovered_chat.update(cx, |this, cx| {
                             let Some(chat) = this.chats.get_mut(&hovered_session) else { return };
-                            if hovered {
-                                chat.hovered_message_row = Some(ix);
-                            } else if chat.hovered_message_row == Some(ix) {
+                            if hovered && chat.rows.get(ix).is_some_and(|row| row.id == row_id) {
+                                chat.hovered_message_row = Some((ix, row_id));
+                            } else if chat.hovered_message_row.is_some_and(|(_, id)| id == row_id) {
                                 chat.hovered_message_row = None;
                             }
                             cx.notify();
@@ -2278,7 +2353,7 @@ impl Workbench {
                             },
                         ))
                 };
-                let summary_toggle = |id: SharedString, part, open, label: String, color| {
+                let summary_toggle_at = |target: usize, id: SharedString, part, open, label: String, color| {
                     let entity = entity.clone();
                     let session = session.clone();
                     let press = chat.disclosure_press.clone();
@@ -2288,11 +2363,14 @@ impl Workbench {
                                 Disclosure::DelegateDetails => this.toggle_thread_job(&session, ix, cx),
                                 Disclosure::MoreDelegateDetails => this.request_older_job_details(&session, ix),
                                 _ => if let Some(chat) = this.chats.get_mut(&session) {
-                                    chat.toggle(ix, part, this.appearance.settings.show_worker_messages, cx);
+                                    chat.toggle(target, part, this.appearance.settings.show_worker_messages, cx);
                                 },
                             }
                         });
                     })
+                };
+                let summary_toggle = |id, part, open, label, color| {
+                    summary_toggle_at(ix, id, part, open, label, color)
                 };
                 let disclosure = |part, open, label: String| {
                     summary_toggle(format!("chat-{session}-{ix}-{part:?}").into(),
@@ -2566,7 +2644,15 @@ impl Workbench {
                                         None if block.report.is_some() => tr!("chat-ended"),
                                         None => tr!("chat-tool-running"),
                                     };
+                                    let allowed = chat.approval_receipts.values().any(|receipt| {
+                                        receipt.job() == Some(block.id.as_str())
+                                            && receipt.state == ApprovalState::Granted && receipt.automatic
+                                            && receipt.tool_item.as_ref().and_then(|item| chat.delegate_items.get(item)) == Some(&(ix, index))
+                                    });
                                     let label = format!("{}{STATUS_SEPARATOR}{status}", call.summary);
+                                    let label = if allowed {
+                                        format!("{label}{STATUS_SEPARATOR}{}", tr!("chat-automatically-allowed"))
+                                    } else { label };
                                     body = body.child(
                                         disclosure(Disclosure::DelegateTool(index), call.input_open, label)
                                             .font(this.appearance.code_font.clone())
@@ -2603,6 +2689,10 @@ impl Workbench {
                                 DelegateEntry::Text(_) | DelegateEntry::Tool(_) => {}
                             }
                         }
+                        body = body.children(chat.approval_receipts.values().filter(|receipt| {
+                            receipt.job() == Some(block.id.as_str()) && receipt.state == ApprovalState::Denied
+                        }).map(|receipt| div().text_xs().text_color(theme.danger)
+                            .child(format!("{}{STATUS_SEPARATOR}{}", tr!("chat-deny"), receipt.tool))));
                         if let Some((ok, report)) = block.report.as_ref().filter(|_| text_open) {
                             let text = if report.interrupted { tr!("chat-worker-recovery") } else { report.text.as_str() };
                             body = body.child(v_flex().id(SharedString::from(format!("delegate-report-{}", block.id)))
@@ -2620,18 +2710,24 @@ impl Workbench {
                         }
                     }
                     Content::Tools(group) => {
-                        let batch_failure = group.calls.iter().find_map(ToolCall::batch_failure_summary);
-                        let failed = batch_failure.is_some() || group
-                            .calls
-                            .iter()
+                        let run = geometry.tool_runs.at(ix);
+                        let open = run.map_or(group.open, |run| run.open(&chat.rows));
+                        let calls = run.map_or_else(|| (0..group.calls.len()).map(|call| (ix, call)).collect(),
+                            |run| run.calls.clone());
+                        let call_at = |(row, call): (usize, usize)| {
+                            let Content::Tools(group) = &chat.rows[row].content else { unreachable!() };
+                            &group.calls[call]
+                        };
+                        let batch_failure = calls.iter().map(|&position| call_at(position)).find_map(ToolCall::batch_failure_summary);
+                        let failed = batch_failure.is_some() || calls.iter().map(|&position| call_at(position))
                             .any(|call| call.result.as_ref().is_some_and(|r| !r.ok));
-                        if !group.calls.is_empty() {
-                            let label = tr!("chat-tool-calls", calls = group.calls.len());
+                        if !calls.is_empty() {
+                            let label = tr!("chat-tool-calls", calls = calls.len());
                             let color = if failed { theme.danger } else { theme.muted_foreground };
-                            let long_partner_run = group.calls.len() >= LONG_PARTNER_TOOL_RUN
+                            let long_partner_run = calls.len() >= LONG_PARTNER_TOOL_RUN
                                 && matches!(row.actor, Actor::Claude | Actor::Codex { parent_tool_use: None, .. });
                             let label = if long_partner_run {
-                                let pending = group.calls.iter().any(|call| call.result.is_none());
+                                let pending = calls.iter().any(|&position| call_at(position).result.is_none());
                                 let status = if !pending {
                                     tr!("chat-done")
                                 } else if group.ended {
@@ -2644,7 +2740,10 @@ impl Workbench {
                             } else {
                                 label
                             };
-                            let collapsed_failure = batch_failure.filter(|_| !group.open);
+                            let label = if let Some(count) = run.map(|run| run.approvals()).filter(|count| *count > 0) {
+                                format!("{label}{STATUS_SEPARATOR}{}", tr!("chat-auto-approved-count", count = count))
+                            } else { label };
+                            let collapsed_failure = batch_failure.filter(|_| !open);
                             let label = match collapsed_failure {
                                 Some(summary) => format!("{summary}{STATUS_SEPARATOR}{label}"),
                                 None => label,
@@ -2652,7 +2751,7 @@ impl Workbench {
                             let toggle = summary_toggle(
                                 format!("chat-{session}-{ix}-Group").into(),
                                 Disclosure::Group,
-                                group.open,
+                                open,
                                 label,
                                 color,
                             );
@@ -2731,24 +2830,28 @@ impl Workbench {
                                         .child(if clipped && !approval.details_open { format!("{preview}…") } else { details.into_owned() })),
                             );
                         }
-                        if group.open {
-                            for (i, call) in group.calls.iter().enumerate() {
+                        if open {
+                            for (row, i) in calls {
+                                let call = call_at((row, i));
+                                let input = Disclosure::Input(i);
                                 let mut tool = v_flex()
                                     .min_w_0()
                                     .gap_1()
                                     .child(
-                                        disclosure(
-                                            Disclosure::Input(i),
-                                            call.input_open,
-                                            call.summary.clone(),
+                                        summary_toggle_at(row, format!("chat-{session}-{row}-{input:?}").into(),
+                                            input, call.input_open, call.summary.clone(), theme.muted_foreground,
                                         )
                                         .font(this.appearance.code_font.clone()),
                                     )
                                     .children(call.input_open.then(|| {
-                                        code(&format!("input-{i}"),
+                                        code(&format!("input-{row}-{i}"),
                                             &serde_json::to_string_pretty(&call.input)
                                                 .unwrap_or_else(|_| call.input.to_string()),
                                         )
+                                    }))
+                                    .children(run.and_then(|run| run.attached.get(&(row, i))).map(|_| {
+                                        div().pl_3().text_xs().text_color(theme.muted_foreground)
+                                            .child(tr!("chat-automatically-allowed"))
                                     }));
                                 if let Some(result) = &call.result {
                                     let batch_failure = call.batch_failure_summary();
@@ -2762,8 +2865,8 @@ impl Workbench {
                                     };
                                     let color = if result.ok && batch_failure.is_none() { theme.muted_foreground } else { theme.danger };
                                     let part = Disclosure::Result(i);
-                                    let toggle = summary_toggle(
-                                        format!("chat-{session}-{ix}-{part:?}").into(),
+                                    let toggle = summary_toggle_at(row,
+                                        format!("chat-{session}-{row}-{part:?}").into(),
                                         part,
                                         call.result_open,
                                         label,
@@ -2781,14 +2884,28 @@ impl Workbench {
                                                 toggle
                                             })
                                             .children(
-                                                call.result_open.then(|| code(&format!("output-{i}"), &result.output)),
+                                                call.result_open.then(|| code(&format!("output-{row}-{i}"), &result.output)),
                                             ),
                                     );
                                 }
                                 body = body.child(tool.pl_3());
                             }
+                            if let Some(count) = run.map(|run| run.unlinked).filter(|count| *count > 0) {
+                                body = body.child(div().pl_3().text_xs().text_color(theme.muted_foreground)
+                                    .child(tr!("chat-auto-approved-count", count = count)));
+                            }
                         }
                     }
+                }
+                if let Some(&count) = geometry.tool_runs.standalone.get(&ix) {
+                    body = body.child(div().text_xs().text_color(theme.muted_foreground)
+                        .child(tr!("chat-auto-approved-count", count = count)));
+                }
+                if let Some(tools) = geometry.tool_runs.denials.get(&ix) {
+                    body = body.children(tools.iter().map(|tool| {
+                        div().text_xs().text_color(theme.danger)
+                            .child(format!("{}{STATUS_SEPARATOR}{tool}", tr!("chat-deny")))
+                    }));
                 }
                 let action_index = match group {
                     Some(group) if group.last == ix => group.last_text,
@@ -2877,9 +2994,7 @@ impl Workbench {
                                     format!("chat-message-actions-{ix}")
                                 }))
                                 .when(latest_message != Some(ix), |actions| {
-                                    actions.focusable().opacity(if group_hovered { 1. } else { 0. })
-                                        .group_hover("chat-message-row", |style| style.opacity(1.))
-                                        .in_focus(|style| style.opacity(1.))
+                                    older_message_actions(actions, group_hovered, keyboard_focus, (!covered).then_some(hover_group))
                                 })
                                 .children((message.memo_saved == Some(false)).then(|| {
                                     div().text_xs().text_color(theme.danger).child(tr!("library-memo-save-failed"))
@@ -3113,7 +3228,7 @@ impl Workbench {
             .pt(CHAT_STATUS_TEXT_INSET).bg(theme.background)
             .children(goal_status.map(|status| div().id("chat-tail-activity").min_w_0().text_size(rems(0.75))
                 .line_height(UI_LINE_HEIGHT).text_color(theme.muted_foreground)
-                .child(status_row(&goal_tail_label(status), theme.muted_foreground).id("chat-tail-activity-label").truncate())))
+                .child(chat_activity::goal_activity_row(status, "chat-tail-activity-label".into(), cx))))
             .when(has_commands || has_finished_jobs || goal_status.is_none() && chat.has_activity(self.chat_waiting.reason(&self.active)), |strip| {
                 strip.child(self.render_chat_activity(&self.active, cx.weak_entity(), cx))
             })
@@ -3154,6 +3269,17 @@ impl Workbench {
                 )
             })
     }
+}
+
+fn older_message_actions(
+    actions: gpui_kit::Stateful<gpui_kit::Div>,
+    hovered: bool,
+    keyboard: bool,
+    hover_group: Option<SharedString>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    actions.focusable().opacity(if hovered { 1. } else { 0. })
+        .when_some(hover_group, |actions, group| actions.group_hover(group, |style| style.opacity(1.)))
+        .when(keyboard, |actions| actions.focus_within(|style| style.opacity(1.)))
 }
 
 fn message_actions() -> gpui_kit::Div {
@@ -5676,6 +5802,85 @@ mod one_voice_tests {
         }
         assert!(InternalNote::for_item(&Actor::System, "drain-1-checkpoint").is_none());
         assert!(InternalNote::for_item(&Actor::Claude, "reply").is_none());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+    #[test]
+    fn older_message_actions_follow_hover_and_keyboard_focus() {
+        use gpui_kit::{
+            AppContext as _, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseExitEvent,
+            MouseMoveEvent, PlatformInput, Render,
+        };
+
+        struct Fixture {
+            focus: gpui_kit::FocusHandle,
+            previous: gpui_kit::FocusHandle,
+            covered: bool,
+        }
+
+        fn marker(latest: bool) -> gpui_kit::Hsla {
+            gpui_kit::rgb(if latest { 0x185bea } else { 0xe43c92 }).into()
+        }
+
+        impl Render for Fixture {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let group = "fixture-older-message";
+                let older = div().id("older-marker").w(px(80.)).h(px(24.)).bg(marker(false))
+                    .child(div().id("older-control").size_full().track_focus(&self.focus));
+                v_flex().size_full().tab_group()
+                    .child(div().id("previous-control").h(px(40.)).track_focus(&self.previous))
+                    .child(div().group(group).child(older_message_actions(
+                        older, false, !self.covered && window.last_input_was_keyboard(),
+                        (!self.covered).then(|| group.into()),
+                    )))
+                    .child(div().id("latest-marker").w(px(80.)).h(px(24.)).bg(marker(true)))
+            }
+        }
+
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(|cx| {
+            gpui_kit::init(cx);
+            let (window, view) = gpui_kit::open_window(gpui_kit::component::TitleBar::window_options(),
+                cx, |_, cx| cx.new(|cx| Fixture {
+                    focus: cx.focus_handle().tab_index(1).tab_stop(true),
+                    previous: cx.focus_handle().tab_index(0).tab_stop(true),
+                    covered: false,
+                })).unwrap();
+            window.update(cx, |_, window, cx| {
+                let draw = |window: &mut Window, cx: &mut gpui_kit::App| {
+                    window.draw(cx).clear(cx);
+                    let quads = window.painted_quads();
+                    assert!(quads.iter().any(|quad| quad.background == marker(true).into()));
+                    quads.iter().any(|quad| quad.background == marker(false).into())
+                };
+                let move_to = |position| PlatformInput::MouseMove(MouseMoveEvent { position, ..Default::default() });
+
+                assert!(!draw(window, cx));
+                let older = window.shot_element_bounds("older-marker").unwrap().center();
+                let latest = window.shot_element_bounds("latest-marker").unwrap().center();
+                window.dispatch_event(move_to(older), cx);
+                assert!(draw(window, cx));
+                window.dispatch_event(PlatformInput::MouseExited(MouseExitEvent { position: older, ..Default::default() }), cx);
+                assert!(!draw(window, cx));
+
+                window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left, position: older, click_count: 1, ..Default::default()
+                }), cx);
+                let focus = view.read(cx).focus.clone();
+                window.dispatch_event(move_to(latest), cx);
+                assert!(focus.is_focused(window));
+                assert!(!draw(window, cx));
+
+                view.read(cx).previous.clone().focus(window, cx);
+                window.dispatch_event(PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("tab").unwrap(), is_held: false, prefer_character_input: false,
+                }), cx);
+                assert!(focus.is_focused(window));
+                assert!(draw(window, cx));
+                view.update(cx, |view, cx| { view.covered = true; cx.notify(); });
+                assert!(!draw(window, cx));
+            }).unwrap();
+            cx.spawn(async move |cx| { let _ = cx.update(|cx| cx.quit()); }).detach();
+        });
     }
 
     #[cfg(all(target_os = "linux", feature = "headless-shot"))]

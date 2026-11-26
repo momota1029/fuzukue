@@ -8,9 +8,9 @@ pub(crate) use search::{search, DEFAULT_LIMIT, MAX_LIMIT};
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
@@ -566,13 +566,15 @@ pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     result.map_err(Into::into)
 }
 
+fn pdf_text_command(source: &Path) -> Command {
+    let mut command = Command::new("pdftotext");
+    command.args(["-layout", "-enc", "UTF-8"]).arg(source).arg("-");
+    command
+}
+
 pub(crate) fn extract_text(source: &Path, pdf: bool) -> Result<String> {
     let text = if pdf {
-        let output = Command::new("pdftotext")
-            .args(["-layout", "-enc", "UTF-8"])
-            .arg(source)
-            .arg("-")
-            .output()
+        let output = pdf_text_command(source).output()
             .context("pdftotext を起動できない")?;
         ensure!(
             output.status.success(),
@@ -594,8 +596,6 @@ fn extract(
     next_id: &mut u64,
 ) -> Result<Cached> {
     let pdf = extension(file) == "pdf";
-    let text = extract_text(source, pdf)?;
-    ensure!(stamp(source)? == stamp_before, "抽出中に資料が更新された");
     let (id, dir) = loop {
         let id = *next_id;
         *next_id = id.checked_add(1).context("コーパス番号が上限に達した")?;
@@ -606,29 +606,13 @@ fn extract(
         }
     };
     let result = (|| {
-        let mut parts = 0;
-        let mut write = |chunk: &str| -> Result<()> {
-            parts += 1;
-            let path = dir.join(format!("{parts}.txt"));
-            OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(path)?
-                .write_all(chunk.as_bytes())?;
-            Ok(())
-        };
-        let lines = if pdf {
-            for page in text.split_terminator('\x0c') {
-                write(page)?;
-            }
-            None
+        let (parts, lines) = if pdf {
+            (extract_pdf_parts(source, &dir)?, None)
         } else {
-            let lines: Vec<_> = text.split_inclusive('\n').collect();
-            for chunk in lines.chunks(TEXT_LINES) {
-                write(&chunk.concat())?;
-            }
-            Some(lines.len())
+            let (parts, lines) = extract_line_parts(BufReader::new(fs::File::open(source)?), &dir)?;
+            (parts, Some(lines))
         };
+        ensure!(stamp(source)? == stamp_before, "抽出中に資料が更新された");
         Ok(Cached {
             stamp: stamp_before,
             id,
@@ -640,6 +624,87 @@ fn extract(
         let _ = fs::remove_dir_all(dir);
     }
     result
+}
+
+fn create_part(dir: &Path, part: usize) -> std::io::Result<fs::File> {
+    OpenOptions::new().create_new(true).write(true).open(dir.join(format!("{part}.txt")))
+}
+
+fn extract_line_parts(mut input: impl BufRead, dir: &Path) -> Result<(usize, usize)> {
+    let mut line = String::new();
+    let mut lines = 0;
+    let mut parts = 0;
+    let mut output: Option<BufWriter<_>> = None;
+    while input.read_line(&mut line)? != 0 {
+        if lines % TEXT_LINES == 0 {
+            if let Some(mut previous) = output.take() {
+                previous.flush()?;
+            }
+            parts += 1;
+            output = Some(BufWriter::new(create_part(dir, parts)?));
+        }
+        output.as_mut().unwrap().write_all(line.as_bytes())?;
+        lines += 1;
+        line.clear();
+    }
+    if let Some(mut output) = output {
+        output.flush()?;
+    }
+    Ok((parts, lines))
+}
+
+fn extract_page_parts(mut input: impl BufRead, dir: &Path) -> Result<usize> {
+    let mut page = Vec::new();
+    let mut parts = 0;
+    while input.read_until(b'\x0c', &mut page)? != 0 {
+        let text = page.strip_suffix(b"\x0c").unwrap_or(&page);
+        std::str::from_utf8(text)?;
+        parts += 1;
+        create_part(dir, parts)?.write_all(text)?;
+        page.clear();
+    }
+    Ok(parts)
+}
+
+#[cfg(test)]
+#[test]
+fn streamed_reference_parts_keep_page_and_line_boundaries() -> Result<()> {
+    let lines_dir = tempfile::tempdir()?;
+    let text = "α\r\n".repeat(TEXT_LINES) + "last line";
+    assert_eq!(extract_line_parts(text.as_bytes(), lines_dir.path())?, (2, TEXT_LINES + 1));
+    assert_eq!(fs::read_to_string(lines_dir.path().join("1.txt"))?, "α\r\n".repeat(TEXT_LINES));
+    assert_eq!(fs::read_to_string(lines_dir.path().join("2.txt"))?, "last line");
+
+    let pages_dir = tempfile::tempdir()?;
+    assert_eq!(extract_page_parts("π\x0c\x0cend".as_bytes(), pages_dir.path())?, 3);
+    assert_eq!(fs::read_to_string(pages_dir.path().join("1.txt"))?, "π");
+    assert_eq!(fs::read_to_string(pages_dir.path().join("2.txt"))?, "");
+    assert_eq!(fs::read_to_string(pages_dir.path().join("3.txt"))?, "end");
+    Ok(())
+}
+
+fn extract_pdf_parts(source: &Path, dir: &Path) -> Result<usize> {
+    // Read the page stream while the converter runs. Spool diagnostics so the
+    // child can always write stderr without growing the server's memory.
+    let mut stderr = tempfile::tempfile()?;
+    let mut child = pdf_text_command(source)
+        .stdout(Stdio::piped())
+        .stderr(stderr.try_clone()?)
+        .spawn()
+        .context("pdftotext を起動できない")?;
+    let result = extract_page_parts(BufReader::new(child.stdout.take().unwrap()), dir);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let parts = result?;
+    if !status.success() {
+        stderr.rewind()?;
+        let mut diagnostics = Vec::new();
+        stderr.take(4096).read_to_end(&mut diagnostics)?;
+        anyhow::bail!("pdftotext: {}", String::from_utf8_lossy(&diagnostics).trim());
+    }
+    Ok(parts)
 }
 
 fn range(value: &str, last: usize) -> Result<(usize, usize)> {

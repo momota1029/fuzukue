@@ -1,4 +1,4 @@
-use fuzukue_proto::{ApprovalDisplayAction, ApprovalOwner, Envelope};
+use fuzukue_proto::{ApprovalDisplayAction, ApprovalOwner, Envelope, ServerEvent};
 use serde_json::json;
 
 use super::*;
@@ -26,6 +26,9 @@ impl Workbench {
             state: ApprovalState::Pending,
             grant_scope: None,
             consumed_at: None,
+            automatic: false,
+            tool_item: None,
+            anchor_item: None,
             action: ApprovalDisplayAction {
                 tool: "fs_write".into(),
                 args: json!({

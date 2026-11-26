@@ -5915,6 +5915,9 @@ impl Window {
                 PlatformInput::MousePressure(mouse_pressure)
             }
             PlatformInput::MouseExited(mouse_exited) => {
+                // Platform exit reports can repeat the last in-window coordinates.
+                // Subsequent hit tests have no pointer until another mouse event.
+                self.mouse_position = point(-px(1.0), -px(1.0));
                 self.modifiers = mouse_exited.modifiers;
                 PlatformInput::MouseExited(mouse_exited)
             }

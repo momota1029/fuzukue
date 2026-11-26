@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fuzukue_proto::{CachedSession, ClientMsg, JobSummary, ServerEvent, ThreadHistoryFailure};
 use gpui_kit::{Context, ListOffset, Pixels, Task, px};
 
-use super::{CHAT_LEADING_PADDING, Chat, Content, Row, RowKind, Workbench};
+use super::{CHAT_LEADING_PADDING, Chat, Content, Row, RowKind, ToolRuns, Workbench};
 use crate::ConnectionStatus;
 
 const KEPT_PAGES: usize = 4;
@@ -371,7 +371,6 @@ impl Workbench {
         }
         chat.history.last_scroll = Some(chat.scroller.logical_scroll_top());
         self.out.cache_transcript(&session, Some(generation));
-        self.restore_approval_notices(&session, cx);
         if session == self.active {
             self.github_view();
             self.request_thread_tail();
@@ -749,9 +748,6 @@ impl Workbench {
             chat.scroller.scroll_to(anchor);
         }
         chat.history.last_scroll = Some(chat.scroller.logical_scroll_top());
-        if pending.jump {
-            self.restore_approval_notices(&session, cx);
-        }
         self.continue_history(&session, Direction::Newer, !added_visible_rows, cx);
     }
 
@@ -995,7 +991,11 @@ impl Chat {
                 batches.entry(before).or_default().push((index, row));
             }
         }
+        let receipts = std::mem::take(&mut page.approval_receipts);
         if batches.is_empty() {
+            for receipt in receipts.into_values() {
+                self.record_approval_receipt(receipt, cx);
+            }
             return false;
         }
         if !initial && self.scroller.is_following_tail()
@@ -1052,6 +1052,9 @@ impl Chat {
             let mut anchor = self.scroller.logical_scroll_top();
             anchor.offset_in_item -= CHAT_LEADING_PADDING;
             self.scroller.scroll_to(anchor);
+        }
+        for receipt in receipts.into_values() {
+            self.record_approval_receipt(receipt, cx);
         }
         self.clear_transcript_hover();
         cx.notify();
@@ -1158,10 +1161,12 @@ impl Chat {
         let visible = |row: &Row| row.kind(show_worker_messages) != RowKind::Hidden;
         if let Some(previous) = self.rows[..start].iter().rposition(visible) {
             self.scroller.remeasure_items(previous..previous + 1);
-        } else if let Some(next) = self.rows[end..].iter().position(visible).map(|next| end + next) {
+        }
+        if let Some(next) = self.rows[end..].iter().position(visible).map(|next| end + next) {
             self.scroller.remeasure_items(next..next + 1);
         }
     }
+
 }
 
 
@@ -1190,6 +1195,79 @@ mod tests {
         let chat = &view.chats[session];
         let Content::Message(message) = &chat.rows[chat.by_item[item]].content else { panic!("missing message") };
         &message.text
+    }
+
+    #[test]
+    fn automatic_approvals_join_live_tools_and_the_tools_loaded_on_an_older_page() {
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(|cx| {
+            gpui_kit::init(cx);
+            crate::math::init(cx);
+            let (window, view) = gpui_kit::open_window(gpui_kit::component::TitleBar::window_options(),
+                cx, |window, cx| cx.new(|cx| Workbench::new_with_target(window, cx, Some(Err("No socket fixture"))))).unwrap();
+            window.update(cx, |_, _, cx| view.update(cx, |view, cx| {
+                let chat = view.chat(A, cx);
+                let call = |item: &str, name: &str| ServerEvent::ToolCall {
+                    session: A.into(), item: item.into(), actor: Actor::Claude,
+                    name: name.into(), input: serde_json::Value::Null,
+                };
+                let grant = |id: &str, item: Option<&str>| fuzukue_proto::ApprovalReceipt {
+                    id: id.into(), job: "front_desk".into(), tool: "Bash".into(),
+                    tool_item: item.map(str::to_owned), anchor_item: None,
+                    automatic: true, state: fuzukue_proto::ApprovalState::Granted, updated_at: 1,
+                };
+                let old_receipt = grant("older", Some("old-call"));
+                chat.record_approval_receipt(old_receipt.clone(), cx);
+                chat.record_approval_receipt(grant("legacy", None), cx);
+                assert!(chat.rows.is_empty());
+
+                chat.apply_history_row(call("first", "Bash"), cx);
+                let after = grant("after", Some("first"));
+                chat.record_approval_receipt(after.clone(), cx);
+                chat.apply_history_row(call("middle", "Read"), cx);
+                let before = grant("before", Some("last"));
+                chat.record_approval_receipt(before.clone(), cx);
+                chat.apply_history_row(call("last", "Bash"), cx);
+                chat.record_approval_receipt(after.clone(), cx);
+
+                let verify = |chat: &Chat, expected: &[&str], linked: &[&str]| {
+                    let runs = ToolRuns::new(chat);
+                    let run = runs.at(chat.by_tool[expected[0]].0).unwrap();
+                    assert_eq!(run.calls, expected.iter().map(|item| chat.by_tool[*item]).collect::<Vec<_>>());
+                    let headers = (0..chat.rows.len()).filter(|&row| runs.at(row).is_some() && !runs.hides(row)).count();
+                    assert_eq!(headers, 1);
+                    for item in linked {
+                        assert_eq!(run.attached.get(&chat.by_tool[*item]), Some(&1));
+                    }
+                    assert_eq!(run.approvals(), linked.len());
+                    assert!(runs.standalone.is_empty());
+                };
+                verify(chat, &["first", "middle", "last"], &["first", "last"]);
+
+                chat.prepend_history(vec![call("old-call", "Bash"), old_receipt.event(A)], false, cx);
+                verify(chat, &["old-call", "first", "middle", "last"], &["old-call", "first", "last"]);
+
+                chat.apply_history_row(text(A, "reply", "A conversation boundary"), cx);
+                chat.apply_history_row(call("after-text", "Read"), cx);
+                chat.request_approval("pending".into(), Actor::Claude,
+                    crate::i18n::Message { fallback: "Permission requested".into(), localized: None }, false, cx);
+                chat.apply_history_row(call("after-pending", "Read"), cx);
+                let runs = ToolRuns::new(chat);
+                for item in ["after-text", "after-pending"] {
+                    let position = chat.by_tool[item];
+                    assert_eq!(runs.at(position.0).unwrap().calls, [position]);
+                }
+                assert_eq!(chat.first_pending_approval(), Some("pending"));
+
+                let mut reloaded = Chat::new(cx);
+                reloaded.prepend_history(vec![
+                    call("first", "Bash"), after.event(A), call("middle", "Read"),
+                    call("last", "Bash"), before.event(A), after.event(A),
+                ], true, cx);
+                verify(&reloaded, &["first", "middle", "last"], &["first", "last"]);
+                assert_eq!(reloaded.rows.len(), 1);
+            })).unwrap();
+            cx.spawn(async move |cx| { let _ = cx.update(|cx| cx.quit()); }).detach();
+        });
     }
 
     #[test]

@@ -107,6 +107,21 @@ pub fn paper_batch_failure_summary<'a>(name: &str, output: &'a str) -> Option<&'
     (lines.next()? == "" && lines.next()?.starts_with("- ")).then_some(heading)
 }
 
+/// Matches a tool name in an approval receipt to the name in the transcript.
+pub fn approval_matches_tool(approval: &str, tool: &str) -> bool {
+    fn name(value: &str) -> &str {
+        match value {
+            "item/commandExecution/requestApproval" => "exec",
+            "item/fileChange/requestApproval" => "edit",
+            _ => value.strip_prefix("mcp/")
+                .or_else(|| value.strip_prefix("mcp__fuzukue__"))
+                .or_else(|| value.strip_prefix("fuzukue."))
+                .unwrap_or(value),
+        }
+    }
+    name(approval) == name(tool)
+}
+
 /// Tracks adjacent rows within a conversation. Results update existing rows
 /// and do not participate in grouping.
 #[derive(Default)]

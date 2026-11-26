@@ -1285,6 +1285,7 @@ impl Codex {
                 .unwrap_or_default();
             let request = format!("{thread_id}:{id}");
             let mut registration = crate::full_approval::worker_registration(session, job, "codex", method, &request, p);
+            registration.tool_item = p["itemId"].as_str().map(str::to_owned);
             if external {
                 registration.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
             }
@@ -1311,7 +1312,9 @@ impl Codex {
             let trusted = self.threads.lock().unwrap().get(thread_id)
                 .is_some_and(|thread| thread.partner.is_some() && thread.trusted_approval_turn);
             if trusted && !self.hub.external_approval_input(session) {
-                full = Some(crate::full_approval::desk_registration(session, "codex", method, &format!("{thread_id}:{id}"), p));
+                let mut registration = crate::full_approval::desk_registration(session, "codex", method, &format!("{thread_id}:{id}"), p);
+                registration.tool_item = p["itemId"].as_str().map(str::to_owned);
+                full = Some(registration);
             }
         }
         match (summary, thread) {
@@ -1467,7 +1470,8 @@ impl Codex {
                     _ => None,
                 };
                 if let Some(tool) = tool.filter(|_| trusted && !self.hub.external_approval_input(&session)) {
-                    let request = crate::full_approval::desk_registration(&session, "codex", tool, &item_id, item);
+                    let mut request = crate::full_approval::desk_registration(&session, "codex", tool, &item_id, item);
+                    request.tool_item = Some(item_id.clone());
                     if let Err(error) = self.hub.authorize_full_approval(request) {
                         tracing::warn!(%error, "Could not audit native Codex operation");
                     }

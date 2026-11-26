@@ -120,7 +120,7 @@ fn approval_dock_keeps_composer_focus_and_supports_keyboard_and_bulk_review() {
                     assert_eq!(runner.update(cx, |view, _, _| view.approval_count(&view.active))?, 0);
                     assert!(!visible(&runner, cx, "approval-row-fixture-0")?);
                     assert!(visible(&runner, cx, "approval-dismiss")?);
-                    runner.step(wait("chat-local-notice-11"), cx).await?;
+                    assert!(!visible(&runner, cx, "chat-local-notice-11")?);
                     Ok(())
                 }.await;
                 finished.send(outcome).unwrap();

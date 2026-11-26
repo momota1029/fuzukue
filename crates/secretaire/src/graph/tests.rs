@@ -142,6 +142,8 @@ fn refreshes_two_thousand_cards_and_reuses_cached_inputs() {
     let project = TestDir::new();
     let state = TestDir::new();
     project.write("deck.toml", "kind = 'research'");
+    project.write("build/generated/deck.toml", "kind = 'research'");
+    project.write("build/generated/cards/output.md", "---\nid: generated\n---\nBuild output");
     for i in 0..2000 {
         let requires = if i == 0 {
             String::new()
@@ -153,13 +155,16 @@ fn refreshes_two_thousand_cards_and_reuses_cached_inputs() {
         ));
     }
     let graph = WorkspaceGraph::default();
-    graph.refresh(project.path(), state.path());
-    assert!(state.path().join("card-graph.json").is_file());
+    graph.invalidate_paths(&[project.path().join("cards/0000.md")]);
+    graph.refresh_loaded(project.path(), state.path());
+    assert!(!state.path().join("card-graph.json").exists());
 
     let overview = graph.with_graph(project.path(), state.path(), true, |graph| {
         assert_eq!(graph.inputs.card_reads, 2000);
         call(graph, Tool::Overview, json!({}))
     });
+    assert!(state.path().join("card-graph.json").is_file());
+    assert_eq!(overview["decks"].as_array().unwrap().len(), 1);
     assert_eq!(overview["decks"][0]["card_count"], 2000);
     assert!(overview["decks"][0]["omitted_cards"].as_u64().unwrap() > 0);
     assert!(overview.to_string().len() < 15_000);
@@ -193,6 +198,16 @@ fn refreshes_two_thousand_cards_and_reuses_cached_inputs() {
         result
     );
     assert_eq!(result["matches"][0]["card"]["title"], "Updated");
+
+    graph.trim_idle(std::time::Duration::ZERO);
+    project.write("cards/0000.md", "---\nid: card-0\n---\nPost-eviction marker.");
+    graph.invalidate_paths(&[project.path().join("cards/0000.md")]);
+    graph.refresh_loaded(project.path(), state.path());
+    assert!(graph.data.lock().unwrap().is_none());
+    let result = graph.with_graph(project.path(), state.path(), true, |graph| {
+        call(graph, Tool::Search, json!({"query":"Post-eviction marker"}))
+    });
+    assert_eq!(result["matches"][0]["card"]["id"], "card-0");
 }
 
 #[test]

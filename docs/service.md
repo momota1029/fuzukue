@@ -39,6 +39,8 @@ systemd 254 以降と cgroup v2 では、サービスの `Delegate=yes` と `Del
 
 ジョブごとの `memory.max` は既定で 8 GiB、`memory.high` は上限の半分。上限は `FUZUKUE_JOB_MEMORY_MIB` で変更できる。レシピにはレシピ自身のメモリ上限を適用する。
 
+サーバーは起動時、ジョブ終了後、以後 30 秒ごとに、ユニット内のファイルキャッシュ（共有メモリを除く）と slab を調べる。ジョブの cgroup が空のときに限り、合計が既定の 1536 MiB を超えた分の回収を試みる。`FUZUKUE_SERVICE_CACHE_MIB` で変更でき、`0` はユニット単位の回収を無効にする。対応カーネルでは `swappiness=0` を指定する。旧カーネルでは十分な非アクティブファイルキャッシュがあるときだけ小分けに回収し、スワップが増えたらユニット単位の回収を止める。
+
 古いユニットで分離が使えない場合、起動ログに移行コマンドが出る。`secretaire service enable-job-isolation fuzukue.service`（リリース版は `fuzukue-release.service`）を実行すると、設定を drop-in に加え、稼働中のサービスを再起動して反映する。
 
 ユニット全体のメモリにはジョブとページキャッシュが含まれる。サーバー単体の使用量は `server/memory.current`、匿名メモリとファイルキャッシュの内訳は `server/memory.stat` の `anon` と `file` で確認できる。cgroup の委譲が使えない環境ではプロセスグループで停止する。

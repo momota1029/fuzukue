@@ -273,19 +273,8 @@ fn approval_dock_formats_counts_and_resolution_notices() {
     assert_eq!(en.format("approval-dock-pending-badge", &args), "1 pending approval");
     assert_eq!(en.format("approval-dock-review-count", &args), "1 request");
 
-    let mut args = FluentArgs::new();
-    args.set("tool", "fs_write");
-    args.set("id", "approval-1");
-    for (locale, local, remote) in [
-        (ja, "許可（あなた） · fs_write · approval-1", "許可 · fs_write · approval-1"),
-        (en, "Allowed by you · fs_write · approval-1", "Allowed · fs_write · approval-1"),
-    ] {
-        args.set("state", locale.text("approval-dock-allowed"));
-        args.set("actor", "you");
-        assert_eq!(locale.format("approval-dock-resolution", &args), local);
-        args.set("actor", "other");
-        assert_eq!(locale.format("approval-dock-resolution", &args), remote);
-    }
+    assert_eq!(ja.format("chat-auto-approved-count", &args), "自動許可 1 件");
+    assert_eq!(en.format("chat-auto-approved-count", &args), "1 automatically allowed");
 }
 
 #[test]

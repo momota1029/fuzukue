@@ -263,7 +263,29 @@ data class QueuedApproval(
     @SerialName("updated_at") val updatedAt: Long,
     val state: ApprovalQueueState,
     val action: QueuedApprovalAction,
+    val automatic: Boolean = false,
+    @SerialName("tool_item") val toolItem: String? = null,
+    @SerialName("anchor_item") val anchorItem: String? = null,
 )
+
+@Serializable
+data class ApprovalReceipt(
+    val id: String,
+    val job: String,
+    val tool: String,
+    @SerialName("tool_item") val toolItem: String? = null,
+    @SerialName("anchor_item") val anchorItem: String? = null,
+    val state: ApprovalQueueState,
+    val automatic: Boolean,
+    @SerialName("updated_at") val updatedAt: Long,
+) {
+    val workerJob: String? get() = job.takeUnless { it == "front_desk" }
+    val anchor: String? get() = when (state) {
+        ApprovalQueueState.Granted -> toolItem ?: anchorItem
+        ApprovalQueueState.Denied -> anchorItem ?: workerJob
+        else -> null
+    }
+}
 
 @Serializable
 data class QueuedApprovalDecision private constructor(val kind: String, val scope: JsonObject? = null) {
@@ -372,6 +394,8 @@ sealed interface ServerEvent {
     @Serializable
     data class ToolResult(override val session: String, val item: String, val ok: Boolean, val output: String) : InThread
 
+    data class ApprovalRecorded(override val session: String, val receipt: ApprovalReceipt) : InThread
+
     @Serializable
     data class DelegateProgress(override val session: String, val job: String, val summary: String) : InThread
 
@@ -458,7 +482,15 @@ object Protocol {
             "partner_default_changed" -> ServerEvent.PartnerDefaults
             "local_notice" -> if ((event["item"] as? JsonPrimitive)?.content == COMPOSER_NOTICE_ITEM) {
                 json.decodeFromJsonElement<ServerEvent.ComposerNotice>(event)
-            } else ServerEvent.Unknown(type)
+            } else {
+                val localized = event["localized"] as? JsonObject
+                val session = (event["session"] as? JsonPrimitive)?.content
+                val receipt = ((localized?.get("args") as? JsonObject)?.get("receipt") as? JsonPrimitive)?.content
+                    ?.takeIf { (localized?.get("key") as? JsonPrimitive)?.content == "approval-receipt" }
+                    ?.let { runCatching { json.decodeFromString<ApprovalReceipt>(it) }.getOrNull() }
+                if (session != null && receipt != null) ServerEvent.ApprovalRecorded(session, receipt)
+                else ServerEvent.Unknown(type)
+            }
             "user_prompt" -> json.decodeFromJsonElement<ServerEvent.UserPrompt>(event)
             "attachment_progress" -> json.decodeFromJsonElement<ServerEvent.AttachmentProgress>(event)
             "attachment_uploaded" -> json.decodeFromJsonElement<ServerEvent.AttachmentUploaded>(event)

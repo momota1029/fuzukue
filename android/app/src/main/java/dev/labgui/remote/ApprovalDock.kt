@@ -360,19 +360,11 @@ private fun ApprovalProgress(progress: ApprovalDecisionProgress, onShowFailures:
 }
 
 @Composable
-internal fun ApprovalOutcomeRow(row: TimelineRow.ApprovalOutcome) {
-    val label = when (row.approval.state) {
-        ApprovalQueueState.Granted -> R.string.approval_outcome_granted
-        ApprovalQueueState.Denied -> R.string.approval_outcome_denied
-        ApprovalQueueState.Expired -> R.string.approval_outcome_expired
-        ApprovalQueueState.Withdrawn -> R.string.approval_outcome_withdrawn
-        ApprovalQueueState.Pending -> return
-    }
-    val outcome = stringResource(label, row.approval.action.tool, row.approval.action.targetText())
+internal fun ApprovalDenialRow(tool: String) {
     Text(
-        if (row.decidedHere) stringResource(R.string.approval_outcome_local, outcome) else outcome,
+        stringResource(R.string.tool_approval_denied, tool),
         Modifier.padding(horizontal = 8.dp),
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        color = MaterialTheme.colorScheme.error,
         style = MaterialTheme.typography.bodySmall,
     )
 }

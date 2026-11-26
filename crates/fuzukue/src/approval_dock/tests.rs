@@ -17,6 +17,9 @@ fn item(id: &str, thread: &str, job: &str, risk: ApprovalRisk) -> ApprovalSummar
         state: ApprovalState::Pending,
         grant_scope: None,
         consumed_at: None,
+        automatic: false,
+        tool_item: None,
+        anchor_item: None,
         action: ApprovalDisplayAction {
             tool: "fs_write".into(),
             args: json!({"path": format!("notes/{id}.md")}),
@@ -72,8 +75,8 @@ fn bulk_requires_matching_kind_scope_and_thread_and_excludes_high_risk() {
     let mut resolved = first;
     resolved.state = ApprovalState::Denied;
     resolved.updated_at = 20;
-    assert!(dock.resolve(resolved.clone(), false));
-    assert!(!dock.resolve(resolved, false));
+    assert!(dock.resolve(resolved.clone()));
+    assert!(!dock.resolve(resolved));
     dock.pending_change(item("third", "thread", "a", ApprovalRisk::Low));
     assert_eq!(dock.decision_candidates("thread", &reviewed), ["second"]);
 }

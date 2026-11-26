@@ -728,6 +728,7 @@ impl Hub {
                 }
             }
         }
+        self.bind_approval_tool(inner, &event);
         let replayable = retain_replay_event(&mut event);
         let env = Envelope { workspace: None, seq: if replayable { inner.next_seq } else { 0 }, event };
         let notice = notifications::before_publish(inner, &env.event);
@@ -1047,7 +1048,8 @@ impl Hub {
         inner.threads.as_mut().unwrap().trim_transcripts();
         match tail {
             Some((events, workers, next_before)) => ServerEvent::ThreadTail {
-                session, request, generation, through: inner.next_seq - 1, events, workers, next_before,
+                events: self.history_with_approval_receipts(&session, events),
+                session, request, generation, through: inner.next_seq - 1, workers, next_before,
             },
             None => ServerEvent::ThreadHistoryFailed { session, request, reason: Some(Unavailable) },
         }
@@ -1070,7 +1072,8 @@ impl Hub {
         inner.threads.as_mut().unwrap().trim_transcripts();
         match page {
             Ok((events, next_before)) => ServerEvent::ThreadHistoryPage {
-                session, request, events, next_before,
+                events: self.history_with_approval_receipts(&session, events),
+                session, request, next_before,
                 generation: if scoped { generation } else { None },
                 through: scoped.then_some(inner.next_seq - 1),
             },
@@ -1088,7 +1091,8 @@ impl Hub {
         threads.trim_transcripts();
         match page {
             Ok((events, next_after)) => ServerEvent::ThreadHistoryFrom {
-                session, request, start, next_after, generation, through: inner.next_seq - 1, events,
+                events: self.history_with_approval_receipts(&session, events),
+                session, request, start, next_after, generation, through: inner.next_seq - 1,
             },
             Err(reason) => ServerEvent::ThreadHistoryFailed { session, request, reason: Some(reason) },
         }
@@ -1099,6 +1103,7 @@ impl Hub {
         let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
         let (events, next_before) = threads.job_details(&session, &job, before);
         threads.trim_transcripts();
+        let events = self.history_with_approval_receipts(&session, events);
         ServerEvent::ThreadJobDetails { session, job, request, through: inner.next_seq - 1, before, next_before, events }
     }
 

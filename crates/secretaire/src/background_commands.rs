@@ -107,6 +107,7 @@ fn summary(command: &str) -> String {
                     | "sleep"
                     | "tail"
                     | "watch"
+                    | "while"
                     | "bash"
                     | "sh"
                     | "curl"
@@ -167,6 +168,11 @@ fn running(id: &str, summary: String, started_at_ms: u64) -> BackgroundCommand {
     }
 }
 
+fn description(value: &Value) -> Option<String> {
+    let text = value.as_str()?.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
 #[derive(Default)]
 pub(crate) struct Claude {
     pending: HashMap<String, PendingClaudeCommand>,
@@ -175,6 +181,7 @@ pub(crate) struct Claude {
 }
 
 struct PendingClaudeCommand {
+    description: Option<String>,
     summary: String,
     monitor: bool,
 }
@@ -204,9 +211,11 @@ impl Claude {
                         if monitor && summary.is_empty() {
                             summary = "Monitor".into();
                         }
-                        self.pending
-                            .entry(id.into())
-                            .or_insert(PendingClaudeCommand { summary, monitor });
+                        self.pending.entry(id.into()).or_insert_with(|| PendingClaudeCommand {
+                            description: description(&block["input"]["description"]),
+                            summary,
+                            monitor,
+                        });
                     }
                 }
             }
@@ -230,13 +239,15 @@ impl Claude {
                 let tool = event["tool_use_id"].as_str().unwrap_or_default();
                 let backgrounded = event["is_backgrounded"].as_bool();
                 if let Some(id) = event["task_id"].as_str().and_then(command_id) {
-                    if self.pending.get(tool).is_some_and(|call| {
-                        backgrounded == Some(true) || (call.monitor && backgrounded.is_none())
-                    }) {
-                        self.start(tool, Some(id));
+                    // The pending call already identifies an explicitly backgrounded
+                    // Bash or a Monitor, including CLI events without this flag.
+                    if backgrounded != Some(false) {
+                        self.start(tool, Some(id), description(&event["description"]));
                     }
                 }
             }
+            // Progress and notification summaries describe task output. The title
+            // comes from the matched tool call or task start and stays stable.
             (Some("system"), Some("task_notification")) => {
                 self.finish(event["task_id"].as_str(), event["status"].as_str());
             }
@@ -271,16 +282,17 @@ impl Claude {
             .and_then(|text| text.split_whitespace().next())
             .and_then(|id| command_id(id.trim_end_matches('.')));
         if task.is_some() || block["is_error"] == true || !self.pending[tool].monitor {
-            self.start(tool, task);
+            self.start(tool, task, None);
         }
     }
 
-    fn start(&mut self, tool: &str, task: Option<&str>) {
+    fn start(&mut self, tool: &str, task: Option<&str>, task_description: Option<String>) {
         if let Some(call) = self.pending.remove(tool) {
             if let Some(id) = task.filter(|id| !self.finished_before_result.contains(*id)) {
-                self.running
-                    .entry(id.into())
-                    .or_insert_with(|| running(id, call.summary, now_ms()));
+                self.running.entry(id.into()).or_insert_with(|| {
+                    let title = call.description.or(task_description).unwrap_or(call.summary);
+                    running(id, title, now_ms())
+                });
             }
         }
     }
@@ -435,6 +447,56 @@ mod tests {
             }));
             assert_eq!(state.running().count(), 0);
         }
+    }
+
+    #[test]
+    fn claude_titles_the_background_task_from_its_tool_call() {
+        let mut state = Claude::default();
+        let mut foreground = bash_call("foreground", false);
+        foreground["message"]["content"][0]["input"]["description"] = json!("List fixture files");
+        state.observe(&foreground);
+        state.observe(&bash_result("foreground", "bforeground"));
+
+        let mut call = bash_call("toolu_wait", true);
+        call["message"]["content"][0]["input"]["command"] = json!("while :; do gh run view; sleep 120; done");
+        call["message"]["content"][0]["input"]["description"] = json!("  Wait for\n the validation run  ");
+        state.observe(&call);
+        let started = |tool, task| json!({
+            "type": "system", "subtype": "task_started", "task_type": "local_bash",
+            "task_id": task, "tool_use_id": tool, "description": "CLI task description",
+            "summary": "A different activity's report",
+        });
+        state.observe(&started("foreground", "bforeground"));
+        assert_eq!(state.running().count(), 0);
+        state.observe(&started("toolu_wait", "bwait"));
+        state.observe(&bash_result("toolu_wait", "bwait"));
+        state.observe(&json!({"type": "result", "subtype": "success"}));
+        state.observe(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "bwait",
+            "description": "Still polling", "summary": "Progress text for this command",
+        }));
+        let commands: Vec<_> = state.running().collect();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].id, "bwait");
+        assert_eq!(commands[0].summary, "Wait for the validation run");
+    }
+
+    #[test]
+    fn claude_falls_back_to_the_matched_start_description_or_command_prefix() {
+        let mut state = Claude::default();
+        let mut call = bash_call("toolu_loop", true);
+        call["message"]["content"][0]["input"]["command"] = json!("while :; do sleep 120; done");
+        call["message"]["content"][0]["input"]["description"] = json!(" \n ");
+        state.observe(&call);
+        state.observe(&bash_result("toolu_loop", "bloop"));
+        assert_eq!(state.running().next().unwrap().summary, "while …");
+
+        state.observe(&bash_call("toolu_cli", true));
+        state.observe(&json!({
+            "type": "system", "subtype": "task_started", "task_type": "local_bash",
+            "task_id": "bcli", "tool_use_id": "toolu_cli", "description": "Run fixture tests",
+        }));
+        assert_eq!(state.running().find(|command| command.id == "bcli").unwrap().summary, "Run fixture tests");
     }
 
     #[test]

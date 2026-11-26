@@ -145,5 +145,75 @@ pub struct ApprovalSummary {
     pub state: ApprovalState,
     pub grant_scope: Option<ApprovalGrantScope>,
     pub consumed_at: Option<i64>,
+    #[serde(default)]
+    pub automatic: bool,
+    /// Transcript tool item, when the producer supplies a correlation ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_item: Option<String>,
+    /// The preceding transcript item at request time, for decisions without an executed tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_item: Option<String>,
     pub action: ApprovalDisplayAction,
+}
+
+pub const APPROVAL_RECEIPT_KEY: &str = "approval-receipt";
+
+/// Compact display metadata sent next to the corresponding saved transcript item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalReceipt {
+    pub id: String,
+    pub job: String,
+    pub tool: String,
+    pub tool_item: Option<String>,
+    pub anchor_item: Option<String>,
+    pub state: ApprovalState,
+    pub automatic: bool,
+    pub updated_at: i64,
+}
+
+impl ApprovalSummary {
+    pub fn receipt(&self) -> Option<ApprovalReceipt> {
+        matches!(self.state, ApprovalState::Granted | ApprovalState::Denied).then(|| ApprovalReceipt {
+            id: self.approval_id.clone(),
+            job: self.owner.job.clone(),
+            tool: self.action.tool.clone(),
+            tool_item: self.tool_item.clone(),
+            anchor_item: self.anchor_item.clone(),
+            state: self.state,
+            automatic: self.automatic,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+impl ApprovalReceipt {
+    pub fn event(&self, session: &str) -> crate::ServerEvent {
+        crate::ServerEvent::LocalNotice {
+            session: session.into(),
+            item: format!("{APPROVAL_RECEIPT_KEY}:{}", self.id),
+            text: String::new(),
+            localized: Some(crate::LocalizedMessage::new(APPROVAL_RECEIPT_KEY, [
+                ("receipt", serde_json::to_string(self).expect("serializable approval receipt")),
+            ])),
+        }
+    }
+
+    pub fn from_message(message: &crate::LocalizedMessage) -> Option<Self> {
+        if message.key != APPROVAL_RECEIPT_KEY {
+            return None;
+        }
+        serde_json::from_str(message.args.get("receipt")?).ok()
+    }
+
+    pub fn job(&self) -> Option<&str> {
+        (self.job != "front_desk").then_some(self.job.as_str())
+    }
+
+    pub fn history_anchor(&self) -> Option<&str> {
+        if self.state == ApprovalState::Granted {
+            self.tool_item.as_deref().or(self.anchor_item.as_deref())
+        } else {
+            self.anchor_item.as_deref().or_else(|| self.job())
+        }
+    }
 }

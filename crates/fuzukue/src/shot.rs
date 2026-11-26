@@ -5512,7 +5512,7 @@ mod tests {
                         assert_eq!(geometry(&runner, cx)?, following);
                         runner.update(cx, |view, window, _| {
                             assert_eq!(view.background_command_activity(&session, 66_000),
-                                Some(("コマンド実行中 2 件".into(), "1:05".into())));
+                                Some(("コマンド実行中 2 件".into(), "cargo test -q", "1:05".into())));
                             let bounds = |id| window.shot_element_bounds(id).unwrap();
                             let phase = bounds("chat-tail-activity-label");
                             let count = bounds("chat-tail-activity-command-label");

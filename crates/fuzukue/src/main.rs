@@ -1375,9 +1375,6 @@ impl Workbench {
                 }
             }
         }
-        if !self.transcripts.scoped && self.active != session {
-            self.restore_approval_notices(&session, cx);
-        }
         self.active = session;
         self.request_thread_tail();
         self.resume_history_prefetch(cx);
@@ -1543,7 +1540,7 @@ impl Workbench {
                             }
                         }
                         ServerEvent::ApprovalQueue { request, result } => self.approvals.snapshot(request, result),
-                        ServerEvent::ApprovalQueueChanged { approval } => self.approval_changed(approval, false, window, cx),
+                        ServerEvent::ApprovalQueueChanged { approval } => self.approval_changed(approval, window, cx),
                         ServerEvent::ApprovalDecisionResult { request, result } => self.approval_result(request, result, window, cx),
                         ServerEvent::Workspaces { workspaces } => self.workspaces.entries = workspaces,
                         ServerEvent::WorkspaceDirectory { request, result } => self.workspace_directory(request, result, window, cx),

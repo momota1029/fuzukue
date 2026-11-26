@@ -31,6 +31,9 @@
     <string name="approval_dock_unavailable">この依頼は期限切れ、解決済み、または変更済みです。</string>
     <string name="approval_dock_interrupted">接続が切れたため、サーバーの判断結果を確認できませんでした。</string>
     <string name="approval_outcome_granted">許可 · %1$s · %2$s</string>
+    <string name="tool_automatic_approval_count">自動許可 %1$d 件</string>
+    <string name="tool_automatic_approval_detail">自動で許可 · %1$s</string>
+    <string name="tool_approval_denied">拒否 · %1$s</string>
     <string name="approval_outcome_denied">拒否 · %1$s · %2$s</string>
     <string name="approval_outcome_expired">期限切れ · %1$s · %2$s</string>
     <string name="approval_outcome_withdrawn">撤回 · %1$s · %2$s</string>

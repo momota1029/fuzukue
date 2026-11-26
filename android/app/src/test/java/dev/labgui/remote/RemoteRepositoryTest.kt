@@ -196,10 +196,10 @@ class RemoteRepositoryTest {
         assertEquals(1, decision.succeeded)
         assertEquals(listOf(ApprovalDecisionFailure(b, "already decided")), decision.failures)
         assertFalse(decision.isSending)
-        assertEquals(
-            listOf(TimelineRow.ApprovalOutcome(denied, false), TimelineRow.ApprovalOutcome(granted, true)),
-            state.timeline("s").rows.values.toList(),
-        )
+        val timeline = state.timeline("s")
+        assertEquals(ApprovalQueueState.Denied, timeline.approvalReceipts["b"]?.state)
+        assertEquals(ApprovalQueueState.Granted, timeline.approvalReceipts["a"]?.state)
+        assertTrue(timeline.displayRows.isEmpty())
     }
 
     @Test fun aBulkReviewOnlySendsRequestsThatAreStillPendingAndMatchTheReviewedAction() {

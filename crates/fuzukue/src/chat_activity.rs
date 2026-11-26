@@ -164,6 +164,33 @@ fn activity_id(suffix: &str) -> SharedString {
     format!("chat-tail-activity-{suffix}").into()
 }
 
+fn activity_title(id: SharedString, text: &str) -> Stateful<Div> {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    div().id(id).min_w_0().max_w(rems(20.)).truncate().child(line)
+}
+
+pub(super) fn goal_activity_row(status: &GoalTail, id: SharedString, cx: &gpui_kit::App) -> Stateful<Div> {
+    let label = goal_tail_label(status);
+    let color = cx.theme().muted_foreground;
+    let row = h_flex().id(id).min_w_0().overflow_hidden().whitespace_nowrap();
+    if let Some((state, detail)) = label.split_once(STATUS_SEPARATOR) {
+        let full = status_speech(&label);
+        row.role(Role::Group)
+            .aria_label(full.clone())
+            .child(div().id(activity_id("goal-state")).flex_none().child(state.to_owned()))
+            .child(status_sep(color).id(activity_id("goal-separator")))
+            .child(activity_title(activity_id("goal-title"), detail))
+            .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+    } else {
+        row.child(activity_title(activity_id("goal-title"), &label))
+    }
+}
+
+fn command_title(command: &BackgroundCommand) -> &str {
+    let title = command.summary.trim();
+    if title.is_empty() { tr!("chat-activity-command") } else { title }
+}
+
 fn command_elapsed(command: &BackgroundCommand, now_ms: u64) -> String {
     activity_time(now_ms.saturating_sub(command.started_at_ms) / 1000)
 }
@@ -257,12 +284,19 @@ impl Workbench {
             })
     }
 
-    pub(crate) fn background_command_activity(&self, session: &str, now_ms: u64) -> Option<(String, String)> {
+    pub(crate) fn background_command_activity(&self, session: &str, now_ms: u64) -> Option<(String, &str, String)> {
         let running = || self.chat_waiting.background_commands(session).iter()
             .filter(|command| command.state == BackgroundCommandState::Running);
         let oldest = running().min_by_key(|command| command.started_at_ms)?;
+        let count = running().count();
+        let kind = if count == 1 {
+            tr!("chat-activity-command").to_owned()
+        } else {
+            tr!("chat-activity-background-commands", count = count)
+        };
         Some((
-            tr!("chat-activity-background-commands", count = running().count()),
+            kind,
+            command_title(oldest),
             command_elapsed(oldest, now_ms),
         ))
     }
@@ -284,30 +318,33 @@ impl Workbench {
                 .child(div().id(activity_id("label")).child(tr!("chat-wait-compacting")));
         }
         let turn = chat.turn_activity();
-        let static_goal = self.chat_waiting.static_goal_status(session, chat);
+        let static_goal = self.chat_waiting.static_goal_status(session, chat)
+            .filter(|_| commands.is_none());
         let jobs: Vec<_> = chat.pending_jobs().map(|(_, _, job)| job).collect();
         let (label, metadata) = if compacting {
             (Some(tr!("chat-wait-compacting").to_owned()), None)
-        } else if let Some(goal) = static_goal {
-            (Some(goal_tail_label(goal)), None)
-        } else if chat.has_activity(waiting) {
+        } else if static_goal.is_none() && chat.has_activity(waiting) {
             let (label, metadata) = activity_summary(turn.as_ref(), &jobs, waiting, now_ms);
             (Some(label), metadata)
         } else {
             (None, None)
         };
         let show_phase = label.is_some();
+        let goal_label = static_goal.map(goal_tail_label);
         let status_label = status_speech(&join_status_parts(
-            label.as_deref().into_iter().chain(metadata.as_deref())
-                .chain(commands.as_ref().into_iter().flat_map(|(label, elapsed)| [label.as_str(), elapsed.as_str()])),
+            label.as_deref().into_iter().chain(goal_label.as_deref()).chain(metadata.as_deref())
+                .chain(commands.as_ref().into_iter().flat_map(|(label, title, elapsed)| {
+                    [label.as_str(), *title, elapsed.as_str()]
+                })),
         ));
         let theme = cx.theme();
-        let idle_jobs = label.is_none() && commands.is_none();
+        let idle_jobs = label.is_none() && static_goal.is_none() && commands.is_none();
         let status_label = if idle_jobs { tr!("chat-job-list").to_owned() } else { status_label };
-        let spinning = !idle_jobs && (static_goal.is_none() || commands.is_some());
+        let spinning = !idle_jobs && static_goal.is_none();
         let status = h_flex()
             .id(activity_id("trigger"))
             .min_w_0()
+            .overflow_hidden()
             .items_center()
             .cursor_pointer()
             .text_size(rems(0.75))
@@ -321,6 +358,7 @@ impl Workbench {
                     .id(activity_id("label"))
                     .truncate(),
             ))
+            .children(static_goal.map(|goal| goal_activity_row(goal, activity_id("label"), cx)))
             .when_some(metadata, |status, metadata| {
                 status
                     .child(status_sep(theme.muted_foreground).id(activity_id("separator-metadata")))
@@ -332,10 +370,12 @@ impl Workbench {
                             .truncate(),
                     )
             })
-            .when_some(commands, |status, (label, elapsed)| {
+            .when_some(commands, |status, (label, title, elapsed)| {
                 status
                     .when(show_phase, |status| status.child(status_sep(theme.muted_foreground)))
-                    .child(div().id(activity_id("command-label")).min_w_0().truncate().child(label))
+                    .child(div().id(activity_id("command-label")).flex_none().child(label))
+                    .child(status_sep(theme.muted_foreground))
+                    .child(activity_title(activity_id("command-title"), title))
                     .child(status_sep(theme.muted_foreground))
                     .child(div().id(activity_id("command-time")).flex_none().child(elapsed))
             });
@@ -470,28 +510,29 @@ impl Workbench {
                     .items_center()
                     .gap_1()
                     .child(activity_spinner(activity_id("turn-icon"), theme.ring))
-                    .child(status_row(&turn_activity_detail(turn), theme.muted_foreground))
+                    .child(status_row(&turn_activity_detail(turn), theme.muted_foreground).truncate())
             }))
-            .children(waiting.map(|wait| status_row(&waiting_label(wait, now_ms), theme.muted_foreground)))
-            .children(goal.map(|goal| status_row(&goal_tail_label(goal), theme.muted_foreground)))
+            .children(waiting.map(|wait| status_row(&waiting_label(wait, now_ms), theme.muted_foreground).truncate()))
+            .children(goal.map(|goal| goal_activity_row(goal, activity_id("goal"), cx)))
             .children(commands.iter().enumerate().map(|(index, command)| {
-                let label = if command.summary.is_empty() {
-                    tr!("chat-activity-command").to_owned()
-                } else {
-                    command.summary.clone()
-                };
+                let label = command_title(command);
                 let state = command_state(command.state);
                 let elapsed = command_elapsed(command, now_ms);
+                let full = label.to_owned();
                 h_flex().id(activity_id(&format!("command-{index}")))
                     .min_w_0()
+                    .overflow_hidden()
                     .role(Role::Group)
                     .aria_label(format!("{label}, {state}, {elapsed}"))
                     .whitespace_nowrap()
-                    .child(div().min_w_0().truncate().child(label))
+                    .child(activity_title(activity_id(&format!("command-title-{index}")), label))
                     .child(status_sep(theme.muted_foreground))
-                    .child(div().flex_none().text_color(theme.muted_foreground).child(state))
+                    .child(div().id(activity_id(&format!("command-state-{index}")))
+                        .flex_none().text_color(theme.muted_foreground).child(state))
                     .child(status_sep(theme.muted_foreground))
-                    .child(div().flex_none().text_color(theme.muted_foreground).child(elapsed))
+                    .child(div().id(activity_id(&format!("command-time-{index}")))
+                        .flex_none().text_color(theme.muted_foreground).child(elapsed))
+                    .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
             }));
         let pending_jobs = chat.pending_jobs().count();
         for (index, &(_, id, summary, block)) in jobs.iter().enumerate() {
@@ -670,7 +711,9 @@ impl Workbench {
                         .rounded_full()
                         .bg(theme.danger)
                 }))
-                .when(!running, |row| row.child(job_chip(activity_id(&format!("job-state-{index}")), accessible_status, cx)))
+                .when(!running, |row| {
+                    row.child(job_chip(activity_id(&format!("job-state-{index}")), accessible_status, cx).flex_none())
+                })
                 .children(job.display.card_id.as_ref().map(|id| {
                     job_chip(activity_id(&format!("job-card-{index}")), id, cx)
                 }))
@@ -734,6 +777,7 @@ impl Workbench {
                     .child(
                         status_row(&label, theme.muted_foreground)
                             .id(activity_id(&format!("job-tool-status-{index}")))
+                            .truncate()
                             .text_color(if worker.failed {
                                 theme.danger
                             } else {
@@ -977,6 +1021,119 @@ mod tests {
         let details = queued.details.unwrap();
         assert_eq!(details.last_activity, Some("Checked file paths"));
         assert_eq!(details.latest_message, None);
+    }
+
+    #[test]
+    fn activity_titles_use_single_line_end_ellipsis() {
+        let mut title = activity_title(activity_id("fixture"), "確認作業\n次の手順");
+        let style = title.style();
+        let text = style.text_style();
+        assert_eq!(text.white_space, Some(gpui_kit::WhiteSpace::Nowrap));
+        assert_eq!(text.text_overflow, Some(gpui_kit::TextOverflow::Truncate("…".into())));
+        assert_eq!(style.min_size.width, Some(px(0.).into()));
+        assert_eq!(style.max_size.width, Some(rems(20.).into()));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+    #[test]
+    fn background_command_and_goal_keep_separate_rows_at_narrow_width() {
+        use gpui_kit::{
+            AppContext as _, Bounds, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+            Render, WindowBounds, WindowOptions,
+        };
+
+        struct Fixture(Entity<Workbench>);
+
+        impl Render for Fixture {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let footer = self.0.update(cx, |workbench, cx| workbench.render_chat_footer(window, cx));
+                v_flex().size_full().justify_end().child(footer)
+            }
+        }
+
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(|cx| {
+            gpui_kit::init(cx);
+            crate::math::init(cx);
+            let (window, view) = gpui_kit::open_window(WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)), gpui_kit::size(px(360.), px(540.)),
+                ))),
+                ..gpui_kit::component::TitleBar::window_options()
+            }, cx, |window, cx| {
+                let workbench = cx.new(|cx| Workbench::new_with_target(window, cx, Some(Err("Not connected"))));
+                cx.new(|_| Fixture(workbench))
+            }).unwrap();
+            let view = view.read(cx).0.clone();
+
+            let session = "activity-title";
+            let command = "確認作業の実行を待機する".repeat(30);
+            let started_at_ms = unix_millis();
+            let goal = GoalTail::PendingVerification { reason: "画面表示を確認する".repeat(30) };
+            window.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.threads_loaded = true;
+                    view.switch_session(session.into(), cx);
+                    view.on_event(ServerEvent::ChatWaiting { waiting: ChatWaiting {
+                        goal_status: [(session.to_owned(), goal)].into(),
+                        ..Default::default()
+                    } }, cx);
+                    view.on_event(ServerEvent::BackgroundCommands { threads: [(session.to_owned(), vec![
+                        BackgroundCommand {
+                            id: "fixture-command".into(),
+                            summary: command.clone(),
+                            started_at_ms,
+                            state: BackgroundCommandState::Running,
+                        },
+                    ])].into() }, cx);
+                    let (_, title, elapsed) = view.background_command_activity(session, started_at_ms + 23_000).unwrap();
+                    assert_eq!(title, command);
+                    assert_eq!(elapsed, "0:23");
+                });
+                window.draw(cx).clear(cx);
+                let bounds = |window: &Window, suffix: &str| {
+                    window.shot_element_bounds(&activity_id(suffix)).unwrap_or_else(|| panic!("missing {suffix}"))
+                };
+                assert!(window.shot_element_bounds(&activity_id("goal-title")).is_none());
+                let strip_title = bounds(window, "command-title");
+                let strip_kind = bounds(window, "command-label");
+                let strip_time = bounds(window, "command-time");
+                assert!(strip_title.size.width > px(0.));
+                assert!(strip_kind.right() <= strip_title.left());
+                assert!(strip_title.right() <= strip_time.left());
+                assert_eq!(strip_title.size.height, strip_kind.size.height);
+
+                let position = bounds(window, "trigger").center();
+                for event in [
+                    PlatformInput::MouseMove(MouseMoveEvent { position, ..Default::default() }),
+                    PlatformInput::MouseDown(MouseDownEvent { position, click_count: 1, ..Default::default() }),
+                    PlatformInput::MouseUp(MouseUpEvent { position, click_count: 1, ..Default::default() }),
+                ] {
+                    window.dispatch_event(event, cx);
+                }
+                window.draw(cx).clear(cx);
+                let goal_state = bounds(window, "goal-state");
+                let goal_separator = bounds(window, "goal-separator");
+                let goal_title = bounds(window, "goal-title");
+                let command_title = bounds(window, "command-title-0");
+                let command_state = bounds(window, "command-state-0");
+                let command_time = bounds(window, "command-time-0");
+                let panel = bounds(window, "details");
+                assert!(panel.size.width <= px(360.));
+                assert!(goal_state.size.width > px(0.));
+                assert!(goal_title.size.width > px(0.));
+                assert!(command_title.size.width > px(0.));
+                assert!(goal_state.right() <= goal_separator.left());
+                assert!(goal_separator.right() <= goal_title.left());
+                assert_eq!(goal_title.size.height, goal_state.size.height);
+                assert!(goal_title.bottom() <= command_title.top());
+                assert!(command_title.right() <= command_state.left());
+                assert!(command_state.right() <= command_time.left());
+                assert_eq!(command_title.size.height, command_state.size.height);
+            }).unwrap();
+            cx.spawn(async move |cx| {
+                let _ = cx.update(|cx| cx.quit());
+            }).detach();
+        });
     }
 
     #[test]

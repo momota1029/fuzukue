@@ -8,7 +8,7 @@ internal val ServerEvent.InThread.isSavedTranscriptEvent: Boolean
     get() = when (this) {
         is ServerEvent.TextDelta, is ServerEvent.UserPrompt, is ServerEvent.ToolCall, is ServerEvent.ToolResult,
         is ServerEvent.DelegateProgress, is ServerEvent.DelegateRenamed, is ServerEvent.ThreadJobActivity,
-        is ServerEvent.ReplySuperseded, is ServerEvent.TurnEnded -> true
+        is ServerEvent.ReplySuperseded, is ServerEvent.TurnEnded, is ServerEvent.ApprovalRecorded -> true
         else -> false
     }
 

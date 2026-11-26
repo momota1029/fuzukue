@@ -14,7 +14,7 @@ use gpui_kit::{
     SharedString, Window,
 };
 
-use super::{AssistantGroup, Content, RowKind, CHAT_GROUP_GAP, CHAT_WIDTH};
+use super::{AssistantGroup, Content, RowKind, ToolRuns, CHAT_GROUP_GAP, CHAT_WIDTH};
 
 pub(crate) struct TranscriptPosition {
     anchor: ListOffset,
@@ -97,6 +97,7 @@ pub(super) struct TranscriptView {
 pub(super) struct TranscriptRows {
     pub kinds: Vec<RowKind>,
     pub estimates: Vec<RowEstimate>,
+    pub tool_runs: ToolRuns,
     pub first_visible: Option<usize>,
     pub last_visible: Option<usize>,
     pub latest_message: Option<usize>,

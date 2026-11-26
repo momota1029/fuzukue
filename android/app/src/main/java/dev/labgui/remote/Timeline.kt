@@ -34,8 +34,14 @@ sealed interface TimelineRow {
         val text: String, val user: Boolean, val userItem: String? = null, val paths: List<String> = emptyList(),
     ) : TimelineRow
     data class Note(val text: String) : TimelineRow
-    data class ApprovalOutcome(val approval: QueuedApproval, val decidedHere: Boolean) : TimelineRow
-    data class Tool(val label: String, val ok: Boolean? = null) : TimelineRow
+    data class ApprovalDenial(val tool: String) : TimelineRow
+    data class Tool(val label: String, val ok: Boolean? = null, val name: String = label, val actor: Actor? = null) : TimelineRow
+    data class ToolRun(
+        val tools: List<Pair<Tool, Int>>,
+        val unlinkedApprovals: Int,
+    ) : TimelineRow {
+        val approvalCount: Int get() = unlinkedApprovals + tools.sumOf { it.second }
+    }
     data class Job(
         val info: JobInfo,
         val summary: String? = null,
@@ -64,6 +70,7 @@ data class Timeline(
     internal val olderPages: Int = 0,
     val jobSummaries: JobSummaries = JobSummaries(),
     val historyEdge: HistoryEdge = HistoryEdge.Unknown,
+    val approvalReceipts: Map<String, ApprovalReceipt> = emptyMap(),
 ) {
     internal val visibleRows: Map<String, TimelineRow>
         get() = rows.filterNot { (id, row) ->
@@ -71,12 +78,16 @@ data class Timeline(
                 (id in streamingSilencePrefixes || isSilentAssistantText(row.text))
         }
 
+    internal val displayRows: Map<String, TimelineRow>
+        get() = groupToolRows(visibleRows, approvalReceipts.values)
+
     fun reduce(
         event: ServerEvent.InThread,
         now: Long = System.currentTimeMillis(),
         replaying: Boolean = false,
         attentionNow: Long = System.nanoTime(),
     ): Timeline = when (event) {
+        is ServerEvent.ApprovalRecorded -> recordApproval(event.receipt)
         is ServerEvent.ComposerNotice -> if (replaying || composerNotice == event.text) this
             else copy(composerNotice = event.text)
         is ServerEvent.UserPrompt -> {
@@ -125,7 +136,7 @@ data class Timeline(
                 val detail = listOf("command", "file_path", "path", "file")
                     .firstNotNullOfOrNull { (input?.get(it) as? JsonPrimitive)?.content }
                 val label = if (detail == null) event.name else "${event.name} ${detail.lineSequence().first().take(120)}"
-                withRow(event.item, TimelineRow.Tool(label))
+                withRow(event.item, TimelineRow.Tool(label, name = event.name, actor = event.actor))
             }
         }
         is ServerEvent.ToolResult -> when (val previous = rows[event.item]) {
@@ -190,22 +201,22 @@ data class Timeline(
 
     internal fun reduceSaved(event: ServerEvent.InThread): Timeline {
         val updated = reduce(event, replaying = true)
-        return copy(rows = updated.rows, streamingSilencePrefixes = updated.streamingSilencePrefixes)
+        return copy(
+            rows = updated.rows, streamingSilencePrefixes = updated.streamingSilencePrefixes,
+            approvalReceipts = updated.approvalReceipts,
+        )
     }
 
-    internal fun recordApproval(approval: QueuedApproval, decidedHere: Boolean): Timeline {
-        val id = "async-approval/${approval.id}/${approval.state}"
-        val latest = rows.values.lastOrNull { it is TimelineRow.ApprovalOutcome && it.approval.id == approval.id }
-            as? TimelineRow.ApprovalOutcome
-        if (latest != null && latest.approval.updatedAt > approval.updatedAt) return this
-        val previous = rows[id] as? TimelineRow.ApprovalOutcome
-        if (previous != null && (!decidedHere || previous.decidedHere)) return this
-        return withRow(id, TimelineRow.ApprovalOutcome(approval, decidedHere))
+    internal fun recordApproval(receipt: ApprovalReceipt): Timeline {
+        val previous = approvalReceipts[receipt.id]
+        if (previous == receipt || previous != null && (previous.updatedAt > receipt.updatedAt ||
+                previous.updatedAt == receipt.updatedAt && previous.toolItem != null && receipt.toolItem == null)
+        ) return this
+        return copy(approvalReceipts = approvalReceipts + (receipt.id to receipt))
     }
 
-    // Queue outcomes arrive on the live subscription, outside paged transcript history.
     internal fun clearHistory() = copy(
-        rows = rows.filterValues { it is TimelineRow.ApprovalOutcome },
+        rows = emptyMap(),
         streamingSilencePrefixes = emptySet(),
         historyEdge = HistoryEdge.Unknown,
     )
@@ -233,11 +244,12 @@ data class Timeline(
             }
             if (firstContiguous == null) putAll(batch)
         }
-        return copy(
+        val timeline = copy(
             rows = merged,
             streamingSilencePrefixes = streamingSilencePrefixes +
                 page.streamingSilencePrefixes.filter { it !in rows },
         )
+        return page.approvalReceipts.values.fold(timeline, Timeline::recordApproval)
     }
 
     private fun withRow(id: String, row: TimelineRow) = copy(rows = rows + (id to row))

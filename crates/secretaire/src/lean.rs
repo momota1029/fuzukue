@@ -66,9 +66,9 @@ pub fn referenced_decls(project: &Path) -> BTreeSet<String> {
         roots.push(project.to_path_buf());
     }
     for root in roots {
-        if let Ok(g) = fuzukue_cards::Graph::open(&root) {
-            for c in g.cards.values().filter(|c| !c.external) {
-                decls.extend(c.lean.iter().cloned());
+        if let Ok(deck) = fuzukue_cards::Graph::open_local_in_workspace(&root, project) {
+            for card in deck.cards.into_values() {
+                decls.extend(card.lean);
             }
         }
     }

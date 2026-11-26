@@ -119,7 +119,7 @@ async fn full_attach_and_drain_follow_the_worker_approval_waiter() -> Result<()>
     *workspace.worker_approval_policy.lock().unwrap() = fuzukue_proto::WorkerApprovalPolicy::Advisor;
     let pending = tokio::spawn(async move {
         delegate::request_worker_approval(&worker, &thread, "delegate:fixture", "fixture-rpc", "Bash",
-            &serde_json::json!({"command":"cargo test"}), false).await
+            &serde_json::json!({"command":"cargo test"}), false, None).await
     });
     let request_id = match tokio::time::timeout(Duration::from_secs(5), live.recv()).await??.event {
         ServerEvent::ApprovalRequested { request_id, .. } => request_id,

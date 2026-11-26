@@ -1,9 +1,10 @@
 //! Project history in an isolated Git object store and index.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Seek, Write};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::io::{BufReader, Seek, Write};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ use fuzukue_proto::{ChangedTurns, HistoryBranch, HistoryOutcome, HistoryRecord, 
 use crate::{Hub, Workspace};
 
 const DIFF_LIMIT: usize = 128 * 1024;
+const SNAPSHOT_REF: &str = "refs/labo/snapshot-cache";
 const EXCLUDED: &[&str] = &[
     ".git",
     "target",
@@ -438,6 +440,36 @@ struct Repo {
     state_path: Option<String>,
     global_ignore: Option<PathBuf>,
     project_exclude: Option<PathBuf>,
+    snapshot_cache: RefCell<Option<SnapshotCache>>,
+}
+
+type CachedFiles = BTreeMap<String, (FileStamp, String)>;
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SnapshotCache {
+    tree: String,
+    files: CachedFiles,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FileStamp {
+    inode: (u64, u64),
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    mode: u32,
+}
+
+impl FileStamp {
+    fn read(info: &fs::Metadata) -> Self {
+        Self {
+            inode: (info.dev(), info.ino()),
+            len: info.len(),
+            modified: (info.mtime(), info.mtime_nsec()),
+            changed: (info.ctime(), info.ctime_nsec()),
+            mode: info.mode(),
+        }
+    }
 }
 
 fn git_command(project: &Path) -> Command {
@@ -522,6 +554,7 @@ impl Repo {
             state_path,
             global_ignore,
             project_exclude,
+            snapshot_cache: RefCell::default(),
         };
         if !repo.dir.join("HEAD").is_file() {
             let mut cmd = git_command(project);
@@ -627,18 +660,45 @@ impl Repo {
             args.extend(["--", path]);
         }
         let files = self.run(&args, None)?;
-        self.read_files(
-            &self.project,
-            files
-                .split(|byte| *byte == 0)
-                .filter_map(|raw| std::str::from_utf8(raw).ok())
-                .filter(|path| {
-                    !path.is_empty()
-                        && !path.ends_with('/')
-                        && !self.hard_excluded(path)
-                        && only.is_none_or(|only| only == *path)
-                }),
-        )
+        let paths = files
+            .split(|byte| *byte == 0)
+            .filter_map(|raw| std::str::from_utf8(raw).ok())
+            .filter(|path| {
+                !path.is_empty()
+                    && !path.ends_with('/')
+                    && !self.hard_excluded(path)
+                    && only.is_none_or(|only| only == *path)
+            });
+        if only.is_some() {
+            return self.read_files(&self.project, paths);
+        }
+
+        let mut slot = self.snapshot_cache.borrow_mut();
+        let cache = slot.get_or_insert_with(|| self.load_snapshot_cache().unwrap_or_default());
+        let (tree, next) = self.scan_files(&self.project, paths, Some(&cache.files))?;
+        if cache.tree.is_empty() || cache.files != next {
+            *cache = warn(self.save_snapshot_cache(&tree, next)).unwrap_or_default();
+        }
+        Ok(tree)
+    }
+
+    fn load_snapshot_cache(&self) -> Option<SnapshotCache> {
+        let file = fs::File::open(self.dir.join("snapshot-cache.json")).ok()?;
+        let cache: SnapshotCache = serde_json::from_reader(BufReader::new(file)).ok()?;
+        let pinned = self.oid(&["rev-parse", "--verify", "--quiet", SNAPSHOT_REF], None).ok()?;
+        (cache.tree == pinned).then_some(cache)
+    }
+
+    fn save_snapshot_cache(&self, tree: &Tree, files: CachedFiles) -> Result<SnapshotCache> {
+        // Keep cached blobs reachable during history GC. A crash between the
+        // ref update and the atomic cache write causes a cache miss at restart.
+        let tree = self.tree_id(tree)?;
+        self.run(&["update-ref", SNAPSHOT_REF, &tree], None)?;
+        let cache = SnapshotCache { tree, files };
+        crate::durable::write(&self.dir.join("snapshot-cache.json"), |output| {
+            Ok(serde_json::to_writer(output, &cache)?)
+        })?;
+        Ok(cache)
     }
 
     fn snapshot_deleted(&self, relative: &str) -> Result<Tree> {
@@ -670,7 +730,17 @@ impl Repo {
         root: &Path,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Result<Tree> {
+        self.scan_files(root, paths, None).map(|(tree, _)| tree)
+    }
+
+    fn scan_files<'a>(
+        &self,
+        root: &Path,
+        paths: impl IntoIterator<Item = &'a str>,
+        cached: Option<&CachedFiles>,
+    ) -> Result<(Tree, CachedFiles)> {
         let mut tree = Tree::new();
+        let mut stamps = CachedFiles::new();
         let mut regular = Vec::new();
         let mut input = String::new();
         for path in paths {
@@ -686,7 +756,15 @@ impl Repo {
                 } else {
                     "100644"
                 };
-                regular.push((path, mode));
+                let stamp = cached.map(|_| FileStamp::read(&info));
+                if let Some((previous, oid)) = cached.and_then(|files| files.get(path)) {
+                    if stamp.as_ref() == Some(previous) {
+                        tree.insert(path.into(), Entry { mode, oid: oid.clone() });
+                        stamps.insert(path.into(), (previous.clone(), oid.clone()));
+                        continue;
+                    }
+                }
+                regular.push((path, mode, stamp));
                 // Git's stdin-paths accepts C-quoted file names.
                 input.push('"');
                 for ch in path.chars() {
@@ -719,7 +797,8 @@ impl Repo {
         }
         if !regular.is_empty() {
             let mut cmd = self.command(root);
-            cmd.args(["hash-object", "-w", "--no-filters", "--stdin-paths"]);
+            // Stream large blobs during the initial scan and after edits.
+            cmd.args(["-c", "core.bigFileThreshold=16m", "hash-object", "-w", "--no-filters", "--stdin-paths"]);
             let hashes = String::from_utf8(checked(
                 output(cmd, Some(input.as_bytes()))?,
                 "hash-object",
@@ -728,17 +807,17 @@ impl Repo {
                 hashes.lines().count() == regular.len(),
                 "incomplete history snapshot"
             );
-            for ((path, mode), oid) in regular.into_iter().zip(hashes.lines()) {
-                tree.insert(
-                    path.into(),
-                    Entry {
-                        mode,
-                        oid: oid.into(),
-                    },
-                );
+            for ((path, mode, stamp), oid) in regular.into_iter().zip(hashes.lines()) {
+                if let Some(stamp) = stamp {
+                    // A concurrent write or rename invalidates the stat hint.
+                    if root.join(path).symlink_metadata().is_ok_and(|info| FileStamp::read(&info) == stamp) {
+                        stamps.insert(path.into(), (stamp, oid.into()));
+                    }
+                }
+                tree.insert(path.into(), Entry { mode, oid: oid.into() });
             }
         }
-        Ok(tree)
+        Ok((tree, stamps))
     }
 
     fn tree_id(&self, tree: &Tree) -> Result<String> {
@@ -1265,6 +1344,36 @@ impl Workspace {
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
+
+    #[test]
+    fn snapshot_reuses_pinned_blobs_and_invalidates_atomic_replacement() -> Result<()> {
+        let (project, history) = fixture();
+        let path = project.path().join("document");
+        fs::write(&path, "before")?;
+        let repo = Repo::open(project.path(), &history.state)?;
+        let first = repo.snapshot(None)?;
+        let blob = &first["document"].oid;
+        // The baseline alone is enough to keep these blobs through pruning.
+        repo.run(&["gc", "--prune=now"], None)?;
+        let reopened = Repo::open(project.path(), &history.state)?;
+        let mut saved = reopened.load_snapshot_cache().context("missing snapshot cache")?;
+        assert_eq!(saved.files["document"].1, *blob);
+        assert_eq!(reopened.oid(&["cat-file", "-t", blob], None)?, "blob");
+        // Distinct sentinel proves the unchanged path is served from metadata.
+        saved.files.get_mut("document").unwrap().1 = "cached".into();
+        let (cached, _) = reopened.scan_files(project.path(), ["document"], Some(&saved.files))?;
+        assert_eq!(cached["document"].oid, "cached");
+        let mut replacement = tempfile::NamedTempFile::new_in(project.path())?;
+        replacement.write_all(b"after!")?;
+        replacement.persist(&path)?;
+        let changed = reopened.snapshot(None)?;
+        assert_ne!(changed["document"].oid, *blob);
+        assert_eq!(reopened.run(&["cat-file", "blob", &changed["document"].oid], None)?, b"after!");
+        fs::write(project.path().join(".gitignore"), "document\n")?;
+        assert!(!reopened.snapshot(None)?.contains_key("document"));
+        assert!(!reopened.load_snapshot_cache().unwrap().files.contains_key("document"));
+        Ok(())
+    }
 
     fn fixture() -> (TestDir, Arc<History>) {
         let project = TestDir::new();

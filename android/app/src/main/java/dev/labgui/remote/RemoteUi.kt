@@ -6,6 +6,7 @@ import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -633,8 +634,8 @@ private fun Conversation(
 ) {
     val thread = state.threads.find { it.id == session }
     val timeline = state.timeline(session)
-    val visibleRows = remember(timeline.rows, timeline.streamingSilencePrefixes) {
-        timeline.visibleRows.entries.toList().asReversed()
+    val visibleRows = remember(timeline.rows, timeline.streamingSilencePrefixes, timeline.approvalReceipts) {
+        timeline.displayRows.entries.toList().asReversed()
     }
     val approvals = state.approvals.values.filter {
         it.session == session && it.requestId !in state.approvalDock.pending
@@ -712,17 +713,28 @@ private fun Conversation(
                         items(visibleRows, key = { "event/${it.key}" }) { entry ->
                             when (val row = entry.value) {
                                 is TimelineRow.Message -> MessageBubble(row, target, attachmentView.sent)
-                                is TimelineRow.Job -> JobPanel(row, timeline.jobSummaries[entry.key] ?: row.wireSummary) { older ->
-                                    onRequestJob(session, entry.key, older)
+                                is TimelineRow.Job -> {
+                                    val receipts = timeline.approvalReceipts.values.filter { it.workerJob == entry.key }
+                                    Column {
+                                        JobPanel(row, timeline.jobSummaries[entry.key] ?: row.wireSummary) { older ->
+                                            onRequestJob(session, entry.key, older)
+                                        }
+                                        for (receipt in receipts.filter { it.state == ApprovalQueueState.Denied }) {
+                                            ApprovalDenialRow(receipt.tool)
+                                        }
+                                        if (row.details != null) {
+                                            for (receipt in receipts.filter { it.automatic && it.state == ApprovalQueueState.Granted }) {
+                                                Text(stringResource(R.string.tool_automatic_approval_detail, receipt.tool),
+                                                    Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.labelSmall)
+                                            }
+                                        }
+                                    }
                                 }
-                                is TimelineRow.ApprovalOutcome -> ApprovalOutcomeRow(row)
+                                is TimelineRow.ApprovalDenial -> ApprovalDenialRow(row.tool)
                                 is TimelineRow.Note -> Text(row.text, color = colors.onSurfaceVariant,
                                     style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 8.dp))
-                                is TimelineRow.Tool -> Text(
-                                    row.label + when (row.ok) { true -> stringResource(R.string.job_done_suffix); false -> stringResource(R.string.job_failed_suffix); null -> "" },
-                                    style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant,
-                                    modifier = Modifier.padding(horizontal = 8.dp),
-                                )
+                                is TimelineRow.Tool -> ToolLine(row)
+                                is TimelineRow.ToolRun -> ToolRunPanel(row)
                             }
                         }
                         if (visibleRows.isEmpty() && approvals.isEmpty() && pending.isEmpty()) item {
@@ -1025,6 +1037,52 @@ private fun jobStatusLabel(status: JobStatus) = stringResource(when (status) {
     JobStatus.Queued -> R.string.job_queued
     JobStatus.Running -> R.string.job_running
 })
+
+@Composable
+private fun ToolLine(tool: TimelineRow.Tool) {
+    val status = when (tool.ok) {
+        true -> stringResource(R.string.job_done_suffix)
+        false -> stringResource(R.string.job_failed_suffix)
+        null -> ""
+    }
+    Text(tool.label + status, Modifier.padding(horizontal = 8.dp),
+        style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+@Composable
+private fun ToolRunPanel(run: TimelineRow.ToolRun) {
+    val count = stringResource(R.string.tool_automatic_approval_count, run.approvalCount)
+    if (run.tools.isEmpty()) {
+        Text(count, Modifier.padding(horizontal = 8.dp),
+            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        return
+    }
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Column {
+        val disclosure = if (expanded) "▾" else "▸"
+        val status = when {
+            run.tools.any { it.first.ok == false } -> stringResource(R.string.job_failed_suffix)
+            run.tools.all { it.first.ok == true } -> stringResource(R.string.job_done_suffix)
+            else -> ""
+        }
+        Text("$disclosure " + stringResource(R.string.job_tool_count, run.tools.size) + status + " · " + count,
+            Modifier.clickable { expanded = !expanded }.padding(horizontal = 8.dp, vertical = 6.dp),
+            style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (expanded) {
+            for ((tool, approvals) in run.tools) {
+                ToolLine(tool)
+                if (approvals > 0) {
+                    Text(stringResource(R.string.tool_automatic_approval_count, approvals),
+                        Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            if (run.unlinkedApprovals > 0) {
+                Text(stringResource(R.string.tool_automatic_approval_count, run.unlinkedApprovals),
+                    Modifier.padding(horizontal = 8.dp), style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
 
 @Composable
 private fun JobPanel(job: TimelineRow.Job, summary: JobSummary?, onRequest: (older: Boolean) -> Unit) {

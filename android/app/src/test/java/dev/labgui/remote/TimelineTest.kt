@@ -5,6 +5,60 @@ import org.junit.Test
 import java.util.concurrent.TimeUnit.MINUTES
 
 class TimelineTest {
+    @Test fun automaticApprovalReceiptsFollowToolsAcrossLiveHistoryAndReload() {
+        fun call(item: String, name: String) =
+            ServerEvent.ToolCall("s", item, Actor("claude"), name, kotlinx.serialization.json.JsonObject(emptyMap()))
+        fun grant(id: String, item: String? = null) = ApprovalReceipt(
+            id, "front_desk", "Bash", toolItem = item,
+            state = ApprovalQueueState.Granted, automatic = true, updatedAt = 1,
+        )
+
+        val olderReceipt = grant("older", "old-call")
+        val onlyReceipts = Timeline().recordApproval(olderReceipt).recordApproval(grant("legacy"))
+        assertTrue(onlyReceipts.displayRows.isEmpty())
+
+        val after = grant("after", "first")
+        val before = grant("before", "last")
+        val timeline = onlyReceipts
+            .reduce(call("first", "Bash"))
+            .recordApproval(after)
+            .reduce(call("middle", "Read"))
+            .recordApproval(before)
+            .reduce(call("last", "Bash"))
+            .recordApproval(after)
+
+        val run = timeline.displayRows.values.single() as TimelineRow.ToolRun
+        assertEquals(listOf(1, 0, 1), run.tools.map { it.second })
+        assertEquals(2, run.approvalCount)
+
+        val older = Timeline().reduceSaved(call("old-call", "Bash"))
+            .reduceSaved(ServerEvent.ApprovalRecorded("s", olderReceipt))
+        val combined = timeline.prependHistory(older, emptyList())
+        val joined = combined.displayRows.values.single() as TimelineRow.ToolRun
+        assertEquals(listOf(1, 1, 0, 1), joined.tools.map { it.second })
+        assertEquals(3, joined.approvalCount)
+
+        val denied = ApprovalReceipt(
+            "denied", "front_desk", "Read", anchorItem = "last",
+            state = ApprovalQueueState.Denied, automatic = false, updatedAt = 2,
+        )
+        val separated = combined.recordApproval(denied)
+            .reduce(ServerEvent.UserPrompt("s", "reply", "A conversation boundary"))
+            .reduce(call("after-denial", "Read"))
+        assertEquals(listOf("old-call", "approval-denial/denied", "user/reply", "after-denial"),
+            separated.displayRows.keys.toList())
+        assertTrue(separated.displayRows["approval-denial/denied"] is TimelineRow.ApprovalDenial)
+        assertTrue(separated.displayRows["after-denial"] is TimelineRow.Tool)
+
+        val reloaded = listOf(
+            call("first", "Bash"), ServerEvent.ApprovalRecorded("s", after),
+            call("middle", "Read"), call("last", "Bash"),
+            ServerEvent.ApprovalRecorded("s", before), ServerEvent.ApprovalRecorded("s", after),
+        ).fold(Timeline(), Timeline::reduceSaved)
+        assertEquals(timeline.displayRows, reloaded.displayRows)
+        assertEquals(listOf("first", "middle", "last"), reloaded.rows.keys.toList())
+    }
+
     @Test fun composerNoticesReplaceOneStatusWithoutAddingRows() {
         val waiting = """{"type":"local_notice","session":"s","item":"composer-status","text":"Wait for Claude"}"""
         val stopped = """{"type":"local_notice","session":"s","item":"composer-status","text":"Codex stopped"}"""

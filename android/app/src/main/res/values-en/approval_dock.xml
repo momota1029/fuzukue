@@ -31,6 +31,9 @@
     <string name="approval_dock_unavailable">This request has expired, been resolved, or changed.</string>
     <string name="approval_dock_interrupted">The connection closed before the server confirmed this decision.</string>
     <string name="approval_outcome_granted">Granted · %1$s · %2$s</string>
+    <string name="tool_automatic_approval_count">%1$d automatically allowed</string>
+    <string name="tool_automatic_approval_detail">Automatically allowed · %1$s</string>
+    <string name="tool_approval_denied">Denied · %1$s</string>
     <string name="approval_outcome_denied">Denied · %1$s · %2$s</string>
     <string name="approval_outcome_expired">Expired · %1$s · %2$s</string>
     <string name="approval_outcome_withdrawn">Withdrawn · %1$s · %2$s</string>

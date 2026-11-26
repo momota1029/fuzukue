@@ -2449,8 +2449,9 @@ fn open_approval_with<'a>(
 
 pub(crate) async fn request_worker_approval(
     app: &App, session: &str, job: &str, backend_id: &str, tool: &str, input: &serde_json::Value, human_only: bool,
+    item: Option<&str>,
 ) -> Result<String> {
-    approval::request(app, approval::Owner::new(session, job, backend_id), tool, input, human_only).await
+    approval::request(app, approval::Owner::new(session, job, backend_id), tool, input, human_only, item).await
 }
 
 pub(crate) async fn request_workspace_write_approval(
@@ -2464,7 +2465,7 @@ pub(crate) async fn request_workspace_write_approval(
 
 pub(crate) async fn request_shell_approval(
     app: &App, session: &str, job: &str, backend_id: &str, scope: &crate::worker_scope::Scope,
-    input: serde_json::Value,
+    input: serde_json::Value, item: Option<&str>,
 ) -> Result<Option<serde_json::Value>> {
     let protected = crate::worker_scope::protected_roots(&app.state_dir);
     let shell = crate::worker_scope::shell::check(scope, &input, &protected);
@@ -2475,6 +2476,7 @@ pub(crate) async fn request_shell_approval(
         (format!("Bash {input}"), None)
     };
     let mut full = crate::full_approval::worker_registration(session, job, "claude", "Bash", backend_id, &input);
+    full.tool_item = item.map(|id| crate::full_approval::worker_tool_item(job, "claude", id));
     if !app.delegates.worker_approval_trusted(session, job) {
         full.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
     }

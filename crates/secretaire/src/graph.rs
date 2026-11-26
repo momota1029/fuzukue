@@ -49,6 +49,7 @@ impl WorkspaceGraph {
         if let Ok(mut data) = self.data.try_lock() {
             if data.as_ref().is_some_and(|(_, used)| used.elapsed() >= idle) {
                 *data = None;
+                *self.pending.lock().unwrap() = None;
             }
         }
     }
@@ -61,30 +62,46 @@ impl WorkspaceGraph {
 
     pub(crate) fn invalidate_paths(&self, paths: &[PathBuf]) {
         let mut pending = self.pending.lock().unwrap();
-        if let Some(pending) = pending.as_mut() {
-            pending.extend(paths.iter().cloned());
+        if let Some(files) = pending.as_mut() {
+            // A full refresh is cheaper than retaining every change while idle.
+            if files.len().saturating_add(paths.len()) > 1024 {
+                *pending = None;
+            } else {
+                files.extend(paths.iter().cloned());
+            }
         }
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Keep an active graph current without opening it or extending its idle lifetime.
+    pub(crate) fn refresh_loaded(&self, project: &Path, state: &Path) {
+        if !self.is_dirty() {
+            return;
+        }
+        let mut data = self.data.lock().unwrap();
+        let Some((graph, _)) = data.as_mut() else { return };
+        let (dirty, paths) = self.take_invalidations();
+        if dirty {
+            graph.refresh(project, state, true, paths.as_ref());
+        }
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
     }
 
-    pub(crate) fn refresh(&self, project: &Path, state: &Path) {
-        self.with_graph(project, state, true, |_| ());
+    fn take_invalidations(&self) -> (bool, Option<FileSet>) {
+        // Clear before reading files so an event received during a refresh
+        // remains pending for the next one.
+        let mut pending = self.pending.lock().unwrap();
+        let dirty = self.dirty.swap(false, Ordering::AcqRel);
+        (dirty, std::mem::replace(&mut *pending, Some(FileSet::new())))
     }
 
     fn with_graph<T>(&self, project: &Path, state: &Path, refresh_external: bool, run: impl FnOnce(&Graph) -> T) -> T {
         let mut data = self.data.lock().unwrap();
-        // Clear before reading files so an event received during the build
-        // remains pending for the next refresh. Out-of-workspace inputs are
-        // checked here because the workspace watcher cannot see those files.
-        let (dirty, paths) = {
-            let mut pending = self.pending.lock().unwrap();
-            let dirty = self.dirty.swap(false, Ordering::AcqRel);
-            (dirty, std::mem::replace(&mut *pending, Some(FileSet::new())))
-        };
+        // Requests check external inputs because the workspace watcher cannot see them.
+        let (dirty, paths) = self.take_invalidations();
         match data.as_mut() {
             Some((graph, _)) if dirty || refresh_external && graph.has_unwatched_inputs => {
                 graph.refresh(project, state, dirty, paths.as_ref())

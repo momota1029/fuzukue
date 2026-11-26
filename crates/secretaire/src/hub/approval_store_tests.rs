@@ -9,6 +9,8 @@ use crate::{Hub, test_support::TestDir};
 fn request() -> Registration {
     Registration {
         thread_auto: false,
+        tool_item: None,
+        anchor_item: None,
         owner: ApprovalOwner {
             thread: "thread-1".into(),
             job: "job-1".into(),
@@ -77,6 +79,76 @@ fn full_approval_grants_one_claim_and_masks_its_history() -> Result<()> {
     assert!(queue.consume_once(&id, &owner, &action)?);
     assert!(!queue.consume_once(&id, &owner, &action)?);
     assert!(queue.full_settings(None)?.active.is_none());
+    Ok(())
+}
+
+#[test]
+fn approval_receipts_follow_their_tool_and_job_across_restart() -> Result<()> {
+    use fuzukue_proto::{Actor, ApprovalReceipt, ServerEvent};
+
+    fn receipts(events: &[ServerEvent]) -> Vec<ApprovalReceipt> {
+        events.iter().filter_map(|event| match event {
+            ServerEvent::LocalNotice { localized: Some(message), .. } => ApprovalReceipt::from_message(message),
+            _ => None,
+        }).collect()
+    }
+
+    let temp = TestDir::new();
+    let session = "thread-1";
+    let job = "delegate:fixture";
+    let hub = hub(temp.path());
+    hub.approval_queue.get().unwrap().set_full_mode(ENABLE_FULL, "fixture", vec![], vec![])?;
+    hub.publish(ServerEvent::UserPrompt {
+        session: session.into(), item: "prompt".into(), text: "Fixture".into(),
+        paths: vec![], to_worker: false,
+    });
+
+    let call = |item: &str, actor, name: &str, input| ServerEvent::ToolCall {
+        session: session.into(), item: item.into(), actor, name: name.into(), input,
+    };
+    let log = call("log", Actor::Claude, "mcp__fuzukue__git_log", json!({"limit": 2}));
+    assert_eq!(hub.authorize_full_approval(crate::full_approval::desk_registration(
+        session, "claude", "mcp/git_log", "before-log", &json!({"limit": 2}),
+    ))?, FullAuthorization::Granted);
+    hub.publish(log.clone());
+
+    let later = call("later", Actor::Claude, "mcp__fuzukue__git_log", json!({"limit": 4}));
+    hub.publish(later.clone());
+    assert_eq!(hub.authorize_full_approval(crate::full_approval::desk_registration(
+        session, "claude", "mcp/git_log", "after-log", &json!({"limit": 4}),
+    ))?, FullAuthorization::Granted);
+
+    let mut worker = crate::full_approval::worker_registration(
+        session, job, "claude", "Bash", "worker-rpc", &json!({"command": "true"}),
+    );
+    worker.tool_item = Some(format!("{job}:tool"));
+    assert_eq!(hub.authorize_full_approval(worker)?, FullAuthorization::Granted);
+    let worker = call(&format!("{job}:tool"), Actor::System, "Bash", json!({"command": "true"}));
+
+    let mut pending = request();
+    pending.owner = crate::full_approval::desk_owner(session);
+    let denied = hub.register_approval(pending)?;
+    hub.decide_approval(&denied, ApprovalDecision::Deny, "fixture", None)?;
+
+    let tail = call("tail", Actor::Claude, "Read", json!({}));
+    let page = || vec![log.clone(), later.clone(), worker.clone()];
+    let shown = receipts(&hub.history_with_approval_receipts(session, page()));
+    assert_eq!(shown.len(), 4);
+    assert_eq!(shown[0].tool_item.as_deref(), Some("log"));
+    assert_eq!(shown[1].tool_item.as_deref(), Some("later"));
+    assert_eq!(shown[2].state, ApprovalState::Denied);
+    assert_eq!(shown[2].anchor_item.as_deref(), Some("later"));
+    assert_eq!(shown[3].job(), Some(job));
+    assert!(receipts(&hub.history_with_approval_receipts(session, vec![tail.clone()])).is_empty());
+    assert!(hub.pending_approvals()?.0.is_empty());
+    drop(hub);
+
+    let restarted = self::hub(temp.path());
+    assert_eq!(receipts(&restarted.history_with_approval_receipts(session, page())), shown);
+    assert!(receipts(&restarted.history_with_approval_receipts(session, vec![tail])).is_empty());
+    let (pending, mut updates) = restarted.pending_approvals()?;
+    assert!(pending.is_empty());
+    assert!(matches!(updates.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     Ok(())
 }
 

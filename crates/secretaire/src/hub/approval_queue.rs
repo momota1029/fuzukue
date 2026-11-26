@@ -2,7 +2,7 @@ use std::{path::Path, sync::{Arc, Weak}, time::Duration};
 
 use anyhow::{Context, Result};
 use fuzukue_proto::{
-    ApprovalDecision, ApprovalOwner, ApprovalSummary, FullApprovalChange, FullApprovalMode,
+    Actor, ApprovalDecision, ApprovalOwner, ApprovalSummary, FullApprovalChange, FullApprovalMode,
     FullApprovalSettings, PermissionMode, ServerEvent,
 };
 use tokio::sync::broadcast;
@@ -22,6 +22,41 @@ pub(super) struct LegacyFullApproval {
     resume: Box<dyn FnOnce(bool) + Send>,
 }
 
+fn approval_job<'a>(item: &'a str, actor: &'a Actor) -> &'a str {
+    fuzukue_proto::delegate_job_id(item, actor).unwrap_or("front_desk")
+}
+
+fn history_with_approval_receipts(
+    session: &str, events: Vec<ServerEvent>, receipts: &[fuzukue_proto::ApprovalReceipt],
+) -> Vec<ServerEvent> {
+    let mut by_anchor = std::collections::HashMap::<&str, Vec<_>>::new();
+    for receipt in receipts {
+        let anchor = receipt.history_anchor();
+        if let Some(anchor) = anchor {
+            by_anchor.entry(anchor).or_default().push(receipt);
+        }
+        if receipt.state == fuzukue_proto::ApprovalState::Denied {
+            if let Some(job) = receipt.job().filter(|job| Some(*job) != anchor) {
+                by_anchor.entry(job).or_default().push(receipt);
+            }
+        }
+    }
+    if by_anchor.is_empty() {
+        return events;
+    }
+    let mut history = Vec::with_capacity(events.len());
+    for event in events {
+        let matching = match &event {
+            ServerEvent::ToolCall { item, .. } | ServerEvent::TextDelta { item, .. }
+            | ServerEvent::UserPrompt { item, .. } => by_anchor.remove(item.as_str()),
+            _ => None,
+        };
+        history.push(event);
+        history.extend(matching.into_iter().flatten().map(|receipt| receipt.event(session)));
+    }
+    history
+}
+
 impl Hub {
     pub(crate) fn init_approval_queue(&self, workspace: String, state_dir: &Path) {
         self.approval_queue
@@ -36,8 +71,70 @@ impl Hub {
 
     // The MCP producers adopt this API in the next implementation step.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn register_approval(&self, registration: Registration) -> Result<String> {
+    pub(crate) fn register_approval(&self, mut registration: Registration) -> Result<String> {
+        Self::prepare_approval_registration(&self.inner.lock().unwrap(), &mut registration);
         self.approval_queue()?.register(registration)
+    }
+
+    fn prepare_approval_registration(inner: &Inner, registration: &mut Registration) {
+        let owner = &registration.owner;
+        if registration.anchor_item.is_none() {
+            registration.anchor_item = Self::latest_approval_anchor(inner, &owner.thread, &owner.job).map(str::to_owned);
+        }
+        let Some(fingerprint) = registration.action.args["fingerprint"].as_str()
+            .filter(|_| registration.action.tool.starts_with("mcp/") && registration.tool_item.is_none())
+        else { return };
+        let latest = inner.log.iter().rev().filter(|envelope| {
+            envelope.event.transcript_session() == Some(owner.thread.as_str())
+        }).take_while(|envelope| {
+            !matches!(&envelope.event, ServerEvent::TurnEnded { .. } | ServerEvent::UserPrompt { .. })
+        }).find_map(|envelope| match &envelope.event {
+            ServerEvent::ToolCall { item, actor, name, input, .. }
+                if approval_job(item, actor) == owner.job
+                    && fuzukue_view::chat::approval_matches_tool(&registration.action.tool, name)
+                    && crate::full_approval::fingerprint(input) == fingerprint => Some(item.clone()),
+            _ => None,
+        });
+        registration.tool_item = latest;
+    }
+
+    fn latest_approval_anchor<'a>(inner: &'a Inner, session: &str, job: &str) -> Option<&'a str> {
+        inner.log.iter().rev().find_map(|envelope| {
+            if envelope.event.transcript_session() != Some(session) {
+                return None;
+            }
+            match &envelope.event {
+                ServerEvent::ToolCall { item, actor, .. } | ServerEvent::TextDelta { item, actor, .. }
+                    if approval_job(item, actor) == job || item == job => Some(item.as_str()),
+                ServerEvent::UserPrompt { item, .. } if job == "front_desk" => Some(item.as_str()),
+                _ => None,
+            }
+        })
+    }
+
+    pub(super) fn bind_approval_tool(&self, inner: &Inner, event: &ServerEvent) {
+        let ServerEvent::ToolCall { session, item, actor, name, input } = event else { return };
+        if !(name.starts_with("mcp__fuzukue__") || name.starts_with("fuzukue.")) {
+            return;
+        }
+        let Some(queue) = self.approval_queue.get() else { return };
+        let job = approval_job(item, actor);
+        let previous = Self::latest_approval_anchor(inner, session, job);
+        if let Err(error) = queue.bind_mcp_tool(session, job, name, input, item, previous) {
+            tracing::warn!(%error, "Could not link an approval to its transcript tool");
+        }
+    }
+
+    pub(super) fn history_with_approval_receipts(&self, session: &str, events: Vec<ServerEvent>) -> Vec<ServerEvent> {
+        let Some(queue) = self.approval_queue.get() else { return events };
+        let receipts = match queue.transcript_receipts(session) {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                tracing::warn!(%error, "Could not load approval receipts");
+                return events;
+            }
+        };
+        history_with_approval_receipts(session, events, &receipts)
     }
 
     pub(crate) fn set_full_approval(
@@ -114,10 +211,11 @@ impl Hub {
     }
 
     pub(crate) fn publish_sweepable_approval(
-        &self, event: ServerEvent, waiter: Weak<()>, registration: Registration,
+        &self, event: ServerEvent, waiter: Weak<()>, mut registration: Registration,
         resume: impl FnOnce(bool) + Send + 'static,
     ) -> Result<FullAuthorization> {
         let mut inner = self.inner.lock().unwrap();
+        Self::prepare_approval_registration(&inner, &mut registration);
         let authorization = self.authorize_automatic_locked(&inner, registration.clone(), None)?;
         if authorization == FullAuthorization::Human {
             let ServerEvent::ApprovalRequested { request_id, .. } = &event else {
@@ -155,8 +253,9 @@ impl Hub {
     }
 
     pub(super) fn authorize_automatic_locked(
-        &self, inner: &Inner, request: Registration, legacy_id: Option<&str>,
+        &self, inner: &Inner, mut request: Registration, legacy_id: Option<&str>,
     ) -> Result<FullAuthorization> {
+        Self::prepare_approval_registration(inner, &mut request);
         let (full, thread) = Self::automatic_modes(inner, &request);
         if let Some(queue) = self.approval_queue.get().filter(|_| !crate::canary()) {
             queue.authorize_automatic(request, full, thread, legacy_id)
@@ -230,12 +329,6 @@ impl Hub {
     }
 
     pub(crate) fn authorize_full_approval(&self, request: Registration) -> Result<FullAuthorization> {
-        if !request.thread_auto {
-            return match self.approval_queue.get().filter(|_| !crate::canary()) {
-                Some(queue) => queue.authorize_full(request),
-                None => Ok(FullAuthorization::Human),
-            };
-        }
         self.authorize_automatic_locked(&self.inner.lock().unwrap(), request, None)
     }
 
