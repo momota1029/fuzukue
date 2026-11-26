@@ -591,7 +591,7 @@ impl Tool {
                 &[],
             ),
             Self::OpenFile => (
-                harness_text!("Open a project file in the user’s editor. Pass a line range to show it. Editing is done by the user.", "プロジェクトのファイルを利用者の画面のエディタで開く。行を指定するとその範囲を表示する。編集は利用者が行う。"),
+                harness_text!("Open a project text file or image on the user’s desktop. Pass a line range for text files. Editing is done by the user.", "プロジェクトのテキストや画像を利用者のデスクトップで開く。テキストでは表示する行範囲を指定できる。編集は利用者が行う。"),
                 json!({
                     "path": { "type": "string", "description": harness_text!("Project-relative file path.", "プロジェクト相対のファイルのパス") },
                     "line": { "type": "integer", "minimum": 1, "description": harness_text!("First line to show, starting at 1.", "表示する最初の行（1 から数える）") },
@@ -2295,8 +2295,6 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         }
         Tool::OpenFile => {
             let OpenFileArgs { path, line, end_line } = parse_args(args)?;
-            let full = crate::safe_join(project, &path)?;
-            ensure!(full.is_file(), "ファイルがない: {path}");
             let lines = match (line, end_line) {
                 (Some(start), end) => {
                     let end = end.unwrap_or(start);
@@ -2306,6 +2304,12 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 (None, Some(_)) => anyhow::bail!("end_line には line も指定する"),
                 (None, None) => None,
             };
+            let project = project.to_owned();
+            let requested = path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::source_editor::validate_preview(&project, &requested)
+            })
+            .await??;
             app.hub.publish_snapshot(ServerEvent::OpenFile {
                 session: session.to_owned(), path: path.clone(), lines,
             });

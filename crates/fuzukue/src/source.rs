@@ -1,4 +1,4 @@
-use std::{ops::RangeInclusive, path::Path, rc::Rc, time::Duration};
+use std::{ops::RangeInclusive, path::Path, rc::Rc, sync::Arc, time::Duration};
 
 pub(super) mod card;
 pub(super) mod editing;
@@ -18,11 +18,14 @@ use gpui_kit::component::{
 };
 use gpui_kit::base::Disableable as _;
 use gpui_kit::{
-    div, prelude::*, px, Context, Entity, Focusable as _, MouseButton, SharedString,
-    Subscription, Task, Window,
+    div, img, prelude::*, px, Context, Entity, Focusable as _, MouseButton, ObjectFit,
+    RenderImage, SharedString, Subscription, Task, Window,
 };
 use fuzukue_proto::{ClientMsg, LspStatus, SourceEdit, SourceRange, SourceSaveOutcome, EDITOR_PROTOCOL, LSP_PROTOCOL};
-use fuzukue_view::source_language_with_text;
+use fuzukue_view::{
+    source_file::{self, Kind, PreviewError},
+    source_language_with_text,
+};
 use sha2::{Digest, Sha256};
 
 use super::{icons::Symbol, RightPane, Workbench};
@@ -42,13 +45,41 @@ struct SourceTab {
     id: u64,
     path: String,
     _load: Task<()>,
-    error: Option<String>,
+    error: Option<PreviewError>,
     document: Option<SourceDocument>,
+    image: Option<WorkspaceImage>,
     closing: bool,
     return_to_library: bool,
     lsp_location: Option<lsp_types::Position>,
     reading: Option<lean::Reading>,
     reading_line: Option<usize>,
+}
+
+struct WorkspaceImage {
+    render: Arc<RenderImage>,
+    actual_size: bool,
+}
+
+enum SourcePreview {
+    Text(String, &'static str, Vec<OutlineEntry>),
+    Image(Arc<RenderImage>),
+}
+
+fn prepare_preview(path: &str, bytes: Vec<u8>) -> Result<SourcePreview, PreviewError> {
+    match source_file::classify(&bytes)? {
+        Kind::Text => {
+            let text = String::from_utf8(bytes).map_err(|_| PreviewError::Unsupported)?;
+            let language = source_language_with_text(path, &text);
+            let outline = source_outline::extract(language, &text);
+            Ok(SourcePreview::Text(text, language, outline))
+        }
+        Kind::Image(format) => {
+            let decoded = source_file::decode_image(&bytes, format)?;
+            Ok(SourcePreview::Image(crate::image_render::from_rgba(
+                decoded.into_rgba8(),
+            )))
+        }
+    }
 }
 
 struct SourceDocument {
@@ -130,9 +161,13 @@ impl SourcePane {
         }
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(super) fn clear(&mut self, window: &mut Window) {
         self.stop_lsp();
-        self.tabs.clear();
+        for tab in self.tabs.drain(..) {
+            if let Some(image) = tab.image {
+                let _ = window.drop_image(image.render);
+            }
+        }
         self.centered = false;
         self.active = None;
     }
@@ -223,31 +258,29 @@ impl Workbench {
         let id = self.source.id();
         let http = self.http.clone();
         let request_path = path.clone();
-        let current_protocol = self.protocol >= EDITOR_PROTOCOL;
+        let editor_route = self.protocol >= EDITOR_PROTOCOL;
         let load = cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let bytes = if current_protocol {
-                        http.fetch_editor(&request_path)
-                    } else {
-                        http.fetch(&request_path)
-                    }?;
-                    let text = String::from_utf8(bytes).map_err(|err| err.to_string())?;
-                    if text.contains('\0') {
-                        return Err(tr!("editor-a-utf-8-text-file-is-required").into());
-                    }
-                    let language = source_language_with_text(&request_path, &text);
-                    let outline = source_outline::extract(language, &text);
-                    Ok((text, language, outline))
+                    let bytes = http.fetch_preview(&request_path, editor_route)?;
+                    prepare_preview(&request_path, bytes)
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok((base, language, outline)) => {
+                    Ok(SourcePreview::Text(base, language, outline)) => {
                         this.install_source_document(
                             id, base, language, outline, lines, window, cx,
                         );
+                    }
+                    Ok(SourcePreview::Image(render)) => {
+                        if let Some(tab) = this.source.tab_mut(id) {
+                            tab.image = Some(WorkspaceImage {
+                                render,
+                                actual_size: false,
+                            });
+                        }
                     }
                     Err(error) => {
                         if let Some(tab) = this.source.tab_mut(id) {
@@ -264,6 +297,7 @@ impl Workbench {
             _load: load,
             error: None,
             document: None,
+            image: None,
             closing: false,
             return_to_library: false,
             lsp_location: None,
@@ -465,7 +499,10 @@ impl Workbench {
                 });
             }
         }
-        let return_to_library = self.source.tabs.remove(index).return_to_library;
+        let tab = self.source.tabs.remove(index);
+        if let Some(image) = tab.image {
+            let _ = window.drop_image(image.render);
+        }
         if self.source.active == Some(id) {
             if let Some(tab) = self
                 .source
@@ -478,7 +515,7 @@ impl Workbench {
                 self.source.active = None;
                 self.close_right_pane(cx);
             }
-            if return_to_library && matches!(self.right, RightPane::Source | RightPane::None) {
+            if tab.return_to_library && matches!(self.right, RightPane::Source | RightPane::None) {
                 self.right = RightPane::Library;
                 self.reset_library_search(false, cx);
             }
@@ -864,7 +901,52 @@ impl Workbench {
                     this.source.centered = !this.source.centered;
                     cx.notify();
                 })),
-            )
+            );
+        if let Some(image) = &tab.image {
+            let label = if image.actual_size {
+                tr!("editor-image-fit")
+            } else {
+                tr!("editor-image-actual-size")
+            };
+            let header = header.child(
+                Button::new("source-image-zoom")
+                    .ghost()
+                    .xsmall()
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(image) = this.source.tab_mut(id).and_then(|tab| tab.image.as_mut()) {
+                            image.actual_size = !image.actual_size;
+                            cx.notify();
+                        }
+                    })),
+            );
+            let size = image.render.size(0);
+            let viewer = div()
+                .id(if image.actual_size { "source-image-scroll" } else { "source-image-fit" })
+                .flex_1()
+                .w_full()
+                .min_h_0()
+                .min_w_0()
+                .p(PANE_INSET)
+                .child(
+                    img(image.render.clone())
+                        .id("source-image")
+                        .object_fit(ObjectFit::Contain)
+                        .when(image.actual_size, |img| {
+                            img.w(px(size.width.0 as f32))
+                                .h(px(size.height.0 as f32))
+                                .flex_none()
+                        })
+                        .when(!image.actual_size, |img| img.size_full()),
+                );
+            let viewer = if image.actual_size {
+                viewer.overflow_scrollbar().into_any_element()
+            } else {
+                viewer.overflow_hidden().into_any_element()
+            };
+            return pane.child(header).child(viewer);
+        }
+        let header = header
             .child(
                 source_button(
                     "source-outline-toggle",
@@ -921,11 +1003,16 @@ impl Workbench {
         );
         pane = pane.child(header);
         let Some(doc) = doc else {
+            let message = tab.error.map_or_else(
+                || tr!("editor-loading"),
+                |error| tr!(error.message_key()),
+            );
             return pane.child(
                 div()
+                    .id(if tab.error.is_some() { "source-preview-error" } else { "source-loading" })
                     .p_4()
                     .text_sm()
-                    .child(tab.error.clone().unwrap_or_else(|| tr!("editor-loading").into())),
+                    .child(message),
             );
         };
 
@@ -1173,4 +1260,39 @@ fn jump_offset(
         state.unfold_at(position, cx);
         state.set_cursor_position(position, window, cx);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use std::io::Cursor;
+
+    #[test]
+    fn prepares_workspace_image_for_gpui() {
+        let pixels = RgbaImage::from_pixel(2, 3, Rgba([20, 40, 60, 255]));
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let Ok(SourcePreview::Image(image)) = prepare_preview("target/sheet.png", png.into_inner()) else {
+            panic!("expected an image preview");
+        };
+        assert_eq!(image.size(0).width.0, 2);
+        assert_eq!(image.size(0).height.0, 3);
+        assert_eq!(&image.as_bytes(0).unwrap()[..4], &[60, 40, 20, 255]);
+    }
+
+    #[test]
+    fn prepares_workspace_text_and_rejects_binary() {
+        let text = "fn example() {}\n";
+        assert!(matches!(
+            prepare_preview("example.rs", text.as_bytes().to_vec()),
+            Ok(SourcePreview::Text(base, "rust", _)) if base == text
+        ));
+        assert!(matches!(
+            prepare_preview("binary.dat", vec![0, 0xff]),
+            Err(PreviewError::Unsupported)
+        ));
+    }
 }

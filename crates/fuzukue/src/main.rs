@@ -29,6 +29,7 @@ mod github_report;
 #[cfg(test)]
 mod cjk_emphasis_tests;
 mod icons;
+mod image_render;
 mod library;
 mod menu_bar;
 mod settings_file;
@@ -1627,7 +1628,7 @@ impl Workbench {
         self.clear_scoped_workspace();
         self.screenshots = Default::default();
         self.files.reset();
-        self.source.clear();
+        self.source.clear(window);
         self.tests = Default::default();
         self.symbols.clear();
         self.library.clear();

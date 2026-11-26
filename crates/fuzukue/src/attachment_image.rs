@@ -9,7 +9,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     img, prelude::*, px, App, Asset, IntoElement, ObjectFit, RenderImage, SharedString, Window,
 };
-use image::{Frame, ImageFormat, ImageReader};
+use image::{ImageFormat, ImageReader};
 
 use super::{attachment_chip, status_speech};
 use crate::conn::HttpTarget;
@@ -56,14 +56,8 @@ pub(super) fn decode_attachment_image(name: &str, bytes: &[u8]) -> Option<Arc<At
     if width > 1600 || height > 1200 {
         decoded = decoded.resize(1600, 1200, image::imageops::FilterType::Triangle);
     }
-    let mut pixels = decoded.into_rgba8();
-    // GPUI's render images use BGRA.
-    for pixel in pixels.pixels_mut() {
-        pixel.0.swap(0, 2);
-    }
-    let render = Arc::new(RenderImage::new([Frame::new(pixels)]));
     Some(Arc::new(AttachmentImage {
-        render,
+        render: crate::image_render::from_rgba(decoded.into_rgba8()),
         width,
         height,
     }))

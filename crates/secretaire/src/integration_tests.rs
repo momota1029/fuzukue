@@ -41,6 +41,9 @@ mod windowed_history;
 #[path = "integration_tests/large_deck.rs"]
 mod large_deck;
 
+#[path = "integration_tests/source_preview.rs"]
+mod source_preview;
+
 fn sample_lab() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lab")
 }

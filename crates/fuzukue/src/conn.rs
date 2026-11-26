@@ -11,7 +11,10 @@ use std::{
 
 use futures::channel::mpsc::UnboundedSender;
 use fuzukue_proto::{Actor, CachedSession, ClientMsg, Envelope, ServerEvent, PROTOCOL_VERSION};
-use fuzukue_view::server::{Launch, ServerMode, ServerSettings, DEFAULT_URL};
+use fuzukue_view::{
+    server::{Launch, ServerMode, ServerSettings, DEFAULT_URL},
+    source_file::{self, PreviewError},
+};
 use tungstenite::{client::IntoClientRequest, stream::MaybeTlsStream, Message, WebSocket};
 
 use crate::server::ServerOwner;
@@ -298,7 +301,20 @@ impl HttpTarget {
     }
 
     pub(super) fn fetch_editor(&self, path: &str) -> Result<Vec<u8>, String> {
-        self.fetch_route("editor", path)
+        self.fetch_preview(path, true).map_err(|error| tr!(error.message_key()).into())
+    }
+
+    pub(super) fn fetch_preview(&self, path: &str, editor_route: bool) -> Result<Vec<u8>, PreviewError> {
+        let route = if editor_route { "editor" } else { "file" };
+        let response = self.file_response(route, path).map_err(|error| match error {
+            ureq::Error::Status(413, _) => PreviewError::TooLarge,
+            ureq::Error::Status(415, _) => PreviewError::Unsupported,
+            _ => PreviewError::Unavailable,
+        })?;
+        if !(200..300).contains(&response.status()) {
+            return Err(PreviewError::Unavailable);
+        }
+        source_file::read(response.into_reader())
     }
 
     pub(super) fn fetch_exploration(&self, deck: &str) -> Result<Vec<fuzukue_proto::ExplorationNode>, String> {

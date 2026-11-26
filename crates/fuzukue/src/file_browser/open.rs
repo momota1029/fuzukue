@@ -30,7 +30,8 @@ pub(super) fn open_target(path: &str) -> OpenTarget {
         "md" | "markdown" | "mdown" | "tex" | "bib" => OpenTarget::InApp(InApp::DeckOrSource),
         "pdf" => OpenTarget::InApp(InApp::Pdf),
         "txt" | "text" | "log" | "csv" | "tsv" => OpenTarget::InApp(InApp::Source),
-        _ if fuzukue_view::source_language(path) != "text" => OpenTarget::InApp(InApp::Source),
+        _ if fuzukue_view::source_file::has_image_extension(path)
+            || fuzukue_view::source_language(path) != "text" => OpenTarget::InApp(InApp::Source),
         _ => OpenTarget::External,
     }
 }
@@ -249,7 +250,11 @@ mod tests {
             ("data.json", OpenTarget::InApp(InApp::Source)),
             ("config.toml", OpenTarget::InApp(InApp::Source)),
             ("style.YAML", OpenTarget::InApp(InApp::Source)),
-            ("photo.png", OpenTarget::External),
+            ("photo.PNG", OpenTarget::InApp(InApp::Source)),
+            ("photo.jpeg", OpenTarget::InApp(InApp::Source)),
+            ("photo.gif", OpenTarget::InApp(InApp::Source)),
+            ("photo.webp", OpenTarget::InApp(InApp::Source)),
+            ("photo.bmp", OpenTarget::InApp(InApp::Source)),
             ("diagram.svg", OpenTarget::External),
             ("archive.zip", OpenTarget::External),
         ] {

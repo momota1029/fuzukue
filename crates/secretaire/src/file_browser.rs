@@ -344,6 +344,12 @@ pub(crate) fn resolve_file(app: &Workspace, path: &str, lookup_deck: bool) -> Re
     })
 }
 
+/// Open a canonical path from the workspace descriptor, without following symlinks.
+pub(crate) fn open_resolved_path(project: &Path, path: &Path) -> Result<File> {
+    let root = Root::new(project)?;
+    root.open(path.strip_prefix(&root.path)?, READ_FILE)
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct DownloadQuery {
     workspace: Option<String>,

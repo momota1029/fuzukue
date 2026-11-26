@@ -183,7 +183,7 @@ fn catalogs_parse_and_match_code_and_each_other() {
         skip_tests: true,
         ..Default::default()
     };
-    for component in ["fuzukue", "secretaire", "fuzukue-i18n", "fuzukue-proto"] {
+    for component in ["fuzukue", "secretaire", "fuzukue-i18n", "fuzukue-proto", "fuzukue-view"] {
         for path in sources(&root().join("crates").join(component).join("src")) {
             usage.visit_file(&syn::parse_file(&fs::read_to_string(path).unwrap()).unwrap());
         }

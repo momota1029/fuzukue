@@ -6,6 +6,7 @@ pub mod lean;
 pub mod markdown_code;
 mod paper;
 pub mod server;
+pub mod source_file;
 pub mod style_notes;
 mod tex;
 pub mod ui_kit;

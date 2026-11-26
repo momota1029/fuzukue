@@ -1,4 +1,9 @@
 editor-a-utf-8-text-file-is-required = UTF-8 のテキストファイルが必要
+editor-preview-unavailable = ワークスペースのファイルを開けなかったよ。
+editor-preview-unsupported = このファイルはプレビューできないよ。UTF-8 のテキストか、正しい PNG、JPEG、GIF、WebP、BMP 画像を開いてね。
+editor-preview-too-large = ファイルが大きすぎてプレビューできないよ。
+editor-image-actual-size = 実寸
+editor-image-fit = ペインに合わせる
 editor-cancel = キャンセル
 editor-close-tab = タブを閉じる
 editor-connection-lost-before-the-save-result-arrived = 接続が切れたため、保存結果を受信できませんでした

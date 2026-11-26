@@ -1,4 +1,9 @@
 editor-a-utf-8-text-file-is-required = A UTF-8 text file is required
+editor-preview-unavailable = This workspace file could not be opened.
+editor-preview-unsupported = This file cannot be previewed. Open a UTF-8 text file or a valid PNG, JPEG, GIF, WebP, or BMP image.
+editor-preview-too-large = This file is too large to preview.
+editor-image-actual-size = Actual size
+editor-image-fit = Fit to pane
 editor-cancel = Cancel
 editor-close-tab = Close tab
 editor-connection-lost-before-the-save-result-arrived = Connection lost before the save result arrived

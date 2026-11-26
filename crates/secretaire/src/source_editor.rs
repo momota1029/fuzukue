@@ -9,9 +9,12 @@ use std::{
 use anyhow::{bail, ensure, Context as _, Result};
 use axum::{
     extract::{Path as RoutePath, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
 };
+use fuzukue_i18n::Locale;
 use fuzukue_proto::{SourceEdit, SourceRange, SourceSaveOutcome};
+use fuzukue_view::source_file::{self, Kind, PreviewError};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 
@@ -21,13 +24,64 @@ pub async fn read_handler(
     RoutePath(path): RoutePath<String>,
     State(app): State<Arc<App>>,
     Query(query): Query<WorkspaceQuery>,
-) -> Result<String, (StatusCode, String)> {
-    let error = |error: anyhow::Error| (StatusCode::NOT_FOUND, error.to_string());
-    let app = app.route(query.workspace).await.map_err(error)?;
-    tokio::task::spawn_blocking(move || read_text(&resolve(&app.project_dir, &path)?))
+) -> Result<Response, (StatusCode, &'static str)> {
+    let app = app
+        .route(query.workspace)
         .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .map_err(error)
+        .map_err(|_| preview_response_error(PreviewError::Unavailable))?;
+    tokio::task::spawn_blocking(move || {
+        let (bytes, kind) = read_preview(&app.project_dir, &path).map_err(preview_response_error)?;
+        if let Kind::Image(format) = kind {
+            source_file::inspect_image(&bytes, format).map_err(preview_response_error)?;
+        }
+        let headers = [
+            (header::CONTENT_TYPE, kind.content_type()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ];
+        Ok((headers, bytes).into_response())
+    })
+    .await
+    .map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, preview_message(PreviewError::Unavailable))
+    })?
+}
+
+fn read_preview(project: &Path, path: &str) -> Result<(Vec<u8>, Kind), PreviewError> {
+    let full = resolve(project, path).map_err(|_| PreviewError::Unavailable)?;
+    let file = crate::file_browser::open_resolved_path(project, &full)
+        .map_err(|_| PreviewError::Unavailable)?;
+    let metadata = file.metadata().map_err(|_| PreviewError::Unavailable)?;
+    if !metadata.is_file() {
+        return Err(PreviewError::Unavailable);
+    }
+    if metadata.len() > source_file::MAX_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    let bytes = source_file::read(file)?;
+    let kind = source_file::classify(&bytes)?;
+    Ok((bytes, kind))
+}
+
+fn preview_response_error(error: PreviewError) -> (StatusCode, &'static str) {
+    let status = match error {
+        PreviewError::Unavailable => StatusCode::NOT_FOUND,
+        PreviewError::Unsupported => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        PreviewError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+    };
+    (status, preview_message(error))
+}
+
+fn preview_message(error: PreviewError) -> &'static str {
+    Locale::supported(harness_text!("en", "ja")).unwrap().text(error.message_key())
+}
+
+pub(super) fn validate_preview(project: &Path, path: &str) -> Result<()> {
+    let error = |error| anyhow::anyhow!("{} ({path})", preview_message(error));
+    let (bytes, kind) = read_preview(project, path).map_err(error)?;
+    if let Kind::Image(format) = kind {
+        source_file::decode_image(&bytes, format).map_err(error)?;
+    }
+    Ok(())
 }
 
 fn relative_path(path: &str) -> Result<&Path> {
