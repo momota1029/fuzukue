@@ -306,6 +306,8 @@ fn worker_shell(
         "Saved workspace shell rule"
     } else {
         match policy {
+            WorkerApprovalPolicy::Ask if approved.own_files => "Worker read of its own job files",
+            WorkerApprovalPolicy::Ask if approved.basic => "Basic read command (ask policy)",
             WorkerApprovalPolicy::Ask => return None,
             WorkerApprovalPolicy::Advisor => "Workspace shell allowlist (advisor policy)",
             WorkerApprovalPolicy::Auto => "Workspace shell allowlist (auto policy)",
@@ -2002,6 +2004,12 @@ pub(crate) async fn run_worker(
                             write_worker_approval(stdin, backend_id, None).await?;
                             continue;
                         }
+                        if tool == "Read" && app.delegates.worker_approval_trusted(session, job)
+                            && scope.reads_own_file(cwd, &request["input"])
+                        {
+                            write_worker_approval(stdin, backend_id, Some(request["input"].clone())).await?;
+                            continue;
+                        }
                         if execution.is_none() && tool == "Bash" && app.delegates.worker_approval_trusted(session, job) {
                             if let Some((approved, who)) = worker_shell(app, scope, request) {
                                 write_worker_approval(stdin, backend_id, Some(approved.input.clone())).await?;
@@ -2624,11 +2632,13 @@ mod tests {
         std::fs::write(&file, "initial contents")?;
         let app = Workspace::new(root.clone(), String::new(), state.clone(), Arc::new(Hub::new()));
         let scope = crate::worker_scope::Scope::open(&root, &root, &root)?;
-        let input = json!({"command": "cat notes.md"});
+        let basic = json!({"input": {"command": "cat notes.md"}});
+        assert_eq!(worker_shell(&app, &scope, &basic).unwrap().1, "Basic read command (ask policy)");
+        let input = json!({"command": "head notes.md"});
         let mut request = json!({"input": input});
         assert!(worker_shell(&app, &scope, &request).is_none());
-        app.shell_approval_rules.remember(&state, &scope, &request["input"], Some("cat"))?;
-        request["input"]["command"] = json!("cat -n notes.md");
+        app.shell_approval_rules.remember(&state, &scope, &request["input"], Some("head"))?;
+        request["input"]["command"] = json!("head -n1 notes.md");
         assert_eq!(worker_shell(&app, &scope, &request).unwrap().1, "Saved workspace shell rule");
 
         request["human_only"] = json!(true);
@@ -2637,6 +2647,65 @@ mod tests {
         std::fs::remove_file(&file)?;
         std::os::unix::fs::symlink(state.join("shell-approval-rules.json"), &file)?;
         assert!(worker_shell(&app, &scope, &request).is_none());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_reads_its_own_job_files_under_every_policy() -> Result<()> {
+        use fuzukue_proto::WorkerApprovalPolicy::{Advisor, Ask, Auto};
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().canonicalize()?.join("worktree");
+        let state = tmp.path().canonicalize()?.join("state");
+        // The job directory lives in the protected server state directory.
+        let scratch = state.join("worker-fixture");
+        let tasks = scratch.join("claude-1000/-worktree/session/tasks");
+        for dir in [&root, &tasks, &scratch.join(".claude")] {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(root.join("notes.md"), "notes")?;
+        std::fs::write(state.join("token"), "secret")?;
+        std::fs::write(scratch.join(".claude/.credentials.json"), "secret")?;
+        let output = tasks.join("b1.output");
+        std::fs::write(&output, "done")?;
+        std::os::unix::fs::symlink(state.join("token"), tasks.join("link.output"))?;
+        let app = Workspace::new(root.clone(), String::new(), state.clone(), Arc::new(Hub::new()));
+        let scope = crate::worker_scope::Scope::open(&root, &root, &scratch)?;
+        let quoted = |path: &Path| shlex::try_quote(path.to_str().unwrap()).unwrap().into_owned();
+        for policy in [Ask, Advisor, Auto] {
+            *app.worker_approval_policy.lock().unwrap() = policy;
+            let shell = |command: String| worker_shell(&app, &scope, &json!({"input": {"command": command}}));
+            for command in [
+                format!("sleep 60 && cat {}", quoted(&output)),
+                format!("tail -n 20 {}", quoted(&output)),
+            ] {
+                let who = shell(command.clone()).unwrap_or_else(|| panic!("{command}")).1;
+                if policy == Ask {
+                    assert_eq!(who, "Worker read of its own job files");
+                }
+            }
+            for command in [
+                format!("cat {}", quoted(&state.join("token"))),
+                format!("cat {}", quoted(&scratch.join(".claude/.credentials.json"))),
+                format!("cat {}", quoted(&tasks.join("link.output"))),
+                format!("cat {} && cat {}", quoted(&output), quoted(&state.join("token"))),
+                format!("sleep 60; cat {}", quoted(&output)),
+                "sleep 1e9 && pwd".into(),
+            ] {
+                assert!(shell(command.clone()).is_none(), "{command}");
+            }
+            assert_eq!(shell("cat notes.md".into()).is_some(), true);
+            assert_eq!(shell("head notes.md".into()).is_some(), policy != Ask);
+        }
+        let read = |path: &Path| scope.reads_own_file(&root, &json!({"file_path": path, "offset": 1}));
+        assert!(read(&output));
+        for path in [
+            state.join("token"), scratch.join(".claude/.credentials.json"), tasks.join("link.output"),
+            root.join("notes.md"), tasks.join("missing.output"),
+        ] {
+            assert!(!read(&path), "{}", path.display());
+        }
+        assert!(!scope.reads_own_file(&root, &json!({"file_path": output, "pages": "1"})));
         Ok(())
     }
 

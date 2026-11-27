@@ -19,11 +19,19 @@ enum Join {
     And,
 }
 
+/// Every stage of these commands only prints a path, a listing, or file
+/// contents, or waits. R-65 chose them as the first unattended subset.
+const BASIC_READS: &[&str] = &["pwd", "ls", "cat", "sleep"];
+
 pub(crate) struct ApprovedShell {
     pub(crate) input: Value,
     pub(crate) prefix: Option<&'static str>,
     pub(crate) command: String,
     rule: String,
+    /// Every stage is in BASIC_READS.
+    pub(crate) basic: bool,
+    /// Every file operand is in the job's own temporary directory, and no stage reads anything else.
+    pub(crate) own_files: bool,
 }
 
 impl ApprovedShell {
@@ -91,6 +99,10 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
     }
     let mut script = format!("cd -- {}", shlex::try_quote(cwd.to_str()?).ok()?);
     let mut rules = Vec::new();
+    let scratch = scope.scratch.as_path();
+    // Tracks whether every operand checked so far is one of the job's own files.
+    let own = std::cell::Cell::new(Some(false));
+    let mut own_files = true;
     for (index, (join, words)) in stages.iter().enumerate() {
         script.push_str(match join {
             Join::And => " && ",
@@ -98,17 +110,27 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
         });
         let (name, args) = words.split_first()?;
         let operands = |names: &[String], kind| {
-            names
-                .iter()
-                .all(|name| checked_path(&roots, &cwd, name, protected, kind).is_some())
+            names.iter().all(|name| {
+                let checked = checked_path(&roots, &cwd, name, protected, scratch, kind);
+                if let Some(path) = &checked {
+                    if name != "-" {
+                        let mine = super::own_file(scratch, path);
+                        own.set(own.get().filter(|_| mine).map(|_| true));
+                    }
+                }
+                checked.is_some()
+            })
         };
+        if !matches!(name.as_str(), "sleep" | "cat" | "head" | "tail" | "wc" | "stat" | "sed" | "grep") {
+            own_files = false;
+        }
 
         if name == "cd" {
             if index != 0 || !matches!(stages.get(1), Some((Join::And, _))) {
                 return None;
             }
             let [path] = args else { return None };
-            cwd = checked_path(&roots, &cwd, path, protected, PathKind::Directory)?;
+            cwd = checked_path(&roots, &cwd, path, protected, scratch, PathKind::Directory)?;
             script.push_str("cd -- ");
             script.push_str(&shlex::try_quote(cwd.to_str()?).ok()?);
             rules.push("cd");
@@ -126,7 +148,7 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
             "ls" => {
                 if !operands(positional, PathKind::Entry)
                     || (positional.is_empty()
-                        && checked_path(&roots, &cwd, ".", protected, PathKind::Directory).is_none())
+                        && checked_path(&roots, &cwd, ".", protected, scratch, PathKind::Directory).is_none())
                 {
                     return None;
                 }
@@ -134,6 +156,7 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
             "cat" | "head" | "tail" | "wc" if operands(positional, PathKind::FileOrStdin) => {}
             "stat" if !positional.is_empty() && operands(positional, PathKind::Entry) => {}
             "pwd" if args.is_empty() => {}
+            "sleep" if matches!(args, [duration] if seconds(duration)) => {}
             "date" if args.iter().all(|arg| arg == "-u" || arg.starts_with('+')) => {}
             "which" if !args.is_empty() && args.iter().all(|arg| is_identifier(arg)) => {}
             "ps" if ps_args(args) => {}
@@ -177,7 +200,7 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
                         && name == "rg"
                         && *join != Join::Pipe
                         && (!files
-                            || checked_path(&roots, &cwd, ".", protected, PathKind::Directory)
+                            || checked_path(&roots, &cwd, ".", protected, scratch, PathKind::Directory)
                                 .is_none()))
                     || (files && !options.iter().any(|option| option == "--no-ignore"))
                 {
@@ -185,7 +208,7 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
                 }
             }
             "find" => {
-                if !find_args(&roots, &cwd, args, protected) {
+                if !find_args(&roots, &cwd, args, protected, scratch) {
                     return None;
                 }
             }
@@ -227,7 +250,12 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
         shlex::try_quote(&script).ok()?,
     ));
     let first = *rules.first()?;
+    let basic = rules.iter().all(|rule| BASIC_READS.contains(rule));
+    // The front desk passes its project as the scratch; only a separate job directory counts.
+    let own_files = own_files && own.get() == Some(true) && scope.scratch != scope.cwd;
     Some(ApprovedShell {
+        basic,
+        own_files,
         input: updated,
         // A leading cd can be saved as an exact command only. Every stage
         // must pass the same checks regardless of which rule ultimately matches.
@@ -294,6 +322,7 @@ fn checked_path(
     cwd: &Path,
     name: &str,
     protected: &[PathBuf],
+    scratch: &Path,
     kind: PathKind,
 ) -> Option<PathBuf> {
     if name == "-" && matches!(kind, PathKind::FileOrStdin) {
@@ -313,9 +342,14 @@ fn checked_path(
     let canonical = absolute.canonicalize().ok()?;
     if !absolute.components().eq(canonical.components())
         || !roots.iter().any(|root| canonical.starts_with(root))
-        || protected
-            .iter()
-            .any(|root| canonical.starts_with(root) || root.starts_with(&canonical))
+        || protected.iter().any(|root| {
+            // The job directory lives under the server state directory. Only its
+            // own files are exempt, never a protected root nested inside it.
+            let own = scratch != root.as_path()
+                && scratch.starts_with(root)
+                && super::own_file(scratch, &canonical);
+            (canonical.starts_with(root) && !own) || root.starts_with(&canonical)
+        })
     {
         return None;
     }
@@ -389,6 +423,14 @@ fn flags<'a>(
         .then_some((&args[..index], &args[index..]))
 }
 
+/// A plain `sleep` duration such as `60`, `1.5`, or `2m`.
+fn seconds(value: &str) -> bool {
+    let number = value.strip_suffix(['s', 'm']).unwrap_or(value);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, "0"));
+    !whole.is_empty() && !fraction.is_empty() && whole.len() <= 6
+        && (whole.bytes().chain(fraction.bytes())).all(|byte| byte.is_ascii_digit())
+}
+
 fn integer(value: &str) -> bool {
     let value = value.strip_prefix(['+', '-']).unwrap_or(value);
     !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit())
@@ -437,13 +479,13 @@ fn jq_filter(filter: &str) -> bool {
         })
 }
 
-fn find_args(roots: &[&Path], cwd: &Path, args: &[String], protected: &[PathBuf]) -> bool {
+fn find_args(roots: &[&Path], cwd: &Path, args: &[String], protected: &[PathBuf], scratch: &Path) -> bool {
     let Some((path, expressions)) = args.split_first() else {
         return false;
     };
     // GNU find treats an operand that starts with ! or ( as an expression.
     if path.starts_with(['!', '('])
-        || checked_path(roots, cwd, path, protected, PathKind::Directory).is_none()
+        || checked_path(roots, cwd, path, protected, scratch, PathKind::Directory).is_none()
     {
         return false;
     }

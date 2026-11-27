@@ -173,6 +173,19 @@ impl Scope {
         }
     }
 
+    /// A Read request for one of the job's own files, such as background command output.
+    pub(crate) fn reads_own_file(&self, cwd: &Path, input: &Value) -> bool {
+        let Some(fields) = input.as_object() else { return false };
+        let known = fields.iter().all(|(key, value)| match key.as_str() {
+            "file_path" => value.is_string(),
+            "offset" | "limit" => value.as_u64().is_some(),
+            _ => false,
+        });
+        known && input["file_path"].as_str().filter(|path| !path.is_empty()).is_some_and(|path| {
+            cwd.join(path).canonicalize().is_ok_and(|path| path.is_file() && own_file(&self.scratch, &path))
+        })
+    }
+
 }
 
 pub(crate) fn protected_roots(state_dir: &Path) -> Vec<PathBuf> {
@@ -194,8 +207,21 @@ pub(crate) fn protected_roots(state_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// A resolved path inside the job's temporary directory, such as background
+/// command output. Top-level dot entries hold copied backend logins and stay excluded.
+pub(crate) fn own_file(scratch: &Path, canonical: &Path) -> bool {
+    canonical.strip_prefix(scratch).is_ok_and(|relative| {
+        relative.components().next().is_none_or(|first| {
+            matches!(first, Component::Normal(name) if !name.to_string_lossy().starts_with('.'))
+        })
+    })
+}
+
 pub(crate) const SHELL_READ_GUIDANCE: &str =
     "\n\nFor shell reads, pass paths directly to commands (e.g. `sed -n '1,40p' dir/file`, `rg -n x dir/file`). Avoid `cd dir && cmd`.";
+
+pub(crate) const WORKER_READ_GUIDANCE: &str =
+    "\n\nRead files with the file-reading tool (Read, or fs_read when available) instead of `cat`, `head`, or `tail` in the shell. This includes your own background command output and other files in the job's temporary directory, which never need approval.";
 
 pub(crate) fn append_environment_notes(instructions: &mut String, workspace: &Path) -> Result<()> {
     let (_, en) = include_str!("../../../rules/worker-environment.md")
@@ -204,6 +230,7 @@ pub(crate) fn append_environment_notes(instructions: &mut String, workspace: &Pa
     instructions.push_str("\n\n");
     instructions.push_str(en.trim());
     instructions.push_str(SHELL_READ_GUIDANCE);
+    instructions.push_str(WORKER_READ_GUIDANCE);
 
     let path = fuzukue_proto::compat::workspace_data(workspace, "worker-notes.md");
     let metadata = match fs::symlink_metadata(&path) {
