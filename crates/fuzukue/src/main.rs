@@ -194,6 +194,7 @@ struct Workbench {
     http: HttpTarget,
     connection_epoch: u64,
     usage: Vec<UsageWindow>,
+    usage_clock: Option<gpui_kit::Task<()>>,
     pause_at: f32,
     /// PDF から飛んできたカードなら、PDF に戻るボタンを出す
     from_pdf: bool,
@@ -318,7 +319,10 @@ fn unix_now() -> i64 {
 }
 
 fn until_text(at: i64) -> String {
-    let minutes = fuzukue_view::minutes_until(at, unix_now());
+    remaining_time_text(fuzukue_view::minutes_until(at, unix_now()))
+}
+
+fn remaining_time_text(minutes: i64) -> String {
     if minutes >= 60 {
         tr!("workbench-time-hours-minutes", hours = minutes / 60, minutes = minutes % 60)
     } else {
@@ -710,6 +714,7 @@ impl Workbench {
             http: HttpTarget::default(),
             connection_epoch: 0,
             usage: Vec::new(),
+            usage_clock: None,
             pause_at: 0.95,
             from_pdf: false,
             tabs: Vec::new(),
@@ -1770,6 +1775,7 @@ impl Workbench {
         self.workshop.loaded = false;
         self.workshop.approvals.clear();
         self.usage.clear();
+        self.usage_clock = None;
         self.selected = None;
         self.comments.clear();
         self.comment_target = None;
@@ -2347,6 +2353,7 @@ impl Render for Workbench {
         window.set_rem_size(cx.theme().font_size);
         self.sync_chat_activity_clock(cx);
         self.sync_blocker_expiry(cx);
+        self.sync_usage_clock(cx);
         self.ensure_paper_pdf(window, cx);
         if self.right == RightPane::Card {
             if let Some(card) = self.selected.clone() {
@@ -2990,32 +2997,62 @@ impl Workbench {
                 .children(self.deck_diagnostics_panel(None, cx)))
     }
 
-    /// 「Claude 5時間 12%（あと2時間3分）」を agent ごとに 1 行。閾値に近い枠は色を変える。
+    fn sync_usage_clock(&mut self, cx: &mut Context<Self>) {
+        let now = unix_now();
+        let visible = self.right == RightPane::Overview && !self.settings_open;
+        if !visible || !self.usage.iter().any(|w| w.resets_at.is_some_and(|reset| reset > now)) {
+            self.usage_clock = None;
+        } else if self.usage_clock.is_none() {
+            self.usage_clock = Some(cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(15)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }));
+        }
+    }
+
     fn usage_lines(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme().clone();
-        let mut agents: Vec<&str> = self.usage.iter().map(|w| w.agent.as_str()).collect();
-        agents.dedup();
-        agents
-            .into_iter()
-            .map(|agent| {
-                let parts: Vec<String> = self
-                    .usage
-                    .iter()
-                    .filter(|w| w.agent == agent)
-                    .map(|w| {
-                        let left = w.resets_at.map(|r| format!("（{}）", until_text(r))).unwrap_or_default();
-                        format!("{} {:.0}%{left}", w.name, w.used * 100.0)
-                    })
-                    .collect();
-                let hot = self.usage.iter().any(|w| w.agent == agent && (w.rejected || w.used >= self.pause_at * 0.85));
-                let label = if agent == "claude" { "Claude" } else if agent == "codex" { "Codex" } else { agent };
-                div()
-                    .text_xs()
-                    .text_color(if hot { theme.warning } else { theme.muted_foreground })
-                    .child(format!("{label} · {}", parts.join(" · ")))
-                    .into_any_element()
-            })
-            .collect()
+        let now = unix_now();
+        self.usage.iter().map(|window| {
+            let hot = self.usage.iter().any(|w| {
+                w.agent == window.agent && w.resets_at.is_none_or(|reset| reset > now)
+                    && (w.rejected || w.used >= self.pause_at * 0.85)
+            });
+            let agent = match window.agent.as_str() {
+                "claude" => "Claude",
+                "codex" => "Codex",
+                name => name,
+            };
+            let used = if window.resets_at.is_some_and(|reset| reset <= now) { 0.0 } else { window.used };
+            let mut parts = vec![format!("{agent} {} {:.0}%", window.name, used * 100.0)];
+            let mut estimate_text = None;
+            if let Some(look) = fuzukue_view::usage::outlook(window, now) {
+                parts.push(match look.reset_minutes {
+                    Some(minutes) => tr!("workbench-usage-reset", time = remaining_time_text(minutes)),
+                    None => tr!("workbench-usage-reset-soon").into(),
+                });
+                if let Some(rate) = look.percent_per_hour {
+                    parts.push(tr!("workbench-usage-allowance", rate = rate));
+                }
+                if let Some(estimate) = look.estimate {
+                    let time = remaining_time_text(estimate.minutes);
+                    estimate_text = Some(if estimate.reaches_reset {
+                        tr!("workbench-usage-reaches-reset", time = time)
+                    } else {
+                        tr!("workbench-usage-runs-out", time = time)
+                    });
+                }
+            }
+            v_flex()
+                .min_w_0()
+                .text_xs()
+                .text_color(if hot { theme.warning } else { theme.muted_foreground })
+                .child(div().child(parts.join(" · ")))
+                .children(estimate_text.map(|text| div().child(text)))
+                .into_any_element()
+        }).collect()
     }
 
     fn render_issue_detail(&self, number: u64, cx: &mut Context<Self>) -> impl IntoElement {

@@ -89,6 +89,7 @@ enum Step {
     Connect,
     ModelSetupFixture,
     DistributionPreview,
+    UsagePreview,
     ClientDownloadPreview { resuming: bool },
     ClientRollbackPreview,
     GitHubReportPreview,
@@ -560,6 +561,33 @@ impl Runner {
                 std::fs::write(folder.join("notes.txt"), "Synthetic attachment fixture\n")?;
                 self.update(cx, |view, _, cx| {
                     view.add_attachments(view.active.clone(), vec![folder], cx);
+                })?;
+            }
+            Step::UsagePreview => {
+                ensure!(!self.read_only, "usage preview needs an isolated fixture");
+                self.update(cx, |view, _, cx| {
+                    let now = crate::unix_now();
+                    let window = |agent: &str, name: &str, used, reset_in, rate: Option<f64>| fuzukue_proto::UsageWindow {
+                        agent: agent.into(),
+                        name: name.into(),
+                        used,
+                        resets_at: Some(now + reset_in),
+                        rejected: false,
+                        recent_pace: rate.map(|used_per_hour| fuzukue_proto::UsagePace {
+                            observed_at: now,
+                            used_per_hour,
+                        }),
+                    };
+                    view.right = RightPane::Overview;
+                    view.on_event(ServerEvent::Usage {
+                        windows: vec![
+                            window("claude", "5h", 0.89, 900, Some(0.33)),
+                            window("claude", "7d", 0.80, 7200, Some(0.18)),
+                            window("codex", "7d", 0.57, 36_000, None),
+                        ],
+                        pause_at: 0.95,
+                    }, cx);
+                    cx.notify();
                 })?;
             }
             Step::SelfUpdatePreview { canary, waiting } => {

@@ -536,6 +536,7 @@ async fn update_result_is_saved_while_busy_and_quota_blocked_without_changing_he
         used: 1.0,
         resets_at: Some(crate::usage::now() + 600),
         rejected: true,
+        recent_pace: None,
     }]);
     assert!(workspace.hub.thread_active(&session));
     assert!(workspace.usage.blocked("claude").is_some());

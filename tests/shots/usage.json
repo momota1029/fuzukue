@@ -1,0 +1,13 @@
+{
+  "steps": [
+    {"action": "size", "width": 1120, "height": 800},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "en"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "usage"},
+    {"action": "usage_preview"},
+    {"action": "screenshot", "name": "usage-en"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "screenshot", "name": "usage-ja"}
+  ]
+}

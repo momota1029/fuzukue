@@ -653,23 +653,16 @@ fn usage_progress(app: &Workspace, pace: GoalPace, backends: &[AgentBackend]) ->
         GoalPace::Normal => (0.70, 0.90),
         GoalPace::Economy => (0.55, 0.80),
     };
-    let mut slowed = false;
-    let mut paused = false;
-    let mut resume_at = Some(0);
-    for window in app.usage.current().into_iter().filter(|window| {
-        backends
-            .iter()
-            .any(|backend| backend.usage_key() == window.agent)
-    }) {
-        if window.rejected || window.used >= pause_at {
-            paused = true;
-            resume_at = resume_at.zip(window.resets_at).map(|(a, b)| a.max(b));
-        }
-        slowed |= window.used >= slow_at;
-    }
-    if paused {
+    let relevant = |window: &fuzukue_proto::UsageWindow| {
+        backends.iter().any(|backend| backend.usage_key() == window.agent)
+    };
+    let blockers = app.usage.pause_windows(crate::usage::now(), pause_at, true, relevant);
+    if !blockers.is_empty() {
+        let resume_at = blockers.iter().try_fold(0, |latest, window| {
+            window.resets_at.map(|at| latest.max(at))
+        });
         GoalProgress::Paused { resume_at }
-    } else if slowed {
+    } else if app.usage.current().iter().any(|window| relevant(window) && window.used >= slow_at) {
         GoalProgress::Slowed
     } else {
         GoalProgress::Ready

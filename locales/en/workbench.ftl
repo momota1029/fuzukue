@@ -86,6 +86,11 @@ workbench-issues = Issues
 workbench-repository-issues = Issues · { $repo }
 workbench-time-hours-minutes = { $hours }h { $minutes }m
 workbench-time-minutes = { $minutes }m
+workbench-usage-reset = Resets in { $time }
+workbench-usage-reset-soon = Resets in <1m
+workbench-usage-allowance = Budget { $rate }%/h until reset
+workbench-usage-reaches-reset = At recent pace, ~{ $time } left (lasts to reset)
+workbench-usage-runs-out = At recent pace, ~{ $time } left (runs out before reset)
 workbench-card-count = { $count ->
     [one] { $count } card
    *[other] { $count } cards

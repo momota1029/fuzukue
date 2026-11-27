@@ -459,12 +459,22 @@ impl ClaudeSession {
         let me = self.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
+            let mut usage = me.usage.subscribe();
             let mut received_session_id = false;
             let mut saw_turn_output = false;
             let mut missing_resume = false;
             loop {
                 let line = tokio::select! {
                     _ = stop_reading.cancelled() => break,
+                    _ = usage.changed() => {
+                        if me.process_generation.load(Ordering::Acquire) != generation {
+                            return;
+                        }
+                        if let Err(e) = me.pause_for_usage(generation).await {
+                            me.hub.publish(ServerEvent::Error { message: format!("claude {}: {e:#}", me.id) });
+                        }
+                        continue;
+                    }
                     line = lines.next_line() => line,
                 };
                 let Ok(Some(line)) = line else { break };
@@ -1254,7 +1264,7 @@ impl ClaudeSession {
         let reply = result["result"].as_str().filter(|text| !text.is_empty())
             .or_else(|| active.as_ref().map(|turn| turn.last_text.as_str())).unwrap_or_default();
         if rate_limited && turns.paused_until.is_none() {
-            let until = self.usage.blocked("claude").map(|(until, _)| until)
+            let until = self.usage.provider_limit("claude").map(|(until, _)| until)
                 .unwrap_or_else(|| now() + FALLBACK_PAUSE_SECS);
             let retry = active.as_ref()
                 .filter(|turn| !matches!(turn.kind, TurnKind::GoalDecision(_) | TurnKind::Escalated))
@@ -1462,6 +1472,22 @@ impl ClaudeSession {
     }
 
     /// 出力を見て、使用量の更新・休憩の判断・許可の問い合わせの中継をする。
+    async fn pause_for_usage(self: &Arc<Self>, generation: u64) -> Result<()> {
+        let mut turns = self.state.lock().await;
+        if self.process_generation.load(Ordering::Acquire) != generation || turns.paused_until.is_some() {
+            return Ok(());
+        }
+        if let Some(turn) = turns.active.as_mut().filter(|turn| turn.compaction.is_none()) {
+            if let Some((until, reason)) = self.usage.blocked("claude") {
+                turn.before = None;
+                let interrupted = turn.usage_continuation();
+                self.pause(&mut turns, until, reason, Some(interrupted));
+                self.interrupt_claude().await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn watch_usage(self: &Arc<Self>, v: &Value, generation: u64) -> Result<()> {
         match v["type"].as_str() {
             Some("control_request") if v["request"]["subtype"] == "can_use_tool" => {
@@ -1650,18 +1676,7 @@ impl ClaudeSession {
             }
             Some("rate_limit_event") => {
                 self.usage.update_claude(&v["rate_limit_info"]);
-                let mut turns = self.state.lock().await;
-                if turns.paused_until.is_none() {
-                    if let Some((until, reason)) = self.usage.blocked("claude") {
-                        if let Some(turn) = &mut turns.active {
-                            if turn.compaction.is_some() { return Ok(()); }
-                            turn.before = None;
-                            let interrupted = turn.usage_continuation();
-                            self.pause(&mut turns, until, reason, Some(interrupted));
-                            self.interrupt_claude().await?;
-                        }
-                    }
-                }
+                self.pause_for_usage(generation).await?;
             }
             Some("system") if v["subtype"] == "compact_boundary" => {
                 if let Some(compaction) = self.state.lock().await.active.as_mut().and_then(|turn| turn.compaction.as_mut()) {

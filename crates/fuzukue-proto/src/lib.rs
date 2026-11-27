@@ -1800,6 +1800,35 @@ pub struct UsageWindow {
     pub resets_at: Option<i64>,
     /// 上限に達して断られている
     pub rejected: bool,
+    /// Recent consumption for display, when successive readings support an estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_pace: Option<UsagePace>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct UsagePace {
+    /// Unix time of the latest observed increase.
+    pub observed_at: i64,
+    /// Fraction of this window's quota consumed per hour.
+    pub used_per_hour: f64,
+}
+
+impl UsagePace {
+    pub const MAX_AGE_SECS: i64 = 15 * 60;
+
+    /// Seconds the reported allowance lasts at this pace, if the estimate is fresh.
+    pub fn runway_seconds(self, used: f32, now: i64) -> Option<f64> {
+        if !(0..=Self::MAX_AGE_SECS).contains(&now.saturating_sub(self.observed_at))
+            || !self.used_per_hour.is_finite()
+            || self.used_per_hour <= 0.0
+            || !used.is_finite()
+            || used < 0.0
+        {
+            return None;
+        }
+        let seconds = (1.0 - f64::from(used)).max(0.0) * 3600.0 / self.used_per_hour;
+        seconds.is_finite().then_some(seconds)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
