@@ -494,6 +494,7 @@ fn review_card(draft: &Draft, inbox: bool, cx: &Context<Workbench>) -> impl Into
             prefix,
             tr!("workspace-request-cancel"),
             tr!("workspace-request-send"),
+            None,
             &cx.entity(),
             move |send| ClientMsg::WorkspaceRequest {
                 action: Action::Decide { revision: revision.clone(), send },

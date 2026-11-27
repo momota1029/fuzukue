@@ -3575,9 +3575,10 @@ pub(super) fn folder_approval_buttons(request_id: &str, entity: &Entity<Workbenc
             .child(button(None, tr!("chat-deny"))))
 }
 
-pub(super) fn approval_buttons(request_id: &str, entity: &Entity<Workbench>) -> impl IntoElement {
+/// `hint` is the tooltip of the allow button.
+pub(super) fn approval_buttons(request_id: &str, hint: Option<String>, entity: &Entity<Workbench>) -> impl IntoElement {
     let id = request_id.to_owned();
-    approval_decision_buttons(request_id, tr!("chat-deny"), tr!("chat-allow"), entity, move |accept| {
+    approval_decision_buttons(request_id, tr!("chat-deny"), tr!("chat-allow"), hint, entity, move |accept| {
         ClientMsg::Resolve {
             request_id: id.clone(),
             decision: if accept { "accept" } else { "decline" }.into(),
@@ -3586,7 +3587,7 @@ pub(super) fn approval_buttons(request_id: &str, entity: &Entity<Workbench>) -> 
 }
 
 pub(super) fn approval_decision_buttons(
-    id: &str, decline: &str, accept: &str, entity: &Entity<Workbench>,
+    id: &str, decline: &str, accept: &str, hint: Option<String>, entity: &Entity<Workbench>,
     action: impl Fn(bool) -> ClientMsg + Clone + 'static,
 ) -> impl IntoElement {
     let button = |label: &str, decision: &'static str, primary| {
@@ -3594,7 +3595,7 @@ pub(super) fn approval_decision_buttons(
         let action = action.clone();
         let button = Button::new(SharedString::from(format!("{decision}-{id}"))).label(label.to_owned());
         let button = if primary {
-            button.primary()
+            button.primary().when_some(hint.clone(), |button, hint| button.tooltip(hint))
         } else {
             button.secondary()
         };

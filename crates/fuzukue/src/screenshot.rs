@@ -33,7 +33,7 @@ use crate::{icons::Symbol, RightPane, Workbench};
 pub(super) struct Screenshots {
     prompt: Option<(u64, Instant)>,
     capture: Option<(u64, Option<u64>)>,
-    preview: Option<Preview>,
+    pub(super) preview: Option<Preview>,
     feedback: Option<String>,
     #[cfg(all(target_os = "linux", feature = "headless-shot"))]
     capture_fixture: Option<Result<Vec<u8>>>,
@@ -45,7 +45,7 @@ impl Screenshots {
     }
 }
 
-struct Preview {
+pub(super) struct Preview {
     image: Arc<Image>,
     note: Entity<TextareaState>,
     previous_focus: Option<WeakFocusHandle>,

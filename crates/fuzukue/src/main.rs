@@ -517,6 +517,10 @@ impl Workbench {
                 }).unwrap_or(false)
             {
                 cx.stop_propagation();
+            } else if view.update(cx, |this, cx| {
+                this.approval_shortcut_key(&event.keystroke, window, cx)
+            }).unwrap_or(false) {
+                cx.stop_propagation();
             } else if matches!(event.keystroke.key.as_str(), "home" | "end" | "pageup" | "pagedown")
                 && view.update(cx, |this, cx| {
                     this.thread_navigation_key(event, window, cx)
@@ -2360,6 +2364,7 @@ impl Render for Workbench {
                 self.load_card_content(card, cx);
             }
         }
+        self.begin_approval_frame();
         let theme = cx.theme().clone();
         let source_centered = self.right == RightPane::Source && self.source.centered;
         let paper_info = self.thread_info_visible()
@@ -2445,6 +2450,9 @@ impl Render for Workbench {
                     this.change_text_size(delta, window, cx);
                     cx.stop_propagation();
                 }
+            }))
+            .capture_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, _| {
+                this.approval_shortcut_released(&event.keystroke);
             }))
             // Ctrl+K（Mac は ⌘K）で探す、Esc で閉じる
             .on_key_down(cx.listener(|this, ev: &gpui_kit::KeyDownEvent, window, cx| {

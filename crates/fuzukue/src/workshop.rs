@@ -290,7 +290,7 @@ impl Workbench {
             .children(self.workshop.approvals.iter().map(|(id, summary)| {
                 v_flex().gap_2().p_3().rounded_md().bg(theme.secondary).items_start()
                     .child(div().text_sm().whitespace_normal().child(summary.text().into_owned()))
-                    .child(approval_buttons(id, &entity))
+                    .child(approval_buttons(id, None, &entity))
             }))
             .child(v_flex().gap_1().text_sm().children(card_links))
             .child(div().font_bold().text_sm().child(if issue.details.is_some() {

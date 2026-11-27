@@ -20,11 +20,11 @@ pub(super) struct History {
     recent_open: bool,
     recent_request: Option<u64>,
     recent: Option<Result<Vec<HistoryRecord>, String>>,
-    panel: Option<Panel>,
+    pub(super) panel: Option<Panel>,
     changed_turns: ChangedTurns,
 }
 
-struct Panel {
+pub(super) struct Panel {
     scope: HistoryScope,
     focus_record: Option<String>,
     list_request: Option<u64>,

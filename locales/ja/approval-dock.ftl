@@ -48,3 +48,7 @@ approval-dock-risk-mid = 中リスク
 approval-dock-risk-high = 高リスク
 approval-dock-allow = 許可
 approval-dock-deny = 拒否
+approval-dock-shortcut-hint = 一度だけ許可（{ $shortcut }）
+approval-dock-shortcut-high-risk = 高リスクの依頼は { $shortcut } で許可できない。内容を確かめて「許可」をクリックする。
+approval-dock-shortcut-git = Git の操作は { $shortcut } で許可できない。内容を確かめて「許可」をクリックする。
+approval-dock-shortcut-folder = フォルダーの許可は { $shortcut } で決められない。許可する期間をクリックする。

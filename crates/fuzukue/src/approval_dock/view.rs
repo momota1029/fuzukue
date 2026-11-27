@@ -1,10 +1,11 @@
 use gpui_kit::{
-    component::{h_flex, scroll::Scrollbar, v_flex, ActiveTheme as _, Theme},
+    base::ElementExt as _,
+    component::{h_flex, scroll::Scrollbar, tooltip::Tooltip, v_flex, ActiveTheme as _, Theme},
     div, prelude::*, px, AnyElement, Context, Div, FontWeight, Pixels, Role, ScrollHandle, SharedString,
     Stateful, Window,
 };
 
-use super::*;
+use super::{shortcut::{Painted, SHORTCUT}, *};
 use crate::{appearance::ThemeSurfaces, chat::chat_column};
 
 const ROW_BUTTONS: [&str; 4] = ["details", "select", "allow", "deny"];
@@ -106,6 +107,19 @@ impl Workbench {
         }
 
         self.approvals.last_focus = window.focused(cx);
+        let first_card = shortcut::first_card(&live, !questions.is_empty(), self.approvals.thread(&self.active).next());
+        self.approvals.shortcut.observe(&self.active, first_card.clone());
+        // Say why the shortcut left the first card alone.
+        let refusal = self.approvals.shortcut.refused(&self.active).and_then(|card| match card {
+            shortcut::Card::Question => None,
+            shortcut::Card::Live(id) => shortcut::live_click_reason(id),
+            shortcut::Card::Queued(..) => self.approvals.thread(&self.active).next().and_then(shortcut::queued_click_reason),
+        }).map(|key| match key {
+            "approval-dock-shortcut-folder" => tr!("approval-dock-shortcut-folder", shortcut = SHORTCUT),
+            "approval-dock-shortcut-git" => tr!("approval-dock-shortcut-git", shortcut = SHORTCUT),
+            _ => tr!("approval-dock-shortcut-high-risk", shortcut = SHORTCUT),
+        });
+        let painted = self.approvals.shortcut.painted.clone();
         let groups = self.approvals.groups(&self.active);
 
         let entity = cx.entity();
@@ -150,7 +164,10 @@ impl Workbench {
                 cx.notify();
                 cx.stop_propagation();
             }))
-            .child(header);
+            .child(header)
+            .children(refusal.map(|refusal| div().id("approval-shortcut-notice").role(Role::Status)
+                .w_full().min_w_0().text_sm().whitespace_normal().text_color(theme.warning).child(refusal)))
+            .on_prepaint(move |_, _, _| painted.set(Painted { dock: true, ..painted.get() }));
 
         if let Some(review) = &self.approvals.review {
             dock = dock.child(self.render_review(review, body_height, cx));
@@ -158,8 +175,8 @@ impl Workbench {
             let selected = self.approvals.selected_requests(&self.active);
             let mut rows = Self::dock_scroll(&self.approvals.scroll, body_height);
             let busy = self.chats.get(&self.active).is_some_and(|chat| chat.busy());
-            for approval in &live {
-                rows = rows.child(self.render_live_approval(approval, busy, &entity, cx));
+            for (index, approval) in live.iter().enumerate() {
+                rows = rows.child(self.render_live_approval(approval, index == 0, busy, &entity, cx));
             }
             for card in questions {
                 rows = rows.child(div().w_full().min_w_0().p_2().rounded_md().border_1()
@@ -167,7 +184,8 @@ impl Workbench {
             }
             for group in groups {
                 for (index, item) in group.into_iter().enumerate() {
-                    rows = rows.child(self.render_request(item, index == 0, selected.first().copied(), cx));
+                    let first = matches!(&first_card, Some(shortcut::Card::Queued(id, _)) if id == &item.approval_id);
+                    rows = rows.child(self.render_request(item, index == 0, first, selected.first().copied(), cx));
                 }
             }
             dock = dock
@@ -205,7 +223,7 @@ impl Workbench {
     }
 
     fn render_request(
-        &self, item: &ApprovalSummary, first_in_job: bool, selected_kind: Option<&ApprovalSummary>,
+        &self, item: &ApprovalSummary, first_in_job: bool, first: bool, selected_kind: Option<&ApprovalSummary>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -218,6 +236,15 @@ impl Workbench {
         let select = id.clone();
         let scope = json(&item.action.scope);
         let surface = ThemeSurfaces::current(cx);
+        let allow_button = self.dock_button(
+            id, "allow", decision_label(ALLOW), self.can_decide(), Tone::Primary, cx,
+            move |this, _, cx| {
+                this.decide_one(&allow, ALLOW);
+                cx.notify();
+            },
+        ).when(first && shortcut::queued_click_reason(item).is_none(), |button| button.tooltip(|window, cx| {
+            Tooltip::new(tr!("approval-dock-shortcut-hint", shortcut = SHORTCUT)).build(window, cx)
+        }));
 
         let controls = h_flex().gap_1().items_center().flex_wrap()
             .child(self.dock_button(
@@ -234,13 +261,10 @@ impl Workbench {
                     move |this, _, cx| { this.toggle_selection(&select); cx.notify(); },
                 ).aria_selected(selected)
             }))
-            .child(self.dock_button(
-                id, "allow", decision_label(ALLOW), self.can_decide(), Tone::Primary, cx,
-                move |this, _, cx| {
-                    this.decide_one(&allow, ALLOW);
-                    cx.notify();
-                },
-            ))
+            .child(div().flex_none().child(allow_button).when(first, |wrapper| {
+                let painted = self.approvals.shortcut.painted.clone();
+                wrapper.on_prepaint(move |bounds, _, _| painted.set(Painted { allow: Some(bounds), ..painted.get() }))
+            }))
             .child(self.dock_button(
                 id, "deny", decision_label(DENY), self.can_decide(), Tone::Default, cx,
                 move |this, _, cx| {
@@ -306,13 +330,17 @@ impl Workbench {
                     .child(controls)
                     // The file list follows the buttons so that they stay in reach in the dock.
                     .children(card.as_ref().filter(|_| !detail).map(|card| file_list(card, LISTED, theme)))
-                    .children(details),
+                    .children(details)
+                    .when(first, |row| {
+                        let painted = self.approvals.shortcut.painted.clone();
+                        row.on_prepaint(move |bounds, _, _| painted.set(Painted { card: Some(bounds), ..painted.get() }))
+                    }),
             )
     }
 
     /// A live approval: the same controls that used to sit in the transcript.
     fn render_live_approval(
-        &self, approval: &crate::chat::PendingLiveApproval, busy: bool,
+        &self, approval: &crate::chat::PendingLiveApproval, first: bool, busy: bool,
         entity: &gpui_kit::Entity<Workbench>, cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -321,13 +349,20 @@ impl Workbench {
         let preview: String = details.lines().take(3).collect::<Vec<_>>().join("\n").chars().take(180).collect();
         let clipped = preview.len() < details.trim_end_matches('\n').len();
         let open = self.approvals.live_details.contains(&id);
+        let folder = id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST);
+        let hint = (first && shortcut::live_click_reason(&id).is_none())
+            .then(|| tr!("approval-dock-shortcut-hint", shortcut = SHORTCUT));
+        let buttons = if folder {
+            crate::chat::folder_approval_buttons(&id, entity, busy).into_any_element()
+        } else {
+            crate::chat::approval_buttons(&id, hint, entity).into_any_element()
+        };
         let mut header = h_flex().flex_wrap().gap_2().items_center()
             .child(div().text_color(theme.muted_foreground).text_sm().child(tr!("chat-approval-waiting")))
-            .child(if id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST) {
-                crate::chat::folder_approval_buttons(&id, entity, busy).into_any_element()
-            } else {
-                crate::chat::approval_buttons(&id, entity).into_any_element()
-            });
+            .child(div().min_w_0().child(buttons).when(first, |wrapper| {
+                let painted = self.approvals.shortcut.painted.clone();
+                wrapper.on_prepaint(move |bounds, _, _| painted.set(Painted { allow: Some(bounds), ..painted.get() }))
+            }));
         if approval.remember_shell {
             let request_id = id.clone();
             let entity = entity.clone();
@@ -365,9 +400,13 @@ impl Workbench {
                 .when(approval.shell, |details| details.font(code_font))
                 .max_h(px(if open { 240. } else { 66. })).overflow_y_scroll()
                 .child(if clipped && !open { format!("{preview}…") } else { details.into_owned() }))
+            .when(first, |row| {
+                let painted = self.approvals.shortcut.painted.clone();
+                row.on_prepaint(move |bounds, _, _| painted.set(Painted { card: Some(bounds), ..painted.get() }))
+            })
     }
 
-    fn decide_one(&mut self, id: &str, decision: ApprovalDecision) {
+    pub(super) fn decide_one(&mut self, id: &str, decision: ApprovalDecision) {
         if self.approvals.thread(&self.active).any(|item| item.approval_id == id) {
             self.submit_approvals(vec![id.to_owned()], decision, Feedback::default());
         }

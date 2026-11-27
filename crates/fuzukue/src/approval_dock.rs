@@ -39,6 +39,7 @@ pub(super) struct ApprovalDock {
     scroll: ScrollHandle,
     focus: HashMap<(String, &'static str), FocusHandle>,
     last_focus: Option<FocusHandle>,
+    shortcut: shortcut::Shortcut,
 }
 
 struct Review {
@@ -90,6 +91,7 @@ impl ApprovalDock {
         self.review = None;
         self.detail = None;
         self.selected.clear();
+        self.shortcut.disconnect();
         self.interrupt_submission();
     }
 
@@ -481,6 +483,7 @@ impl Workbench {
     }
 }
 
+mod shortcut;
 mod view;
 #[cfg(all(target_os = "linux", feature = "headless-shot"))]
 mod shot_fixture;

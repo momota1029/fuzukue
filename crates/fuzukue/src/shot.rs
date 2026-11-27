@@ -27,6 +27,8 @@ mod agent_models_test;
 #[cfg(test)]
 mod approval_dock_test;
 #[cfg(test)]
+mod approval_shortcut_test;
+#[cfg(test)]
 mod workspace_requests_test;
 #[cfg(test)]
 mod file_browser_test;

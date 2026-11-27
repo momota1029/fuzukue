@@ -57,3 +57,7 @@ approval-dock-risk-mid = Medium risk
 approval-dock-risk-high = High risk
 approval-dock-allow = Allow
 approval-dock-deny = Deny
+approval-dock-shortcut-hint = Allow once ({ $shortcut })
+approval-dock-shortcut-high-risk = { $shortcut } does not allow high-risk requests. Review it and click Allow.
+approval-dock-shortcut-git = { $shortcut } does not allow Git operations. Review it and click Allow.
+approval-dock-shortcut-folder = { $shortcut } does not allow folder access. Click how long to allow it.
