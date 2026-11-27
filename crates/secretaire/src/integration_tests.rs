@@ -44,6 +44,10 @@ mod large_deck;
 #[path = "integration_tests/source_preview.rs"]
 mod source_preview;
 
+#[cfg(unix)]
+#[path = "integration_tests/thread_todo.rs"]
+mod thread_todo;
+
 fn sample_lab() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lab")
 }
@@ -2107,6 +2111,8 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("desk_queue", &[("job_ids", "array"), ("offset", "integer"), ("limit", "integer")], &[]),
         ("desk_redeliver", &[("id", "string"), ("confirm", "boolean")], &["id", "confirm"]),
         ("withdraw_approval", &[("approval_id", "string"), ("reason", "string")], &["approval_id"]),
+        ("todo_list", &[("include_done", "boolean")], &[]),
+        ("todo_update", &[("changes", "array")], &["changes"]),
         ("list_recipes", &[], &[]),
         ("run_recipe", &[("name", "string"), ("args", "object")], &["name"]),
         ("recipe_status", &[("request_id", "string")], &["request_id"]),

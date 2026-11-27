@@ -572,7 +572,7 @@ impl Codex {
             loop {
                 let mut deferred = None;
                 let answer = self.run_turn_with_schema(
-                    &thread, &prompt, &[], None, Some(&cancel), Some((steering, &mut deferred)), TurnKind::Conversation, || Ok(()),
+                    &thread, &prompt, &[], None, Some(&cancel), Some((steering, &mut deferred)), TurnKind::Conversation, || Ok(()), || {},
                 ).await?;
                 let Some(next) = deferred.or_else(|| steering.next_or_finish()) else {
                     anyhow::ensure!(!answer.trim().is_empty(), "The Codex worker returned no final report");
@@ -630,7 +630,7 @@ impl Codex {
         cancel.check()?;
         let thread = self.start_thread_with_policy(project, session, None, true, Some(settings), None, launch).await?;
         let result = self.run_turn_with_schema(
-            &thread, prompt, &[], Some(schema), Some(cancel), None, TurnKind::Conversation, || Ok(()),
+            &thread, prompt, &[], Some(schema), Some(cancel), None, TurnKind::Conversation, || Ok(()), || {},
         ).await;
         self.collect_metadata(&thread, metadata);
         self.close_worker(&thread).await;
@@ -648,7 +648,7 @@ impl Codex {
         )).await??;
         let mut cleanup = SummaryThread { codex: self.clone(), thread: Some(thread.clone()) };
         let result = tokio::time::timeout(timeout,
-            self.run_turn_with_schema(&thread, evidence, &[], None, None, None, TurnKind::Conversation, || Ok(())),
+            self.run_turn_with_schema(&thread, evidence, &[], None, None, None, TurnKind::Conversation, || Ok(()), || {}),
         ).await;
         if result.is_err() {
             let _ = tokio::time::timeout(Duration::from_secs(5), self.interrupt(&thread)).await;
@@ -928,14 +928,15 @@ impl Codex {
 
     /// ターンを始め、終わるまで待って最後の答えを返す。途中経過はタイムラインに流れる。
     pub async fn run_turn(&self, thread_id: &str, text: &str) -> Result<String> {
-        self.run_turn_with_images(thread_id, text, &[], TurnKind::Conversation, || Ok(())).await
+        self.run_turn_with_images(thread_id, text, &[], TurnKind::Conversation, || Ok(()), || {}).await
     }
 
     pub(crate) async fn run_turn_with_images(
         &self, thread_id: &str, text: &str, images: &[PathBuf], kind: TurnKind,
         before_submit: impl FnOnce() -> Result<()>,
+        after_submit: impl FnOnce(),
     ) -> Result<String> {
-        self.run_turn_with_schema(thread_id, text, images, None, None, None, kind, before_submit).await
+        self.run_turn_with_schema(thread_id, text, images, None, None, None, kind, before_submit, after_submit).await
     }
 
     pub(crate) fn partner_acted_or_asked(&self, thread_id: &str) -> bool {
@@ -953,6 +954,7 @@ impl Codex {
         steering: Option<(&mut crate::delegate::JobInput, &mut Option<String>)>,
         kind: TurnKind,
         before_submit: impl FnOnce() -> Result<()>,
+        after_submit: impl FnOnce(),
     ) -> Result<String> {
         if let Some(cancel) = cancel {
             cancel.check()?;
@@ -1019,6 +1021,7 @@ impl Codex {
                 return Err(error);
             }
         };
+        after_submit();
         if let (Some(cancel), Some((input, deferred)), Some(turn_id)) =
             (cancel, steering, started["turn"]["id"].as_str())
         {

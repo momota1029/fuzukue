@@ -72,6 +72,8 @@ struct ActiveTurn {
     compaction: Option<Compaction>,
     escalation: Option<ChatSettings>,
     records: Vec<String>,
+    /// TODO changes in an input whose resumed session has yet to accept it.
+    todo_notices: crate::todo::Notices,
     _payload_hold: crate::hub::PayloadHold,
 }
 
@@ -720,9 +722,9 @@ impl ClaudeSession {
         let external = matches!(kind, TurnKind::ExternalInput) || self.app.upgrade()
             .is_some_and(|app| !crate::mcp::exec::trusted_session(&app, &self.id));
         self.apply_turn_settings(turns.closed, prompt.escalation.as_ref(), external).await?;
-        let input = match self.app.upgrade() {
-            Some(app) => app.partner_input(&self.id, input).await?,
-            None => input,
+        let (input, todo_notices) = match self.app.upgrade() {
+            Some(app) => app.partner_input(&self.id, input, external).await?,
+            None => (input, Default::default()),
         };
         let update_proof = self.mcp_key.as_ref().map(|_| crate::mail::session_key());
         let mut context = self.usage.context_line();
@@ -753,6 +755,7 @@ impl ClaudeSession {
             exec: Default::default(),
             history, before, resume_prompt, kind, acted_or_asked: false, last_text: String::new(),
             interrupted: false, compaction: None, escalation: prompt.escalation.clone(), records: prompt.records.clone(),
+            todo_notices,
         });
         self.stream.lock().unwrap().relay_reply = matches!(kind, TurnKind::WorkerDigest).then(RelayReply::default);
         self.hub.set_github_auth_request(&self.id, prompt.github_auth);
@@ -768,6 +771,10 @@ impl ClaudeSession {
             self.stream.lock().unwrap().relay_reply = None;
             return Err(error);
         }
+        // A rejected resume replays the prompt, so its notices wait for the first reply.
+        if let Some(turn) = turns.active.as_mut().filter(|turn| turn.resume_prompt.is_none()) {
+            self.record_todo_delivery(turn);
+        }
         if seed.is_some() {
             self.recovery.lock().unwrap().take();
         }
@@ -780,6 +787,13 @@ impl ClaudeSession {
             self.hub.mark_external_approval_input(&self.id);
         }
         Ok(())
+    }
+
+    fn record_todo_delivery(&self, turn: &mut ActiveTurn) {
+        let notices = std::mem::take(&mut turn.todo_notices);
+        if let Some(app) = self.app.upgrade() {
+            crate::todo::delivered(&app, &self.id, notices);
+        }
     }
 
     async fn start_pending(self: &Arc<Self>, turns: &mut TurnState) -> Result<()> {
@@ -972,7 +986,7 @@ impl ClaudeSession {
             history: None, before: None, resume_prompt: None,
             kind: TurnKind::Conversation, acted_or_asked: false, last_text: String::new(),
             interrupted: false, compaction: Some(Compaction { complete, boundary: None }), escalation: None,
-            records: Vec::new(),
+            records: Vec::new(), todo_notices: Default::default(),
         });
         // SDK slash commands use a bare string instead of the normal prompt preamble.
         self.stream.lock().unwrap().compacting = true;
@@ -1190,6 +1204,9 @@ impl ClaudeSession {
         self.hub.cancel_questions(&self.id, &Actor::Claude, None);
         self.cancel_tool_approvals(None);
         let mut active = turns.active.take();
+        if let Some(turn) = active.as_mut().filter(|_| result["is_error"] != true) {
+            self.record_todo_delivery(turn);
+        }
         self.hub.set_github_auth_request(&self.id, None);
         if active.as_ref().is_some_and(|turn| turn.interrupted)
             || turns.interrupted.is_some() || rate_limited
@@ -1672,6 +1689,7 @@ impl ClaudeSession {
             Some("assistant") => {
                 let mut turns = self.state.lock().await;
                 if let Some(turn) = &mut turns.active {
+                    self.record_todo_delivery(turn);
                     let mut text = Vec::new();
                     for block in v["message"]["content"].as_array().into_iter().flatten() {
                         match block["type"].as_str() {

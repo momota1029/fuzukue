@@ -1,0 +1,13 @@
+todo-title = TODO
+todo-badge = TODO { $count }
+todo-badge-waiting = TODO { $count } · Waiting { $waiting }
+todo-unreadable-badge = TODO unreadable
+todo-unreadable = The saved TODO list cannot be read. The file has been left untouched.
+todo-empty = No open TODOs
+todo-doing = In progress
+todo-waiting-reply = Waiting for reply
+todo-waiting-action = Waiting for you
+todo-done = Done
+todo-done-count = Done { $count }
+todo-mark-done = Mark as done
+todo-reopen = Reopen

@@ -3346,6 +3346,7 @@ impl Workbench {
                     .child(text.clone());
                 status_tooltip(notice, text)
             }))
+            .children(self.render_todo_badge(cx))
             .when(show_latest, |strip| {
                 strip.child(
                     gpui_kit::deferred(h_flex()

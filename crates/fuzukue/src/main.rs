@@ -62,6 +62,7 @@ mod symbols;
 mod threads;
 mod trash;
 mod thread_info;
+mod todo;
 mod distribution;
 mod tailnet;
 mod updater;
@@ -229,6 +230,7 @@ struct Workbench {
     review_clock: Option<gpui_kit::Task<()>>,
     chat_activity_clock: Option<gpui_kit::Task<()>>,
     chat_waiting: chat::ChatWaitingState,
+    todos: todo::Todos,
     built_pdfs: HashMap<String, String>,
     paper_pdf: paper_pdf::PaperPdf,
     protocol: u32,
@@ -779,6 +781,7 @@ impl Workbench {
             review_clock: None,
             chat_activity_clock: None,
             chat_waiting: Default::default(),
+            todos: Default::default(),
             paper_focus: cx.focus_handle(),
             chat_focus: cx.focus_handle(),
             view_focus,
@@ -1480,6 +1483,8 @@ impl Workbench {
                 self.workspace_requests = Default::default();
                 self.agent_models.disconnect();
                 self.chat_waiting = Default::default();
+                // The server sends every list again on reconnect.
+                self.todos = Default::default();
                 for chat in self.chats.values_mut() {
                     chat.set_consulting(false);
                 }
@@ -1721,6 +1726,7 @@ impl Workbench {
         self.palette_graph = None;
         self.chat_activity_clock = None;
         self.chat_waiting = Default::default();
+        self.todos = Default::default();
         self.chats.clear();
         self.workspace_requests = Default::default();
         self.recent_transcripts.clear();
@@ -1987,6 +1993,9 @@ impl Workbench {
             ServerEvent::PlanChanged { session, plan, progress, parallel_limits } => {
                 self.thread_info.parallel_limits = parallel_limits;
                 self.thread_info.update_plan(session, plan, progress);
+            }
+            ServerEvent::TodoChanged { session, items, unreadable, .. } => {
+                self.todos.update(session, items, unreadable);
             }
             ServerEvent::DelegateRenamed { session, job, change } if render => {
                 self.chat(&session, cx).delegate_renamed(&job, &change, cx);

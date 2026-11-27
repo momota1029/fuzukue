@@ -1,0 +1,13 @@
+todo-title = TODO
+todo-badge = TODO { $count }
+todo-badge-waiting = TODO { $count } ・ 待ち { $waiting }
+todo-unreadable-badge = TODO を読めない
+todo-unreadable = 保存された TODO を読めない。ファイルは上書きしていない。
+todo-empty = 未完了の TODO はない
+todo-doing = 作業中
+todo-waiting-reply = 返事待ち
+todo-waiting-action = 操作待ち
+todo-done = 済み
+todo-done-count = 済み { $count }
+todo-mark-done = 済みにする
+todo-reopen = 未完了に戻す

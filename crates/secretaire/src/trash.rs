@@ -41,13 +41,41 @@ struct Entry {
 
 pub(crate) struct Store {
     root: PathBuf,
+    /// Set where entries can be purged, so files kept beside a thread go too.
+    project: Option<PathBuf>,
 }
 
 impl Store {
     pub(crate) fn new(state: &Path) -> Self {
         Self {
             root: state.join("trash"),
+            project: None,
         }
+    }
+
+    fn purging(app: &Workspace) -> Self {
+        Self {
+            project: Some(app.project_dir.clone()),
+            ..Self::new(&app.state_dir)
+        }
+    }
+
+    /// Deletes an entry for good.
+    fn discard(&self, entry_dir: &Path, entry: Option<&Entry>) -> Result<()> {
+        if let (Some(project), Some(entry)) = (&self.project, entry) {
+            if let (TrashKind::Thread, Some(id), Payload::File { path }) =
+                (&entry.item.kind, &entry.item.source_id, &entry.payload)
+            {
+                // A restored thread keeps its list even if its entry lingered.
+                if !project.join(path).exists() {
+                    if let Err(error) = crate::todo::purge(project, id) {
+                        tracing::warn!("could not remove the TODO list of {id}: {error:#}");
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(entry_dir)?;
+        Ok(())
     }
 
     pub(crate) fn put(
@@ -209,7 +237,7 @@ impl Store {
             if entry.item.expires_at > now {
                 items.push(entry.item);
             } else {
-                fs::remove_dir_all(path)?;
+                self.discard(&path, Some(&entry))?;
             }
         }
         items.sort_by(|a, b| b.expires_at.cmp(&a.expires_at).then(a.label.cmp(&b.label)));
@@ -414,6 +442,10 @@ async fn restore(app: &Arc<Workspace>, entry: Entry, data: &Path) -> Result<()> 
                 let _start = app.prompt_start.lock().await;
                 let path = restore_file(app, &path, data)?;
                 app.hub.restore_thread(path)?;
+                if let Some(id) = &entry.item.source_id {
+                    // The list stayed with the thread. Show it again.
+                    crate::todo::republish(app, id);
+                }
             }
             TrashKind::Submission => {
                 crate::review_reports::restore_submission(app, &path, || {
@@ -452,7 +484,7 @@ pub(crate) async fn request(
     locale: Locale,
 ) -> Result<ServerEvent> {
     let _trash = app.trash_lock.lock().await;
-    let store = Store::new(&app.state_dir);
+    let store = Store::purging(app);
     let now = crate::usage::now();
     store.list(now)?;
     let changed = !matches!(action, TrashAction::List);
@@ -466,7 +498,10 @@ pub(crate) async fn request(
             restore(app, entry, &path.join("data")).await?;
             fs::remove_dir_all(path)?;
         }
-        TrashAction::Purge { id } => fs::remove_dir_all(store.path(&id)?)?,
+        TrashAction::Purge { id } => {
+            let path = store.path(&id)?;
+            store.discard(&path, Store::read(&path).ok().as_ref())?;
+        }
     }
     if changed {
         app.hub.publish_snapshot(ServerEvent::TrashChanged);
@@ -484,7 +519,7 @@ pub(crate) fn sweep(app: &Arc<Workspace>) {
             tick.tick().await;
             let Some(app) = app.upgrade() else { break };
             let _trash = app.trash_lock.lock().await;
-            if let Err(error) = Store::new(&app.state_dir).list(crate::usage::now()) {
+            if let Err(error) = Store::purging(&app).list(crate::usage::now()) {
                 tracing::warn!("could not expire trash: {error:#}");
             }
         }

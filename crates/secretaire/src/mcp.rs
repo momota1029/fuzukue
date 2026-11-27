@@ -39,11 +39,13 @@ pub(crate) fn front_desk_instructions() -> &'static str {
         "\n\nUse consult for a design fork, conflicting requirements, or a risky or irreversible decision.\n\
          When the user asks for a stronger or more capable model in any wording, call escalate_request for the current request without asking for confirmation. Use it on your own judgment after repeated failed attempts, two passes over the same unresolved question, or evidence you cannot reconcile. Use scope reply for an answer and task for work. Give a concrete reason and preserve relevant progress in context. A successful call hands off this request once. Finish the turn without another answer. When the handoff has already happened, continue directly and do not request it again.\n\
          Use the available tools for requested thread, sidebar, and server settings changes instead of asking the user to click. For ordinary delegation, pass model and optional effort only when the user requests a specific model for that job. Otherwise use the configured routing.\n\
-         For bounded blind section math, call request_review with explicit isolation, API backend and model, ordered targets, and only the permitted source ranges. Keep the request_key across retries and read the receipt with read_section_review.",
+         For bounded blind section math, call request_review with explicit isolation, API backend and model, ordered targets, and only the permitted source ranges. Keep the request_key across retries and read the receipt with read_section_review.\n\
+         Keep this thread's TODO list with todo_update, without asking first. Before acting, record each request that will not finish in this turn, including ones put off for later, and each promise of your own to do something later, one item per request. When an item already covers it, edit that item. Questions and small talk are not items. Mark an item done only after verifying the result, and record the evidence in note. Mark it waiting while you wait for the user, and move it on when they answer. Remove an item only when the user says so, and do not add back what the user removed or marked done.",
         "\n\n設計の分かれ道、要件の衝突、影響が大きい判断や取り消せない判断では consult を使う。\n\
          利用者が「上位のモデルを使って」「強いモデルで考えて」「上のものを出せ」など、言い方を問わずより強いモデルを求めたら、確認を挟まず escalate_request を使う。試行が繰り返し失敗した、同じ問いで二度行き詰まった、食い違う証拠を解消できない場合も、自分で判断して使う。返答なら scope は reply、作業なら task。具体的な理由を記録し、済んだ作業や根拠は context に残す。成功したら今の依頼が一度だけ引き継がれるので、返答を書かずにターンを終える。すでに引き継ぎを受けた場合はそのまま進める。\n\
          利用者がスレッドや左欄の操作、サーバー設定の変更を頼んだら、クリックを頼まず、対応する道具を使う。通常の委譲では、利用者がその仕事のモデルを指定したときに model と任意の effort を渡す。省略時は設定済みの振り分けを使う。\n\
-         抜粋限定の節の数学査読では request_review に isolation、API の backend と model、掲載順の対象、許可された原文の範囲を明示する。再送には同じ request_key を使い、記録は read_section_review で読む。",
+         抜粋限定の節の数学査読では request_review に isolation、API の backend と model、掲載順の対象、許可された原文の範囲を明示する。再送には同じ request_key を使い、記録は read_section_review で読む。\n\
+         このスレッドの TODO は、確認を挟まず todo_update で管理する。そのターンで終わらない「やって」「あとで」と、自分がした「あとでやる」の約束は、動く前に項目にする。複数の依頼は一件ずつ。同じ中身の項目があれば足さずに直す。雑談と質問は項目にしない。済みにするのは結果を確かめてからで、確かめた根拠を note に書く。利用者を待つ間は waiting にし、返事のあとで戻す。消すのは利用者がそう言ったときだけで、利用者が消した項目や済みにした項目を足し直さない。",
     )
 }
 
@@ -1293,6 +1295,10 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
             if exec::lease(&app, &q.session, worker.is_none()).is_err() {
                 list.retain(|tool| tool["name"] != exec::NAME);
             }
+            if worker.is_none() && automatic_github_turn(&app, &q.session) {
+                list.retain(|tool| !desk::Tool::ALL.into_iter()
+                    .any(|desk| desk.todo() && tool["name"] == desk.name()));
+            }
             list.extend(crate::extensions::tools(app.clone()).await.into_iter().filter(|tool| {
                 worker.as_ref().is_none_or(|(_, allow)| allow.iter().any(|name| tool["name"] == *name))
             }));
@@ -1801,6 +1807,11 @@ enum FolderGrantAction {
     Revoke { grant_id: String },
 }
 
+/// A turn GitHub started on its own, including issue intake.
+fn automatic_github_turn(app: &Workspace, session: &str) -> bool {
+    app.issue_threads.intake_turn(session) || app.issue_threads.automatic_policy(session).is_some()
+}
+
 async fn exec_front_turn(
     session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>,
 ) -> Option<(String, Arc<crate::cancellation::Cancellation>)> {
@@ -1880,6 +1891,8 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         "監視の操作には受付のセッションが必要");
     ensure!(!matches!(tool, Tool::Desk(_) | Tool::Consult | Tool::EscalateRequest) || claude.is_some() || codex.is_some(),
         "A front desk session is required");
+    ensure!(!matches!(tool, Tool::Desk(desk) if desk.todo()) || trusted,
+        "TODO tools require a trusted front desk turn. They are unavailable during automatic GitHub turns and turns that received external input");
     ensure!(!git_write || claude.is_some() || codex.is_some(), "Git の変更にはパートナーのセッションが必要");
     ensure!(import.is_none() || claude.is_some() || codex.is_some(), "取り込みの承認にはパートナーのセッションが必要");
     ensure!(!matches!(tool, Tool::Graph(crate::graph::mcp::Tool::CardEdit)) || claude.is_some() || codex.is_some(),

@@ -32,10 +32,17 @@ pub(crate) enum Tool {
     Queue,
     Redeliver,
     WithdrawApproval,
+    TodoList,
+    TodoUpdate,
 }
 
 impl Tool {
-    pub(super) const ALL: [Self; 16] = [
+    /// Whether the tool reads or writes the thread's TODO list.
+    pub(super) fn todo(self) -> bool {
+        matches!(self, Self::TodoList | Self::TodoUpdate)
+    }
+
+    pub(super) const ALL: [Self; 18] = [
         Self::ListThreads,
         Self::ArchiveThread,
         Self::PinThread,
@@ -52,6 +59,8 @@ impl Tool {
         Self::Queue,
         Self::Redeliver,
         Self::WithdrawApproval,
+        Self::TodoList,
+        Self::TodoUpdate,
     ];
 
     pub(super) fn name(self) -> &'static str {
@@ -72,13 +81,18 @@ impl Tool {
             Self::Queue => "desk_queue",
             Self::Redeliver => "desk_redeliver",
             Self::WithdrawApproval => "withdraw_approval",
+            Self::TodoList => "todo_list",
+            Self::TodoUpdate => "todo_update",
         }
     }
 
     pub(super) fn writes(self) -> bool {
+        // todo_update only records the thread's own promises, which the user
+        // asked to have added without a prompt, so it asks for no approval.
         !matches!(
             self,
             Self::ListThreads | Self::GetServerSettings | Self::ListJobs | Self::JobStatus | Self::JobWriteAudit | Self::Queue
+                | Self::TodoList | Self::TodoUpdate
         )
     }
 
@@ -181,6 +195,29 @@ impl Tool {
                 "このスレッドで依頼した承認がまだ保留中のとき、取り下げる。利用者に取り消しを頼まれたときや、作業に不要になったときに使う。結果の通知は届かない。"
             ), json!({"approval_id": {"type": "string", "minLength": 1, "maxLength": 64},
                 "reason": {"type": "string", "maxLength": 500}}), &["approval_id"]),
+            Self::TodoList => (harness_text!(
+                "Read this thread's whole TODO list. Set include_done to read done and removed items too.",
+                "このスレッドの TODO を全部読む。include_done で済みと削除済みも読む。"
+            ), json!({"include_done": {"type": "boolean"}}), &[]),
+            Self::TodoUpdate => (harness_text!(
+                "Add, edit, change the state of, or remove items in this thread's TODO list. Each change is applied separately and reports its own result. Set done only after verifying the result, with the evidence in note. Remove only when the user says so.",
+                "このスレッドの TODO を追加、修正、状態変更、削除する。変更は一件ずつ適用して、それぞれ結果を返す。済みにするのは結果を確かめてからで、根拠を note に書く。削除は利用者がそう言ったときだけ。"
+            ), json!({"changes": {
+                "type": "array", "minItems": 1, "maxItems": crate::todo::MAX_CHANGES,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {"type": "string", "enum": ["add", "edit", "set_state", "remove"]},
+                        "id": {"type": "string", "description": harness_text!("Item ID such as T3. Required except for add.", "T3 のような項目 ID。add 以外で必須。")},
+                        "text": {"type": "string", "maxLength": crate::todo::MAX_TEXT, "description": harness_text!("What is promised, in the user's language. For add and edit.", "利用者の言語で書く約束の内容。add と edit で使う。")},
+                        "state": {"type": "string", "enum": ["todo", "doing", "waiting", "done"]},
+                        "wait": {"type": "string", "enum": ["reply", "action"], "description": harness_text!("With state waiting: reply for the user's answer, action for something only the user can do.", "state が waiting のときに使う。返事待ちは reply、利用者にしかできない操作を待つときは action。")},
+                        "note": {"type": "string", "maxLength": crate::todo::MAX_NOTE, "description": harness_text!("Short remark. Required when setting done. An empty string clears it.", "短い一言。済みにするときは必須。空文字で消す。")}
+                    },
+                    "required": ["op"],
+                    "additionalProperties": false
+                }
+            }}), &["changes"]),
             Self::BlockStep => (harness_text!(
                 "Mark a single planned step as needing user input. Continue with the other unblocked steps. If this is the last runnable step, use replan to find independent work or conclude with a verification summary.",
                 "方針の一つの手順に利用者の確認が必要と記録し、残りの手順を進める。実行できる手順がこれだけなら replan で独立した作業を探すか、確認事項を添えて完了する。"
@@ -200,6 +237,20 @@ impl Tool {
 
     pub(super) async fn call(self, app: &Workspace, session: &str, args: &Value) -> Result<Value> {
         Ok(match self {
+            Self::TodoList => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Query { #[serde(default)] include_done: bool }
+                let Query { include_done } = parse_args(args)?;
+                crate::todo::list(app, session, include_done)?
+            }
+            Self::TodoUpdate => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Update { changes: Vec<crate::todo::Change> }
+                let Update { changes } = parse_args(args)?;
+                crate::todo::update(app, session, changes)?
+            }
             Self::ListJobs => unreachable!("list_jobs renders JSON lines and a text table"),
             Self::JobStatus => {
                 let Job { job, view } = parse_args(args)?;

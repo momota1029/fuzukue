@@ -83,6 +83,7 @@ mod send_latency;
 mod synctex;
 mod threads;
 mod tiers;
+mod todo;
 mod tool_guard;
 mod trash;
 mod front_desk;
@@ -168,6 +169,7 @@ pub struct Workspace {
     drain_codex: std::sync::Mutex<HashMap<String, i64>>,
     agent_usage: agent_usage::Log,
     plans: planner::Plans,
+    todos: todo::Todos,
     agent_settings: std::sync::Mutex<fuzukue_proto::AgentSettings>,
     codex: Mutex<Option<Arc<Codex>>>,
     tool_queue: ToolQueue,
@@ -284,6 +286,7 @@ impl Workspace {
             deferred: Default::default(),
             agent_usage: Default::default(),
             plans: Default::default(),
+            todos: Default::default(),
             agent_settings: std::sync::Mutex::new(state::load_agent_settings(&state_dir)),
             state_dir,
             screenshots: Default::default(),
@@ -374,9 +377,14 @@ impl Workspace {
         Ok(tokio::task::spawn_blocking(move || workspace::thread_context(&project, &attached)).await?)
     }
 
-    async fn partner_input(&self, session: &str, prompt: String) -> anyhow::Result<String> {
+    /// Adds the front desk's context to a turn input. `external` marks an input
+    /// whose turn is yet to be marked in the hub. Pass the returned notices to
+    /// [`todo::delivered`] once the input is submitted.
+    async fn partner_input(
+        &self, session: &str, prompt: String, external: bool,
+    ) -> anyhow::Result<(String, todo::Notices)> {
         if !threads::is_thread(session) || self.issue_threads.intake_turn(session) {
-            return Ok(prompt);
+            return Ok((prompt, Default::default()));
         }
         let attachments = self.thread_context(session).await?;
         let context = if attachments.is_empty() {
@@ -389,8 +397,16 @@ impl Workspace {
             .map(|registry| registry.workspace_requests.front_desk_context(self, session))
             .unwrap_or_default();
         let automatic = if self.hands_off(session) { full_approval::desk_notice() } else { "" };
-        Ok(harness_format!("(secretaire) Current thread attachments\n{context}{reports}{requests}{automatic}\n\nTurn input:\n{prompt}",
-            "(secretaire) このターンの添付先\n{context}{reports}{requests}{automatic}\n\nターンの入力:\n{prompt}"))
+        // Turns acting on external input see no TODOs, and screen changes stay pending.
+        let (todos, notices) = if !external && mcp::exec::trusted_session(self, session) {
+            let (text, notices) = todo::turn_context(self, session);
+            (format!("\n\n{text}"), notices)
+        } else {
+            Default::default()
+        };
+        let input = harness_format!("(secretaire) Current thread attachments\n{context}{reports}{requests}{todos}{automatic}\n\nTurn input:\n{prompt}",
+            "(secretaire) このターンの添付先\n{context}{reports}{requests}{todos}{automatic}\n\nターンの入力:\n{prompt}");
+        Ok((input, notices))
     }
 
     fn record_artifacts<'a>(&self, session: &str, paths: impl IntoIterator<Item = &'a str>) {
@@ -1541,6 +1557,7 @@ async fn serve_workspace(
             ServerEvent::Handoffs { .. } | ServerEvent::HandoffOpened { .. } | ServerEvent::HandoffDetail { .. }
             | ServerEvent::HandoffWorkerUpdated { .. } | ServerEvent::HandoffGenerated { .. } | ServerEvent::HandoffFailed { .. } => protocol >= fuzukue_proto::HANDOFF_PROTOCOL,
             ServerEvent::PlanChanged { .. } => protocol >= fuzukue_proto::PLAN_PROTOCOL,
+            ServerEvent::TodoChanged { .. } => protocol >= fuzukue_proto::TODO_PROTOCOL,
             ServerEvent::DelegateRenamed { .. } => protocol >= fuzukue_proto::JOB_LABEL_PROTOCOL,
             ServerEvent::DelegateDismissed { .. } => protocol >= fuzukue_proto::JOB_DISMISS_PROTOCOL,
             ServerEvent::Agents { .. } | ServerEvent::AgentSettingsChanged { .. } | ServerEvent::DelegateProgress { .. } => protocol >= 14,
@@ -1697,6 +1714,13 @@ async fn serve_workspace(
 
     if protocol >= fuzukue_proto::PLAN_PROTOCOL {
         for event in planner::snapshots(&app) {
+            tx.send(send(&snapshot(event))).await.ok()?;
+        }
+    }
+    if protocol >= fuzukue_proto::TODO_PROTOCOL {
+        let workspace = app.clone();
+        let lists = tokio::task::spawn_blocking(move || todo::snapshots(&workspace)).await.unwrap_or_default();
+        for event in lists {
             tx.send(send(&snapshot(event))).await.ok()?;
         }
     }
@@ -2379,6 +2403,7 @@ async fn serve_workspace(
                     }
                 }
                 Ok(ClientMsg::PauseGoal { .. }) if protocol < fuzukue_proto::GOAL_PAUSE_PROTOCOL => {}
+                Ok(ClientMsg::SetTodoState { .. }) if protocol < fuzukue_proto::TODO_PROTOCOL => {}
                 Ok(ClientMsg::Replan { .. } | ClientMsg::SetGoalPace { .. } | ClientMsg::SetAgentFallback { .. })
                     if protocol < fuzukue_proto::PLAN_PROTOCOL => {}
                 Ok(ClientMsg::SetAgentPolicy { .. } | ClientMsg::SetAgentCaller { .. } | ClientMsg::GetAgentStats | ClientMsg::GetAgentHistory { .. })
@@ -3257,7 +3282,8 @@ async fn prompt_codex_with_images(
             let before = app.review_snapshot(&app.project_dir, &session).await;
             let history = app.start_partner_history(&app.project_dir, "codex", &session).await;
             let result = async {
-                let mut input = app.partner_input(&session, prompt).await?;
+                let external = matches!(kind, TurnKind::ExternalInput);
+                let (mut input, notices) = app.partner_input(&session, prompt, external).await?;
                 input.push_str("\n\n");
                 input.push_str(&self_update::RequestingTurn::proof_instruction(&update_proof));
                 let images = if is_nudge { &[][..] } else { &images };
@@ -3269,7 +3295,7 @@ async fn prompt_codex_with_images(
                         app.drain.begin_submission(&app.state_dir, &session, std::slice::from_ref(&delivery.id))?;
                     }
                     Ok(())
-                }).await;
+                }, || todo::delivered(&app, &session, notices)).await;
                 app.hub.set_github_auth_request(&session, None);
                 result
             }.await;
@@ -3652,7 +3678,7 @@ fn canary_disables(msg: &ClientMsg) -> bool {
         | Replan { .. } | WorkerPrompt { .. } | BranchReview { .. } | RequestReview { .. }
         | ListExtensions | GrantExtension { .. } | SetExtensionEnabled { .. }
         | UpdateExtension { .. } | RenderExtension { .. } | ExtensionUiEvent { .. }
-        | RememberShellApproval { .. } | RevokeShellApproval { .. })
+        | RememberShellApproval { .. } | RevokeShellApproval { .. } | SetTodoState { .. })
 }
 
 async fn interrupt_partner(app: &Workspace, session: &str) -> anyhow::Result<()> {
@@ -3772,6 +3798,7 @@ async fn handle_from_client(
         ClientMsg::SetAgentRoleModel { role, selection } => app.set_agent_role_model(role, selection).await?,
         ClientMsg::SetAgentFallback { name, selection } => app.set_agent_fallback(name, selection).await?,
         ClientMsg::SetGoalPace { session, pace } => planner::set_pace(app, &session, pace)?,
+        ClientMsg::SetTodoState { session, item, done } => todo::set_done(app, &session, &item, done)?,
         ClientMsg::PauseGoal { session } => {
             let _start = app.prompt_start.lock().await;
             planner::pause_goal(app, &session)?;
@@ -3878,8 +3905,10 @@ async fn handle_from_client(
                 let thread = app.session_records.lock().unwrap().get(&session)
                     .and_then(|record| record.codex_thread_id.clone()).context("Codex のスレッドが見つからない")?;
                 let codex = app.running_codex().await.context("Codex が停止した")?;
-                let steering = app.partner_input(&session, prompt.clone()).await?;
+                // The hub knows whether the running turn has received external input.
+                let (steering, notices) = app.partner_input(&session, prompt.clone(), false).await?;
                 codex.steer_with_images(&thread, &steering, &images).await?;
+                todo::delivered(app, &session, notices);
                 app.hub.set_github_auth_request(&session,
                     github_auth_request(TurnKind::UserConversation, "", user_event.as_ref()));
                 app.hub.mark_user_steer(&session);

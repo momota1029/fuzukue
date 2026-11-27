@@ -74,9 +74,12 @@ pub const WORKSPACE_REQUEST_RECOVERY_PROTOCOL: u32 = 72;
 pub const THREAD_WINDOW_PROTOCOL: u32 = 73;
 pub const JOB_SUMMARY_PROTOCOL: u32 = 74;
 pub const TOOL_DETAILS_PROTOCOL: u32 = 75;
-pub const PROTOCOL_VERSION: u32 = TOOL_DETAILS_PROTOCOL;
+pub const PROTOCOL_VERSION: u32 = TODO_PROTOCOL;
 pub const DECK_PAGE_BYTES: usize = 1024 * 1024;
 pub const CARD_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+
+mod todo;
+pub use todo::*;
 
 mod approvals;
 pub use approvals::*;
@@ -1175,6 +1178,8 @@ pub enum ClientMsg {
     Replan { session: String, reason: String },
     SetGoalPace { session: String, pace: Option<GoalPace> },
     PauseGoal { session: String },
+    /// Marks one TODO item done, or reopens it as not started.
+    SetTodoState { session: String, item: String, done: bool },
     WorkerPrompt { session: String, job: String, text: String, paths: Vec<String> },
     StopWorker { session: String, job: String },
     RenameJob { session: String, job: String, label: String },
@@ -2734,6 +2739,15 @@ pub enum ServerEvent {
         progress: Option<GoalProgress>,
         #[serde(default)]
         parallel_limits: GoalParallelLimits,
+    },
+    /// The whole TODO list of one thread. Removed items are omitted.
+    /// `unreadable` means the saved list exists but cannot be read.
+    TodoChanged {
+        session: String,
+        revision: u64,
+        items: Vec<TodoItem>,
+        #[serde(default)]
+        unreadable: bool,
     },
     ToolCall { session: String, item: String, actor: Actor, name: String, input: serde_json::Value },
     ToolResult { session: String, item: String, ok: bool, output: String },
