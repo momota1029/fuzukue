@@ -490,9 +490,19 @@ impl Auth {
             .context(
                 "GitHub is disconnected. Connect GitHub in the front desk chat or settings.",
             )?;
-        cache
+        let result = cache
             .execute(&AGENT, &credential.token, &repo, page, query)
-            .await
+            .await;
+        if matches!(&result, Err(error) if error.is::<http::Unauthorized>()) {
+            let _operation = self.operation.lock().await;
+            let current = self.token.load(&config).map_err(super::mcp::tool_error)?;
+            if current.is_some_and(|current| current.token == credential.token)
+                && super::verify_rejected_token(&*self.http, &credential).await
+            {
+                return Err(super::mcp::tool_error(super::RECONNECT));
+            }
+        }
+        result
     }
 }
 

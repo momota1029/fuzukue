@@ -60,7 +60,7 @@ impl Client {
             .set("Accept", "application/vnd.github+json")
             .set("X-GitHub-Api-Version", "2022-11-28")
             .set("Authorization", &format!("Bearer {}", self.token));
-        response(request)
+        response(request, Some(api_endpoint(path)))
     }
 
     pub(super) fn json(&self, path: &[&str], query: &[(&str, &str)]) -> Result<(Value, bool)> {
@@ -118,7 +118,7 @@ impl Client {
             .context("GitHub job log download is outside the allowed HTTPS hosts.")?;
         // GitHub's short-lived download URL is used once, without an OAuth
         // header, and is never returned to the caller.
-        let download = response(self.agent.get(url.as_str()))?;
+        let download = response(self.agent.get(url.as_str()), None)?;
         ensure!(
             matches!(download.status(), 200 | 206),
             "GitHub job log download did not return data."
@@ -205,7 +205,50 @@ fn read_bytes(response: ureq::Response, bytes: usize) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn response(request: ureq::Request) -> Result<ureq::Response> {
+fn api_endpoint(path: &[&str]) -> &'static str {
+    match path {
+        [] => "GET /repos/{owner}/{repo}",
+        ["actions", "runs"] => "GET /repos/{owner}/{repo}/actions/runs",
+        ["actions", "workflows", _, "runs"] => {
+            "GET /repos/{owner}/{repo}/actions/workflows/{id}/runs"
+        }
+        ["actions", "runs", _, "jobs"] => "GET /repos/{owner}/{repo}/actions/runs/{id}/jobs",
+        ["actions", "jobs", _, "logs"] => "GET /repos/{owner}/{repo}/actions/jobs/{id}/logs",
+        ["issues", _, "comments"] => "GET /repos/{owner}/{repo}/issues/{id}/comments",
+        ["issues", _] => "GET /repos/{owner}/{repo}/issues/{id}",
+        ["issues"] => "GET /repos/{owner}/{repo}/issues",
+        ["pulls", _] => "GET /repos/{owner}/{repo}/pulls/{id}",
+        ["pulls"] => "GET /repos/{owner}/{repo}/pulls",
+        ["releases", "tags", _] => "GET /repos/{owner}/{repo}/releases/tags/{tag}",
+        ["releases", _, "assets"] => "GET /repos/{owner}/{repo}/releases/{id}/assets",
+        ["releases"] => "GET /repos/{owner}/{repo}/releases",
+        ["tags"] => "GET /repos/{owner}/{repo}/tags",
+        ["commits", _] => "GET /repos/{owner}/{repo}/commits/{ref}",
+        ["commits"] => "GET /repos/{owner}/{repo}/commits",
+        ["compare", _] => "GET /repos/{owner}/{repo}/compare/{refs}",
+        ["contents", ..] => "GET /repos/{owner}/{repo}/contents/{path}",
+        _ => "GET /repos/{owner}/{repo}/{endpoint}",
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct Unauthorized;
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(harness_text!(
+            "GitHub rejected this request (HTTP 401).",
+            "GitHub がこのリクエストを拒否しました（HTTP 401）。",
+        ))
+    }
+}
+
+impl std::error::Error for Unauthorized {}
+
+fn response(
+    request: ureq::Request,
+    oauth_endpoint: Option<&'static str>,
+) -> Result<ureq::Response> {
     // Transport diagnostics, error bodies, and redirect URLs can contain
     // credentials. Report only fixed messages and parsed numeric rate limits.
     match request.call() {
@@ -215,7 +258,17 @@ fn response(request: ureq::Request) -> Result<ureq::Response> {
                 return Err(limit.into());
             }
             match code {
-                401 => bail!("GitHub authentication failed (HTTP 401). Reconnect GitHub."),
+                401 => {
+                    if let Some(endpoint) = oauth_endpoint {
+                        super::super::record_401(endpoint);
+                        return Err(Unauthorized.into());
+                    }
+                    super::super::record_401("GET signed Actions job log");
+                    bail!(harness_text!(
+                        "GitHub job log download was rejected (HTTP 401). Try again.",
+                        "GitHub のジョブログを取得できませんでした（HTTP 401）。もう一度試してください。",
+                    ));
+                }
                 403 => bail!(
                     "GitHub denied access (HTTP 403). Check the connected account's repository access and OAuth scope."
                 ),

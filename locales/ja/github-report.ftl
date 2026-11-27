@@ -24,6 +24,7 @@ github-report-config-error = サーバーが GitHub の設定を読み込めま�
 github-report-storage-error = サーバーが GitHub の認証情報を読み込み、保存、または削除できませんでした。
 github-report-offline = 接続が切れました。報告の送信中だった場合は、再送する前に GitHub を確認してください。
 github-report-rejected = GitHub が要求を受け付けませんでした（HTTP { $code }）。
+github-report-reconnect = GitHub の連携を解除して、接続し直してください。
 github-report-response-error = GitHub から予期しない応答がありました。
 github-report-denied = GitHub で連携が拒否されました。
 github-report-expired = GitHub の確認コードが期限切れです。連携をやり直すと新しいコードが発行されます。

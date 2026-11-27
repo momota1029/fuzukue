@@ -3,12 +3,16 @@ use std::{collections::VecDeque, sync::Mutex as StdMutex};
 use super::*;
 
 struct Fake {
-    responses: StdMutex<VecDeque<Value>>,
+    responses: StdMutex<VecDeque<Result<Value>>>,
     requests: StdMutex<Vec<(Instant, Request)>>,
 }
 
 impl Fake {
     fn new(responses: impl IntoIterator<Item = Value>) -> Self {
+        Self::with_results(responses.into_iter().map(Ok))
+    }
+
+    fn with_results(responses: impl IntoIterator<Item = Result<Value>>) -> Self {
         Self {
             responses: StdMutex::new(responses.into_iter().collect()),
             requests: StdMutex::default(),
@@ -23,12 +27,11 @@ impl Http for Fake {
             .unwrap()
             .push((Instant::now(), request));
         Box::pin(async {
-            Ok(self
-                .responses
+            self.responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("unexpected HTTP request"))
+                .expect("unexpected HTTP request")
         })
     }
 }
@@ -52,6 +55,7 @@ fn fake_credential() -> Credential {
         scope: Scope::PublicRepo,
         token: TEST_TOKEN.into(),
         login: "reporter".into(),
+        connected_at: None,
         avatar_url: None,
     }
 }
@@ -63,7 +67,12 @@ async fn polls_pending_and_slow_down_then_resolves_the_account() {
         json!({"error":"authorization_pending"}),
         json!({"error":"slow_down","interval":10}),
         json!({"error":"authorization_pending"}),
-        json!({"access_token":TEST_TOKEN}),
+        json!({
+            "access_token": TEST_TOKEN,
+            "expires_in": 28800,
+            "refresh_token": "synthetic-refresh-credential",
+            "refresh_token_expires_in": 15897600
+        }),
         json!({"login":"reporter"}),
     ]);
     let started = Instant::now();
@@ -80,6 +89,9 @@ async fn polls_pending_and_slow_down_then_resolves_the_account() {
         .unwrap();
     assert_eq!(result.login, "reporter");
     assert_eq!(result.token, TEST_TOKEN);
+    let stored = serde_json::to_value(&result).unwrap();
+    assert!(stored["connected_at"].is_string());
+    assert!(stored.get("refresh_token").is_none());
 
     let requests = fake.requests.lock().unwrap();
     assert_eq!(
@@ -184,6 +196,32 @@ fn stores_credentials_outside_the_workspace_and_removes_them_on_disconnect() {
     file.remove().unwrap();
     file.remove().unwrap();
     assert!(!file.0.exists());
+}
+
+#[tokio::test]
+async fn issue_401_requires_reconnect_only_if_the_verification_also_rejects_the_token() {
+    for (verification, expected) in [
+        (Ok(json!({"login": "reporter"})), Error::Response),
+        (Err(Error::Offline), Error::Response),
+        (Err(RECONNECT), RECONNECT),
+    ] {
+        let fake = Fake::with_results([Err(RECONNECT), verification]);
+        let result = create_issue(
+            &fake,
+            &fake_credential(),
+            "owner/project",
+            "Title",
+            "Body",
+            None,
+        )
+        .await;
+        assert_eq!(result, Err(expected));
+        let requests = fake.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].1.url, "https://api.github.com/user");
+        assert!(requests[1].1.token.as_deref() == Some(TEST_TOKEN));
+        assert!(matches!(requests[1].1.body, Body::Get));
+    }
 }
 
 #[tokio::test]

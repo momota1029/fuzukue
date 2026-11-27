@@ -177,6 +177,7 @@ fn error_text(error: Error) -> String {
         Error::Config => tr!("github-report-config-error"),
         Error::Storage => tr!("github-report-storage-error"),
         Error::Offline => tr!("github-report-offline"),
+        Error::Rejected(401) => tr!("github-report-reconnect"),
         Error::Rejected(code) => return tr!("github-report-rejected", code = code.to_string()),
         Error::Response => tr!("github-report-response-error"),
         Error::Denied => tr!("github-report-denied"),

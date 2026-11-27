@@ -496,6 +496,35 @@ async fn errors_are_sanitized_and_rate_limits_pause_requests() -> Result<()> {
 }
 
 #[tokio::test]
+async fn signed_log_401_is_not_an_oauth_credential_failure() {
+    let signed_url =
+        "https://example-fixtures.blob.core.windows.net/job/log?sig=synthetic-signature";
+    let mut redirect =
+        Reply::json("/actions/jobs/10/logs", Value::Null).header("Location", signed_url);
+    redirect.status = 302;
+    let mock = MockGitHub::new([
+        redirect,
+        Reply {
+            url: signed_url.into(),
+            status: 401,
+            headers: Vec::new(),
+            body: String::new(),
+        },
+    ]);
+    let error = mock
+        .call(
+            &mut CacheState::default(),
+            Tool::Runs,
+            json!({"action":"job_log", "job_id":10}),
+        )
+        .await
+        .unwrap_err();
+    assert!(!error.is::<http::Unauthorized>());
+    assert!(!error.to_string().contains(signed_url));
+    mock.done();
+}
+
+#[tokio::test]
 async fn logs_refuse_untrusted_redirects() -> Result<()> {
     let mut reply = Reply::json("/actions/jobs/11/logs", Value::Null)
         .header("Location", format!("https://example.invalid/{TOKEN}"));

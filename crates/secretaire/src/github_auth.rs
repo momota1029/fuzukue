@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use fuzukue_proto::{
     GitHubAvatar, GitHubConnectState as State, GitHubReportAction as Action,
@@ -31,6 +32,18 @@ const API: &str = "https://api.github.com";
 const MAX_RESPONSE: u64 = 1024 * 1024;
 
 type Result<T> = std::result::Result<T, Error>;
+const RECONNECT: Error = Error::Rejected(401);
+
+fn reconnect_message() -> &'static str {
+    harness_text!(
+        "Disconnect and reconnect GitHub.",
+        "GitHub の連携を解除して、接続し直してください。",
+    )
+}
+
+fn record_401(endpoint: &'static str) {
+    tracing::warn!(at = %Utc::now(), endpoint, "GitHub returned HTTP 401");
+}
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -149,12 +162,22 @@ async fn form(http: &dyn Http, url: &str, fields: &[(&str, &str)]) -> Result<Val
     let body = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(fields.iter().copied())
         .finish();
-    http.send(Request {
-        url: url.into(),
-        token: None,
-        body: Body::Form(body),
-    })
-    .await
+    let result = http
+        .send(Request {
+            url: url.into(),
+            token: None,
+            body: Body::Form(body),
+        })
+        .await;
+    if result == Err(RECONNECT) {
+        record_401(if url == DEVICE_CODE {
+            "POST /login/device/code"
+        } else {
+            "POST /login/oauth/access_token (device authorization)"
+        });
+        return Err(Error::Config);
+    }
+    result
 }
 
 async fn api(http: &dyn Http, path: &str, token: &str, body: Body) -> Result<Value> {
@@ -253,16 +276,34 @@ impl Device {
                     Some("expired_token") => return Err(Error::Expired),
                     Some(_) => return Err(Error::Response),
                     None => {
+                        let connected_at = Utc::now();
                         let token = field(&response, "access_token")?;
+                        let refresh_token = response["refresh_token"]
+                            .as_str()
+                            .filter(|value| !value.is_empty());
                         if !token
                             .bytes()
                             .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
                         {
                             return Err(Error::Response);
                         }
-                        let user = api(http, "user", token, Body::Get).await?;
+                        let user = api(http, "user", token, Body::Get).await;
+                        if user == Err(RECONNECT) {
+                            record_401("GET /user (device authorization)");
+                        }
+                        tracing::warn!(
+                            %connected_at,
+                            has_expires_in = response.get("expires_in").is_some(),
+                            has_refresh_token = response.get("refresh_token").is_some(),
+                            has_refresh_token_expires_in = response.get("refresh_token_expires_in").is_some(),
+                            verification = verification_state(&user),
+                            verification_error = ?user.as_ref().err(),
+                            "GitHub OAuth device token received"
+                        );
+                        let user = user?;
                         let login = field(&user, "login")?;
                         if login == token
+                            || refresh_token == Some(login)
                             || login == self.device_code
                             || !login
                                 .bytes()
@@ -275,10 +316,13 @@ impl Device {
                             scope,
                             token: token.into(),
                             login: login.into(),
+                            connected_at: Some(connected_at),
                             avatar_url: user["avatar_url"]
                                 .as_str()
                                 .filter(|url| {
-                                    !url.contains(token) && !url.contains(&self.device_code)
+                                    !url.contains(token)
+                                        && !url.contains(&self.device_code)
+                                        && refresh_token.is_none_or(|refresh| !url.contains(refresh))
                                 })
                                 .and_then(avatar::safe_url),
                         });
@@ -304,6 +348,8 @@ struct Credential {
     scope: Scope,
     token: String,
     login: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connected_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     avatar_url: Option<String>,
 }
@@ -631,6 +677,11 @@ impl Auth {
                     return Err(Error::Cancelled);
                 }
                 auth.token.save(&credential, &app.project_dir)?;
+                tracing::warn!(
+                    workspace = %app.id,
+                    connected_at = ?credential.connected_at,
+                    "GitHub OAuth connection saved"
+                );
                 Ok(credential)
             });
             let state = result.map_or_else(failed, |credential| {
@@ -766,13 +817,42 @@ async fn create_issue(
         &credential.token,
         Body::Json(data),
     )
-    .await?;
-    let number = response["number"]
+    .await;
+    if response == Err(RECONNECT) {
+        record_401("POST /repos/{owner}/{repo}/issues");
+        if !verify_rejected_token(http, credential).await {
+            return Err(Error::Response);
+        }
+    }
+    let number = response?["number"]
         .as_u64()
         .filter(|number| *number > 0)
         .ok_or(Error::Response)?;
     // Build the URL from the approved repository and issue number, never from an arbitrary response URL.
     Ok(format!("https://github.com/{repo}/issues/{number}"))
+}
+
+fn verification_state(result: &Result<Value>) -> &'static str {
+    match result {
+        Ok(_) => "accepted",
+        Err(RECONNECT) => "rejected",
+        Err(_) => "inconclusive",
+    }
+}
+
+async fn verify_rejected_token(http: &dyn Http, credential: &Credential) -> bool {
+    let result = api(http, "user", &credential.token, Body::Get).await;
+    if result == Err(RECONNECT) {
+        record_401("GET /user (token verification)");
+    }
+    tracing::warn!(
+        at = %Utc::now(),
+        connected_at = ?credential.connected_at,
+        verification = verification_state(&result),
+        verification_error = ?result.as_ref().err(),
+        "GitHub OAuth token verification via GET /user"
+    );
+    result == Err(RECONNECT)
 }
 
 pub(crate) fn event(request: u64, result: Result<Update>) -> ServerEvent {

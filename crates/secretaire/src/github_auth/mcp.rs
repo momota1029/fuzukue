@@ -113,8 +113,10 @@ impl Tool {
     }
 }
 
-fn tool_error(error: Error) -> anyhow::Error {
-    if error == Error::Disabled {
+pub(crate) fn tool_error(error: Error) -> anyhow::Error {
+    if error == RECONNECT {
+        anyhow::anyhow!(reconnect_message())
+    } else if error == Error::Disabled {
         anyhow::anyhow!("{}", harness_text!(
             "GitHub OAuth is not configured. Set github.oauth_client_id in fuzukue.toml. See docs/github-auth.md.",
             "GitHub OAuth が未設定。fuzukue.toml の github.oauth_client_id を設定して。手順は docs/github-auth.md。"))

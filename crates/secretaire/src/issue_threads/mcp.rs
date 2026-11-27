@@ -299,7 +299,7 @@ impl Tool {
                 let url = match app.github_auth
                     .create_if_connected(&config, &repo, &args.title, &args.body, label)
                     .await
-                    .map_err(|error| anyhow::anyhow!("GitHub API issue creation: {error:?}"))?
+                    .map_err(crate::github_auth::mcp::tool_error)?
                 {
                     Some(url) => url,
                     None => {

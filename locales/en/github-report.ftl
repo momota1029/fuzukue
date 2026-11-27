@@ -24,6 +24,7 @@ github-report-config-error = The server could not read its GitHub settings.
 github-report-storage-error = The server could not read, save, or remove the GitHub credential.
 github-report-offline = The connection was interrupted. If you were sending a report, check GitHub before retrying.
 github-report-rejected = GitHub rejected the request (HTTP { $code }).
+github-report-reconnect = Disconnect and reconnect GitHub.
 github-report-response-error = GitHub returned an unexpected response.
 github-report-denied = GitHub authorization was declined.
 github-report-expired = The GitHub device code expired. Start the connection again for a new code.
