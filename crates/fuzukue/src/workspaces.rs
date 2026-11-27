@@ -302,7 +302,7 @@ impl Workbench {
         if self.protocol < 11 || self.workspaces.pending || self.workspaces.browser.is_some() {
             return;
         }
-        self.close_palette();
+        self.close_palette(window, cx);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(path.to_owned()));
         cx.subscribe_in(
             &input,

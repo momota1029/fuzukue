@@ -7,7 +7,7 @@ use fuzukue_proto::{
     ApprovalDecision, ApprovalGrantScope, ApprovalRisk, ApprovalState, ApprovalSummary,
     ApprovalUnattended, ClientMsg, NotificationKind,
 };
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::{
     div, point, prelude::*, px, Context, FocusHandle, Focusable as _, Role, ScrollHandle, Window,
 };
@@ -239,7 +239,7 @@ impl Workbench {
     }
 
     pub(super) fn approval_changed(
-        &mut self, approval: ApprovalSummary, window: &Window, cx: &mut Context<Self>,
+        &mut self, approval: ApprovalSummary, window: &mut Window, cx: &mut Context<Self>,
     ) {
         if !self.approvals.ready || self.workspaces.active.as_ref() != Some(&approval.workspace) {
             return;
@@ -257,11 +257,27 @@ impl Workbench {
                 chat.record_approval_receipt(receipt, cx);
             }
         }
+        let focused_action = self.approvals.focus.iter().find_map(|((id, action), handle)| {
+            handle.is_focused(window).then_some((id == &approval.approval_id, *action))
+        });
         self.approvals.resolve(approval);
+        let count = self.approval_count(&self.active);
+        if !window.has_active_dialog(cx) && focused_action.is_some_and(|(removed, action)| {
+            removed || count == 0 && action == "toggle"
+        }) {
+            let target = if self.approvals.review.is_some() {
+                self.approval_focus("", "back", cx)
+            } else if count > 0 {
+                self.approval_focus("", "toggle", cx)
+            } else {
+                self.input.read(cx).focus_handle(cx)
+            };
+            target.focus(window, cx);
+        }
     }
 
     pub(super) fn approval_result(
-        &mut self, request: u64, result: Result<ApprovalSummary, String>, window: &Window, cx: &mut Context<Self>,
+        &mut self, request: u64, result: Result<ApprovalSummary, String>, window: &mut Window, cx: &mut Context<Self>,
     ) {
         let Some(submission) = self.approvals.submitted.as_mut() else { return };
         if !submission.outstanding.remove(&request) {

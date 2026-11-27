@@ -74,8 +74,8 @@ impl Workbench {
             }
         }
 
+        self.approvals.last_focus = window.focused(cx);
         let groups = self.approvals.groups(&self.active);
-        let focused = window.focused(cx);
 
         let theme = cx.theme();
         let heading = tr!("approval-dock-pending", count = ids.len());
@@ -141,7 +141,6 @@ impl Workbench {
                 .child(self.dock_button("", "dismiss", tr!("approval-dock-dismiss"), true, Tone::Default, cx,
                     |this, _, cx| { this.approvals.feedback.remove(&this.active); cx.notify(); })));
         }
-        self.approvals.last_focus = focused;
         Some(chat_column().pt_1().flex_none().child(dock).into_any_element())
     }
 
@@ -312,11 +311,13 @@ impl Workbench {
             .rounded_md().border_1().border_color(theme.border).bg(fill).text_color(text)
             .px_2().py_0p5().text_xs().child(title)
             .when(!enabled, |button| button.opacity(0.5))
-            .when(enabled, |button| {
+            .when(enabled || self.approvals.last_focus.as_ref() == Some(focus), |button| {
                 let ring = theme.ring;
-                button.track_focus(focus).tab_index(0).cursor_pointer()
+                button.track_focus(focus).tab_index(0).tab_stop(enabled)
                     .focus_visible(move |style| style.border_color(ring))
-                    .hover(move |style| style.bg(hover))
+            })
+            .when(enabled, |button| {
+                button.cursor_pointer().hover(move |style| style.bg(hover))
                     .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
             })
     }

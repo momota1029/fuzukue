@@ -26,7 +26,7 @@ fn paste_action(has_text: bool, has_image: bool, file_paths: &[PathBuf]) -> Past
 }
 
 impl Workbench {
-    pub(super) fn paste_attachment(
+    pub(crate) fn paste_attachment(
         &mut self,
         clipboard: &ClipboardItem,
         cx: &mut Context<Self>,

@@ -14,7 +14,7 @@ use gpui_kit::component::{
         RangeDecorationStyle, RopeExt as _, ShowCompletions,
     },
     scroll::ScrollableElement as _,
-    v_flex, ActiveTheme as _, Sizable as _,
+    v_flex, ActiveTheme as _, Sizable as _, WindowExt as _,
 };
 use gpui_kit::base::Disableable as _;
 use gpui_kit::{
@@ -45,6 +45,7 @@ struct SourceTab {
     id: u64,
     path: String,
     _load: Task<()>,
+    focus_on_load: Option<(u64, bool)>,
     error: Option<PreviewError>,
     document: Option<SourceDocument>,
     image: Option<WorkspaceImage>,
@@ -58,6 +59,12 @@ struct SourceTab {
 struct WorkspaceImage {
     render: Arc<RenderImage>,
     actual_size: bool,
+}
+
+enum SourceOpen {
+    Focus,
+    Preview,
+    Background,
 }
 
 enum SourcePreview {
@@ -225,7 +232,44 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.right = RightPane::Source;
+        self.load_source_file(path, lines, SourceOpen::Focus, window, cx);
+    }
+
+    pub(super) fn preview_source_file(
+        &mut self,
+        path: String,
+        lines: Option<RangeInclusive<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // An incoming request may show a source without interrupting typing.
+        // If switching panes would replace the focused field, load a tab in the background.
+        let composer_focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+        let source_replaces_composer = self.source.centered && self.thread_info_visible() && !self.settings_open;
+        let mode = if window.focused(cx).is_none()
+            || composer_focused && !source_replaces_composer
+            || self.chat_focus.contains_focused(window, cx)
+            || self.view_focus.is_focused(window)
+        {
+            SourceOpen::Preview
+        } else {
+            SourceOpen::Background
+        };
+        self.load_source_file(path, lines, mode, window, cx);
+    }
+
+    fn load_source_file(
+        &mut self,
+        path: String,
+        lines: Option<RangeInclusive<usize>>,
+        mode: SourceOpen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reveal = !matches!(mode, SourceOpen::Background);
+        if reveal {
+            self.right = RightPane::Source;
+        }
         if let Some(tab) = self
             .source
             .tabs
@@ -233,7 +277,11 @@ impl Workbench {
             .find(|tab| tab.path == path && tab.error.is_none())
         {
             let id = tab.id;
-            self.select_source(id, window, cx);
+            match mode {
+                SourceOpen::Focus => self.select_source(id, window, cx),
+                SourceOpen::Preview => self.source.active = Some(id),
+                SourceOpen::Background => return,
+            }
             if lines.is_some() {
                 if let Some(tab) = self.source.tab_mut(id) {
                     tab.reading = None;
@@ -295,6 +343,8 @@ impl Workbench {
             id,
             path,
             _load: load,
+            focus_on_load: matches!(mode, SourceOpen::Focus)
+                .then(|| (window.focus_revision(), window.is_window_active())),
             error: None,
             document: None,
             image: None,
@@ -304,7 +354,9 @@ impl Workbench {
             reading: None,
             reading_line: None,
         });
-        self.source.active = Some(id);
+        if reveal {
+            self.source.active = Some(id);
+        }
         cx.notify();
     }
 
@@ -319,6 +371,8 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         let active = self.source.active == Some(id) && self.right == RightPane::Source;
+        let Some(tab) = self.source.tab_mut(id) else { return };
+        let focus = tab.focus_on_load.take() == Some((window.focus_revision(), window.is_window_active()));
         let remote = Rc::new(lsp::Remote::new(id, language, self.out.clone(), self.source.lsp_requests.clone()));
         let (editor, subscription, observe) = Self::make_source_editor(id, language, &base, &remote, window, cx);
         let mut line_mark = None;
@@ -326,8 +380,12 @@ impl Workbench {
             if active {
                 line_mark = Some(jump_lines(&editor, lines, window, cx));
             }
-        } else if active {
+        } else if active && focus && !self.settings_open && !window.has_active_dialog(cx) {
+            let composer_had_focus = self.input.read(cx).focus_handle(cx).is_focused(window);
             editor.update(cx, |editor, cx| editor.focus(window, cx));
+            if composer_had_focus {
+                self.expected_composer_blur = Some(window.focus_revision());
+            }
         }
         let Some(tab) = self.source.tab_mut(id) else {
             return;
@@ -457,8 +515,12 @@ impl Workbench {
 
     fn select_source(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.source.active = Some(id);
-        if let Some(doc) = self.source.document_mut(id) {
-            doc.editor.update(cx, |editor, cx| editor.focus(window, cx));
+        if let Some(tab) = self.source.tab_mut(id) {
+            if let Some(doc) = &tab.document {
+                doc.editor.update(cx, |editor, cx| editor.focus(window, cx));
+            } else {
+                tab.focus_on_load = Some((window.focus_revision(), window.is_window_active()));
+            }
         }
         cx.notify();
     }

@@ -28,6 +28,8 @@ mod lazy_deck;
 mod github_report;
 #[cfg(test)]
 mod cjk_emphasis_tests;
+#[cfg(all(test, target_os = "linux", feature = "headless-shot"))]
+mod focus_tests;
 mod icons;
 mod image_render;
 mod library;
@@ -233,6 +235,7 @@ struct Workbench {
     paper_focus: gpui_kit::FocusHandle,
     chat_focus: gpui_kit::FocusHandle,
     view_focus: gpui_kit::FocusHandle,
+    expected_composer_blur: Option<u64>,
     app_menu: menu_bar::MenuBar,
     _workbench_keys: gpui_kit::Subscription,
     /// 検索・添付の参照先、および概要の表示に使うデッキ情報。
@@ -268,6 +271,7 @@ struct Workbench {
     stats: std::collections::BTreeMap<(String, String), fuzukue_proto::ServerEvent>,
     /// 探す（Ctrl+K）の入力欄。開いているときだけ
     palette: Option<Entity<InputState>>,
+    palette_previous_focus: Option<gpui_kit::WeakFocusHandle>,
     palette_graph: Option<(String, Vec<fuzukue_proto::DeckRoute>)>,
     palette_search: Option<Task<()>>,
     /// PDF が開いたら移動するページ（0 始まり）
@@ -630,6 +634,7 @@ impl Workbench {
         composer_markdown::observe(&input, window, cx);
         let composer_focus = input.read(cx).focus_handle(cx);
         cx.on_focus(&composer_focus, window, |_, window, cx| TextSelection::clear(window, cx)).detach();
+        cx.on_blur(&composer_focus, window, Self::log_composer_blur).detach();
         cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { secondary: true, shift: false } = ev {
                 this.send_prompt(window, cx);
@@ -733,6 +738,7 @@ impl Workbench {
             comment_selection: None,
             open_comments: HashSet::new(),
             palette: None,
+            palette_previous_focus: None,
             palette_graph: None,
             palette_search: None,
             stats: std::collections::BTreeMap::new(),
@@ -767,6 +773,7 @@ impl Workbench {
             paper_focus: cx.focus_handle(),
             chat_focus: cx.focus_handle(),
             view_focus,
+            expected_composer_blur: None,
             app_menu: menu_bar::MenuBar::new(cx),
             _workbench_keys: workbench_keys,
             built_pdfs: HashMap::new(),
@@ -1210,7 +1217,8 @@ impl Workbench {
     }
 
     fn show_palette(&mut self, memo: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_palette();
+        self.close_palette(window, cx);
+        self.palette_previous_focus = window.focused(cx).map(|focus| focus.downgrade());
         self.library.move_target = memo;
         let placeholder = if self.library.move_target.is_some() {
             tr!("library-memo-search-destination")
@@ -1245,15 +1253,22 @@ impl Workbench {
         cx.notify();
     }
 
-    fn close_palette(&mut self) {
-        self.palette = None;
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.palette_previous_focus.take();
+        if self.palette.take().is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window)) {
+            if let Some(previous) = previous.and_then(|focus| focus.upgrade()) {
+                previous.focus(window, cx);
+            } else {
+                window.blur(cx);
+            }
+        }
         self.palette_search = None;
         self.library.move_target = None;
     }
 
     fn palette_open(&mut self, item: PaletteItem, window: &mut Window, cx: &mut Context<Self>) {
         let memo = self.library.move_target.take();
-        self.close_palette();
+        self.close_palette(window, cx);
         if let (Some(id), PaletteItem::Deck(deck)) = (memo, &item) {
             self.move_memo(id, deck.clone(), cx);
             return;
@@ -1312,8 +1327,8 @@ impl Workbench {
                 .child(
                     v_flex()
                         .id("title-search")
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.close_palette();
+                        .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                            this.close_palette(window, cx);
                             cx.notify();
                             cx.stop_propagation();
                         }))
@@ -1356,6 +1371,56 @@ impl Workbench {
                 }
             });
         }).detach();
+    }
+
+    fn log_composer_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.is_window_active()
+            || self.expected_composer_blur.take() == Some(window.focus_revision())
+            || window.has_active_dialog(cx)
+            || self.palette.is_some()
+            || self.app_menu.is_expanded()
+            || self.workspace_browser_open()
+            || self.screenshots.preview_open()
+            || self.symbol_view_visible()
+            || self.thread_info_visible() && (self.right == RightPane::Read
+                || self.right == RightPane::Source && self.source.centered)
+        {
+            return;
+        }
+
+        let target = window.focused(cx);
+        if self.input.read(cx).focus_handle(cx).is_focused(window) {
+            eprintln!("composer focus lost: composer absent from dispatch tree");
+            return;
+        }
+        let (origin, from_input) = window.focus_change_origin().unzip();
+        if from_input == Some(true) {
+            return;
+        }
+        let contexts = window.context_stack();
+        let has_context = |name| contexts.iter().any(|context| context.contains(name));
+        if has_context("PopupMenu") || has_context("PopoverContent") {
+            return;
+        }
+        let destination = if target.is_none() {
+            "none"
+        } else if has_context("FileBrowser") {
+            "file browser"
+        } else if has_context("Input") {
+            "text input"
+        } else if self.chat_focus.contains_focused(window, cx) {
+            "transcript"
+        } else if self.view_focus.is_focused(window) {
+            "workbench"
+        } else {
+            "other"
+        };
+        let location = origin.map(|site| {
+            // Source file basenames and numeric handles carry no user content.
+            let file = site.file().rsplit(['/', '\\']).next().unwrap_or("unknown");
+            format!("{file}:{}", site.line())
+        });
+        eprintln!("composer focus lost: destination={destination} handle={target:?} origin={location:?}");
     }
 
     fn switch_session(&mut self, session: String, cx: &mut Context<Self>) {
@@ -1532,7 +1597,7 @@ impl Workbench {
                                 session, repo, move_from: Some(from),
                             }, title, window, cx);
                         }
-                        ServerEvent::ScreenshotSaved { request, path, error } => self.screenshot_saved(request, path, error),
+                        ServerEvent::ScreenshotSaved { request, path, error } => self.screenshot_saved(request, path, error, window, cx),
                         ServerEvent::WorkspaceSelected { id, replay } => {
                             if replay || self.workspaces.active.as_deref() != Some(id.as_str()) {
                                 self.receiving_backlog = true;
@@ -1604,7 +1669,7 @@ impl Workbench {
                             if !self.receiving_backlog && session == self.active =>
                         {
                             let lines = lines.map(|(start, end)| start as usize..=end as usize);
-                            self.open_source_file(path, lines, window, cx);
+                            self.preview_source_file(path, lines, window, cx);
                         }
                         event if self.transcripts.scoped && env.workspace.is_some() => {
                             if let Some(render) = self.scoped_event(env.seq, &event, cx) {
@@ -1626,6 +1691,7 @@ impl Workbench {
 
     fn clear_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_scoped_workspace();
+        self.dismiss_screenshot_preview(window, cx);
         self.screenshots = Default::default();
         self.files.reset();
         self.source.clear(window);
@@ -1642,9 +1708,8 @@ impl Workbench {
         self.comment_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.comment_popup = None;
         self.comment_selection = None;
-        self.palette = None;
+        self.close_palette(window, cx);
         self.palette_graph = None;
-        self.palette_search = None;
         self.chat_activity_clock = None;
         self.chat_waiting = Default::default();
         self.chats.clear();
@@ -2462,7 +2527,7 @@ impl Workbench {
     }
 
     fn close_on_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.close_screenshot() {
+        if self.close_screenshot(window, cx) {
             cx.notify();
             true
         } else if self.workspace_browser_open() {
@@ -2475,7 +2540,7 @@ impl Workbench {
 
     fn close_top_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.palette.is_some() {
-            self.close_palette();
+            self.close_palette(window, cx);
         } else if self.right == RightPane::Files && !self.settings_open {
             self.close_file_browser(window, cx);
         } else if self.history.close() {

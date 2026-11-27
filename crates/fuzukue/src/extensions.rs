@@ -235,7 +235,7 @@ impl Workbench {
         }
     }
 
-    pub(super) fn open_extension(&mut self, id: String, cx: &mut Context<Self>) {
+    pub(super) fn open_extension(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.right == RightPane::Extension
             && self.extensions.active.as_ref() == Some(&id)
             && !self.settings_open
@@ -243,7 +243,7 @@ impl Workbench {
             self.close_right_pane(cx);
             return;
         }
-        self.close_palette();
+        self.close_palette(window, cx);
         self.settings_open = false;
         self.pending_paper_open = None;
         self.right = RightPane::Extension;

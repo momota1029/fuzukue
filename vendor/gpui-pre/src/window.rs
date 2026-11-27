@@ -607,6 +607,7 @@ impl FocusHandle {
     }
 
     /// Moves the focus to the element associated with this handle.
+    #[track_caller]
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         window.focus(self, cx)
     }
@@ -1294,6 +1295,8 @@ pub struct Window {
     /// Incremented every time focus moves. Used to invalidate a
     /// pending keyboard activation state when focus changes.
     pub(crate) focus_generation: u64,
+    dispatching_focus_input: bool,
+    focus_change_origin: Option<(&'static std::panic::Location<'static>, bool)>,
     pending_input: Option<PendingInput>,
     pending_modifier: ModifierState,
     pub(crate) pending_input_observers: SingleSubscriberSet<AnyObserver>,
@@ -2416,6 +2419,8 @@ impl Window {
             focus: None,
             focus_enabled: true,
             focus_generation: 0,
+            dispatching_focus_input: false,
+            focus_change_origin: None,
             pending_input: None,
             pending_modifier: ModifierState::default(),
             pending_input_observers: SingleSubscriberSet::new(),
@@ -2617,20 +2622,38 @@ impl Window {
         })
     }
 
+    /// Changes when a focus assignment or explicit blur changes the focused handle.
+    pub fn focus_revision(&self) -> u64 {
+        self.focus_generation
+    }
+
+    /// The last focus change's call site and whether it was during a key or pointer press.
+    pub fn focus_change_origin(&self) -> Option<(&'static std::panic::Location<'static>, bool)> {
+        self.focus_change_origin
+    }
+
+    #[track_caller]
+    fn record_focus_change(&mut self) {
+        self.focus_generation = self.focus_generation.wrapping_add(1);
+        self.focus_change_origin = Some((std::panic::Location::caller(), self.dispatching_focus_input));
+    }
+
     /// Move focus to the element associated with the given [`FocusHandle`].
+    #[track_caller]
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
         if !self.focus_enabled || self.focus == Some(handle.id) {
             return;
         }
 
         self.focus = Some(handle.id);
-        self.focus_generation = self.focus_generation.wrapping_add(1);
+        self.record_focus_change();
         self.clear_pending_keystrokes(cx);
 
         self.refresh();
     }
 
     /// Remove focus from all elements within this context's window.
+    #[track_caller]
     pub fn blur(&mut self, cx: &mut App) {
         self.clear_pending_keystrokes(cx);
 
@@ -2639,7 +2662,7 @@ impl Window {
         }
 
         if self.focus.is_some() {
-            self.focus_generation = self.focus_generation.wrapping_add(1);
+            self.record_focus_change();
         }
         self.focus = None;
         self.refresh();
@@ -6007,6 +6030,17 @@ impl Window {
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
+        let dispatching_focus_input = self.dispatching_focus_input;
+        self.dispatching_focus_input |= matches!(
+            event,
+            PlatformInput::KeyDown(_)
+                | PlatformInput::KeyUp(_)
+                | PlatformInput::MouseDown(_)
+                | PlatformInput::MouseUp(_)
+                | PlatformInput::Touch(_)
+                | PlatformInput::TimedTouch(..)
+                | PlatformInput::LongPress(_)
+        );
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
@@ -6018,6 +6052,7 @@ impl Window {
             };
             self.dispatch_touch_event(touch_event, sample_time, cx);
         }
+        self.dispatching_focus_input = dispatching_focus_input;
         if let PlatformInput::LongPress(long_press) = &event {
             match long_press.phase {
                 crate::TouchPhase::Started if !self.default_prevented => {

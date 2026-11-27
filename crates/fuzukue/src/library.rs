@@ -139,7 +139,7 @@ impl Workbench {
             input
         });
         input.read(cx).focus_handle(cx).focus(window, cx);
-        self.close_palette();
+        self.close_palette(window, cx);
         self.settings_open = false;
         self.pending_paper_open = None;
         self.right = RightPane::Library;

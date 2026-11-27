@@ -17,7 +17,7 @@ use gpui_kit::{
     },
     div, img,
     prelude::*,
-    px, Context, Entity, Focusable as _, Image, ImageFormat, ObjectFit, Window,
+    px, App, Context, Entity, Focusable as _, Image, ImageFormat, ObjectFit, WeakFocusHandle, Window,
 };
 use fuzukue_proto::{
     ClientMsg, ScreenshotDestination, ScreenshotResponse, CLIENT_SCREENSHOT_PROTOCOL,
@@ -48,10 +48,28 @@ impl Screenshots {
 struct Preview {
     image: Arc<Image>,
     note: Entity<TextareaState>,
+    previous_focus: Option<WeakFocusHandle>,
     pane: String,
     session: String,
     saving: Option<u64>,
     error: Option<String>,
+}
+
+impl Preview {
+    fn owns_focus(&self, window: &Window, cx: &App) -> bool {
+        self.note.read(cx).focus_handle(cx).is_focused(window)
+            || window.context_stack().iter().any(|context| context.contains("ScreenshotPreview"))
+    }
+
+    fn restore_focus(&self, window: &mut Window, cx: &mut App) {
+        if self.owns_focus(window, cx) {
+            if let Some(previous) = self.previous_focus.as_ref().and_then(WeakFocusHandle::upgrade) {
+                previous.focus(window, cx);
+            } else {
+                window.blur(cx);
+            }
+        }
+    }
 }
 
 enum Target {
@@ -260,7 +278,7 @@ impl Workbench {
             }
             return;
         }
-        self.close_palette();
+        self.close_palette(window, cx);
         self.close_sidebar_menu(cx);
         self.screenshots.feedback = None;
         let token = next_id();
@@ -362,10 +380,12 @@ impl Workbench {
                 .auto_grow(2, 4)
                 .placeholder(tr!("screenshot-note"))
         });
+        let previous_focus = window.focused(cx).map(|focus| focus.downgrade());
         note.read(cx).focus_handle(cx).focus(window, cx);
         self.screenshots.preview = Some(Preview {
             image: Arc::new(Image::from_bytes(ImageFormat::Png, png)),
             note,
+            previous_focus,
             session,
             pane,
             saving: None,
@@ -373,7 +393,7 @@ impl Workbench {
         });
     }
 
-    pub(super) fn close_screenshot(&mut self) -> bool {
+    pub(super) fn close_screenshot(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self
             .screenshots
             .preview
@@ -382,7 +402,13 @@ impl Workbench {
         {
             return true;
         }
-        self.screenshots.preview.take().is_some()
+        self.dismiss_screenshot_preview(window, cx)
+    }
+
+    pub(super) fn dismiss_screenshot_preview(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        let Some(preview) = self.screenshots.preview.take() else { return false };
+        preview.restore_focus(window, cx);
+        true
     }
 
     pub(super) fn screenshot_disconnected(&mut self) {
@@ -410,9 +436,15 @@ impl Workbench {
         }
         let note = preview.note.read(cx).value().trim().to_owned();
         let screenshot = preview.image.clone();
+        let preview_focus = window.focused(cx);
+        // The dialog needs to capture the preview's return target before the note disappears.
+        preview.restore_focus(window, cx);
         if self.open_github_report_draft(Some((screenshot, note)), window, cx) {
             self.screenshots.preview = None;
         } else if let Some(preview) = self.screenshots.preview.as_mut() {
+            if let Some(focus) = preview_focus {
+                focus.focus(window, cx);
+            }
             preview.error = Some(tr!("github-report-close-dialog").into());
         }
         cx.notify();
@@ -423,6 +455,8 @@ impl Workbench {
         request: u64,
         path: Option<String>,
         error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let Some(preview) = self
             .screenshots
@@ -433,7 +467,7 @@ impl Workbench {
             return;
         };
         if let Some(path) = path {
-            self.screenshots.preview = None;
+            self.dismiss_screenshot_preview(window, cx);
             self.screenshots.feedback = Some(tr!("screenshot-saved", path = path));
         } else {
             preview.error =
@@ -474,6 +508,7 @@ impl Workbench {
                 preview.error = Some(tr!("screenshot-connection-lost").into());
             }
         } else if preview.session == self.active {
+            let transfer_focus = preview.owns_focus(window, cx);
             let png = preview.image.bytes.clone();
             if self.attach_screenshot(png, cx) {
                 if !note.is_empty() {
@@ -488,7 +523,9 @@ impl Workbench {
                     });
                 }
                 self.screenshots.preview = None;
-                self.input.read(cx).focus_handle(cx).focus(window, cx);
+                if transfer_focus {
+                    self.input.read(cx).focus_handle(cx).focus(window, cx);
+                }
             } else if let Some(preview) = self.screenshots.preview.as_mut() {
                 preview.error = Some(tr!("chat-cannot-send-attachments").into());
             }
@@ -528,6 +565,7 @@ impl Workbench {
                         .child(
                             v_flex()
                                 .id("screenshot-preview")
+                                .key_context("ScreenshotPreview")
                                 .w_full()
                                 .max_w(px(580.))
                                 .max_h_full()
@@ -552,8 +590,8 @@ impl Workbench {
                                                 .icon(Symbol::X.icon())
                                                 .accessibility_label(tr!("pane-close"))
                                                 .disabled(preview.saving.is_some())
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.close_screenshot();
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.close_screenshot(window, cx);
                                                     cx.notify();
                                                 })),
                                         ),

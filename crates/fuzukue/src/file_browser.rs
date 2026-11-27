@@ -22,7 +22,7 @@ use gpui_kit::{
     },
     div, point,
     prelude::*,
-    px, relative, Anchor, AnyElement, Context, DismissEvent, Entity, FocusHandle, Focusable as _,
+    px, relative, Anchor, AnyElement, App, Context, DismissEvent, Entity, FocusHandle, Focusable as _,
     Keystroke, MouseButton, Pixels, ScrollHandle, Task, WeakEntity, Window,
 };
 
@@ -107,6 +107,12 @@ impl Files {
 }
 
 impl Browser {
+    fn owns_focus(&self, window: &Window, cx: &App) -> bool {
+        self.input.read(cx).focus_handle(cx).is_focused(window)
+            || self.tree_focus.is_focused(window)
+            || window.context_stack().iter().any(|context| context.contains("FileBrowser"))
+    }
+
     fn searching(&self) -> bool {
         self.search_on || self.filter.starts_with('/')
     }
@@ -309,7 +315,7 @@ impl Workbench {
         if !self.file_browser_supported() {
             return;
         }
-        self.close_palette();
+        self.close_palette(window, cx);
         if self.right == RightPane::Files {
             self.settings_open = false;
             self.navigate_files(dir, true, window, cx);
@@ -361,12 +367,12 @@ impl Workbench {
 
     pub(super) fn close_file_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(browser) = self.files.browser.take() {
+            let owns_focus = browser.owns_focus(window, cx);
             self.right = browser.previous;
             self.settings_open = browser.previous_settings;
-            browser
-                .previous_focus
-                .unwrap_or_else(|| self.view_focus.clone())
-                .focus(window, cx);
+            if owns_focus {
+                browser.previous_focus.unwrap_or_else(|| self.view_focus.clone()).focus(window, cx);
+            }
         } else {
             self.right = RightPane::None;
         }
@@ -683,8 +689,12 @@ impl Workbench {
         self.files.recent.truncate(50);
         match open_target(&path) {
             OpenTarget::InApp(target) => {
+                let transfer_focus = browser.owns_focus(window, cx) || self.view_focus.is_focused(window);
+                let previous = browser.previous;
                 self.files.browser = None;
-                self.view_focus.focus(window, cx);
+                if transfer_focus {
+                    self.view_focus.focus(window, cx);
+                }
                 match (target, resolved.deck) {
                     (InApp::Pdf, _) => self.open_pdf(path, Some(window), cx),
                     (InApp::DeckOrSource, Some(deck)) => {
@@ -693,8 +703,14 @@ impl Workbench {
                         self.files.paper_file = Some((key, path));
                     }
                     _ => {
-                        self.source.centered = true;
-                        self.open_source_file(path, None, window, cx);
+                        // A centered source pane can put thread details where the composer is.
+                        self.source.centered = transfer_focus || !self.thread_info_visible();
+                        if transfer_focus {
+                            self.open_source_file(path, None, window, cx);
+                        } else {
+                            self.right = previous;
+                            self.preview_source_file(path, None, window, cx);
+                        }
                     }
                 }
             }
@@ -1156,6 +1172,7 @@ impl Workbench {
             }));
         v_flex()
             .id("file-browser")
+            .key_context("FileBrowser")
             .size_full()
             .min_w_0()
             .overflow_hidden()

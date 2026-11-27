@@ -626,7 +626,7 @@ impl Workbench {
                 format!("extension-view-{}", extension.name),
                 extension.title.clone(),
                 None,
-                move |this, _, cx| this.open_extension(id.clone(), cx),
+                move |this, window, cx| this.open_extension(id.clone(), window, cx),
             ));
         }
         items.push(item(
