@@ -138,6 +138,7 @@ pub struct ClaudeSession {
     state: tokio::sync::Mutex<TurnState>,
     mcp_key: Option<String>,
     approvals: Mutex<std::collections::HashMap<String, PendingApproval>>,
+    refusals: Mutex<crate::full_approval::guard::Refusals>,
 }
 
 struct ClaudeProcess {
@@ -308,6 +309,7 @@ fn worker_shell(
         match policy {
             WorkerApprovalPolicy::Ask if approved.own_files => "Worker read of its own job files",
             WorkerApprovalPolicy::Ask if approved.basic => "Basic read command (ask policy)",
+            WorkerApprovalPolicy::Ask if approved.creates_directories => "New directories in the job's own area",
             WorkerApprovalPolicy::Ask => return None,
             WorkerApprovalPolicy::Advisor => "Workspace shell allowlist (advisor policy)",
             WorkerApprovalPolicy::Auto => "Workspace shell allowlist (auto policy)",
@@ -450,6 +452,7 @@ impl ClaudeSession {
             state: tokio::sync::Mutex::new(TurnState::default()),
             mcp_key,
             approvals: Mutex::new(std::collections::HashMap::new()),
+            refusals: Default::default(),
         });
 
         app.hub.publish(ServerEvent::SessionStarted { session: id, project: session.project.to_string_lossy().into_owned() });
@@ -1542,11 +1545,20 @@ impl ClaudeSession {
                 let external = turns.active.as_ref().is_some_and(|turn| matches!(turn.kind, TurnKind::ExternalInput))
                     || self.app.upgrade().is_some_and(|app| !crate::mcp::exec::trusted_session(&app, &self.id));
                 let trusted = !external && turns.active.as_ref().is_some_and(|turn| !turn.interrupted);
+                let guarded = self.hub.guarded(tool, &input);
+                // Only listed local tools of this CLI are granted automatically. Outbound
+                // tools and those of other MCP servers stay with a person.
                 let eligible = trusted && !request.get("human_only").is_some_and(|value| value != &Value::Bool(false))
-                    && (matches!(tool, "Bash" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
-                        || tool.strip_prefix("mcp__fuzukue__").is_some_and(crate::mcp::desk_tool_auto_eligible));
-                let audit_tool = tool.strip_prefix("mcp__fuzukue__")
-                    .map(|name| format!("mcp/{name}")).unwrap_or_else(|| tool.into());
+                    && guarded.is_none()
+                    && match tool.strip_prefix("mcp__fuzukue__") {
+                        Some(name) => crate::mcp::desk_tool_auto_eligible(name),
+                        None => crate::full_approval::guard::automatic_tool(tool),
+                    };
+                let audit_tool = match tool.strip_prefix("mcp__fuzukue__") {
+                    Some(name) => format!("mcp/{name}"),
+                    None if matches!(tool, "Bash" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit") => tool.into(),
+                    None => format!("{}{tool}", crate::full_approval::NATIVE_TOOL),
+                };
                 let mut shell_directory = None;
                 let mut shell_prefix = None;
                 if tool == "Bash" && !external && mode != PermissionMode::Plan && shell_can_be_reviewed(request)
@@ -1574,12 +1586,27 @@ impl ClaudeSession {
                             }
                         }
                     }
+                    // A read the checker verified keeps its card, which can save a rule.
+                    let refusal = (trusted && shell_directory.is_none() && !crate::canary())
+                        .then(|| self.refusals.lock().unwrap().refuse(&input, guarded)).flatten();
+                    if let Some(message) = refusal {
+                        return self.write(json!({ "type": "control_response", "response": {
+                            "subtype": "success", "request_id": req_id, "response": {
+                                "behavior": "deny", "message": message,
+                            }
+                        } })).await;
+                    }
                 }
-                let detail = input["command"]
+                let mut detail = input["command"]
                     .as_str()
                     .or_else(|| input["file_path"].as_str())
                     .map(String::from)
                     .unwrap_or_else(|| input.to_string());
+                if matches!(tool, "Bash" | "Monitor") && guarded.is_some_and(|reason| reason.may_push()) {
+                    if let Some(app) = self.app.upgrade() {
+                        detail.push_str(&crate::privacy_findings::push_note(&app.project_dir, &app.state_dir).await);
+                    }
+                }
                 let can_remember_shell = shell_directory.is_some();
                 let event = ServerEvent::ApprovalRequested {
                     session: self.id.clone(),
@@ -1625,7 +1652,8 @@ impl ClaudeSession {
                 }
                 self.approvals.lock().unwrap().insert(id, PendingApproval {
                     request_id: req_id, tool: tool.into(), input,
-                    human_only: external || tool == "Bash" || human_only(request, tool)
+                    human_only: external || tool == "Bash" || guarded.is_some() || human_only(request, tool)
+                        || !crate::full_approval::guard::automatic_tool(tool)
                         || tool.strip_prefix("mcp__fuzukue__").is_some_and(|name| !crate::mcp::desk_tool_auto_eligible(name)),
                     can_remember_shell, sweepable: eligible, _alive: alive,
                 });
@@ -1848,8 +1876,10 @@ pub(crate) async fn run_worker(
     let scope = launch.scope.as_ref().context("worker filesystem scope is missing")?;
     use crate::worker_execution::Approval;
     let execution = launch.execution;
+    // Hands-off work still sends every shell command to the server, which answers
+    // at once unless the command needs a person.
     let scope_settings = match execution {
-        Some(policy) if policy.approval == Approval::Never => json!({}),
+        Some(policy) if policy.approval == Approval::Never && !policy.full => json!({}),
         Some(_) => json!({"permissions": {"ask": ["Bash"]}}),
         None => scope.claude_settings(&std::env::current_exe()?),
     }.to_string();
@@ -1858,6 +1888,7 @@ pub(crate) async fn run_worker(
         let mut command = policy.command(&program, scope).await?;
         policy.backend_home(&mut command, &scope.scratch, "CLAUDE_CONFIG_DIR", ".claude", &[".credentials.json"])?;
         let mode = match policy.approval {
+            _ if policy.full => PermissionMode::AcceptEdits,
             Approval::Never => PermissionMode::BypassPermissions,
             Approval::Auto => PermissionMode::AcceptEdits,
             Approval::Ask => PermissionMode::Default,
@@ -1916,6 +1947,7 @@ pub(crate) async fn run_worker(
             let mut stream = StreamState::default();
             let mut approvals = FuturesUnordered::new();
             let mut pending_approvals: HashMap<String, AbortHandle> = HashMap::new();
+            let mut refusals = crate::full_approval::guard::Refusals::default();
             loop {
                 let line = tokio::select! {
                     biased;
@@ -1947,7 +1979,12 @@ pub(crate) async fn run_worker(
                             }
                             if execution.is_some_and(|policy| policy.full) && item["type"] == "tool_use" {
                                 let name = item["name"].as_str().unwrap_or_default();
-                                if !name.is_empty() && !name.starts_with("mcp__") {
+                                // Commands are recorded when their permission request is answered,
+                                // and a request that needs a person is not a grant.
+                                if !matches!(name, "Bash" | "Monitor") && !name.starts_with("mcp__")
+                                    && crate::full_approval::guard::automatic_tool(name)
+                                    && app.hub.guarded(name, &item["input"]).is_none()
+                                {
                                     if let Some(id) = item["id"].as_str() {
                                         crate::full_approval::observe_worker_tool(&app.hub, session, job, "claude", name, id);
                                     }
@@ -1970,7 +2007,12 @@ pub(crate) async fn run_worker(
                             }
                             use crate::hub::approval_store::FullAuthorization::*;
                             let trusted = app.delegates.worker_approval_trusted(session, job);
-                            let authorization = if trusted {
+                            // Outbound tools, those of other MCP servers and requests the
+                            // CLI reserves for a person are never granted automatically.
+                            let reserved = human_only(request, tool);
+                            let automatic = trusted && !reserved && app.hub.guarded(tool, &request["input"]).is_none()
+                                && crate::full_approval::guard::automatic_tool(tool);
+                            let authorization = if automatic {
                                 crate::full_approval::authorize_worker(&app.hub, session, job, "claude", tool, backend_id,
                                     &request["input"], request["tool_use_id"].as_str())
                             } else {
@@ -1982,7 +2024,9 @@ pub(crate) async fn run_worker(
                                     continue;
                                 }
                                 Ok(AlreadyConsumed) => continue,
-                                Ok(Human) if trusted && execution.is_some_and(|policy| !policy.full && policy.approval != Approval::Ask) => {
+                                Ok(Human) if trusted && !reserved
+                                    && execution.is_some_and(|policy| !policy.full && policy.approval != Approval::Ask) =>
+                                {
                                     write_worker_approval(stdin, backend_id, Some(request["input"].clone())).await?;
                                     continue;
                                 }
@@ -2004,17 +2048,32 @@ pub(crate) async fn run_worker(
                             write_worker_approval(stdin, backend_id, None).await?;
                             continue;
                         }
-                        if tool == "Read" && app.delegates.worker_approval_trusted(session, job)
+                        if tool == "Read" && !human_only(request, tool) && app.delegates.worker_approval_trusted(session, job)
                             && scope.reads_own_file(cwd, &request["input"])
                         {
                             write_worker_approval(stdin, backend_id, Some(request["input"].clone())).await?;
                             continue;
                         }
-                        if execution.is_none() && tool == "Bash" && app.delegates.worker_approval_trusted(session, job) {
-                            if let Some((approved, who)) = worker_shell(app, scope, request) {
+                        if tool == "Bash" && app.delegates.worker_approval_trusted(session, job) {
+                            // Configured execution policies keep their own rules, except that a
+                            // writable sandbox may always create directories in the job's area.
+                            if let Some((approved, who)) = worker_shell(app, scope, request).filter(|(approved, _)| {
+                                execution.is_none_or(|policy| approved.creates_directories
+                                    && policy.sandbox != crate::worker_execution::Sandbox::ReadOnly)
+                            }) {
                                 write_worker_approval(stdin, backend_id, Some(approved.input.clone())).await?;
                                 let id = format!("{job}:{}", crate::mail::session_key());
                                 approved.audit(&app.hub, session, Some(job), &id, who);
+                                continue;
+                            }
+                        }
+                        if tool == "Bash" && !crate::canary() && shell_can_be_reviewed(request)
+                            && app.delegates.worker_approval_trusted(session, job)
+                        {
+                            let guarded = app.hub.guarded(tool, &request["input"]);
+                            if let Some(message) = refusals.refuse(&request["input"], guarded) {
+                                write_worker_approval_response(stdin, backend_id,
+                                    json!({"behavior": "deny", "message": message})).await?;
                                 continue;
                             }
                         }
@@ -2647,6 +2706,41 @@ mod tests {
         std::fs::remove_file(&file)?;
         std::os::unix::fs::symlink(state.join("shell-approval-rules.json"), &file)?;
         assert!(worker_shell(&app, &scope, &request).is_none());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_creates_directories_in_its_own_area_under_every_policy() -> Result<()> {
+        use fuzukue_proto::WorkerApprovalPolicy::{Advisor, Ask, Auto};
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().canonicalize()?.join("worktree");
+        let state = tmp.path().canonicalize()?.join("state");
+        let scratch = state.join("worker-fixture");
+        for dir in [&root.join(".git"), &scratch.join(".claude")] {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::os::unix::fs::symlink(&state, root.join("escape"))?;
+        let app = Workspace::new(root.clone(), String::new(), state.clone(), Arc::new(Hub::new()));
+        let scope = crate::worker_scope::Scope::open(&root, &root, &scratch)?;
+        let shell = |command: String| worker_shell(&app, &scope, &json!({"input": {"command": command}}));
+        for policy in [Ask, Advisor, Auto] {
+            *app.worker_approval_policy.lock().unwrap() = policy;
+            for command in [
+                "mkdir -p target/new/deeper".to_owned(), "mkdir notes".into(),
+                format!("mkdir {}/tmp", scratch.display()),
+            ] {
+                let (approved, _) = shell(command.clone()).unwrap_or_else(|| panic!("{command}"));
+                assert!(approved.creates_directories, "{command}");
+            }
+            for command in [
+                "mkdir ../outside".to_owned(), "mkdir /etc/fuzukue-test".into(), "mkdir .git/hooks2".into(),
+                "mkdir escape/new".into(), "mkdir -m 777 open".into(), format!("mkdir {}/new", state.display()),
+                format!("mkdir {}/.claude/new", scratch.display()),
+            ] {
+                assert!(shell(command.clone()).is_none(), "{command}");
+            }
+        }
         Ok(())
     }
 

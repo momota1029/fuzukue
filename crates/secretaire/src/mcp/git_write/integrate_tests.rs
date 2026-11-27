@@ -616,13 +616,11 @@ mod deferred {
     async fn non_human_paths_cannot_approve_the_privacy_override() -> Result<()> {
         let fixture = Fixture::new()?;
         let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
-        app.hub.set_full_approval(
-            fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour },
-            &crate::remote::SettingsPrincipal::fixture(),
-        )?;
-        // Full mode and a trusted turn still leave the override to a person.
         let response = request(&app, &session, override_args(), Some(Actor::Claude), true).await?;
         let id = response["structuredContent"]["approval_id"].as_str().unwrap().to_owned();
+        // A card already shown to a person stays theirs when the mode changes.
+        enable_full_mode(&app)?;
+        app.hub.edit_threads(|threads| threads.set_partner_permission(&session, fuzukue_proto::PermissionMode::BypassPermissions))?;
         app.hub.sweep_thread_approvals(&session)?;
         let app = reopen(&fixture, app);
         deferred::recover(&app).await?;
@@ -640,6 +638,91 @@ mod deferred {
         deferred::process(&app, &id).await?;
         assert_eq!(head(&fixture)?, fixture.head);
         assert!(results(&app)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hands_off_turns_commit_findings_record_them_and_list_them_before_a_push() -> Result<()> {
+        use fuzukue_proto::PermissionMode;
+        for full_mode in [false, true] {
+            let fixture = Fixture::new()?;
+            let bare = add_upstream(&fixture)?;
+            let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+            if full_mode {
+                enable_full_mode(&app)?;
+            } else {
+                app.hub.edit_threads(|threads| threads.set_partner_permission(&session, PermissionMode::BypassPermissions))?;
+            }
+            // Untrusted and external turns still get the refusal and the human card.
+            let refused = request(&app, &session, args(), Some(Actor::Claude), false).await?;
+            assert_eq!(refused["structuredContent"]["error"]["code"], "privacy_refused", "{refused}");
+            assert_eq!(head(&fixture)?, fixture.head);
+
+            let (_, mut events) = app.hub.subscribe(u64::MAX);
+            let response = request(&app, &session, args(), Some(Actor::Claude), true).await?;
+            assert_eq!(response["isError"], false, "{response}");
+            let result = &response["structuredContent"];
+            assert_eq!(result["commit_sha"], head(&fixture)?);
+            assert_eq!(result["privacy_findings"]["locations"], json!(["tracked.txt:1"]));
+            assert_eq!(result["privacy_findings"]["recorded"], true);
+            assert!(app.hub.pending_approvals()?.0.is_empty());
+            let notice = std::iter::from_fn(|| events.try_recv().ok()).find_map(|envelope| match envelope.event {
+                ServerEvent::LocalNotice { text, item, .. } if item.starts_with("privacy-findings:") => Some(text),
+                _ => None,
+            }).expect("a visible note");
+            assert!(notice.contains("tracked.txt:1") && !notice.contains(SECRET), "{notice}");
+
+            // The push waits for a person, whatever the mode, and lists the places.
+            let app_for_push = app.clone();
+            let push_session = session.clone();
+            let push = tokio::spawn(async move {
+                app_for_push.git_remote(&push_session, Actor::System, crate::git::RemoteOperation::Push).await
+            });
+            let (id, summary) = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let ServerEvent::ApprovalRequested { request_id, summary, .. } = events.recv().await?.event {
+                        return anyhow::Ok((request_id, summary));
+                    }
+                }
+            }).await??;
+            assert!(summary.contains("tracked.txt:1"), "{summary}");
+            assert!(app.delegates.resolve_approval(&id, "accept", false)?);
+            push.await??;
+            assert_eq!(git(&bare, &["rev-parse", "HEAD"])?, head(&fixture)?);
+            assert!(crate::privacy_findings::unpublished(&app.project_dir, &app.state_dir).await.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hands_off_turns_ask_when_findings_cannot_be_recorded() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        app.hub.edit_threads(|threads| {
+            threads.set_partner_permission(&session, fuzukue_proto::PermissionMode::BypassPermissions)
+        })?;
+        // The record file cannot be read or replaced.
+        std::fs::create_dir_all(app.state_dir.join("privacy-findings.json"))?;
+        let response = request(&app, &session, args(), Some(Actor::Claude), true).await?;
+        assert_eq!(response["structuredContent"]["status"], "pending", "{response}");
+        assert_eq!(head(&fixture)?, fixture.head);
+        assert_eq!(app.hub.pending_approvals()?.0.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_of_unpublished_commits_are_never_dropped_and_unused_reservations_are() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let state = tempfile::tempdir()?;
+        drop(crate::privacy_findings::reserve(state.path(), 1, &["unused:1".into()])?);
+        assert!(crate::privacy_findings::unpublished(&fixture.repo, state.path()).await.is_none());
+        for index in 0..250 {
+            crate::privacy_findings::reserve(state.path(), 1, &[format!("file:{index}")])?.publishing();
+        }
+        let listed = crate::privacy_findings::unpublished(&fixture.repo, state.path()).await.context("findings")?;
+        assert!(listed.ends_with("+220"), "{listed}");
+        let stored: Value = serde_json::from_slice(&std::fs::read(state.path().join("privacy-findings.json"))?)?;
+        assert_eq!(stored.as_array().map(Vec::len), Some(250));
         Ok(())
     }
 

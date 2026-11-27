@@ -41,6 +41,13 @@ struct Job {
 
 const TEST_RUNS: &str = "project-test-runs.json";
 
+/// What an agent's isolated test run inherits: program and toolchain discovery
+/// and locale settings.
+const INHERITED: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "ELAN_HOME",
+];
+
 impl Tests {
     pub(crate) fn load(state_dir: &Path) -> Self {
         let runs: Vec<TestRun> = std::fs::read(state_dir.join(TEST_RUNS))
@@ -239,6 +246,72 @@ impl Workspace {
     }
 }
 
+pub(crate) async fn suites_in(root: &Path) -> Result<Vec<TestSuite>> {
+    let path = root.to_owned();
+    let suites = tokio::task::spawn_blocking(move || discovery::discover(&path)).await??;
+    Ok(suites.into_iter().map(|suite| suite.info).collect())
+}
+
+/// The suites an agent asked to run, kept so that what was checked and shown for
+/// approval is what runs.
+pub(crate) struct Planned(Vec<Suite>);
+
+impl Planned {
+    pub(crate) async fn discover(root: &Path, selected: Option<&str>) -> Result<Self> {
+        let path = root.to_owned();
+        let mut suites = tokio::task::spawn_blocking(move || discovery::discover(&path)).await??;
+        suites.retain(|suite| selected.is_none_or(|id| suite.info.id == id));
+        ensure!(!suites.is_empty(), "No matching test suite in {}", root.display());
+        Ok(Self(suites))
+    }
+
+    /// One line per suite with its configured environment and command.
+    pub(crate) fn card(&self) -> String {
+        self.0.iter().map(|suite| {
+            let env: String = suite.env.iter().map(|(name, value)| format!("{name}={value:?} ")).collect();
+            format!("{}: {env}{}", suite.info.id, suite.info.command)
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Why a person must decide whether one of these commands runs.
+    pub(crate) fn guarded(&self, protected: &[std::path::PathBuf]) -> Option<crate::full_approval::guard::Reason> {
+        use crate::full_approval::guard;
+        self.0.iter().find_map(|suite| {
+            guard::argv(&suite.command, protected).or_else(|| {
+                suite.env.values().any(|value| guard::credential(value, protected))
+                    .then_some(guard::Reason::Credentials)
+            })
+        })
+    }
+}
+
+/// Run planned suites with extra environment variables and only a few of the
+/// server's own, without publishing them as workspace test results.
+pub(crate) async fn run_isolated(
+    root: &Path, planned: Planned, filter: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>, cancel: &Cancellation,
+) -> Result<Vec<TestRun>> {
+    let context = RunContext { root, publish: None };
+    let mut runs = Vec::new();
+    for mut suite in planned.0 {
+        suite.scrubbed = true;
+        suite.env.extend(env.clone());
+        let mut run = TestRun {
+            suite: suite.info.id.clone(),
+            revision: 0,
+            state: TestState::Running,
+            passed: 0,
+            failed: 0,
+            failures: Vec::new(),
+            output: String::new(),
+        };
+        execute(&context, &suite, filter, cancel, &mut run).await;
+        runs.push(run);
+    }
+    cancel.check()?;
+    Ok(runs)
+}
+
 pub(crate) async fn run_in_worktree(root: &Path) -> Result<Vec<TestRun>> {
     let path = root.to_owned();
     let suites = tokio::task::spawn_blocking(move || discovery::discover(&path)).await??;
@@ -281,8 +354,17 @@ fn command(suite: &Suite, args: &[String], filter: Option<&str>) -> Command {
     };
     command
         .current_dir(&suite.cwd)
-        .args(&args[1..])
-        .envs(&suite.env);
+        .args(&args[1..]);
+    if suite.scrubbed {
+        // Tokens, proxy settings and credential sockets stay with the server.
+        command.env_clear();
+        command.envs(INHERITED.iter().filter_map(|name| Some((name, std::env::var_os(name)?))));
+    }
+    // The server's own service settings change how tested programs behave.
+    for name in ["FUZUKUE_SERVICE", "FUZUKUE_SELF_UPDATE_READY", "FUZUKUE_SELF_UPDATE_SOURCE"] {
+        command.env_remove(name);
+    }
+    command.envs(&suite.env);
     if let Some(seed) = &suite.seed {
         command.env("FUZUKUE_TEST_SEED", seed).env("LABO_TEST_SEED", seed);
     }

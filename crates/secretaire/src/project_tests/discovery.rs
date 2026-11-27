@@ -22,6 +22,8 @@ pub(super) struct Suite {
     pub expect: Option<PathBuf>,
     pub abs_tol: f64,
     pub rel_tol: f64,
+    /// Run with a few inherited environment variables only.
+    pub scrubbed: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -76,6 +78,7 @@ impl Suite {
             expect: None,
             abs_tol: 1e-8,
             rel_tol: 1e-6,
+            scrubbed: false,
         }
     }
 

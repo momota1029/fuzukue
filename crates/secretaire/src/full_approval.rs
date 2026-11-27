@@ -21,6 +21,12 @@ use crate::{
     remote::SettingsPrincipal,
 };
 
+#[path = "full_approval_guard.rs"]
+pub(crate) mod guard;
+
+/// Approval record prefix for a backend's own tool without a dedicated entry.
+pub(crate) const NATIVE_TOOL: &str = "native/";
+
 pub(crate) const SETTINGS_PATH: &str = "/settings/full-approval";
 pub(crate) const EXECUTION_PATH: &str = "/settings/worker-execution";
 
@@ -210,7 +216,21 @@ pub(crate) fn worker_registration(
     )
 }
 
-/// Backends using their native bypass mode report tool starts instead of approval RPCs.
+/// Tells the front desk not to stop for permission it already has.
+pub(crate) fn desk_notice() -> &'static str {
+    harness_text!(
+        "\n\nThis turn runs hands-off. Do local, reversible work, including commits, patch integration and merging a reviewed branch (confirm=true), without asking the user for permission. Pushing, publishing, other external writes, history-destroying Git operations, administrator installs and server credentials still wait for the user: request them through the normal tool and its card appears.",
+        "\n\nこのターンは確認なしで進める。手元でやり直せる作業は、コミット、パッチの取り込み、確認済みブランチのマージ（confirm=true）まで、利用者に許可を聞かずに進める。プッシュ、公開、そのほかの外部への書き込み、履歴を失う Git 操作、管理者権限の要るインストール、サーバーの認証情報は利用者の判断を待つ。いつもの道具で依頼すれば確認の札が出る。"
+    )
+}
+
+/// Leave a request that needs a person to a person, now and after later mode changes.
+pub(crate) fn require_person(registration: &mut Registration) {
+    registration.unattended = ApprovalUnattended::NeverUnattended;
+    registration.thread_auto = false;
+}
+
+/// Hands-off backends report the tools they start without an approval RPC.
 pub(crate) fn observe_worker_tool(hub: &Hub, session: &str, job: &str, backend: &str, tool: &str, id: &str) {
     let mut request = registration(
         ApprovalOwner { thread: session.into(), job: job.into(), requester: backend.into() },

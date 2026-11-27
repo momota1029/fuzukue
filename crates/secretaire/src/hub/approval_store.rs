@@ -229,6 +229,10 @@ impl Queue {
         }
     }
 
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn load(&self) -> Result<Store> {
         let bytes = match fs::read(self.dir.join(FILE)) {
             Ok(bytes) => bytes,
@@ -910,11 +914,11 @@ pub(super) fn eligible_for_full(owner: &ApprovalOwner, unattended: ApprovalUnatt
     unattended != ApprovalUnattended::NeverUnattended
         && (owner.requester != "front_desk"
             || matches!(tool,
-                "exec" | "folder_read" | "git_integrate_patch" | "github_label" | "github_issue_close"
+                "exec" | "folder_read" | "git_integrate_patch"
                 | "Bash" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
                 | "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
                 | "item/permissions/requestApproval"
-            ) || tool.starts_with("mcp/"))
+            ) || tool.starts_with("mcp/") || tool.starts_with(crate::full_approval::NATIVE_TOOL))
 }
 
 fn now() -> i64 {

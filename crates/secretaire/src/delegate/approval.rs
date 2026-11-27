@@ -157,12 +157,17 @@ where
     );
     full.tool_item = item.map(|id| crate::full_approval::worker_tool_item(&owner.job, "claude", id));
     let trusted = app.delegates.worker_approval_trusted(&owner.session, &owner.job);
-    if !trusted {
-        full.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
+    let guarded = app.hub.guarded(tool, input);
+    if !trusted || human_only || guarded.is_some() || !crate::full_approval::guard::automatic_tool(tool) {
+        crate::full_approval::require_person(&mut full);
+    }
+    let mut summary = format!("{tool} {input}");
+    if matches!(tool, "Bash" | "Monitor") && guarded.is_some_and(|reason| reason.may_push()) {
+        summary.push_str(&crate::privacy_findings::push_note(&app.project_dir, &app.state_dir).await);
     }
     // Register the human waiter before invoking the legacy advisor.
     let (wait, mut reply) = super::open_approval_with(app, &owner.session, &owner.job, Actor::Claude,
-        format!("{tool} {input}").into(), Some(owner.clone()), None, None, Some(full))?;
+        summary.into(), Some(owner.clone()), None, None, Some(full))?;
     let policy = *app.worker_approval_policy.lock().unwrap();
     if trusted && policy != WorkerApprovalPolicy::Ask {
         if let Some((scope, reviewed_path)) = path() {
@@ -259,6 +264,7 @@ mod tests {
         app.delegates.running.lock().unwrap().insert(JOB.into(), Arc::new(RunningJob {
             session: SESSION.into(), key: String::new(), approach: String::new(),
             external_approval: false,
+            external_message: Default::default(),
             summary: Default::default(), retry: Default::default(), tools: Default::default(),
             input: Default::default(), cancel: Default::default(), started: true.into(),
             drain_notice: Default::default(), capture_scope: Default::default(),
@@ -323,6 +329,91 @@ mod tests {
         if let Some(entry) = audit.first() {
             assert_eq!(entry.approval_id, id);
             assert_eq!(entry.granted_by, "full_mode");
+        }
+        Ok(())
+    }
+
+    fn thread_mode(app: &Workspace, mode: fuzukue_proto::PermissionMode) -> Result<String> {
+        let session = app.hub.edit_threads(|threads| threads.create(None))?;
+        app.hub.edit_threads(|threads| threads.set_partner_permission(&session, mode))?;
+        // Move the fixture's running job into the new thread.
+        let job = app.delegates.running.lock().unwrap().remove(JOB).unwrap();
+        let mut job = Arc::try_unwrap(job).ok().expect("unshared job");
+        job.session = session.clone();
+        app.delegates.running.lock().unwrap().insert(JOB.into(), Arc::new(job));
+        Ok(session)
+    }
+
+    #[tokio::test]
+    async fn an_automatic_thread_grants_its_workers_but_not_guarded_or_external_requests() -> Result<()> {
+        use fuzukue_proto::PermissionMode;
+        let (_temp, app) = fixture(WorkerApprovalPolicy::Ask)?;
+        let session = thread_mode(&app, PermissionMode::BypassPermissions)?;
+        let ask = |backend: &str, command: &str| {
+            request(&app, Owner::new(&session, JOB, backend), "Bash",
+                Box::leak(Box::new(json!({"command": command}))), false, None)
+        };
+        assert_eq!(ask("local", "cargo build").await?, "accept");
+
+        // The CLI's own reservation, outbound tools and unreadable lines wait.
+        let input = json!({"command": "cargo build"});
+        let web = json!({"url": "https://example.test"});
+        let unreadable = json!({"command": "echo 'open"});
+        for (backend, tool, input, human_only) in [
+            ("reserved", "Bash", &input, true), ("web", "WebFetch", &web, false),
+            ("unreadable", "Bash", &unreadable, false),
+        ] {
+            let waiting = request(&app, Owner::new(&session, JOB, backend), tool, input, human_only, None);
+            tokio::pin!(waiting);
+            assert!(poll!(waiting.as_mut()).is_pending(), "{backend}");
+            app.hub.sweep_thread_approvals(&session)?;
+            assert!(poll!(waiting.as_mut()).is_pending(), "{backend}");
+        }
+
+        let waiting = ask("push", "git push");
+        tokio::pin!(waiting);
+        assert!(poll!(waiting.as_mut()).is_pending());
+        let (events, _) = app.hub.subscribe_client(0, true);
+        let id = events.into_iter().find_map(|env| match env.event {
+            ServerEvent::ApprovalRequested { request_id, .. } => Some(request_id),
+            _ => None,
+        }).expect("a push asks a person");
+        // Later mode changes never take the question away from the person.
+        app.hub.set_full_approval(
+            fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour },
+            &crate::remote::SettingsPrincipal::fixture(),
+        )?;
+        app.hub.sweep_thread_approvals(&session)?;
+        assert!(poll!(waiting.as_mut()).is_pending());
+        assert!(app.delegates.resolve_approval(&id, "decline", false)?);
+        assert_eq!(waiting.await?, "decline");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn changing_the_thread_to_automatic_releases_only_eligible_pending_worker_requests() -> Result<()> {
+        use fuzukue_proto::PermissionMode;
+        for (command, external, released) in [
+            ("cargo build", false, true), ("git reset --hard", false, false), ("cargo build", true, false),
+        ] {
+            let (_temp, app) = fixture(WorkerApprovalPolicy::Ask)?;
+            let session = thread_mode(&app, PermissionMode::AcceptEdits)?;
+            if external {
+                let job = app.delegates.running.lock().unwrap().remove(JOB).unwrap();
+                let mut job = Arc::try_unwrap(job).ok().expect("unshared job");
+                job.external_approval = true;
+                app.delegates.running.lock().unwrap().insert(JOB.into(), Arc::new(job));
+            }
+            let input = json!({"command": command});
+            let waiting = request(&app, Owner::new(&session, JOB, "backend"), "Bash", &input, false, None);
+            tokio::pin!(waiting);
+            assert!(poll!(waiting.as_mut()).is_pending(), "{command}");
+            app.hub.edit_threads(|threads| threads.set_partner_permission(&session, PermissionMode::BypassPermissions))?;
+            app.hub.sweep_thread_approvals(&session)?;
+            match poll!(waiting.as_mut()) {
+                Poll::Ready(decision) => assert!(released && decision? == "accept", "{command} {external}"),
+                Poll::Pending => assert!(!released, "{command} {external}"),
+            }
         }
         Ok(())
     }

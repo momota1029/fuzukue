@@ -1,5 +1,6 @@
 //! Workspace text mutations for an authenticated delegated job.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -21,13 +22,16 @@ use crate::worker_scope;
 
 use super::workspace_read::{open_no_symlinks, range::IntegerRange, worktree_relative};
 
-const FILE_LIMIT: usize = 256 * 1024;
+/// Largest file the tools read and rewrite. Large sources are edited in ranges.
+const FILE_LIMIT: usize = 4 * 1024 * 1024;
+/// Largest text in one `content`, `old` or `new` argument.
+const ARGUMENT_LIMIT: usize = 256 * 1024;
 const PATCH_LIMIT: usize = 768 * 1024;
 const RECOVERY: &str = "delegate-recovery";
 pub(super) const AUDIT_LIMIT: IntegerRange = IntegerRange::new(1, 100);
 pub(super) static COMMIT: Mutex<()> = Mutex::new(());
 
-pub(crate) const GUIDANCE: &str = "\n\nUse fuzukue fs_write, fs_edit, or fs_apply_patch for worktree edits. Avoid shell redirection, heredocs, and Python for writing files. Use a worktree-relative path or an absolute path inside your job scratch. Outside the assigned checkout and scratch, changes beyond the job's touches require approval.";
+pub(crate) const GUIDANCE: &str = "\n\nUse fuzukue fs_write, fs_edit, or fs_apply_patch for worktree edits, including large files: fs_edit and fs_apply_patch change files up to 4 MiB, and fs_write with append=true adds to the end. Missing parent directories are created, so mkdir is unnecessary. Avoid shell redirection, heredocs, sed -i, and Python or other scripts for writing files. Use a worktree-relative path or an absolute path inside your job scratch. Outside the assigned checkout and scratch, changes beyond the job's touches require approval.";
 
 #[derive(Clone, Copy)]
 pub(crate) enum Tool {
@@ -53,31 +57,31 @@ impl Tool {
 
     pub(super) fn definition(self) -> Value {
         let path = json!({"type":"string","description": harness_text!(
-            "Worktree-relative path or absolute path inside this job's scratch. The parent directory must exist. Symlinks and parent traversal are refused.",
-            "作業ツリー相対パス、またはジョブ専用一時領域内の絶対パス。親ディレクトリは既存のものを指定する。シンボリックリンクと親への遡及は禁止。"
+            "Worktree-relative path or absolute path inside this job's scratch. Missing parent directories are created. Symlinks and parent traversal are refused.",
+            "作業ツリー相対パス、またはジョブ専用一時領域内の絶対パス。足りない親ディレクトリは作成する。シンボリックリンクと親への遡及は禁止。"
         )});
-        let text = json!({"type":"string","maxLength": FILE_LIMIT});
+        let text = json!({"type":"string","maxLength": ARGUMENT_LIMIT});
         let (description, properties, required): (_, _, &[&str]) = match self {
             Self::Write => (
                 harness_text!(
-                    "Create or overwrite one UTF-8 file (256 KiB). Returns its diff and SHA-256. The current approval mode governs writes outside the job's scope.",
-                    "UTF-8 ファイル一件（256 KiB まで）を新規作成または上書きする。差分と SHA-256 を返す。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
+                    "Create or overwrite one UTF-8 file with up to 256 KiB of content, or add it to the end with append=true (resulting file up to 4 MiB; a repeated append adds the text again). Returns its diff and SHA-256. The current approval mode governs writes outside the job's scope.",
+                    "UTF-8 ファイル一件を 256 KiB までの内容で新規作成または上書きする。append=true では末尾に追加する（結果は 4 MiB まで。同じ追記をもう一度呼ぶと二重に追加する）。差分と SHA-256 を返す。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
                 ),
-                json!({"path": path, "content": text}),
+                json!({"path": path, "content": text, "append": {"type": "boolean", "default": false}}),
                 &["path", "content"],
             ),
             Self::Edit => (
                 harness_text!(
-                    "Replace one exact, unique string in a UTF-8 file (256 KiB). A unique replacement with no old match outside it is already applied. The current approval mode governs writes outside the job's scope.",
-                    "UTF-8 ファイル（256 KiB まで）内で一意に一致する文字列を置換する。置換後の文字列が一意で、その外側に置換前の一致がなければ適用済みとみなす。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
+                    "Replace one exact, unique string in a UTF-8 file (4 MiB; each string 256 KiB). A unique replacement with no old match outside it is already applied. The current approval mode governs writes outside the job's scope.",
+                    "UTF-8 ファイル（4 MiB まで。各文字列は 256 KiB まで）内で一意に一致する文字列を置換する。置換後の文字列が一意で、その外側に置換前の一致がなければ適用済みとみなす。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
                 ),
-                json!({"path": path, "old": {"type":"string","minLength":1,"maxLength":FILE_LIMIT}, "new": text}),
+                json!({"path": path, "old": {"type":"string","minLength":1,"maxLength":ARGUMENT_LIMIT}, "new": text}),
                 &["path", "old", "new"],
             ),
             Self::ApplyPatch => (
                 harness_text!(
-                    "Apply a unified text diff (768 KiB) to one UTF-8 file (256 KiB), with --- and +++ headers for path. Supports creation via /dev/null. The current approval mode governs writes outside the job's scope.",
-                    "単一の UTF-8 ファイル（256 KiB まで）に unified diff（768 KiB まで）を適用する。--- と +++ のヘッダーにパスを指定する。/dev/null からの新規作成にも対応。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
+                    "Apply a unified text diff (768 KiB) to one UTF-8 file (4 MiB), with --- and +++ headers for path. Supports creation via /dev/null. The current approval mode governs writes outside the job's scope.",
+                    "単一の UTF-8 ファイル（4 MiB まで）に unified diff（768 KiB まで）を適用する。--- と +++ のヘッダーにパスを指定する。/dev/null からの新規作成にも対応。ジョブの範囲外への書き込みには現在の承認モードが適用される。"
                 ),
                 json!({"path": path, "patch": {"type":"string","maxLength":PATCH_LIMIT}}),
                 &["path", "patch"],
@@ -99,10 +103,14 @@ impl Tool {
         let (path, operation) = match self {
             Self::Write => {
                 let args: WriteArgs = super::parse_args(args)?;
-                (args.path, Operation::Write(args.content))
+                check_argument(&args.content)?;
+                let operation = if args.append { Operation::Append } else { Operation::Write };
+                (args.path, operation(args.content))
             }
             Self::Edit => {
                 let args: EditArgs = super::parse_args(args)?;
+                check_argument(&args.old)?;
+                check_argument(&args.new)?;
                 (
                     args.path,
                     Operation::Edit {
@@ -171,6 +179,8 @@ impl Tool {
 struct WriteArgs {
     path: PathBuf,
     content: String,
+    #[serde(default)]
+    append: bool,
 }
 
 #[derive(Deserialize)]
@@ -190,6 +200,7 @@ struct PatchArgs {
 
 enum Operation {
     Write(String),
+    Append(String),
     Edit { old: String, new: String },
     Patch(String),
 }
@@ -299,6 +310,14 @@ impl Scope {
     }
 
     fn destination(&self, relative: &Path) -> Result<(File, PathBuf)> {
+        let (directory, missing, name) = self.locate(relative)?;
+        ensure!(missing.is_empty(), "The destination parent does not exist");
+        Ok((directory, name))
+    }
+
+    /// The deepest existing directory of a permitted destination, the names
+    /// still to be created below it, and the file name.
+    fn locate(&self, relative: &Path) -> Result<(File, Vec<OsString>, PathBuf)> {
         let scratch = self.scratch.as_ref().filter(|scratch| {
             relative.strip_prefix(scratch).is_ok_and(worktree_relative)
         });
@@ -309,7 +328,16 @@ impl Scope {
             !denied(&absolute) && (scratch.is_some() || !self.protected.iter().any(|path| absolute.starts_with(path))),
             "Access denied to a protected write path"
         );
-        let parent = absolute.parent().context("Missing parent directory")?;
+        let base = scratch.map_or(self.root.as_path(), |scratch| scratch.as_path());
+        let mut parent = absolute.parent().context("Missing parent directory")?;
+        let mut missing = Vec::new();
+        while parent != base
+            && matches!(fs::symlink_metadata(parent), Err(error) if error.kind() == ErrorKind::NotFound)
+        {
+            missing.push(parent.file_name().context("Missing directory name")?.to_owned());
+            parent = parent.parent().context("Missing parent directory")?;
+        }
+        missing.reverse();
         // Walk the real directory components with O_NOFOLLOW, then keep the
         // descriptor for the final entry operations. No aliases are writable.
         let directory = open_no_symlinks(parent)
@@ -320,16 +348,20 @@ impl Scope {
         );
         Ok((
             directory,
+            missing,
             relative.file_name().context("Missing file name")?.into(),
         ))
     }
 
     fn prepare(&self, path: PathBuf, operation: Operation) -> Result<Staged> {
         self.closed.check()?;
-        let (directory, name) = self.destination(&path)?;
-        let before = read(&directory, &name)?;
+        let (directory, missing, name) = self.locate(&path)?;
+        let before = if missing.is_empty() { read(&directory, &name)? } else { None };
         let after = match operation {
             Operation::Write(content) => content,
+            Operation::Append(content) => {
+                before.as_ref().map_or_else(String::new, |file| file.text.clone()) + &content
+            }
             Operation::Edit { old, new } => edit(
                 &before.as_ref().context("File does not exist")?.text,
                 &old,
@@ -350,6 +382,7 @@ impl Scope {
         Ok(Staged {
             path,
             parent: identity(&directory)?,
+            missing,
             before,
             after,
             diff,
@@ -366,11 +399,18 @@ impl Scope {
         let _lock = self.commit_guard(cancel)?;
         let content_hash = digest(staged.after.as_bytes());
         let changed = staged.changed();
-        let (directory, name) = self.destination(&staged.path)?;
+        let (mut directory, missing, name) = self.locate(&staged.path)?;
         ensure!(
-            identity(&directory)? == staged.parent && read(&directory, &name)? == staged.before,
+            identity(&directory)? == staged.parent && missing == staged.missing
+                && (!missing.is_empty() || read(&directory, &name)? == staged.before),
             "The destination changed while preparing the write. Read it again and retry."
         );
+        if changed {
+            for part in &missing {
+                cancel.check()?;
+                directory = create_directory(&directory, part)?;
+            }
+        }
         let mut audit_id = None;
         if changed {
             let record = Audit {
@@ -461,10 +501,31 @@ pub(super) fn read(parent: &File, name: &Path) -> Result<Option<Existing>> {
     }))
 }
 
+fn create_directory(parent: &File, name: &OsStr) -> Result<File> {
+    unix::mkdirat(parent, name, Mode::from_raw_mode(0o777))
+        .context("Could not create the destination parent")?;
+    let directory = unix::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("Could not open the new directory without following links")?;
+    Ok(File::from(directory))
+}
+
 fn check_text(text: &str) -> Result<()> {
     ensure!(
         text.len() <= FILE_LIMIT && !text.contains('\0'),
-        "Use UTF-8 text of at most 256 KiB without NUL bytes"
+        "Use UTF-8 text of at most 4 MiB without NUL bytes"
+    );
+    Ok(())
+}
+
+fn check_argument(text: &str) -> Result<()> {
+    ensure!(
+        text.len() <= ARGUMENT_LIMIT,
+        "Each content, old or new argument holds at most 256 KiB. Split the change into several calls or use fs_apply_patch."
     );
     Ok(())
 }
@@ -472,6 +533,8 @@ fn check_text(text: &str) -> Result<()> {
 struct Staged {
     path: PathBuf,
     parent: (u64, u64),
+    /// Directories to create below `parent`.
+    missing: Vec<OsString>,
     before: Option<Existing>,
     after: String,
     diff: String,

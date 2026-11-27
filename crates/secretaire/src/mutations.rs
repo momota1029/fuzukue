@@ -105,6 +105,10 @@ impl<'a> Mutation<'a> {
         })
     }
 
+    pub(crate) fn session(&self) -> &'a str {
+        self.session
+    }
+
     pub(crate) async fn prepare<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
         tokio::select! {
             biased;

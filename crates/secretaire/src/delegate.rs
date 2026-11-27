@@ -103,7 +103,7 @@ fn language_rule(language: &str) -> String {
 }
 
 fn worker_tests() -> &'static str {
-    "\n\nAfter changing code, run the relevant tests in the work directory you changed. Use list_tests to find the configured suites. While tests fail, keep the work open. If tests cannot run, report why and give the command."
+    "\n\nAfter changing code, run the relevant tests in the work directory you changed. Use list_tests to find the configured suites and run_tests to run them instead of a raw shell command. For an isolated copy, pass dir, and pass target_dir and tmp_dir for a private build directory. Use the shell only when no suite covers the check. While tests fail, keep the work open. If tests cannot run, report why and give the command."
 }
 fn worker_prompt() -> &'static str {
     "\n\nIf you need more conversation context to do the work, ask the front desk with ask_front_desk."
@@ -118,6 +118,7 @@ pub(crate) async fn hold_all_slots(app: &App) -> admission::Hold {
 struct RunningJob {
     session: String,
     external_approval: bool,
+    external_message: Arc<std::sync::atomic::AtomicBool>,
     key: String,
     approach: String,
     summary: Mutex<Option<String>>,
@@ -192,6 +193,10 @@ pub(crate) struct JobInput {
 impl JobInput {
     pub(crate) fn external_approval(&self) -> bool {
         self.job.external_approval
+    }
+    /// Set once a turn with outside input sends this job a message.
+    pub(crate) fn external_message(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.job.external_message.clone()
     }
     pub fn cancellation(&self) -> Arc<Cancellation> {
         self.attempt_cancel.clone()
@@ -474,9 +479,17 @@ impl Workers {
         scope.context("Worker workspace read scope is unavailable")
     }
 
+    /// A message from a turn that read outside input leaves the rest of the job's
+    /// requests to a person.
+    fn receive_external_input(&self, id: &str) {
+        if let Some(job) = self.running.lock().unwrap().get(id) {
+            job.external_message.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     pub(crate) fn worker_approval_trusted(&self, session: &str, id: &str) -> bool {
-        self.running.lock().unwrap().get(id)
-            .is_none_or(|job| job.session == session && !job.external_approval)
+        self.running.lock().unwrap().get(id).is_none_or(|job| job.session == session && !job.external_approval
+            && !job.external_message.load(std::sync::atomic::Ordering::Acquire))
     }
 
     pub(crate) fn workspace_write_scope(&self, session: &str, id: &str) -> Result<(Arc<crate::mcp::workspace_write::Scope>, Arc<Cancellation>)> {
@@ -834,7 +847,7 @@ async fn launch_assignment(
         }));
     }
     if worktree.is_some() {
-        tools.retain(|tool| matches!(tool.as_str(), "escalate" | crate::capture::LIST | crate::capture::CAPTURE)
+        tools.retain(|tool| matches!(tool.as_str(), "escalate" | "list_tests" | "run_tests" | crate::capture::LIST | crate::capture::CAPTURE)
             || tool == crate::mcp::workspace_read::git_read::NAME
             || tool == crate::mcp::git_write::NAME
             || crate::mcp::workspace_read::Tool::named(tool).is_some()
@@ -853,6 +866,7 @@ async fn launch_assignment(
     let control = Arc::new(RunningJob {
         session: session.into(), key: key.clone(), tools: Mutex::new(tools.clone()),
         external_approval: !crate::mcp::exec::trusted_session(app, session),
+        external_message: Default::default(),
         approach: prompt.chars().take(1600).collect(), summary: Mutex::default(), retry: Mutex::default(),
         input: Mutex::new((!blind).then(|| tx.clone())), cancel: Arc::default(),
         started: false.into(), drain_notice: Default::default(),
@@ -1052,7 +1066,8 @@ async fn launch_assignment(
             let execution = if crate::canary() {
                 None
             } else {
-                crate::worker_execution::settings(&app)?.lock().unwrap().effective(lease.is_some()).map(|mut policy| {
+                let hands_off = lease.is_some() || !input.job.external_approval && app.automatic_thread(&session);
+                crate::worker_execution::settings(&app)?.lock().unwrap().effective(hands_off).map(|mut policy| {
                     if input.job.external_approval {
                         policy.approval = crate::worker_execution::Approval::Ask;
                     }
@@ -1060,6 +1075,7 @@ async fn launch_assignment(
                 })
             };
             let read_only = execution.is_some_and(|policy| policy.sandbox == crate::worker_execution::Sandbox::ReadOnly);
+            let hands_off = execution.is_some_and(|policy| policy.full);
             let tools = if read_only { crate::mcp::read_only_worker_tools(tools) } else { tools };
             let mut tools = tools;
             let exec_allowed = exec_trusted && execution.is_some_and(|policy| {
@@ -1067,6 +1083,10 @@ async fn launch_assignment(
             });
             if !exec_allowed {
                 tools.retain(|tool| tool != crate::mcp::exec::NAME);
+            }
+            // The server runs tests outside a configured worker sandbox.
+            if execution.is_some_and(|policy| policy.sandbox != crate::worker_execution::Sandbox::FullAccess) {
+                tools.retain(|tool| tool != "run_tests");
             }
             *input.job.tools.lock().unwrap() = tools.clone();
             let cwd = worktree.as_deref().unwrap_or(&app.project_dir);
@@ -1311,7 +1331,7 @@ async fn launch_assignment(
                 if let Some(scope) = write_scope {
                     scope.close();
                 }
-                if lease.is_some() {
+                if hands_off {
                     (before.changes(&Files::read(&checkout)), quarantine::Review::default())
                 } else {
                     before.review(&checkout, &recovery, &writes_to_check)
@@ -1462,6 +1482,9 @@ pub fn message_worker(app: &App, caller_session: &str, job: &str, text: &str, ex
     if !exec_trusted || session != caller_session {
         app.delegates.revoke_exec(&job);
     }
+    if !crate::mcp::exec::trusted_session(app, caller_session) {
+        app.delegates.receive_external_input(&job);
+    }
     app.delegates.steer(app, &session, &job, text, ServerEvent::TextDelta {
         session: session.clone(), item: format!("{job}:desk:{}", mail::session_key()), actor: Actor::System,
         text: format!("**受付からの指示**\n\n{text}"),
@@ -1512,6 +1535,9 @@ pub fn answer(app: &App, session: &str, id: &str, text: String, exec_trusted: bo
     drop(questions);
     if !exec_trusted {
         app.delegates.revoke_exec(&question.job);
+    }
+    if !crate::mcp::exec::trusted_session(app, session) {
+        app.delegates.receive_external_input(&question.job);
     }
     question.reply.send(text.clone()).map_err(|_| anyhow::anyhow!("受付への質問は終了した"))?;
     desk_message(app, session, &question.job, "受付からの回答", &text);
@@ -2531,7 +2557,8 @@ pub async fn run_legacy_codex(
         let execution = if crate::canary() {
             None
         } else {
-            crate::worker_execution::settings(&app)?.lock().unwrap().effective(lease.is_some())
+            let hands_off = lease.is_some() || app.automatic_thread(&session) && crate::mcp::exec::trusted_session(&app, &session);
+            crate::worker_execution::settings(&app)?.lock().unwrap().effective(hands_off)
         };
         let launch = execution.map(|execution| -> Result<_> {
             let scratch = tempfile::Builder::new().prefix("worker-").tempdir_in(&app.state_dir)?;
@@ -2550,7 +2577,7 @@ pub async fn run_legacy_codex(
         let history = app.history.turn(&app.project_dir, "agent:codex".into(), &session, parent).await;
         let before_project = app.project_dir.clone();
         let before = tokio::task::spawn_blocking(move || Files::read(&before_project)).await;
-        let full = lease.is_some();
+        let full = execution.is_some_and(|policy| policy.full);
         let result = tokio::select! {
             biased;
             _ = crate::full_approval::wait_for_end(lease) => {
@@ -2761,7 +2788,7 @@ pub(crate) async fn request_shell_approval(
 ) -> Result<Option<serde_json::Value>> {
     let protected = crate::worker_scope::protected_roots(&app.state_dir);
     let shell = crate::worker_scope::shell::check(scope, &input, &protected);
-    let (summary, candidate) = if let Some(approved) = shell {
+    let (mut summary, candidate) = if let Some(approved) = shell {
         let candidate = ShellApproval { scope: scope.clone(), input: input.clone(), prefix: approved.prefix };
         (format!("Bash: {}", approved.command), Some(candidate))
     } else {
@@ -2769,8 +2796,12 @@ pub(crate) async fn request_shell_approval(
     };
     let mut full = crate::full_approval::worker_registration(session, job, "claude", "Bash", backend_id, &input);
     full.tool_item = item.map(|id| crate::full_approval::worker_tool_item(job, "claude", id));
-    if !app.delegates.worker_approval_trusted(session, job) {
-        full.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
+    let guarded = app.hub.guarded("Bash", &input);
+    if !app.delegates.worker_approval_trusted(session, job) || guarded.is_some() {
+        crate::full_approval::require_person(&mut full);
+    }
+    if guarded.is_some_and(|reason| reason.may_push()) {
+        summary.push_str(&crate::privacy_findings::push_note(&app.project_dir, &app.state_dir).await);
     }
     let (_wait, reply) = open_approval_with(app, session, job, Actor::Claude, summary.into(),
         Some(approval::Owner::new(session, job, backend_id)), None, candidate, Some(full))?;
@@ -3069,6 +3100,7 @@ async fn mcp_review_findings_respect_authenticated_worker_access() -> Result<()>
         Arc::new(RunningJob {
             session: session.into(),
             external_approval: false,
+            external_message: Default::default(),
             key: key.into(),
             tools: tools.into(),
             approach: Default::default(),
@@ -3184,6 +3216,7 @@ async fn mcp_reading_tools_respect_authenticated_worker_access() -> Result<()> {
         Arc::new(RunningJob {
             session: session.into(),
             external_approval: false,
+            external_message: Default::default(),
             key: key.into(),
             tools: tools.into(),
             approach: Default::default(),

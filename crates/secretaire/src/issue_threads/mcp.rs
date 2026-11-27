@@ -340,26 +340,9 @@ async fn approve(
     confirm: bool,
     summary: LocalizedMessage,
 ) -> Result<()> {
-    let tool = match summary.key.as_str() {
-        "github-approve-labels" => Some("github_label"),
-        "github-approve-close" => Some("github_issue_close"),
-        _ => None,
-    };
-    let full = tool.filter(|_| crate::mcp::exec::trusted_session(app, session)).map(|tool| {
-        let args = serde_json::json!(summary.args);
-        crate::full_approval::desk_registration(session, "mcp", tool, &crate::mail::session_key(), &args)
-    });
-    if !confirm {
-        // Full mode authorizes this call without an explicit confirmation.
-        if let Some(full) = full {
-            if crate::full_approval::authorize(&app.hub, full)? {
-                return Ok(());
-            }
-        }
-        anyhow::bail!("Ask the user first, then set confirm=true");
-    }
-    let decision =
-        crate::delegate::request_approval_with_full(app, session, APPROVAL, actor, summary, full).await?;
+    // A write to GitHub waits for a person in every approval mode.
+    ensure!(confirm, "Ask the user first, then set confirm=true");
+    let decision = crate::delegate::request_approval(app, session, APPROVAL, actor, summary).await?;
     ensure!(decision == "accept", "The user declined the GitHub change");
     Ok(())
 }

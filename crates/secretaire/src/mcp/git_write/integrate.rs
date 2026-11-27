@@ -43,7 +43,7 @@ pub(in crate::mcp) fn definition() -> Value {
                 "allow_paths": {"type": "array", "maxItems": MAX_PATHS,
                     "items": {"type": "string", "minLength": 1, "maxLength": 4096}},
                 "override_privacy": {"type": "boolean", "default": false,
-                    "description": "Proceed with privacy findings only after explicit user approval. When approval is needed the call returns status pending with an approval_id at once. The result arrives later as a new message. Continue other work meanwhile."}
+                    "description": "Proceed with privacy findings only after explicit user approval. Hands-off turns need no flag: they commit, record the flagged locations and list them when a push asks the user. When approval is needed the call returns status pending with an approval_id at once. The result arrives later as a new message. Continue other work meanwhile."}
             },
             "required": ["patch", "message"],
             "additionalProperties": false
@@ -1008,7 +1008,8 @@ pub(crate) async fn execute_snapshot(
         "Against the current HEAD the patch has privacy findings that were not shown for approval. Nothing was changed."
     );
     let progress = Progress::default();
-    let committed = commit(app, mutation, &root, &prepared, snapshot.restore_worktree, claim, &progress).await;
+    let session = mutation.session();
+    let committed = commit(app, session, mutation, &root, &prepared, snapshot.restore_worktree, claim, &progress, None).await;
     let mut result = match committed {
         Ok(result) => result,
         Err(error) if mutation.wrote() => {
@@ -1030,9 +1031,11 @@ pub(crate) async fn execute_snapshot(
     Ok(Execution::Completed(result))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit(
-    app: &Workspace, mutation: &Mutation<'_>, root: &Path, prepared: &Prepared, restore_worktree: bool,
+    app: &Workspace, session: &str, mutation: &Mutation<'_>, root: &Path, prepared: &Prepared, restore_worktree: bool,
     claim: impl FnOnce() -> Result<()>, progress: &Progress,
+    reserved: Option<&crate::privacy_findings::Reservation>,
 ) -> Result<Value> {
     // Staging can be cancelled without leaving anything to review.
     let staged = mutation
@@ -1051,6 +1054,9 @@ async fn commit(
                     let claim = || {
                         claim()?;
                         mutation.begin_write();
+                        if let Some(reserved) = reserved {
+                            reserved.publishing();
+                        }
                         Ok(())
                     };
                     let commit = prepared.publish(staged, claim, progress).await?;
@@ -1064,10 +1070,28 @@ async fn commit(
     app.git_changed();
     let (commit, restore) = local?;
     let paths = prepared.changes.iter().map(|change| &change.path).collect::<Vec<_>>();
-    Ok(json!({
+    let mut result = json!({
         "commit_sha": commit, "paths": paths, "restore": restore,
         "push": {"status": "disabled"}
-    }))
+    });
+    let findings = &prepared.findings;
+    if findings.count != 0 {
+        // The commit exists, so a failed record is reported beside it.
+        let recorded = crate::privacy_findings::record(
+            app, session, result["commit_sha"].as_str().unwrap_or_default(), findings.count, &findings.locations,
+            reserved,
+        );
+        // A reservation keeps the locations listed when naming the commit fails.
+        result["privacy_findings"] = json!({
+            "count": findings.count, "locations": findings.locations,
+            "truncated": findings.count > findings.locations.len(),
+            "recorded": recorded.is_ok() || reserved.is_some(),
+        });
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "could not record privacy findings");
+        }
+    }
+    Ok(result)
 }
 
 pub(in crate::mcp) async fn call(
@@ -1094,19 +1118,36 @@ pub(in crate::mcp) async fn call(
 
     drop(mutation);
     let findings = &prepared.findings;
-    if findings.count != 0 && !args.override_privacy {
-        return Ok(data_result(
-            json!({"error": {
-                "code": "privacy_refused",
-                "message": "Possible private data in added lines. Review these locations before requesting an explicit override.",
-                "locations": findings.locations,
-                "count": findings.count,
-                "truncated": findings.count > findings.locations.len()
-            }}),
-            true,
-        ));
+    // A hands-off turn commits locally and records the locations for the push
+    // question. Locations that cannot be saved are put to a person instead.
+    let mut args = args;
+    let mut hands_off = trusted && app.hands_off(session);
+    let mut reserved = None;
+    let mut unrecordable = false;
+    if hands_off && findings.count != 0 {
+        match crate::privacy_findings::reserve(&app.state_dir, findings.count, &findings.locations) {
+            Ok(reservation) => reserved = Some(reservation),
+            Err(error) => {
+                tracing::warn!(%error, "could not record privacy findings, so the patch waits for a person");
+                (hands_off, unrecordable, args.override_privacy) = (false, true, true);
+            }
+        }
     }
-    let full = (trusted && !args.override_privacy)
+    let refused = || data_result(
+        json!({"error": {
+            "code": "privacy_refused",
+            "message": "Possible private data in added lines. Review these locations before requesting an explicit override.",
+            "locations": findings.locations,
+            "count": findings.count,
+            "truncated": findings.count > findings.locations.len()
+        }}),
+        true,
+    );
+    let flagged = findings.count != 0 && !args.override_privacy;
+    if flagged && !hands_off {
+        return Ok(refused());
+    }
+    let full = (trusted && (hands_off || !args.override_privacy))
             .then(|| crate::full_approval::desk_registration(
                 session,
                 "mcp",
@@ -1119,19 +1160,26 @@ pub(in crate::mcp) async fn call(
                     "message": crate::full_approval::fingerprint(&json!(prepared.message)),
                 }),
             ));
-    if args.override_privacy || local_approval.is_some() {
-        local_approval.context("Privacy override requires front desk approval")?;
+    if args.override_privacy || local_approval.is_some() || flagged {
+        ensure!(local_approval.is_some() || hands_off || unrecordable, "Privacy override requires front desk approval");
         let automatic = match full {
             Some(full) => app.hub.authorize_full_approval(full)?,
             None => FullAuthorization::Human,
         };
         match automatic {
-            FullAuthorization::Granted => recheck.await?,
+            FullAuthorization::Granted => {
+                if local_approval.is_some() {
+                    recheck.await?;
+                }
+            }
             FullAuthorization::AlreadyConsumed => return Ok(failure(
                 "approval_failed",
                 "This full approval was already consumed. Check the original operation before retrying.",
             )),
+            // The mode changed while the patch was checked.
+            FullAuthorization::Human if flagged => return Ok(refused()),
             FullAuthorization::Human => {
+                ensure!(local_approval.is_some() || unrecordable, "Privacy override requires front desk approval");
                 // Bind the checked bytes and return at once. The user decides without a deadline.
                 let snapshot = Snapshot::new(&root, &args, &prepared)?;
                 let request = crate::deferred_approvals::Request {
@@ -1148,7 +1196,8 @@ pub(in crate::mcp) async fn call(
     }
 
     let mutation = Mutation::new(app, session, "Git patch integration".into())?;
-    let committed = commit(app, &mutation, &root, &prepared, args.restore_worktree, || Ok(()), &Progress::default()).await;
+    let committed = commit(app, session, &mutation, &root, &prepared, args.restore_worktree, || Ok(()), &Progress::default(),
+        reserved.as_ref()).await;
     drop(mutation);
     let mut result = match committed {
         Ok(result) => result,

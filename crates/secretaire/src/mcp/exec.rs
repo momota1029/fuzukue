@@ -38,8 +38,8 @@ pub(super) fn definition() -> Value {
     json!({
         "name": NAME,
         "description": harness_text!(
-            "Run a Bash command with closed stdin in a user-initiated turn or its trusted worker assignment while workspace full approval is active. Long stdout and stderr include a workspace-relative path and bounded head/tail. The command runs in the host environment with the server's OS permissions.",
-            "完全承認モード中に、利用者が開始したターンまたはそのターンから依頼された作業役で Bash を実行する。標準入力は閉じる。長い標準出力と標準エラーには先頭・末尾と、ワークスペース相対の保存先を付ける。コマンドはサーバーと同じ OS ユーザーの権限で動く。"
+            "Run a Bash command with closed stdin in a user-initiated turn or its trusted worker assignment while the thread is fully automatic or workspace full approval is active. Pushes, external writes, history-destroying Git, administrator and credential commands wait for the user. Long stdout and stderr include a workspace-relative path and bounded head/tail. The command runs in the host environment with the server's OS permissions.",
+            "スレッドが「すべて自動」または完全承認モードの間、利用者が開始したターンまたはそのターンから依頼された作業役で Bash を実行する。プッシュ、外部への書き込み、履歴を失う Git 操作、管理者権限、認証情報を扱うコマンドは利用者の判断を待つ。標準入力は閉じる。長い標準出力と標準エラーには先頭・末尾と、ワークスペース相対の保存先を付ける。コマンドはサーバーと同じ OS ユーザーの権限で動く。"
         ),
         "inputSchema": {
             "type": "object",
@@ -62,12 +62,10 @@ type Lease = (FullApprovalMode, watch::Receiver<()>);
 pub(super) fn lease(app: &Workspace, session: &str, front_desk: bool) -> Result<Option<Lease>> {
     ensure!(!crate::canary(), "{FULL_REQUIRED}");
     ensure!(trusted_session(app, session), "{TRUST_REQUIRED}");
-    if front_desk {
-        match app.chat_settings(session).permission_mode {
-            fuzukue_proto::PermissionMode::BypassPermissions => return Ok(None),
-            fuzukue_proto::PermissionMode::Default | fuzukue_proto::PermissionMode::Plan => bail!("{FULL_REQUIRED}"),
-            fuzukue_proto::PermissionMode::AcceptEdits => {}
-        }
+    match app.chat_settings(session).permission_mode {
+        fuzukue_proto::PermissionMode::BypassPermissions => return Ok(None),
+        fuzukue_proto::PermissionMode::Default | fuzukue_proto::PermissionMode::Plan if front_desk => bail!("{FULL_REQUIRED}"),
+        _ => {}
     }
     Ok(Some(app.hub.full_approval_lease()?.context(FULL_REQUIRED)?))
 }
@@ -434,7 +432,19 @@ pub(super) async fn call(
     );
     registration.thread_auto = caller.worker.is_none();
     ensure!(lease.as_ref().is_none_or(|(_, changes)| !changes.has_changed().unwrap_or(true)), "{FULL_REQUIRED}");
-    if !crate::full_approval::authorize(&app.hub, registration)? {
+    if let Some(reason) = app.hub.guarded(NAME, &json!({"command": args.command})) {
+        let mut summary = format!("exec ({}): {}", reason.describe(), args.command);
+        if reason.may_push() {
+            summary.push_str(&crate::privacy_findings::push_note(&app.project_dir, &app.state_dir).await);
+        }
+        let decision = tokio::select! {
+            biased;
+            _ = caller.cancelled() => return Err(crate::cancellation::Cancelled.into()),
+            decision = crate::delegate::request_approval(app, session, "exec-guard", fuzukue_proto::Actor::System, summary) => decision?,
+        };
+        ensure!(decision == "accept", "The user declined this command");
+        ensure!(lease.as_ref().is_none_or(|(_, changes)| !changes.has_changed().unwrap_or(true)), "{FULL_REQUIRED}");
+    } else if !crate::full_approval::authorize(&app.hub, registration)? {
         bail!("{FULL_REQUIRED}");
     }
     let start = Instant::now();

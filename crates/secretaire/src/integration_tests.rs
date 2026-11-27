@@ -2070,8 +2070,8 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("open_paper", &[("deck", "string"), ("card", "string")], &["deck"]),
         ("open_file", &[("path", "string"), ("line", "integer"), ("end_line", "integer")], &["path"]),
         ("detach_thread", &[("deck", "string")], &["deck"]),
-        ("list_tests", &[], &[]),
-        ("run_tests", &[("suite", "string"), ("filter", "string")], &[]),
+        ("list_tests", &[("dir", "string")], &[]),
+        ("run_tests", &[("suite", "string"), ("filter", "string"), ("dir", "string"), ("target_dir", "string"), ("tmp_dir", "string")], &[]),
         ("self_update", &[("action", "string"), ("confirm", "boolean"), ("turn_proof", "string"), ("verbose", "boolean"), ("notify", "boolean")], &["action"]),
         ("watch", &[("action", "string"), ("id", "string"), ("name", "string"), ("repo", "string"),
             ("remote", "string"), ("kind", "string"), ("interval", "integer"), ("wake", "string"),
@@ -4805,6 +4805,82 @@ sys.stdin.readline()
         assert_eq!(fs::read_to_string(project.path().join("front-desk-finished"))?, "ok");
         Ok::<_, anyhow::Error>(())
     }).await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn front_desk_hands_off_asks_only_for_guarded_requests_and_redirects_unverified_reads() -> Result<()> {
+    use fuzukue_proto::{ChatSettings, PermissionMode};
+    use std::os::unix::fs::PermissionsExt;
+
+    for (mode, script, cards) in [
+        (PermissionMode::BypassPermissions, r#"
+ask("WebFetch", {"url": "https://example.test"}, "deny")
+ask("Bash", {"command": "cargo build && git commit -m x"}, "allow")
+ask("Bash", {"command": "git push"}, "deny")
+ask("Monitor", {"command": "tail -f log"}, "allow")
+ask("Monitor", {"command": "true # it's\ngit push"}, "deny")
+ask("SendMessage", {"to": "x", "message": "y"}, "deny")
+ask("mcp__outside__send", {"text": "x"}, "deny")
+"#, vec!["WebFetch:", "Bash: git push", "git push", "SendMessage:", "mcp__outside__send"]),
+        (PermissionMode::Default, r#"
+for _ in range(2):
+    assert "fs_search" in ask("Bash", {"command": "rg -n 'a|b' . ; rg c ."}, "deny")
+ask("Bash", {"command": "rg -n 'a|b' . ; rg c ."}, "deny")
+ask("Bash", {"command": "rg -n x . > out"}, "deny")
+"#, vec!["rg -n 'a|b' . ; rg c .", "rg -n x . > out"]),
+    ] {
+        let project = TempProject::new()?;
+        let state = tempfile::tempdir()?;
+        let launcher = project.path().join("claude-fixture");
+        fs::write(&launcher, format!(r#"#!/usr/bin/python3
+import json, sys
+json.loads(sys.stdin.readline())
+count = 0
+def ask(tool, input, expected):
+    global count
+    count += 1
+    print(json.dumps({{"type":"control_request","request_id":f"backend-{{count}}","request":{{
+        "subtype":"can_use_tool","tool_name":tool,"input":input}}}}), flush=True)
+    response = json.loads(sys.stdin.readline())["response"]["response"]
+    assert response["behavior"] == expected, (tool, input, response)
+    return response.get("message", "")
+{script}
+print(json.dumps({{"type":"result","is_error":False}}), flush=True)
+sys.stdin.readline()
+"#))?;
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700))?;
+        let mut app = Workspace::new(project.path().into(), String::new(), state.path().into(),
+            Arc::new(Hub::with_timeline(state.path())));
+        app.claude_program = Some(launcher);
+        let app = Arc::new(app);
+        let id = app.hub.edit_threads(|threads| threads.create(None))?;
+        let settings = ChatSettings { permission_mode: mode, ..Default::default() };
+        app.hub.edit_threads(|store| store.set_roles(&id, Some(settings.clone()), None))?;
+        let session = crate::ClaudeSession::spawn(id.clone(), project.path().into(), "http://127.0.0.1:1",
+            None, None, settings, Box::new(|_| {}), &app).await?;
+        app.sessions.lock().await.insert(id, session.clone());
+        let (_, mut events) = app.hub.subscribe(u64::MAX);
+        session.prompt("Check which requests ask.").await?;
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut seen = Vec::new();
+            loop {
+                match events.recv().await?.event {
+                    ServerEvent::ApprovalRequested { request_id, summary, .. } => {
+                        seen.push(summary);
+                        handle(&app, ClientMsg::Resolve { request_id, decision: "decline".into() }).await?;
+                    }
+                    ServerEvent::TurnEnded { .. } => return anyhow::Ok(seen),
+                    _ => {}
+                }
+            }
+        }).await??;
+        assert_eq!(seen.len(), cards.len(), "{seen:?}");
+        for (summary, expected) in seen.iter().zip(cards) {
+            assert!(summary.contains(expected), "{summary}");
+        }
+    }
     Ok(())
 }
 

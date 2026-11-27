@@ -34,6 +34,10 @@ struct ThreadInfo {
     read_only: bool,
     worker_execution: Option<crate::worker_execution::Policy>,
     worker_external_approval: bool,
+    worker_external_message: Arc<std::sync::atomic::AtomicBool>,
+    cwd: Option<String>,
+    /// The paths of patches in progress, by item. Approval requests omit them.
+    file_changes: HashMap<String, Value>,
     current_turn: Option<String>,
     exec: Option<(String, Arc<crate::cancellation::Cancellation>)>,
     trusted_approval_turn: bool,
@@ -550,6 +554,7 @@ impl Codex {
         ).await?;
         if let Some(thread) = self.threads.lock().unwrap().get_mut(&thread) {
             thread.worker_external_approval = steering.external_approval();
+            thread.worker_external_message = steering.external_message();
         }
         let observed = self.threads.lock().unwrap().get(&thread).map(|thread| RunMetadata {
             model: thread.observed.model.clone(),
@@ -760,9 +765,10 @@ impl Codex {
             use crate::worker_execution::Approval;
             // bubblewrap, when selected, already constrains the app-server and its subprocesses.
             params["sandbox"] = json!("danger-full-access");
+            // Hands-off work asks the server, which answers unless a person is needed.
             params["approvalPolicy"] = json!(match policy.approval {
-                Approval::Ask | Approval::Auto => "untrusted",
-                Approval::Never => "never",
+                Approval::Never if !policy.full => "never",
+                _ => "untrusted",
             });
             params["config"]["features"] = json!({
                 "hooks": false, "plugins": false, "multi_agent": false, "multi_agent_v2": false,
@@ -856,7 +862,7 @@ impl Codex {
             bail!("Codex did not activate the worker filesystem permissions profile");
         }
         if let Some(policy) = execution {
-            let expected = if policy.approval == crate::worker_execution::Approval::Never { "never" } else { "untrusted" };
+            let expected = if policy.approval == crate::worker_execution::Approval::Never && !policy.full { "never" } else { "untrusted" };
             if r["sandbox"]["type"] != "dangerFullAccess" || r["approvalPolicy"] != expected {
                 if let Some(thread) = r["thread"]["id"].as_str() {
                     self.close_worker(thread).await;
@@ -894,6 +900,9 @@ impl Codex {
                 read_only,
                 worker_execution: None,
                 worker_external_approval: false,
+                worker_external_message: Default::default(),
+                cwd: r["cwd"].as_str().map(str::to_owned),
+                file_changes: Default::default(),
                 current_turn: None,
                 exec: None,
                 trusted_approval_turn: false,
@@ -1259,6 +1268,23 @@ impl Codex {
         }
     }
 
+    /// The request as the guard reads it, with the paths a patch changes.
+    fn guard_input(&self, thread_id: &str, method: &str, params: &Value) -> Value {
+        let mut input = params.clone();
+        if method != "item/fileChange/requestApproval" {
+            return input;
+        }
+        let threads = self.threads.lock().unwrap();
+        let Some((thread, object)) = threads.get(thread_id).zip(input.as_object_mut()) else { return input };
+        if let Some(changes) = params["itemId"].as_str().and_then(|item| thread.file_changes.get(item)) {
+            object.insert("changes".into(), changes.clone());
+        }
+        if let Some(cwd) = &thread.cwd {
+            object.entry("cwd").or_insert_with(|| json!(cwd));
+        }
+        input
+    }
+
     async fn on_server_request(self: &Arc<Self>, method: &str, id: Value, p: &Value) {
         let thread_id = p["threadId"].as_str().unwrap_or("");
         if method == "item/tool/requestUserInput" {
@@ -1269,7 +1295,13 @@ impl Codex {
         if matches!(thread, Some((_, _, true))) {
             tracing::debug!(thread_id, method, params = %p, "Codex reviewer request");
         }
-        let reason = p["reason"].as_str().map(|reason| format!(" · {reason}")).unwrap_or_default();
+        let mut reason = p["reason"].as_str().map(|reason| format!(" · {reason}")).unwrap_or_default();
+        let guarded = self.hub.guarded(method, &self.guard_input(thread_id, method, p));
+        if method == "item/commandExecution/requestApproval" && guarded.is_some_and(|reason| reason.may_push()) {
+            if let Some(state) = self.hub.state_dir() {
+                reason.push_str(&crate::privacy_findings::push_note(&self.project_dir, &state).await);
+            }
+        }
         let permissions = (method == "item/permissions/requestApproval" && matches!(&thread, Some((_, _, false))))
             .then(|| p["permissions"].clone());
         let summary = match method {
@@ -1298,13 +1330,14 @@ impl Codex {
         let mut full = None;
         if let (Some(_), Some((session, Actor::Codex { parent_tool_use: Some(job), .. }, false))) = (&summary, &thread) {
             let (execution, external) = self.threads.lock().unwrap().get(thread_id)
-                .map(|thread| (thread.worker_execution, thread.worker_external_approval))
+                .map(|thread| (thread.worker_execution, thread.worker_external_approval
+                    || thread.worker_external_message.load(Ordering::Acquire)))
                 .unwrap_or_default();
             let request = format!("{thread_id}:{id}");
             let mut registration = crate::full_approval::worker_registration(session, job, "codex", method, &request, p);
             registration.tool_item = p["itemId"].as_str().map(str::to_owned);
-            if external {
-                registration.unattended = fuzukue_proto::ApprovalUnattended::NeverUnattended;
+            if external || guarded.is_some() {
+                crate::full_approval::require_person(&mut registration);
             }
             let decision = self.hub.authorize_full_approval(registration.clone());
             full = Some(registration);
@@ -1328,7 +1361,7 @@ impl Codex {
         if let (Some(_), Some((session, Actor::Codex { parent_tool_use: None, .. }, false))) = (&summary, &thread) {
             let trusted = self.threads.lock().unwrap().get(thread_id)
                 .is_some_and(|thread| thread.partner.is_some() && thread.trusted_approval_turn);
-            if trusted && !self.hub.external_approval_input(session) {
+            if trusted && !self.hub.external_approval_input(session) && guarded.is_none() {
                 let mut registration = crate::full_approval::desk_registration(session, "codex", method, &format!("{thread_id}:{id}"), p);
                 registration.tool_item = p["itemId"].as_str().map(str::to_owned);
                 full = Some(registration);
@@ -1465,15 +1498,27 @@ impl Codex {
         }
         let item = &p["item"];
         let item_id = item["id"].as_str().unwrap_or("").to_string();
+        if item["type"] == "fileChange" && !item_id.is_empty() {
+            if let Some(thread) = self.threads.lock().unwrap().get_mut(thread_id) {
+                match method {
+                    "item/completed" => thread.file_changes.remove(&item_id),
+                    _ => thread.file_changes.insert(item_id.clone(), item["changes"].clone()),
+                };
+            }
+        }
         if method == "item/started" && !item_id.is_empty() {
-            let native = match item["type"].as_str() {
-                Some("commandExecution") => Some("exec"),
-                Some("fileChange") => Some("apply_patch"),
-                _ => None,
+            let (native, tool) = match item["type"].as_str() {
+                Some("commandExecution") => (Some("exec"), Some("item/commandExecution/requestApproval")),
+                Some("fileChange") => (Some("apply_patch"), Some("item/fileChange/requestApproval")),
+                _ => (None, None),
             };
+            let guarded = tool.is_some_and(|tool| {
+                self.hub.guarded(tool, &self.guard_input(thread_id, tool, item)).is_some()
+            });
             let full = self.threads.lock().unwrap().get(thread_id)
                 .is_some_and(|thread| thread.worker_execution.is_some_and(|policy| policy.full));
-            if full {
+            // An operation that needs a person is recorded by that decision alone.
+            if full && !guarded {
                 if let (Some(tool), Actor::Codex { parent_tool_use: Some(job), .. }) = (native, &actor) {
                     crate::full_approval::observe_worker_tool(&self.hub, &session, job, "codex", tool, &item_id);
                 }
@@ -1481,12 +1526,7 @@ impl Codex {
             if !read_only && matches!(&actor, Actor::Codex { parent_tool_use: None, .. }) {
                 let trusted = self.threads.lock().unwrap().get(thread_id)
                     .is_some_and(|thread| thread.partner.is_some() && thread.trusted_approval_turn);
-                let tool = match item["type"].as_str() {
-                    Some("commandExecution") => Some("item/commandExecution/requestApproval"),
-                    Some("fileChange") => Some("item/fileChange/requestApproval"),
-                    _ => None,
-                };
-                if let Some(tool) = tool.filter(|_| trusted && !self.hub.external_approval_input(&session)) {
+                if let Some(tool) = tool.filter(|_| trusted && !guarded && !self.hub.external_approval_input(&session)) {
                     let mut request = crate::full_approval::desk_registration(&session, "codex", tool, &item_id, item);
                     request.tool_item = Some(item_id.clone());
                     if let Err(error) = self.hub.authorize_full_approval(request) {
@@ -1938,8 +1978,28 @@ mod tests {
         assert!(matches!(events.try_recv()?.event, ServerEvent::ApprovalResolved {
             request_id: id, decision, automatic: true,
         } if id == request_id && decision == "accept"));
-        codex.on_server_request("item/fileChange/requestApproval", json!(1001), &command).await;
-        assert!(events.try_recv().is_err());
+        let patch = |item: &str, path: &str| {
+            codex.on_notification("item/started", &json!({"threadId": thread, "item": {
+                "id": item, "type": "fileChange", "changes": [{"path": path}],
+            }}));
+            json!({"threadId": thread, "itemId": item})
+        };
+        let file_change = "item/fileChange/requestApproval";
+        let ordinary = patch("patch-ordinary", "/work/project/example.txt");
+        codex.on_server_request(file_change, json!(1001), &ordinary).await;
+        assert!(requested(&mut events).is_none());
+        // Protected paths, and patches whose paths are unknown, ask a person.
+        let unknown = json!({"threadId": thread, "itemId": "patch-unknown"});
+        for (id, request) in [(1010, patch("patch-key", "/home/someone/.ssh/config")),
+            (1011, patch("patch-hook", "/work/project/.git/hooks/pre-commit")), (1012, unknown)]
+        {
+            codex.on_server_request(file_change, json!(id), &request).await;
+            let Some(request_id) = requested(&mut events) else {
+                bail!("{request} must ask a person");
+            };
+            assert!(codex.resolve(&request_id, "decline", false).await?);
+        }
+        while events.try_recv().is_ok() {}
         for (id, mode) in [(1002, PermissionMode::Default), (1005, PermissionMode::Plan)] {
             hub.edit_threads(|store| store.set_partner_permission(&session, mode))?;
             codex.on_server_request(shell, json!(id), &command).await;
@@ -1961,7 +2021,8 @@ mod tests {
         assert!(events.try_recv().is_err());
         assert!(codex.resolve(&request_id, "decline", false).await?);
         let audit = hub.full_approval_settings(None)?.audit;
-        assert_eq!(audit.iter().filter(|entry| entry.granted_by == "full_mode").count(), 2);
+        // The swept command, then the ordinary patch's start and its approval request.
+        assert_eq!(audit.iter().filter(|entry| entry.granted_by == "full_mode").count(), 3);
         assert_eq!(audit.iter().filter(|entry| entry.granted_by == "thread_mode").count(), 1);
         Ok(())
     }
@@ -2027,11 +2088,12 @@ mod tests {
         codex.close_worker(&legacy).await;
 
         // Resolve a live RPC under full mode, then replay it after changing leases.
-        hub.init_approval_queue("fixture".into(), project.path());
+        // The state directory is protected, so it stays apart from the checkout.
+        hub.init_approval_queue("fixture".into(), &project.path().join("state"));
         let change = fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour };
         let principal = crate::remote::SettingsPrincipal::fixture();
         let full = codex.start_thread("owner", Some("delegate:full".into()), None).await?;
-        let push = json!({"threadId": full, "command": "git push", "cwd": project.path()});
+        let push = json!({"threadId": full, "command": "cargo build", "cwd": project.path()});
         codex.on_server_request(method, json!(94), &push).await;
         let ServerEvent::ApprovalRequested { request_id: swept, .. } = requests.recv().await?.event else {
             bail!("expected a pending Codex approval before enable");
@@ -2055,6 +2117,16 @@ mod tests {
         assert_eq!(audit[0].approval_id, swept);
         assert_eq!(audit[0].granted_by, "full_mode");
         assert_eq!(audit[0].action.args, "[redacted]");
+        // A push asks a person while full mode is active and when it is renewed.
+        codex.on_server_request(method, json!(95), &json!({"threadId": full, "command": "git push"})).await;
+        let ServerEvent::ApprovalRequested { request_id: guarded, .. } = requests.recv().await?.event else {
+            bail!("a push must ask a person under full approval");
+        };
+        hub.set_full_approval(fuzukue_proto::FullApprovalChange::Off, &principal)?;
+        hub.set_full_approval(fuzukue_proto::FullApprovalChange::Full {
+            duration: fuzukue_proto::FullApprovalDuration::OneHour,
+        }, &principal)?;
+        assert!(codex.resolve(&guarded, "decline", false).await?);
         codex.close_worker(&full).await;
 
         let replies = std::fs::read_to_string(log)?.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -2065,6 +2137,7 @@ mod tests {
             json!({"jsonrpc":"2.0", "id":92, "result":{"scope":"turn", "permissions":{}}}),
             json!({"jsonrpc":"2.0", "id":93, "result":{"decision":"decline"}}),
             json!({"jsonrpc":"2.0", "id":94, "result":{"decision":"accept"}}),
+            json!({"jsonrpc":"2.0", "id":95, "result":{"decision":"decline"}}),
         ]);
         Ok(())
     }

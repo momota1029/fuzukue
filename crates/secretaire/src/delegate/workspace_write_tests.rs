@@ -50,6 +50,7 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
     let worker = Arc::new(RunningJob {
         session: session.into(),
         external_approval: false,
+        external_message: Default::default(),
         key: key.into(),
         tools: tools.into(),
         approach: Default::default(),
@@ -190,6 +191,33 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
         assert_eq!(result["isError"], false, "{result}");
         assert_eq!(fs::read_to_string(root.join(path))?, "isolated\n");
     }
+    // Missing parents are created, appends add to the end and large files stay editable.
+    let nested = "target/job/checkout/new/deeper/note.txt";
+    for text in ["first\n", "second\n"] {
+        let result = request(true, "tools/call", json!({"name": "fs_write", "arguments":
+            {"path": nested, "content": text, "append": true}})).await?;
+        assert_eq!(result["isError"], false, "{result}");
+    }
+    assert_eq!(fs::read_to_string(root.join(nested))?, "first\nsecond\n");
+    let large = scratch.join("large.rs");
+    fs::write(&large, format!("{}unique line\n", "// filler line\n".repeat(40_000)))?;
+    let result = request(true, "tools/call", json!({"name": "fs_edit", "arguments":
+        {"path": large, "old": "unique line", "new": "edited line"}})).await?;
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(fs::read_to_string(&large)?.ends_with("filler line\nedited line\n"));
+    let oversized = request(true, "tools/call", write("in.txt", &"x".repeat(256 * 1024 + 1))).await?;
+    assert_eq!(oversized["isError"], true, "{oversized}");
+    std::os::unix::fs::symlink(fixture.path(), checkout.join("escape"))?;
+    let escaped = request(true, "tools/call", write("target/job/checkout/escape/new/file.txt", "no")).await?;
+    assert_eq!(escaped["isError"], true, "{escaped}");
+    assert!(!fixture.path().join("new").exists());
+    // A declined write outside the scope creates no directories.
+    let pending = tokio::spawn(request(true, "tools/call", write("outside/new/file.txt", "no")));
+    let (id, _) = next_approval(&mut events).await?;
+    assert!(app.delegates.resolve_approval(&id, "decline", false)?);
+    assert_eq!(pending.await??["isError"], true);
+    assert!(!root.join("outside").exists());
+
     let pending = tokio::spawn(request(true, "tools/call", write("target/other/checkout/denied.txt", "other")));
     let (id, _) = next_approval(&mut events).await?;
     assert!(app.delegates.resolve_approval(&id, "decline", false)?);
@@ -302,6 +330,27 @@ async fn scoped_write_mcp_approves_only_outside_touches() -> Result<()> {
     let audit = app.hub.full_approval_settings(None)?.audit;
     assert!(audit.iter().any(|entry| entry.approval_id == pending_id && entry.granted_by == "thread_mode"));
     assert_eq!(request(true, "tools/call", write("thread-mode-next.txt", "automatic\n")).await?["isError"], false);
+    app.hub.edit_threads(|store| store.set_partner_permission(session, fuzukue_proto::PermissionMode::Default))?;
+
+    // A worker tests an isolated copy with its own build and temporary directories.
+    *worker.capture_scope.lock().unwrap() = Some(crate::capture::WorkerStorage { cwd: root.clone(), scratch: scratch.clone() });
+    fs::write(checkout.join("fuzukue.toml"), concat!(
+        "[tests.isolated]\ncommand = [\"sh\", \"-c\", ",
+        "\"test -d \\\"$CARGO_TARGET_DIR\\\" && test -d \\\"$TMPDIR\\\" && test \\\"$CARGO_INCREMENTAL\\\" = 0\"]\n",
+    ))?;
+    let run = || json!({"name": "run_tests", "arguments": {
+        "dir": "target/job/checkout", "target_dir": "target/job/build", "tmp_dir": "target/job/tmp"}});
+    let listed = request(true, "tools/call", json!({"name": "list_tests", "arguments": {"dir": "target/job/checkout"}})).await?;
+    assert_eq!(listed["structuredContent"]["suites"][0]["id"], "isolated", "{listed}");
+    let pending = tokio::spawn(request(true, "tools/call", run()));
+    let (id, summary) = next_approval(&mut events).await?;
+    assert!(summary.contains("checkout"), "{summary}");
+    assert!(!root.join("target/job/build").exists());
+    assert!(app.delegates.resolve_approval(&id, "decline", false)?);
+    assert_eq!(pending.await??["isError"], true);
+    app.hub.edit_threads(|store| store.set_partner_permission(session, fuzukue_proto::PermissionMode::BypassPermissions))?;
+    let result = request(true, "tools/call", run()).await?;
+    assert_eq!(result["structuredContent"]["runs"][0]["state"], "passed", "{result}");
     app.hub.edit_threads(|store| store.set_partner_permission(session, fuzukue_proto::PermissionMode::Default))?;
 
     let pending = tokio::spawn(request(

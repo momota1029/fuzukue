@@ -692,9 +692,20 @@ impl Workspace {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let summary = fuzukue_proto::LocalizedMessage::new(
-            key, [("source", source), ("destination", destination), ("urls", urls)],
-        );
+        let findings = match operation {
+            RemoteOperation::Push => crate::privacy_findings::unpublished(&self.project_dir, &self.state_dir).await,
+            RemoteOperation::Pull => None,
+        };
+        let mut args = vec![("source", source), ("destination", destination), ("urls", urls)];
+        let key = match findings {
+            Some(findings) => {
+                args.push(("findings", findings));
+                "approval-git-push-findings"
+            }
+            None => key,
+        };
+        let mut summary = fuzukue_proto::LocalizedMessage::new(key, []);
+        summary.args.extend(args.into_iter().map(|(name, value)| (name.into(), value)));
         mutation.approve_with_full(fuzukue_proto::GIT_APPROVAL, actor, summary, full).await?;
         let result = mutation.run(async {
             let _guard = self.git_lock.lock().await;

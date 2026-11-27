@@ -89,7 +89,7 @@ fn capture_timeout() -> Duration {
 }
 
 pub(crate) fn worker_tool_timeout(tools: &[String]) -> u64 {
-    if tools.iter().any(|tool| tool == CAPTURE) {
+    if tools.iter().any(|tool| tool == CAPTURE || tool == "run_tests") {
         mcp_tool_timeout()
     } else {
         200

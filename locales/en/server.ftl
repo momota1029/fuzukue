@@ -13,6 +13,9 @@ approval-change-files = Change files{ $reason }
 approval-grant-turn-permissions = Grant permissions for this turn: { $permissions }{ $reason }
 approval-git-push = Git push · { $source } → { $destination }{ "\u000A" }{ $urls }
 approval-worker-write = { $tool } outside touches · { $path }{ "\u000A" }SHA-256: { $hash }{ "\u000A" }{ $diff }
+approval-git-push-findings = Git push · { $source } → { $destination }{ "\u000A" }{ $urls }{ "\u000A\u000A" }Recorded privacy findings in commits that are not on a remote yet:{ "\u000A" }{ $findings }
+server-privacy-findings-committed = Committed { $commit } with { $count } privacy findings. Check these places before pushing.{ "\u000A" }{ $locations }
+approval-worker-tests = Run tests in { $directory }{ "\u000A" }{ $commands }
 approval-git-pull = Git pull (fast-forward only) · { $source } → { $destination }{ "\u000A" }{ $urls }
 approval-create-issue = Create an issue in { $repo }{ "\u000A\u000A" }{ $title }{ "\u000A\u000A" }{ $body }
 approval-mark-issue-ready = Add dot:ready to { $repo }#{ $number }
@@ -57,9 +60,9 @@ server-resume-error = Couldn’t resume: { $detail }
 server-auto-approval-error = Automatic approval failed: { $detail }
 server-invalid-message = Invalid request: { $detail }
 server-codex-error = Codex error: { $detail }
-server-full-approval-until = Full approval is on until { $at }
-server-full-approval-until-disabled = Full approval is on until turned off
-server-full-approval-off = Full approval is off
+server-full-approval-until = Full approval is on until { $at }{ "\u000A" }Runs without asking: shell commands, file edits, local tools, delegated work, commits and patch integration, including privacy findings (listed again before a push).{ "\u000A" }Still asks: push, publishing and other outside writes, web access, history-destroying Git, administrator installs, server credentials, commands that cannot be checked, and turns driven by outside input. Threads set to ask every time or to plan keep asking.{ "\u000A" }Exception: workers started before automatic approval with approval explicitly set to auto or never keep that setting and may not ask.{ "\u000A" }Command checks only catch honest mistakes and do not isolate work. Edits may continue after an outside message.
+server-full-approval-until-disabled = Full approval is on until turned off{ "\u000A" }Runs without asking: shell commands, file edits, local tools, delegated work, commits and patch integration, including privacy findings (listed again before a push).{ "\u000A" }Still asks: push, publishing and other outside writes, web access, history-destroying Git, administrator installs, server credentials, commands that cannot be checked, and turns driven by outside input. Threads set to ask every time or to plan keep asking.{ "\u000A" }Exception: workers started before automatic approval with approval explicitly set to auto or never keep that setting and may not ask.{ "\u000A" }Command checks only catch honest mistakes and do not isolate work. Edits may continue after an outside message.
+server-full-approval-off = Full approval is off{ "\u000A" }A thread set to approve automatically still runs its own work without asking.
 
 server-parallel-limit = Parallel limit reached ({ $running } of { $limit } running; this thread's setting: { $setting ->
     [normal] normal

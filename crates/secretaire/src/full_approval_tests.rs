@@ -71,8 +71,9 @@ async fn full_approval_launches_claude_with_native_shell_and_audits_its_grant() 
 import json, subprocess, sys
 from pathlib import Path
 args = sys.argv[1:]
-assert args[args.index("--permission-mode") + 1] == "bypassPermissions"
-assert "hooks" not in json.loads(args[args.index("--settings") + 1])
+assert args[args.index("--permission-mode") + 1] == "acceptEdits"
+settings = json.loads(args[args.index("--settings") + 1])
+assert "hooks" not in settings and settings["permissions"]["ask"] == ["Bash"]
 json.loads(sys.stdin.readline())
 
 command = "printf full > ../native-write"

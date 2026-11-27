@@ -29,6 +29,7 @@ pub(crate) mod workspace_read;
 pub(crate) mod result_spill;
 pub(crate) mod exec;
 pub(crate) mod workspace_write;
+mod worker_tests;
 use workspace_read::git_read;
 
 pub(crate) const SERVER_NAME: &str = "fuzukue";
@@ -569,7 +570,9 @@ impl Tool {
             ),
             Self::ListTests => (
                 harness_text!("Discover workspace tests and return suite IDs, working directories, commands, and unavailable runners.", "ワークスペースのテストを検出し、スイート ID、作業ディレクトリ、コマンド、利用できない実行ツールを返す。"),
-                json!({}), &[],
+                json!({
+                    "dir": { "type": "string", "description": harness_text!("Delegated workers only: directory inside the assigned checkout or job directory, such as an isolated copy. Defaults to the checkout.", "作業役のみ: 隔離したコピーなど、割り当てられたチェックアウトかジョブ専用領域の中のディレクトリ。省略するとチェックアウト。") },
+                }), &[],
             ),
             Self::SelfUpdate => (
                 harness_text!("Check update status. Set verbose=true for log tails and trial details. Start and promote wake this desk when the result is ready. For an active update without a recipient, call status with notify=true to receive its result here. Obtain user approval before start, canary, or promote. Discard ends the trial.", "サーバーの更新状況を確認する。工程ログの末尾と試運転の詳細は verbose=true で読む。start と promote は結果が出るとこのスレッドの受付を起こす。通知先が未設定の更新は status で notify=true を指定すると、このスレッドで結果を受け取れる。start、canary、promote は利用者の了承を得てから実行する。discard は試運転を終了する。"),
@@ -587,6 +590,9 @@ impl Tool {
                 json!({
                     "suite": { "type": "string", "description": harness_text!("Suite ID returned by list_tests.", "list_tests が返すスイート ID") },
                     "filter": { "type": "string", "description": harness_text!("Filter by test name for runners that support it.", "実行するテスト名の絞り込み（対応するランナーのみ）") },
+                    "dir": { "type": "string", "description": harness_text!("Delegated workers only: directory to test inside the assigned checkout or job directory, such as an isolated copy. Defaults to the checkout.", "作業役のみ: テストするディレクトリ。隔離したコピーなど、割り当てられたチェックアウトかジョブ専用領域の中。省略するとチェックアウト。") },
+                    "target_dir": { "type": "string", "description": harness_text!("Delegated workers only: private Cargo build directory. Also turns off debug information and incremental builds.", "作業役のみ: 専用の Cargo ビルドディレクトリ。デバッグ情報と差分ビルドも無効にする。") },
+                    "tmp_dir": { "type": "string", "description": harness_text!("Delegated workers only: TMPDIR for the run. Defaults to the job directory.", "作業役のみ: 実行時の TMPDIR。省略するとジョブ専用領域。") },
                 }),
                 &[],
             ),
@@ -1021,7 +1027,7 @@ fn worker_tools() -> impl Iterator<Item = Tool> {
         | Tool::ListLedger | Tool::ReadLedgerAttempts | Tool::GitStatus | Tool::GitDiff | Tool::GitLog
         | Tool::ListTests | Tool::Lsp(_) | Tool::LeanDocCheck | Tool::ClientScreenshot
         | Tool::WorkspaceRead(_) | Tool::GitRead | Tool::GitHubRead(_) | Tool::HarnessCandidates(_) | Tool::BuildPaper
-        | Tool::ListScreenshotScenarios | Tool::CaptureScreenshot | Tool::Recipe(_) | Tool::Exec
+        | Tool::ListScreenshotScenarios | Tool::CaptureScreenshot | Tool::Recipe(_) | Tool::Exec | Tool::RunTests
     )).chain([Tool::AskFrontDesk])
         .chain(workspace_write::Tool::ALL.map(Tool::WorkspaceWrite).into_iter().filter(|_| !crate::canary()))
         .chain((!crate::canary()).then_some(Tool::GitCommitScoped))
@@ -1090,7 +1096,7 @@ pub(crate) fn codex_desk_tool_policy() -> Value {
 
 pub(crate) fn desk_tool_auto_eligible(name: &str) -> bool {
     Tool::available(true).any(|tool| tool.name() == name && !matches!(tool,
-        Tool::GitPush | Tool::MergeBranch | Tool::SelfUpdate | Tool::ClientScreenshot
+        Tool::GitPush | Tool::SelfUpdate | Tool::ClientScreenshot
         | Tool::GitHub(_) | Tool::GitHubAuth(_) | Tool::Handoff(_)
         | Tool::Research(crate::workshop::mcp::Tool::Accept) | Tool::WorkspaceRequest(_)
     ))
@@ -1325,6 +1331,11 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
                     .map(|result| data_result(result, false))
             } else if name == git_write::NAME {
                 Box::pin(git_write::call(&app, &q.session, job, &params["arguments"])).await
+                    .map(|result| data_result(result, false))
+            } else if name == Tool::ListTests.name() {
+                worker_tests::list(&app, job, &params["arguments"]).await.map(|result| data_result(result, false))
+            } else if name == Tool::RunTests.name() {
+                Box::pin(worker_tests::run(&app, &q.session, job, &params["arguments"])).await
                     .map(|result| data_result(result, false))
             } else if name == git_read::NAME {
                 async {
@@ -2281,6 +2292,16 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 filter: Option<String>,
             }
             let Args { suite, filter } = parse_args(args)?;
+            // A configured command that needs a person is shown before it runs.
+            if claude.is_some() || codex.is_some() {
+                let planned = crate::project_tests::Planned::discover(project, suite.as_deref()).await?;
+                if let Some(reason) = planned.guarded(&crate::worker_scope::protected_roots(&app.state_dir)) {
+                    let actor = if claude.is_some() { Actor::Claude } else { Actor::System };
+                    let summary = format!("run_tests ({}):\n{}", reason.describe(), planned.card());
+                    let decision = crate::delegate::request_approval(app, session, "test-guard", actor, summary).await?;
+                    ensure!(decision == "accept", "The user declined this test run");
+                }
+            }
             let jobs = app.run_tests(suite.as_deref(), filter).await?;
             let mut runs = Vec::new();
             let (mut passed, mut failed) = (0, 0);

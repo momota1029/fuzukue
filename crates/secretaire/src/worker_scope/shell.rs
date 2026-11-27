@@ -32,6 +32,8 @@ pub(crate) struct ApprovedShell {
     pub(crate) basic: bool,
     /// Every file operand is in the job's own temporary directory, and no stage reads anything else.
     pub(crate) own_files: bool,
+    /// Every stage creates directories in the checkout or job directory, or changes into one.
+    pub(crate) creates_directories: bool,
 }
 
 impl ApprovedShell {
@@ -156,6 +158,14 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
             "cat" | "head" | "tail" | "wc" if operands(positional, PathKind::FileOrStdin) => {}
             "stat" if !positional.is_empty() && operands(positional, PathKind::Entry) => {}
             "pwd" if args.is_empty() => {}
+            "mkdir" => {
+                let (_, paths) = flags(args, "pv", &["--parents", "--verbose"], "", &[])?;
+                if paths.is_empty() || !paths.iter().all(|path| {
+                    new_directory(&[&scope.cwd, &scope.scratch], &cwd, path, protected, scratch)
+                }) {
+                    return None;
+                }
+            }
             "sleep" if matches!(args, [duration] if seconds(duration)) => {}
             "date" if args.iter().all(|arg| arg == "-u" || arg.starts_with('+')) => {}
             "which" if !args.is_empty() && args.iter().all(|arg| is_identifier(arg)) => {}
@@ -253,9 +263,11 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
     let basic = rules.iter().all(|rule| BASIC_READS.contains(rule));
     // The front desk passes its project as the scratch; only a separate job directory counts.
     let own_files = own_files && own.get() == Some(true) && scope.scratch != scope.cwd;
+    let creates_directories = rules.contains(&"mkdir") && rules.iter().all(|rule| matches!(*rule, "mkdir" | "cd"));
     Some(ApprovedShell {
         basic,
         own_files,
+        creates_directories,
         input: updated,
         // A leading cd can be saved as an exact command only. Every stage
         // must pass the same checks regardless of which rule ultimately matches.
@@ -368,6 +380,29 @@ fn checked_path(
         }
     }
     Some(canonical)
+}
+
+/// Whether `name` is a directory below one of `roots` that can be created, or
+/// already exists, without passing a link, Git metadata or a protected root.
+fn new_directory(roots: &[&Path], cwd: &Path, name: &str, protected: &[PathBuf], scratch: &Path) -> bool {
+    if name.is_empty() || name.starts_with(['~', '-']) {
+        return false;
+    }
+    let path = Path::new(name);
+    if path.components().any(|part| matches!(part, Component::ParentDir | Component::Prefix(_))) {
+        return false;
+    }
+    let absolute: PathBuf = cwd.join(path).components().collect();
+    let existing = absolute.ancestors().find(|path| path.symlink_metadata().is_ok());
+    roots.iter().any(|root| absolute.strip_prefix(root).is_ok_and(|relative| {
+        !relative.iter().any(|part| part.eq_ignore_ascii_case(".git"))
+    })) && existing.is_some_and(|path| {
+        path.is_dir() && path.canonicalize().is_ok_and(|canonical| canonical.components().eq(path.components()))
+    }) && !protected.iter().any(|root| {
+        let own = scratch != root.as_path() && scratch.starts_with(root) && absolute.starts_with(scratch)
+            && super::own_file(scratch, &absolute);
+        absolute.starts_with(root) && !own
+    })
 }
 
 // Options must precede operands. A second dash-prefixed operand can otherwise

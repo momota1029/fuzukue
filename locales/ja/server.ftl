@@ -13,6 +13,9 @@ approval-change-files = ファイルの変更{ $reason }
 approval-grant-turn-permissions = このターンに権限を付与: { $permissions }{ $reason }
 approval-git-push = Git プッシュ · { $source } → { $destination }{ "\u000A" }{ $urls }
 approval-worker-write = 変更予定外の { $tool } · { $path }{ "\u000A" }SHA-256: { $hash }{ "\u000A" }{ $diff }
+approval-git-push-findings = Git プッシュ · { $source } → { $destination }{ "\u000A" }{ $urls }{ "\u000A\u000A" }まだリモートにないコミットで記録した個人情報の指摘:{ "\u000A" }{ $findings }
+server-privacy-findings-committed = 個人情報の指摘が { $count } 件ある状態で { $commit } をコミットした。プッシュの前に次の場所を確かめる。{ "\u000A" }{ $locations }
+approval-worker-tests = { $directory } でテストを実行{ "\u000A" }{ $commands }
 approval-git-pull = Git 取り込み（早送りのみ） · { $source } → { $destination }{ "\u000A" }{ $urls }
 approval-create-issue = { $repo } に Issue を作成{ "\u000A\u000A" }{ $title }{ "\u000A\u000A" }{ $body }
 approval-mark-issue-ready = { $repo }#{ $number } に dot:ready を付ける
@@ -57,9 +60,9 @@ server-resume-error = 再開できない: { $detail }
 server-auto-approval-error = 自動承認に失敗しました: { $detail }
 server-invalid-message = 不正な要求: { $detail }
 server-codex-error = Codex: { $detail }
-server-full-approval-until = 完全承認モードは { $at } まで有効
-server-full-approval-until-disabled = 完全承認モードは停止するまで有効
-server-full-approval-off = 完全承認モードは無効
+server-full-approval-until = 完全承認モードは { $at } まで有効{ "\u000A" }確認なしで進む: シェル、ファイル編集、手元で動くツール、作業の委譲、コミットとパッチの取り込み（個人情報の指摘がある場合も含み、プッシュの前にもう一度示す）。{ "\u000A" }確認する: プッシュ、公開などの外部への書き込み、Web へのアクセス、履歴を失う Git 操作、管理者権限の要るインストール、サーバーの認証情報、判定できないコマンド、外部の入力で始まったターン。「毎回確認」と「計画」のスレッドは引き続き確認する。{ "\u000A" }例外: 自動承認にする前に、起動設定で承認を auto か never と明示して起動した作業役は、その設定のままで、確認しないことがある。{ "\u000A" }コマンドの判定で防げるのはうっかりした誤りだけで、作業は隔離されない。外部の入力が届いた後も、ファイル編集は続くことがある。
+server-full-approval-until-disabled = 完全承認モードは停止するまで有効{ "\u000A" }確認なしで進む: シェル、ファイル編集、手元で動くツール、作業の委譲、コミットとパッチの取り込み（個人情報の指摘がある場合も含み、プッシュの前にもう一度示す）。{ "\u000A" }確認する: プッシュ、公開などの外部への書き込み、Web へのアクセス、履歴を失う Git 操作、管理者権限の要るインストール、サーバーの認証情報、判定できないコマンド、外部の入力で始まったターン。「毎回確認」と「計画」のスレッドは引き続き確認する。{ "\u000A" }例外: 自動承認にする前に、起動設定で承認を auto か never と明示して起動した作業役は、その設定のままで、確認しないことがある。{ "\u000A" }コマンドの判定で防げるのはうっかりした誤りだけで、作業は隔離されない。外部の入力が届いた後も、ファイル編集は続くことがある。
+server-full-approval-off = 完全承認モードは無効{ "\u000A" }「すべて自動」にしたスレッドの作業は、引き続き確認なしで進む。
 
 server-parallel-limit = 並行数の上限に達している（{ $running }/{ $limit } 件が実行中。このスレッドの設定: { $setting ->
     [normal] 標準

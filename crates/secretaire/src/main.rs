@@ -92,6 +92,7 @@ mod thread_artifacts;
 mod test_support;
 mod usage;
 mod planner;
+mod privacy_findings;
 mod background_commands;
 mod chat_waiting;
 mod project_tests;
@@ -387,8 +388,9 @@ impl Workspace {
         let requests = self.registry.upgrade()
             .map(|registry| registry.workspace_requests.front_desk_context(self, session))
             .unwrap_or_default();
-        Ok(harness_format!("(secretaire) Current thread attachments\n{context}{reports}{requests}\n\nTurn input:\n{prompt}",
-            "(secretaire) このターンの添付先\n{context}{reports}{requests}\n\nターンの入力:\n{prompt}"))
+        let automatic = if self.hands_off(session) { full_approval::desk_notice() } else { "" };
+        Ok(harness_format!("(secretaire) Current thread attachments\n{context}{reports}{requests}{automatic}\n\nTurn input:\n{prompt}",
+            "(secretaire) このターンの添付先\n{context}{reports}{requests}{automatic}\n\nターンの入力:\n{prompt}"))
     }
 
     fn record_artifacts<'a>(&self, session: &str, paths: impl IntoIterator<Item = &'a str>) {
@@ -427,6 +429,18 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// Whether the thread's chat mode asks for hands-off work.
+    fn automatic_thread(&self, session: &str) -> bool {
+        self.chat_settings(session).permission_mode == fuzukue_proto::PermissionMode::BypassPermissions
+    }
+
+    /// Whether a trusted front-desk turn of this thread runs hands-off, by its
+    /// chat mode or by workspace full approval.
+    fn hands_off(&self, session: &str) -> bool {
+        mcp::exec::trusted_session(self, session)
+            && self.hub.desk_automatic(session, self.chat_settings(session).permission_mode).unwrap_or(false)
+    }
+
     fn partner_turn_settings(&self, session: &str) -> fuzukue_proto::ChatSettings {
         self.hub.refresh_model_defaults();
         self.chat_settings(session)

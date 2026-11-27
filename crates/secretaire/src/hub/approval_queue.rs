@@ -258,18 +258,21 @@ impl Hub {
         Ok(authorization)
     }
 
+    /// Whether full mode, and whether the thread's automatic choice, may decide this request.
     pub(super) fn automatic_modes(inner: &Inner, registration: &Registration) -> (bool, bool) {
+        let mode = inner.threads.as_ref()
+            .and_then(|store| store.role_settings(&registration.owner.thread))
+            .map(|(settings, _)| settings.permission_mode);
         if !registration.thread_auto {
-            return (true, false);
+            // Delegated work follows its thread's automatic choice as well as full mode.
+            let worker = registration.owner.job != "front_desk";
+            return (true, worker && mode == Some(PermissionMode::BypassPermissions));
         }
         if registration.owner.requester == "front_desk"
             && inner.partner_started.get(&registration.owner.thread).is_some_and(|turn| turn.external_approval_input)
         {
             return (false, false);
         }
-        let mode = inner.threads.as_ref()
-            .and_then(|store| store.role_settings(&registration.owner.thread))
-            .map(|(settings, _)| settings.permission_mode);
         (
             !matches!(mode, Some(PermissionMode::Default | PermissionMode::Plan)),
             mode == Some(PermissionMode::BypassPermissions),
@@ -366,6 +369,18 @@ impl Hub {
             PermissionMode::AcceptEdits => self.full_approval_lease()?.is_some(),
             PermissionMode::BypassPermissions => true,
         })
+    }
+
+    pub(crate) fn state_dir(&self) -> Option<std::path::PathBuf> {
+        self.approval_queue.get().map(|queue| queue.state_dir().to_owned())
+    }
+
+    /// Why a backend tool request stays with a person in every automatic mode.
+    pub(crate) fn guarded(&self, tool: &str, input: &serde_json::Value) -> Option<crate::full_approval::guard::Reason> {
+        let protected = self.approval_queue.get()
+            .map(|queue| crate::worker_scope::protected_roots(queue.state_dir()))
+            .unwrap_or_default();
+        crate::full_approval::guard::request(tool, input, &protected)
     }
 
     pub(crate) fn pending_approvals(
