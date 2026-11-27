@@ -16,6 +16,8 @@
     <plurals name="approval_integrate_privacy">
         <item quantity="other">個人情報らしい行が %1$d 行ある。意図した内容のときだけ許可する。</item>
     </plurals>
+    <string name="approval_integrate_branch">ブランチ %1$s</string>
+    <string name="approval_integrate_detached">切り離された HEAD（%1$s）</string>
     <string name="approval_integrate_files">変更するファイル（%1$d 件）</string>
     <string name="approval_integrate_flagged">検出された行</string>
     <string name="approval_integrate_more">ほか %1$d 件</string>

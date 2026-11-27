@@ -7,6 +7,7 @@ use std::sync::Arc;
 use fuzukue_proto::{Actor, ApprovalRisk, ApprovalUnattended};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::hub::approval_store::{Action, FullAuthorization, Registration};
 use crate::mcp::{data_result, harness_candidates::sanitize, workspace_read::worktree_relative};
@@ -534,8 +535,86 @@ async fn prepare_bytes(
     })
 }
 
+/// A ref transaction that holds the locks of the published ref and, while HEAD
+/// names it, of HEAD. Dropping it closes Git's input, which aborts the
+/// transaction and releases the locks.
+struct RefUpdate {
+    child: tokio::process::Child,
+    input: tokio::process::ChildStdin,
+    output: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+}
+
+impl RefUpdate {
+    /// Lock the move of `reference` from `old` to `new`, then check that it is
+    /// still checked out. Nothing is written until `commit`.
+    async fn lock(git: &Git, identity: &Identity, reference: &str, new: &str, old: &str) -> Result<Self> {
+        let mut command = git.command();
+        identity.apply(&mut command);
+        command
+            .args([
+                "-c",
+                // A dropped transaction may still be releasing its locks.
+                "core.filesRefLockTimeout=1000",
+                "update-ref",
+                "--no-deref",
+                "-m",
+                "fuzukue: integrate patch",
+                "--stdin",
+            ])
+            .stdin(std::process::Stdio::piped())
+            // Killing Git here would leave its lock files behind.
+            .kill_on_drop(false);
+        let mut child = command.spawn().context("Could not start Git")?;
+        let input = child.stdin.take().context("Git stdin is unavailable")?;
+        let output = child.stdout.take().context("Git stdout is unavailable")?;
+        let mut update = Self { child, input, output: BufReader::new(output).lines() };
+        update.send(&format!("start\nupdate {reference} {new} {old}\n"), "start").await?;
+        update.send("prepare\n", "prepare").await?;
+        // A switch from here on needs the HEAD lock held by this transaction.
+        let current = symbolic_head(git.command()).await;
+        if !matches!(&current, Ok(current) if current == reference) {
+            update.abort().await;
+            current?;
+            bail!("HEAD changed after the patch was checked. Retry against the new HEAD.");
+        }
+        Ok(update)
+    }
+
+    async fn send(&mut self, lines: &str, step: &str) -> Result<()> {
+        let failed = "Git could not publish the patch commit because HEAD or its ref may have changed";
+        self.input.write_all(lines.as_bytes()).await.context(failed)?;
+        self.input.flush().await.context(failed)?;
+        let reply = self.output.next_line().await.context(failed)?;
+        ensure!(reply.is_some_and(|reply| reply == format!("{step}: ok")), "{failed}");
+        Ok(())
+    }
+
+    async fn commit(mut self) -> Result<()> {
+        self.send("commit\n", "commit").await?;
+        drop(self.input);
+        ensure!(self.child.wait().await?.success(), "Git could not publish the patch commit");
+        Ok(())
+    }
+
+    /// Release the locks before returning.
+    async fn abort(mut self) {
+        let _ = self.send("abort\n", "abort").await;
+        drop(self.input);
+        let _ = self.child.wait().await;
+    }
+}
+
+/// A commit ready for publication. The index and the checked-out ref are locked.
+struct Staged {
+    lock: IndexLock,
+    identity: Identity,
+    commit: String,
+    update: RefUpdate,
+}
+
 impl Prepared {
-    async fn publish(&self, state: &Path, begin_write: impl FnOnce(), progress: &Progress) -> Result<String> {
+    /// Everything before publication. It moves no ref and leaves the index alone.
+    async fn stage(&self, state: &Path) -> Result<Staged> {
         let git = &self.git;
         let mut lock = IndexLock::new(&git.metadata)?;
         check_repository(git)?;
@@ -582,38 +661,43 @@ impl Prepared {
         let commit = oid(&git_output(create, "create the commit object").await?)?;
         lock.prepare(&stage)?;
         ensure!(lock.still_owned(), "The workspace index lock changed");
+        #[cfg(test)]
+        tests::fault("before_ref_lock").await;
+        let update = RefUpdate::lock(git, &identity, &self.reference, &commit, &self.head).await?;
+        Ok(Staged { lock, identity, commit, update })
+    }
 
-        let update_ref = |new: &str, old: &str, label: &str| {
-            let mut command = git.command();
-            identity.apply(&mut command);
-            command.args([
-                "update-ref",
-                "--no-deref",
-                "-m",
-                label,
-                &self.reference,
-                new,
-                old,
-            ]);
-            command
-        };
+    /// Publish a staged commit. `claim` runs first, before the first await, and
+    /// marks the point after which the attempt counts as having written.
+    async fn publish(
+        &self, staged: Staged, claim: impl FnOnce() -> Result<()>, progress: &Progress,
+    ) -> Result<String> {
+        let git = &self.git;
+        let Staged { mut lock, identity, commit, update } = staged;
         progress.record(|landed| landed.commit_sha = Some(commit.clone()));
-        begin_write();
-        git_output(
-            update_ref(&commit, &self.head, "fuzukue: integrate patch"),
-            "publish the patch commit",
-        )
-        .await?;
+        if let Err(error) = claim() {
+            update.abort().await;
+            return Err(error);
+        }
+        update.commit().await?;
         progress.record(|landed| landed.ref_updated = true);
         #[cfg(test)]
         tests::fault("after_ref_update").await;
         if let Err(error) = lock.publish(&git.metadata.join("index")) {
-            git_output(
-                update_ref(&self.head, &commit, "fuzukue: roll back patch integration"),
-                "roll back the commit after an index publication failure",
-            )
-            .await
-            .with_context(|| format!("Could not publish the index: {error}"))?;
+            let mut rollback = git.command();
+            identity.apply(&mut rollback);
+            rollback.args([
+                "update-ref",
+                "--no-deref",
+                "-m",
+                "fuzukue: roll back patch integration",
+                &self.reference,
+                &self.head,
+                &commit,
+            ]);
+            git_output(rollback, "roll back the commit after an index publication failure")
+                .await
+                .with_context(|| format!("Could not publish the index: {error}"))?;
             progress.record(|landed| landed.rolled_back = true);
             return Err(error).context("Could not publish the index");
         }
@@ -668,6 +752,66 @@ fn failure(code: &str, message: impl ToString) -> Value {
     )
 }
 
+/// What was checked out: a local branch, or the commit of a detached HEAD.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Checkout {
+    /// The full ref name.
+    Branch(String),
+    Detached(String),
+}
+
+impl Checkout {
+    /// `reference` and `head` as read from the repository.
+    fn new(reference: &str, head: &str) -> Self {
+        if reference == "HEAD" {
+            Self::Detached(head.into())
+        } else {
+            Self::Branch(reference.into())
+        }
+    }
+
+    /// The field and value that clients show.
+    fn display(&self) -> (&'static str, &str) {
+        match self {
+            Self::Branch(reference) => ("branch", reference.strip_prefix("refs/heads/").unwrap_or(reference)),
+            Self::Detached(head) => ("detached_head", head),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self.display() {
+            ("branch", name) => harness_format!("branch `{}`", "ブランチ `{}`", name),
+            (_, head) => harness_format!(
+                "a detached HEAD at {}", "切り離された HEAD（{}）", head.chars().take(12).collect::<String>()
+            ),
+        }
+    }
+
+    /// Refuse a checkout other than the one the request was made on.
+    fn require(&self, current: &Self) -> Result<()> {
+        ensure!(
+            self == current,
+            "{}",
+            harness_format!(
+                "The request was made on {requested}, but the checkout is now on {current}. Nothing was changed. Check out {requested} and request it again.",
+                "この依頼は{requested}で出されたが、現在のチェックアウトは{current}。何も変更していない。{requested}に戻して、もう一度依頼してね。",
+                requested = self.describe(), current = current.describe()
+            )
+        );
+        Ok(())
+    }
+
+    /// Check the repository as it is now.
+    async fn verify(&self, root: &Path) -> Result<()> {
+        let git = Git::open(root, root)?;
+        git.prepare_config().await?;
+        let reference = symbolic_head(git.command()).await?;
+        let head = current_commit(&git).await?.context("The workspace must have a HEAD commit")?;
+        self.require(&Self::new(&reference, &head))
+    }
+}
+
 /// The operation bound to a deferred approval. Execution never rereads the
 /// workspace patch file or the server configuration.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -685,6 +829,8 @@ pub(crate) struct Snapshot {
     paths: BTreeSet<String>,
     root: PathBuf,
     head: String,
+    /// Execution is refused unless this is still checked out.
+    checkout: Checkout,
 }
 
 impl Snapshot {
@@ -703,11 +849,12 @@ impl Snapshot {
             paths: prepared.changes.iter().map(|change| change.path.clone()).collect(),
             root: root.into(),
             head: prepared.head.clone(),
+            checkout: Checkout::new(&prepared.reference, &prepared.head),
         })
     }
 
     /// The snapshot fields the card shows. A pending card is reused only while they match.
-    const REVIEWED: [&'static str; 4] = ["paths", "findings_count", "findings_locations", "findings_paths"];
+    const REVIEWED: [&'static str; 5] = ["paths", "findings_count", "findings_locations", "findings_paths", "checkout"];
 
     /// The decision identity. A pending request with the same identity is reused.
     fn action(&self) -> Action {
@@ -735,6 +882,18 @@ impl Snapshot {
         } else {
             format!("Integrate Git patch {} into {} files.", short(&self.patch_sha256), self.paths.len())
         };
+        let mut display_args = json!({
+            "paths": self.paths,
+            "patch_sha256": self.patch_sha256,
+            "head": self.head,
+            "override_privacy": self.override_privacy,
+            "privacy_findings": self.findings_count,
+            "locations": self.findings_locations,
+            "restore_worktree": self.restore_worktree,
+            "push": self.push_requested,
+        });
+        let (field, value) = self.checkout.display();
+        display_args[field] = json!(value);
         Registration {
             owner: crate::deferred_approvals::owner(session),
             thread_auto: false,
@@ -746,16 +905,7 @@ impl Snapshot {
             reason,
             expires_at: fuzukue_proto::APPROVAL_NO_EXPIRY,
             action: self.action(),
-            display_args: json!({
-                "paths": self.paths,
-                "patch_sha256": self.patch_sha256,
-                "head": self.head,
-                "override_privacy": self.override_privacy,
-                "privacy_findings": self.findings_count,
-                "locations": self.findings_locations,
-                "restore_worktree": self.restore_worktree,
-                "push": self.push_requested,
-            }),
+            display_args,
             display_scope: json!({"workspace": self.root.file_name().and_then(|name| name.to_str()).unwrap_or_default()}),
         }
     }
@@ -790,6 +940,8 @@ fn deferred(registered: crate::deferred_approvals::Registered) -> Result<Value> 
             "disabled"
         }
     });
+    let (field, value) = snapshot.checkout.display();
+    data[field] = json!(value);
     data["what_to_do_next"] = match waiting {
         Some((reused, replaced)) => {
             data["reused"] = json!(reused);
@@ -798,7 +950,7 @@ fn deferred(registered: crate::deferred_approvals::Registered) -> Result<Value> 
             }
             json!({
                 "continue": "The approval card waits for the user without a deadline. Nothing has been committed yet. Tell the user briefly, then continue independent work or end the turn.",
-                "result": "When the user decides, the result arrives as a new message in this thread. Do not call again to poll. The same request returns the same approval ID while its card shows the current findings.",
+                "result": "When the user decides, the result arrives as a new message in this thread. Do not call again to poll. The same request returns the same approval ID while its card shows the current findings and checkout. Approval is refused if another branch or detached commit is checked out then.",
                 "withdraw": "Call withdraw_approval with this approval_id if the user asks to cancel it or it is no longer needed."
             })
         }
@@ -816,9 +968,11 @@ pub(crate) enum Execution {
     NeedsReview(Value),
 }
 
-/// Run an approved snapshot once against the current HEAD and a clean index.
+/// Run an approved snapshot once against the current HEAD and a clean index of
+/// the checkout it was requested on. `claim` consumes the grant. It runs only at
+/// the publication point, so an attempt that stops earlier leaves it unused.
 pub(crate) async fn execute_snapshot(
-    app: &Arc<Workspace>, mutation: &Mutation<'_>, payload: &Value,
+    app: &Arc<Workspace>, mutation: &Mutation<'_>, payload: &Value, claim: impl FnOnce() -> Result<()>,
 ) -> Result<Execution> {
     let snapshot: Snapshot = serde_json::from_value(payload.clone())
         .context("The saved patch snapshot is unreadable. Nothing was changed")?;
@@ -829,11 +983,18 @@ pub(crate) async fn execute_snapshot(
         "The saved patch does not match its approved hash. Nothing was changed."
     );
     let allow_paths = globs(snapshot.allow_paths.as_deref())?;
+    mutation.prepare(async {
+        let _guard = app.git_lock.lock().await;
+        snapshot.checkout.verify(&root).await
+    }).await?;
+    #[cfg(test)]
+    tests::interrupt_at("preparing", mutation);
     let prepared = mutation.prepare(async {
         let _guard = app.git_lock.lock().await;
         prepare_bytes(&root, &app.state_dir, snapshot.patch.clone().into_bytes(), snapshot.message.clone(),
             allow_paths.as_ref(), false).await
     }).await.context("The approved patch cannot be applied to the current HEAD and index. Nothing was changed")?;
+    snapshot.checkout.require(&Checkout::new(&prepared.reference, &prepared.head))?;
     let paths: BTreeSet<_> = prepared.changes.iter().map(|change| change.path.clone()).collect();
     ensure!(
         paths == snapshot.paths,
@@ -847,14 +1008,19 @@ pub(crate) async fn execute_snapshot(
         "Against the current HEAD the patch has privacy findings that were not shown for approval. Nothing was changed."
     );
     let progress = Progress::default();
-    let mut result = match commit(app, mutation, &root, &prepared, snapshot.restore_worktree, &progress).await {
+    let committed = commit(app, mutation, &root, &prepared, snapshot.restore_worktree, claim, &progress).await;
+    let mut result = match committed {
         Ok(result) => result,
         Err(error) if mutation.wrote() => {
             let mut review = progress.review(&prepared, error).await;
             review["head_at_request"] = json!(snapshot.head);
             return Ok(Execution::NeedsReview(review));
         }
-        Err(error) => return Err(error.context("Nothing was changed")),
+        Err(error) => {
+            // A switch during execution is reported with the requested checkout.
+            snapshot.checkout.verify(&root).await?;
+            return Err(error.context("Nothing was changed"));
+        }
     };
     if snapshot.push_requested {
         result["push"] = json!({"status": "not_run",
@@ -866,18 +1032,35 @@ pub(crate) async fn execute_snapshot(
 
 async fn commit(
     app: &Workspace, mutation: &Mutation<'_>, root: &Path, prepared: &Prepared, restore_worktree: bool,
-    progress: &Progress,
+    claim: impl FnOnce() -> Result<()>, progress: &Progress,
 ) -> Result<Value> {
-    let local = mutation
-        .run(async {
-            let _guard = app.git_lock.lock().await;
-            let commit = prepared
-                .publish(&app.state_dir, || mutation.begin_write(), progress)
-                .await?;
-            let restore = restore::report(root, &prepared.git, &prepared.changes, restore_worktree, progress).await;
-            Ok((commit, restore))
+    // Staging can be cancelled without leaving anything to review.
+    let staged = mutation
+        .prepare(async {
+            let guard = app.git_lock.lock().await;
+            Ok((prepared.stage(&app.state_dir).await?, guard))
         })
         .await;
+    let local = match staged {
+        Ok((staged, guard)) => {
+            #[cfg(test)]
+            tests::interrupt_at("staged", mutation);
+            mutation
+                .run_from_write(async {
+                    let _guard = guard;
+                    let claim = || {
+                        claim()?;
+                        mutation.begin_write();
+                        Ok(())
+                    };
+                    let commit = prepared.publish(staged, claim, progress).await?;
+                    let restore = restore::report(root, &prepared.git, &prepared.changes, restore_worktree, progress).await;
+                    Ok((commit, restore))
+                })
+                .await
+        }
+        Err(error) => Err(error),
+    };
     app.git_changed();
     let (commit, restore) = local?;
     let paths = prepared.changes.iter().map(|change| &change.path).collect::<Vec<_>>();
@@ -965,7 +1148,7 @@ pub(in crate::mcp) async fn call(
     }
 
     let mutation = Mutation::new(app, session, "Git patch integration".into())?;
-    let committed = commit(app, &mutation, &root, &prepared, args.restore_worktree, &Progress::default()).await;
+    let committed = commit(app, &mutation, &root, &prepared, args.restore_worktree, || Ok(()), &Progress::default()).await;
     drop(mutation);
     let mut result = match committed {
         Ok(result) => result,

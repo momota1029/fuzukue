@@ -163,7 +163,27 @@ impl<'a> Mutation<'a> {
         self.writing.load(Ordering::Relaxed)
     }
 
+    /// Whether a drain or shutdown has asked this operation to stop.
+    pub(crate) fn interrupted(&self) -> bool {
+        self.cancel.check().is_err()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interrupt_for_test(&self) {
+        self.cancel.cancel();
+    }
+
     pub(crate) async fn run<T>(&self, action: impl Future<Output = Result<T>>) -> Result<T> {
+        self.run_recorded(action, false).await
+    }
+
+    /// Run an action that calls `begin_write` before it changes anything. An
+    /// interruption before that point leaves nothing to review.
+    pub(crate) async fn run_from_write<T>(&self, action: impl Future<Output = Result<T>>) -> Result<T> {
+        self.run_recorded(action, true).await
+    }
+
+    async fn run_recorded<T>(&self, action: impl Future<Output = Result<T>>, from_write: bool) -> Result<T> {
         let journal = &self.app.drain;
         let dir = &self.app.state_dir;
         journal.enqueue(
@@ -188,6 +208,7 @@ impl<'a> Mutation<'a> {
             }
         };
         let result = match result {
+            None if from_write && !self.wrote() => Err(anyhow!(update_busy())),
             None => Err(self.needs_review("The server interrupted the operation.")),
             Some(Err(_)) => Err(self.needs_review("The operation timed out.")),
             Some(Ok(Err(error))) if self.writing.load(Ordering::Relaxed) => Err(error.context(
@@ -198,7 +219,10 @@ impl<'a> Mutation<'a> {
         };
         if self.running.swap(false, Ordering::Relaxed) {
             journal.finish(dir, self.session, &self.id, None);
-            if self.app.hub.has_thread(self.session) {
+            // An attempt interrupted before writing is not a failure to report. Its
+            // caller keeps it for later or returns the reason.
+            let deferred = from_write && !self.wrote() && self.interrupted();
+            if !deferred && self.app.hub.has_thread(self.session) {
                 let outcome = if result.is_ok() {
                     "completed"
                 } else {

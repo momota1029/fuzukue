@@ -75,6 +75,7 @@ impl Workbench {
                     "override_privacy": true, "privacy_findings": 1,
                     "locations": ["docs/handbook/section-02.md:14"],
                     "patch_sha256": "3f2a9c1d7e405b8a", "head": "9d41c07be2a1f6c3", "push": false,
+                    "branch": "main",
                 }),
                 scope: json!({"workspace": "handbook"}),
             },

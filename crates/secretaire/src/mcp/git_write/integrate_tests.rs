@@ -14,10 +14,20 @@ enum Fault {
     LoseIndexLockAndBlockRollback(std::path::PathBuf),
     /// The execution deadline passes while worktree files are being restored.
     RestoreTimeout,
+    /// HEAD is pointed elsewhere just before the ref locks are taken.
+    SwitchHead(std::path::PathBuf),
 }
 
 thread_local! {
     static FAULT: std::cell::RefCell<Option<Fault>> = const { std::cell::RefCell::new(None) };
+    static INTERRUPT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Simulate a drain interrupting the operation at a named point.
+pub(super) fn interrupt_at(point: &str, mutation: &Mutation<'_>) {
+    if INTERRUPT.get() == Some(point) {
+        mutation.interrupt_for_test();
+    }
 }
 
 pub(super) async fn fault(point: &str) {
@@ -33,6 +43,9 @@ pub(super) async fn fault(point: &str) {
             tokio::time::advance(std::time::Duration::from_secs(600)).await;
             tokio::time::resume();
             std::future::pending::<()>().await;
+        }
+        ("before_ref_lock", Fault::SwitchHead(repo)) => {
+            git(&repo, &["symbolic-ref", "HEAD", "refs/heads/other"]).unwrap();
         }
         _ => {}
     }
@@ -686,7 +699,7 @@ mod deferred {
         payload["patch"] = json!(modification("tracked.txt", SECRET));
         payload["patch_sha256"] = json!(format!("{:x}", Sha256::digest(modification("tracked.txt", SECRET).as_bytes())));
         let mutation = Mutation::new(&app, &session, "Approved operation".into())?;
-        let Err(error) = execute_snapshot(&app, &mutation, &payload).await else { panic!("unreviewed findings ran") };
+        let Err(error) = execute_snapshot(&app, &mutation, &payload, || panic!("claimed")).await else { panic!("unreviewed findings ran") };
         assert!(error.to_string().contains("privacy findings"), "{error:#}");
         assert_eq!(head(&fixture)?, fixture.head);
         Ok(())
@@ -979,6 +992,208 @@ mod deferred {
         deferred::recover(&app).await?;
         assert!(results(&app)?.iter().all(|(approval, _)| approval != &id));
         assert_eq!(git(&fixture.repo, &["rev-list", "--count", "HEAD"])?, "2");
+        Ok(())
+    }
+
+    /// Every ref and what HEAD names.
+    fn refs(fixture: &Fixture) -> Result<(String, String)> {
+        Ok((
+            fs::read_to_string(fixture.repo.join(".git/HEAD"))?,
+            git(&fixture.repo, &["for-each-ref", "--format=%(refname) %(objectname)"])?,
+        ))
+    }
+
+    fn assert_unlocked(fixture: &Fixture) {
+        for lock in ["index.lock", "HEAD.lock", "refs/heads/main.lock"] {
+            assert!(!fixture.repo.join(".git").join(lock).exists(), "{lock}");
+        }
+    }
+
+    fn assert_refused(app: &Workspace, id: &str, requested: &str) {
+        let (status, result) = outcome(app, id);
+        assert_eq!(status, Status::Failed, "{result}");
+        assert!(result["message"].as_str().unwrap().contains(requested), "{result}");
+        assert!(app.hub.approval_record(id).unwrap().unwrap().0.consumed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn approval_on_another_checkout_is_refused_without_changes() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        // Another branch at the same commit, and a detached HEAD at the same commit.
+        for switch in [&["switch", "-c", "other"][..], &["switch", "--detach"]] {
+            let id = pending(&app, &session, override_args()).await?;
+            let (summary, _) = app.hub.approval_record(&id)?.unwrap();
+            assert_eq!(summary.action.args["branch"], "main");
+            assert!(summary.action.args.get("detached_head").is_none());
+            git(&fixture.repo, switch)?;
+            let before = refs(&fixture)?;
+            let index = fs::read(fixture.repo.join(".git/index"))?;
+            app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+            deferred::process(&app, &id).await?;
+            assert_refused(&app, &id, "`main`");
+            assert_eq!(refs(&fixture)?, before);
+            assert_eq!(fs::read(fixture.repo.join(".git/index"))?, index);
+            assert_unlocked(&fixture);
+            git(&fixture.repo, &["switch", "main"])?;
+        }
+
+        // The recorded branch is part of the digest.
+        let id = pending(&app, &session, override_args()).await?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        let mut tampered = entry(&app, &id);
+        tampered.payload["checkout"] = json!({"branch": "refs/heads/other"});
+        save_entry(&app, &id, &tampered)?;
+        git(&fixture.repo, &["switch", "other"])?;
+        deferred::process(&app, &id).await?;
+        let (status, result) = outcome(&app, &id);
+        assert_eq!(status, Status::Failed, "{result}");
+        assert!(result["message"].as_str().unwrap().contains("does not match the approved record"), "{result}");
+        assert_eq!(state(&app, &id), ApprovalState::Withdrawn);
+        assert_eq!(head(&fixture)?, fixture.head);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detached_requests_run_only_on_the_same_detached_commit() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let short = &fixture.head[..12];
+        git(&fixture.repo, &["switch", "--detach"])?;
+        // A branch at the same commit, then another detached commit.
+        for case in 0..2 {
+            let id = pending(&app, &session, override_args()).await?;
+            let (summary, _) = app.hub.approval_record(&id)?.unwrap();
+            assert_eq!(summary.action.args["detached_head"], fixture.head);
+            assert!(summary.action.args.get("branch").is_none());
+            if case == 0 {
+                git(&fixture.repo, &["switch", "main"])?;
+            } else {
+                git(&fixture.repo, &["commit", "--allow-empty", "-m", "Moved"])?;
+            }
+            let before = refs(&fixture)?;
+            app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+            deferred::process(&app, &id).await?;
+            assert_refused(&app, &id, short);
+            assert_eq!(refs(&fixture)?, before);
+            git(&fixture.repo, &["switch", "--detach", &fixture.head])?;
+        }
+        let id = pending(&app, &session, override_args()).await?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        deferred::process(&app, &id).await?;
+        assert_eq!(outcome(&app, &id).0, Status::Completed);
+        assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD~1"])?, fixture.head);
+        assert_eq!(git(&fixture.repo, &["rev-parse", "main"])?, fixture.head);
+        assert_eq!(fs::read_to_string(fixture.repo.join(".git/HEAD"))?.trim(), head(&fixture)?);
+        assert_unlocked(&fixture);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_request_from_another_branch_replaces_the_pending_card() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let first = pending(&app, &session, override_args()).await?;
+        git(&fixture.repo, &["switch", "-c", "other"])?;
+        let response = request(&app, &session, override_args(), Some(Actor::Claude), false).await?;
+        let data = &response["structuredContent"];
+        assert_eq!(data["replaced_approval_id"], first, "{response}");
+        assert_eq!(data["branch"], "other");
+        assert_eq!(state(&app, &first), ApprovalState::Withdrawn);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_switch_during_execution_lands_nowhere() -> Result<()> {
+        for detached in [false, true] {
+            let fixture = Fixture::new()?;
+            let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+            git(&fixture.repo, &["branch", "other"])?;
+            if detached {
+                git(&fixture.repo, &["switch", "--detach"])?;
+            }
+            let id = pending(&app, &session, override_args()).await?;
+            app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+            let branches = refs(&fixture)?.1;
+            let index = fs::read(fixture.repo.join(".git/index"))?;
+            FAULT.with(|fault| *fault.borrow_mut() = Some(Fault::SwitchHead(fixture.repo.clone())));
+            let processed = deferred::process(&app, &id).await;
+            FAULT.with(|fault| *fault.borrow_mut() = None);
+            processed?;
+            assert_refused(&app, &id, if detached { &fixture.head[..12] } else { "`main`" });
+            assert_eq!(refs(&fixture)?, ("ref: refs/heads/other\n".into(), branches));
+            assert_eq!(fs::read(fixture.repo.join(".git/index"))?, index);
+            assert_unlocked(&fixture);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn head_cannot_be_switched_once_publication_holds_its_lock() -> Result<()> {
+        for detached in [false, true] {
+            let fixture = Fixture::new()?;
+            let (app, _) = setup(&fixture, &modification("tracked.txt", "changed"))?;
+            git(&fixture.repo, &["branch", "other"])?;
+            if detached {
+                git(&fixture.repo, &["switch", "--detach"])?;
+            }
+            let root = app.project_dir.canonicalize()?;
+            let prepared = prepare(&root, &app.state_dir, &crate::mcp::parse_args(&args())?).await?;
+            let staged = prepared.stage(&app.state_dir).await?;
+            assert!(git(&fixture.repo, &["symbolic-ref", "HEAD", "refs/heads/other"]).is_err());
+            let commit = prepared.publish(staged, || Ok(()), &Progress::default()).await?;
+            assert_eq!(head(&fixture)?, commit);
+            assert_eq!(git(&fixture.repo, &["rev-parse", "other"])?, fixture.head);
+            assert_unlocked(&fixture);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_drain_before_the_first_write_keeps_the_grant_for_after_the_restart() -> Result<()> {
+        for point in ["preparing", "staged"] {
+            let fixture = Fixture::new()?;
+            let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+            let id = pending(&app, &session, override_args()).await?;
+            app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+            let (_, mut events) = app.hub.subscribe(u64::MAX);
+            INTERRUPT.set(Some(point));
+            let processed = deferred::process(&app, &id).await;
+            INTERRUPT.set(None);
+            processed?;
+            assert_eq!(entry(&app, &id).phase, Phase::Waiting, "{point}");
+            let (summary, _) = app.hub.approval_record(&id)?.unwrap();
+            assert_eq!((summary.state, summary.consumed_at), (ApprovalState::Granted, None));
+            assert_eq!(head(&fixture)?, fixture.head);
+            // Neither a result nor a review notice is left behind.
+            while let Ok(event) = events.try_recv() {
+                assert!(!matches!(event.event, ServerEvent::LocalNotice { .. }), "{point}");
+            }
+            assert!(app.drain.records(&app.state_dir)?.is_empty(), "{point}");
+            assert!(deferred::withdraw(&app, &session, &id, None).await.is_err());
+
+            let app = reopen(&fixture, app);
+            deferred::recover(&app).await?;
+            deferred::recover(&app).await?;
+            assert_eq!(outcome(&app, &id).0, Status::Completed, "{point}");
+            assert_eq!(git(&fixture.repo, &["rev-list", "--count", "HEAD"])?, "2");
+            assert_eq!(results(&app)?.len(), 1);
+            assert_unlocked(&fixture);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawal_never_cancels_a_decision_of_the_user() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let id = pending(&app, &session, override_args()).await?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        let error = deferred::withdraw(&app, &session, &id, None).await.unwrap_err();
+        assert!(error.to_string().contains("already been decided"), "{error:#}");
+        assert_eq!(state(&app, &id), ApprovalState::Granted);
+        deferred::process(&app, &id).await?;
+        assert_eq!(outcome(&app, &id).0, Status::Completed);
         Ok(())
     }
 

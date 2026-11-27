@@ -36,6 +36,8 @@ approval-dock-integrate-privacy = { $count ->
     [one] { $count } line may contain private data. Allow only if it is intended.
    *[other] { $count } lines may contain private data. Allow only if they are intended.
 }
+approval-dock-branch = Branch { $branch }
+approval-dock-detached-head = Detached HEAD at { $head }
 approval-dock-files = Files to change ({ $count })
 approval-dock-flagged-lines = Flagged lines
 approval-dock-more = { $count } more

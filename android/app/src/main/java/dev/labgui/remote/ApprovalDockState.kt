@@ -83,6 +83,9 @@ internal data class IntegrateCard(
     val findings: Int,
     val patch: String,
     val head: String,
+    /** The branch the request was made on, or null on a detached HEAD. */
+    val branch: String? = null,
+    val detachedHead: String? = null,
 ) {
     /** Flagged lines beyond the ones the server lists. */
     val unlisted: Int get() = (findings - flagged.size).coerceAtLeast(0)
@@ -100,5 +103,7 @@ internal fun QueuedApprovalAction.integrateCard(): IntegrateCard? {
         findings = (values["privacy_findings"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0,
         patch = text(values["patch_sha256"]).orEmpty().take(12),
         head = text(values["head"]).orEmpty().take(12),
+        branch = text(values["branch"]),
+        detachedHead = text(values["detached_head"])?.take(12),
     )
 }

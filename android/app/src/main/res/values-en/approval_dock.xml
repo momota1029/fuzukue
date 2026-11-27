@@ -17,6 +17,8 @@
         <item quantity="one">%1$d line may contain private data. Allow only if it is intended.</item>
         <item quantity="other">%1$d lines may contain private data. Allow only if they are intended.</item>
     </plurals>
+    <string name="approval_integrate_branch">Branch %1$s</string>
+    <string name="approval_integrate_detached">Detached HEAD at %1$s</string>
     <string name="approval_integrate_files">Files to change (%1$d)</string>
     <string name="approval_integrate_flagged">Flagged lines</string>
     <string name="approval_integrate_more">%1$d more</string>

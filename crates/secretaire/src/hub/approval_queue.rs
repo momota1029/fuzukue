@@ -385,6 +385,7 @@ impl Hub {
             .decide(id, decision, principal, reason)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn withdraw_own_approval(
         &self,
         id: &str,

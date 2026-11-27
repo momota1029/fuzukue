@@ -271,6 +271,8 @@ impl Workbench {
         let body = match &card {
             Some(card) => v_flex().w_full().min_w_0().gap_1()
                 .child(div().text_sm().min_w_0().whitespace_normal().child(card.explanation))
+                .children(card.checkout.clone().map(|checkout| div().text_sm().min_w_0().whitespace_normal()
+                    .font_weight(FontWeight::SEMIBOLD).child(checkout)))
                 .children(card.privacy.clone().map(|privacy| div().text_sm().min_w_0().whitespace_normal()
                     .text_color(theme.warning).child(privacy)))
                 // The open details list everything, so the summary lists are not repeated.

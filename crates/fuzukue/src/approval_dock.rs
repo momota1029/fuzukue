@@ -210,6 +210,8 @@ struct IntegrateCard {
     explanation: &'static str,
     privacy: Option<String>,
     workspace: String,
+    /// The branch or detached HEAD the request was made on.
+    checkout: Option<String>,
     files: Vec<String>,
     flagged: Vec<String>,
     /// Flagged lines beyond the ones the server lists.
@@ -229,6 +231,14 @@ fn integrate_card(item: &ApprovalSummary) -> Option<IntegrateCard> {
     let short = |key: &str| {
         args.get(key).and_then(Value::as_str).unwrap_or_default().chars().take(12).collect::<String>()
     };
+    let text = |key: &str| args.get(key).and_then(Value::as_str);
+    let checkout = match text("branch") {
+        Some(branch) => Some(tr!("approval-dock-branch", branch = branch)),
+        None => text("detached_head").map(|_| {
+            let head = short("detached_head");
+            tr!("approval-dock-detached-head", head = head.as_str())
+        }),
+    };
     let files = strings("paths")?;
     let flagged = strings("locations").unwrap_or_default();
     let count = args.get("privacy_findings").and_then(Value::as_u64).unwrap_or_default() as usize;
@@ -237,6 +247,7 @@ fn integrate_card(item: &ApprovalSummary) -> Option<IntegrateCard> {
         privacy: (count > 0).then(|| tr!("approval-dock-integrate-privacy", count = count)),
         workspace: item.action.scope.get("workspace").and_then(Value::as_str).unwrap_or_default().to_owned(),
         unlisted: count.saturating_sub(flagged.len()),
+        checkout,
         files,
         flagged,
         patch: short("patch_sha256"),

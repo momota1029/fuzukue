@@ -10,8 +10,10 @@
 //! Each snapshot moves through these phases, saved before the next step:
 //!
 //! - `waiting`: the request is pending in the approval queue.
-//! - `running`: execution is about to claim the grant with `consume_once`. After a
-//!   restart, an unconsumed grant returns to `waiting`. A consumed grant has an
+//! - `running`: execution is under way. It claims the grant with `consume_once`
+//!   only at the point of its first write, or when it fails for good. A drain or
+//!   restart before that leaves the grant unused and the snapshot returns to
+//!   `waiting`. A consumed grant found in this phase after a restart has an
 //!   unknown outcome. It is reported and never run again.
 //! - `finished`: the outcome is saved. The desk turn is not yet queued.
 //! - `handed_off`: the desk turn is in the held-work journal. The desk delivers it
@@ -20,6 +22,7 @@
 use std::collections::BTreeSet;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -254,7 +257,7 @@ fn open_entries(app: &Workspace, dir: &Path, session: &str, action: &Action) -> 
 
 /// Close an outdated card without a result message. False when it was decided first.
 fn supersede(app: &Workspace, dir: &Path, session: &str, entry: &Entry) -> Result<bool> {
-    let reason = "Replaced by a request that shows the current findings";
+    let reason = "Replaced by a request that shows the current findings and checkout";
     if !app.hub.withdraw_pending_approval(&entry.approval_id, &owner(session), reason)? {
         return Ok(false);
     }
@@ -272,9 +275,11 @@ pub(crate) async fn withdraw(app: &Workspace, session: &str, id: &str, reason: O
     let mut entry = load(&dir, id)?.filter(|entry| entry.session == session).context("Unknown approval ID")?;
     let reason = reason.map(|reason| reason.chars().take(500).collect::<String>())
         .unwrap_or_else(|| "Withdrawn by the front desk".into());
-    let summary = app.hub.withdraw_own_approval(id, &owner(session), Some(reason))
-        .map_err(|_| anyhow::anyhow!("The approval has already been decided. Wait for its result message."))?;
-    ensure!(summary.state == ApprovalState::Withdrawn, "The approval has already been decided");
+    // A decision of the user is never undone.
+    ensure!(
+        app.hub.withdraw_pending_approval(id, &owner(session), &reason)?,
+        "The approval has already been decided. Wait for its result message."
+    );
     let outcome = Outcome { status: Status::Withdrawn, at: now(), result: json!({}) };
     entry.phase = Phase::HandedOff { outcome, silent: true };
     entry.payload = Value::Null;
@@ -353,7 +358,7 @@ pub(crate) async fn process(app: &Arc<Workspace>, id: &str) -> Result<()> {
                             finished(Status::Failed, json!({"message": MISMATCH}))
                         } else {
                             let Some(outcome) = run(app, &dir, &mut entry, &summary.owner, &action).await? else {
-                                // Admission is closed for an update or shutdown. Recovery retries after it.
+                                // An update or shutdown is draining. Recovery retries after it.
                                 return Ok(());
                             };
                             Phase::Finished { outcome }
@@ -386,16 +391,31 @@ async fn run(
     };
     entry.phase = Phase::Running { started_at: now() };
     save(dir, entry)?;
-    if !app.hub.consume_once_approval(&entry.approval_id, owner, action)? {
-        return Ok(Some(Outcome { status: Status::Failed, at: now(),
-            result: json!({"message": "The grant could not be claimed. Nothing was run."}) }));
-    }
-    #[cfg(test)]
-    tests::crash_point("after_consume")?;
+    let id = entry.approval_id.clone();
+    let claimed = AtomicBool::new(false);
+    let claim = || -> Result<()> {
+        ensure!(app.hub.consume_once_approval(&id, owner, action)?, "The grant could not be claimed. Nothing was run.");
+        claimed.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        tests::crash_point("after_consume")?;
+        Ok(())
+    };
     let result = match entry.tool.as_str() {
-        integrate::NAME => integrate::execute_snapshot(app, &mutation, &entry.payload).await,
+        integrate::NAME => integrate::execute_snapshot(app, &mutation, &entry.payload, claim).await,
         _ => Err(anyhow::anyhow!("Unsupported deferred approval")),
     };
+    if claimed.load(Ordering::Relaxed) {
+        #[cfg(test)]
+        tests::crash_point("after_consume")?;
+    } else if mutation.interrupted() {
+        // Nothing was written. The unused grant runs after the drain or restart.
+        entry.phase = Phase::Waiting;
+        save(dir, entry)?;
+        return Ok(None);
+    } else {
+        // A failure before any write is final and uses up the grant.
+        app.hub.consume_once_approval(&id, owner, action)?;
+    }
     drop(mutation);
     let (status, result) = match result {
         Ok(Execution::Completed(result)) => (Status::Completed, result),

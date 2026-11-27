@@ -73,6 +73,13 @@ class ApprovalDockStateTest {
         assertEquals(listOf("docs/b.md:14"), card.flagged)
         assertEquals(2, card.unlisted)
         assertEquals(listOf("handbook", "0123456789ab", "fedcba987654"), listOf(card.workspace, card.patch, card.head))
+        assertNull(card.branch)
+        assertNull(card.detachedHead)
+        fun checkout(field: String, value: String) = action.copy(
+            args = Json.parseToJsonElement("""{"paths":["docs/a.md"],"$field":"$value"}"""),
+        ).integrateCard()!!
+        assertEquals("topic/notes", checkout("branch", "topic/notes").branch)
+        assertEquals("fedcba987654", checkout("detached_head", "fedcba9876543210").detachedHead)
         // Other tools and redacted records keep the generic card.
         assertNull(action.copy(tool = "fs_write").integrateCard())
         assertNull(action.copy(args = JsonPrimitive("[redacted]")).integrateCard())

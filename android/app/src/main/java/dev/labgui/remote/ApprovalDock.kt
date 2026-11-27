@@ -329,6 +329,12 @@ private fun IntegrateSummary(card: IntegrateCard, listed: Int) {
         Text(pluralStringResource(R.plurals.approval_integrate_privacy, card.findings, card.findings),
             color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
     }
+    card.branch?.let {
+        Text(stringResource(R.string.approval_integrate_branch, it), style = MaterialTheme.typography.labelLarge)
+    }
+    card.detachedHead?.let {
+        Text(stringResource(R.string.approval_integrate_detached, it), style = MaterialTheme.typography.labelLarge)
+    }
     ApprovalField(R.string.approval_dock_scope, card.workspace, lines = 1)
     SelectionContainer {
         Column {

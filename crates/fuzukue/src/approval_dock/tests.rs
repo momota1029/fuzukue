@@ -43,10 +43,19 @@ fn integrate_cards_list_files_and_flagged_lines_as_plain_text() {
     assert_eq!(card.unlisted, 2);
     assert_eq!((card.workspace.as_str(), card.patch.as_str(), card.head.as_str()), ("handbook", "0123456789ab", "fedcba987654"));
     assert_eq!(card.explanation, tr!("approval-dock-integrate-explanation"));
-    assert!(card.privacy.unwrap().contains('3'));
+    assert!(card.privacy.as_ref().unwrap().contains('3'));
     let shown = target(&request);
     assert!(shown.contains("docs/a.md") && !shown.contains(['[', '"']), "{shown}");
 
+    assert_eq!(card.checkout, None);
+    let mut on = request.clone();
+    on.action.args["branch"] = json!("topic/notes");
+    let shown_branch = integrate_card(&on).unwrap().checkout.unwrap();
+    assert!(shown_branch.contains("topic/notes"), "{shown_branch}");
+    on.action.args.as_object_mut().unwrap().remove("branch");
+    on.action.args["detached_head"] = json!("fedcba9876543210");
+    let detached = integrate_card(&on).unwrap().checkout.unwrap();
+    assert!(detached.contains("fedcba987654") && !detached.contains("fedcba9876543"), "{detached}");
     // Other tools and redacted records keep the generic card.
     assert!(integrate_card(&item("other", "thread", "job", ApprovalRisk::Low)).is_none());
     request.action.args = json!("[redacted]");
