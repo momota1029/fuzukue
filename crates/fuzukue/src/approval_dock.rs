@@ -30,6 +30,8 @@ pub(super) struct ApprovalDock {
     resolved: HashMap<(String, String), (ApprovalState, i64)>,
     collapsed: bool,
     detail: Option<String>,
+    /// Live approvals whose full summary is expanded.
+    live_details: HashSet<String>,
     selected: HashSet<String>,
     review: Option<Review>,
     submitted: Option<Submission>,
@@ -203,7 +205,55 @@ fn json(value: &Value) -> String {
     value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())
 }
 
+/// The readable parts of a deferred patch integration, shown in place of its raw arguments.
+struct IntegrateCard {
+    explanation: &'static str,
+    privacy: Option<String>,
+    workspace: String,
+    files: Vec<String>,
+    flagged: Vec<String>,
+    /// Flagged lines beyond the ones the server lists.
+    unlisted: usize,
+    patch: String,
+    head: String,
+}
+
+fn integrate_card(item: &ApprovalSummary) -> Option<IntegrateCard> {
+    if item.action.tool != "git_integrate_patch" {
+        return None;
+    }
+    let args = &item.action.args;
+    let strings = |key: &str| -> Option<Vec<String>> {
+        args.get(key)?.as_array()?.iter().map(|value| value.as_str().map(str::to_owned)).collect()
+    };
+    let short = |key: &str| {
+        args.get(key).and_then(Value::as_str).unwrap_or_default().chars().take(12).collect::<String>()
+    };
+    let files = strings("paths")?;
+    let flagged = strings("locations").unwrap_or_default();
+    let count = args.get("privacy_findings").and_then(Value::as_u64).unwrap_or_default() as usize;
+    Some(IntegrateCard {
+        explanation: tr!("approval-dock-integrate-explanation"),
+        privacy: (count > 0).then(|| tr!("approval-dock-integrate-privacy", count = count)),
+        workspace: item.action.scope.get("workspace").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        unlisted: count.saturating_sub(flagged.len()),
+        files,
+        flagged,
+        patch: short("patch_sha256"),
+        head: short("head"),
+    })
+}
+
 fn target(item: &ApprovalSummary) -> String {
+    if let Some(card) = integrate_card(item) {
+        if let [first, rest @ ..] = card.files.as_slice() {
+            return if rest.is_empty() {
+                first.clone()
+            } else {
+                tr!("approval-dock-target-more", path = first.as_str(), count = rest.len())
+            };
+        }
+    }
     let keys = ["target", "paths", "path", "destination", "url", "repo", "cwd"];
     [&item.action.args, &item.action.scope]
         .into_iter()
@@ -215,9 +265,20 @@ fn target(item: &ApprovalSummary) -> String {
 }
 
 fn expiry(item: &ApprovalSummary) -> String {
-    chrono::DateTime::from_timestamp_millis(item.expires_at)
+    let Some(deadline) = item.deadline() else {
+        return tr!("approval-dock-no-deadline").to_owned();
+    };
+    chrono::DateTime::from_timestamp_millis(deadline)
         .map(|time| time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string())
-        .unwrap_or_else(|| item.expires_at.to_string())
+        .unwrap_or_else(|| deadline.to_string())
+}
+
+/// A readable title for tools that have one. Other tools show their name.
+pub(super) fn tool_title(tool: &str) -> String {
+    match tool {
+        "git_integrate_patch" => tr!("approval-dock-tool-integrate").to_owned(),
+        _ => tool.to_owned(),
+    }
 }
 
 impl Workbench {
@@ -386,8 +447,10 @@ impl Workbench {
         }
     }
 
+    /// Queue requests plus live approvals of the thread, as shown in its dock.
     pub(super) fn approval_count(&self, thread: &str) -> usize {
         self.approvals.thread(thread).count()
+            + self.chats.get(thread).map_or(0, |chat| chat.pending_live_approvals().len())
     }
 
     pub(super) fn approval_badge(&self, count: usize, cx: &Context<Self>) -> impl IntoElement {

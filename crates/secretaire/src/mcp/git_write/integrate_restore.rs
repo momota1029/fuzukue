@@ -190,7 +190,9 @@ fn restore_file(
     result
 }
 
-pub(super) async fn report(root: &Path, git: &Git, changes: &[Change], enabled: bool) -> Value {
+pub(super) async fn report(
+    root: &Path, git: &Git, changes: &[Change], enabled: bool, progress: &super::Progress,
+) -> Value {
     let mut restored = Vec::new();
     let mut already_current = Vec::new();
     let mut left_untouched = Vec::new();
@@ -211,6 +213,9 @@ pub(super) async fn report(root: &Path, git: &Git, changes: &[Change], enabled: 
             let reason = match result {
                 Ok(Ok(Outcome::Restored)) => {
                     restored.push(&change.path);
+                    progress.record(|landed| landed.restored.push(change.path.clone()));
+                    #[cfg(test)]
+                    super::tests::fault("during_restore").await;
                     continue;
                 }
                 Ok(Ok(Outcome::Current)) => {

@@ -219,7 +219,6 @@ struct Row {
     id: u64,
     actor: Actor,
     content: Content,
-    ends_tool_run: bool,
     at_ms: Option<u64>,
     estimate: RowEstimate,
 }
@@ -230,7 +229,7 @@ impl Row {
         let estimate = RowEstimate::for_content(&actor, &content);
         Self {
             id: NEXT_ROW_ID.fetch_add(1, Ordering::Relaxed),
-            actor, content, ends_tool_run: false, at_ms: Some(unix_millis()), estimate,
+            actor, content, at_ms: Some(unix_millis()), estimate,
         }
     }
 
@@ -487,12 +486,19 @@ struct Message {
     to_worker: bool,
 }
 
+/// A live approval shown in the dock until it is resolved.
+pub(super) struct PendingLiveApproval {
+    pub request_id: String,
+    pub summary: crate::i18n::Message,
+    pub shell: bool,
+    pub remember_shell: bool,
+}
+
 struct Approval {
     request_id: String,
     summary: crate::i18n::Message,
     resolved: Option<String>,
     automatic: bool,
-    details_open: bool,
     shell: bool,
     remember_shell: bool,
 }
@@ -558,7 +564,6 @@ enum Disclosure {
     Input(usize),
     Result(usize),
     DecidedApprovals,
-    ApprovalDetails(usize),
 }
 
 impl Chat {
@@ -682,6 +687,34 @@ impl Chat {
         })
     }
 
+    /// Live approvals waiting for the user, in arrival order. The dock shows them.
+    pub(super) fn pending_live_approvals(&self) -> Vec<PendingLiveApproval> {
+        let mut pending: Vec<_> = self.by_approval.iter().filter_map(|(id, &(row, index))| {
+            let Content::Tools(group) = &self.rows.get(row)?.content else { return None };
+            let approval = group.approvals.get(index).filter(|approval| approval.resolved.is_none())?;
+            Some((row, index, PendingLiveApproval {
+                request_id: id.clone(),
+                summary: approval.summary.clone(),
+                shell: approval.shell,
+                remember_shell: approval.remember_shell,
+            }))
+        }).collect();
+        pending.sort_by_key(|(row, index, _)| (*row, *index));
+        pending.into_iter().map(|(_, _, approval)| approval).collect()
+    }
+
+    /// Unanswered question cards, in arrival order. The dock shows them.
+    pub(super) fn pending_questions(&self, cx: &gpui_kit::App) -> Vec<Entity<QuestionCard>> {
+        self.rows.iter().filter_map(|row| match &row.content {
+            Content::Question { card, .. } if !card.read(cx).is_resolved() => Some(card.clone()),
+            _ => None,
+        }).collect()
+    }
+
+    pub(super) fn busy(&self) -> bool {
+        self.busy
+    }
+
     pub(super) fn request_approval(
         &mut self,
         request_id: String,
@@ -710,7 +743,6 @@ impl Chat {
                 summary,
                 resolved: None,
                 automatic: false,
-                details_open: false,
                 shell,
                 remember_shell,
             });
@@ -1275,12 +1307,6 @@ impl Chat {
 
     pub(super) fn end_turn(&mut self, actor: &Actor, cx: &mut Context<Workbench>) {
         self.grouping.end_turn(actor);
-        if let Some(row) = self.rows.last_mut().filter(|row| {
-            &row.actor == actor && matches!(row.content, Content::Tools(_))
-        }) {
-            row.ends_tool_run = true;
-            self.transcript.rows.borrow_mut().take();
-        }
         if is_partner(actor) {
             self.delegate_anchor = None;
         }
@@ -1550,13 +1576,23 @@ impl Chat {
     }
 
     fn toggle(&mut self, row: usize, disclosure: Disclosure, show_worker_messages: bool, cx: &mut Context<Workbench>) {
-        if matches!(disclosure, Disclosure::Group) {
-            let runs = ToolRuns::new(self);
+        if matches!(disclosure, Disclosure::Group | Disclosure::DecidedApprovals) {
+            // Act on the runs that were drawn.
+            let drawn = self.transcript.rows.borrow().clone();
+            let computed;
+            let runs = match &drawn {
+                Some(drawn) => &drawn.tool_runs,
+                None => {
+                    computed = ToolRuns::new(self, |row| row.kind(show_worker_messages) != RowKind::Hidden);
+                    &computed
+                }
+            };
             if let Some(run) = runs.at(row) {
-                let open = !run.open(&self.rows);
+                let decided = matches!(disclosure, Disclosure::DecidedApprovals);
+                let open = !if decided { run.decided_open(&self.rows) } else { run.open(&self.rows) };
                 for &index in &run.rows {
                     if let Content::Tools(group) = &mut self.rows[index].content {
-                        group.open = open;
+                        if decided { group.decided_open = open } else { group.open = open }
                     }
                 }
                 self.remeasure(row, cx);
@@ -1578,7 +1614,6 @@ impl Chat {
             (Content::Delegate(block), Disclosure::DelegateEarlierTools) => &mut block.earlier_tools_open,
             (Content::Tools(group), Disclosure::Group) => &mut group.open,
             (Content::Tools(group), Disclosure::DecidedApprovals) => &mut group.decided_open,
-            (Content::Tools(group), Disclosure::ApprovalDetails(index)) => &mut group.approvals[index].details_open,
             _ => return,
         };
         *open = !*open;
@@ -2333,15 +2368,15 @@ impl Workbench {
         let geometry = {
             let mut cached = chat.transcript.rows.borrow_mut();
             if cached.as_ref().is_none_or(|rows| rows.show_worker_messages != show_worker_messages) {
-                let tool_runs = ToolRuns::new(chat);
-                let kinds: Vec<_> = chat.rows.iter().enumerate().map(|(index, row)| {
-                    match &row.content {
-                        _ if tool_runs.hides(index) => RowKind::Hidden,
-                        Content::AutoAttached(route) if thread.is_none_or(|thread| !thread.auto_attached.contains(route)) => {
-                            RowKind::Hidden
-                        }
-                        _ => row.kind(show_worker_messages),
+                let shown = |row: &Row| match &row.content {
+                    Content::AutoAttached(route) if thread.is_none_or(|thread| !thread.auto_attached.contains(route)) => {
+                        RowKind::Hidden
                     }
+                    _ => row.kind(show_worker_messages),
+                };
+                let tool_runs = ToolRuns::new(chat, |row| shown(row) != RowKind::Hidden);
+                let kinds: Vec<_> = chat.rows.iter().enumerate().map(|(index, row)| {
+                    if tool_runs.hides(index) { RowKind::Hidden } else { shown(row) }
                 }).collect();
                 let latest_message = chat.rows.iter().zip(&kinds).rposition(|(row, &kind)| {
                     matches!(row.content, Content::Message(..)) && match kind {
@@ -2352,9 +2387,15 @@ impl Workbench {
                 });
                 *cached = Some(Rc::new(TranscriptRows {
                     estimates: chat.rows.iter().enumerate().map(|(index, row)| {
-                        tool_runs.at(index).filter(|run| run.root() == index && run.open(&chat.rows)).map_or(row.estimate, |run| {
-                            RowEstimate::Disclosure(1 + run.calls.len() + usize::from(run.unlinked > 0))
-                        })
+                        tool_runs.at(index).filter(|run| run.root() == index && run.rows.len() + run.calls.len() > 1)
+                            .map_or(row.estimate, |run| {
+                                let open_calls = if run.open(&chat.rows) {
+                                    run.calls.len() + usize::from(run.unlinked > 0)
+                                } else { 0 };
+                                let open_decided = if run.decided_open(&chat.rows) { run.decided.len() } else { 0 };
+                                let summaries = usize::from(!run.calls.is_empty()) + usize::from(!run.decided.is_empty());
+                                RowEstimate::Disclosure(summaries + open_calls + open_decided)
+                            })
                     }).collect(),
                     tool_runs,
                     first_visible: kinds.iter().position(|&kind| kind != RowKind::Hidden),
@@ -2470,7 +2511,14 @@ impl Workbench {
                 let mut body = v_flex().min_w_0().gap_2();
                 match &row.content {
                     Content::Question { card, .. } => {
-                        body = body.child(card.clone());
+                        // An open question is answered in the dock. The answer stays here.
+                        body = if card.read(cx).is_resolved() {
+                            body.child(card.clone())
+                        } else {
+                            body.child(div().id(SharedString::from(format!("question-in-dock-{ix}")))
+                                .w_full().min_w_0().text_sm().text_color(theme.muted_foreground).truncate()
+                                .child(tr!("chat-question-in-dock")))
+                        };
                     }
                     Content::GitHubConnect { attempt, state } => {
                         body = body.child(crate::github_report::render_github_connect_card(
@@ -2804,12 +2852,16 @@ impl Workbench {
                             let label = tr!("chat-tool-calls", calls = calls.len());
                             let color = if failed { theme.danger } else { theme.muted_foreground };
                             let long_partner_run = calls.len() >= LONG_PARTNER_TOOL_RUN
-                                && matches!(row.actor, Actor::Claude | Actor::Codex { parent_tool_use: None, .. });
+                                && calls.iter().all(|&(row, _)| matches!(chat.rows[row].actor,
+                                    Actor::Claude | Actor::Codex { parent_tool_use: None, .. }));
                             let label = if long_partner_run {
                                 let pending = calls.iter().any(|&position| call_at(position).result.is_none());
+                                // Only calls whose own turn is still running keep a merged run running.
+                                let running = calls.iter().any(|&(row, call)| matches!(&chat.rows[row].content,
+                                    Content::Tools(group) if !group.ended && group.calls[call].result.is_none()));
                                 let status = if !pending {
                                     tr!("chat-done")
-                                } else if group.ended {
+                                } else if !running {
                                     tr!("chat-ended")
                                 } else {
                                     tr!("chat-tool-running")
@@ -2840,16 +2892,24 @@ impl Workbench {
                                 toggle
                             });
                         }
-                        let decided = group.approvals.iter().filter(|approval| approval.resolved.is_some());
-                        if let Some(first) = decided.clone().next() {
+                        let decided_positions = run.map_or_else(
+                            || (0..group.approvals.len()).map(|approval| (ix, approval)).collect::<Vec<_>>(),
+                            |run| run.decided.clone(),
+                        );
+                        let decided: Vec<_> = decided_positions.into_iter().filter_map(|(row, approval)| {
+                            let Content::Tools(group) = &chat.rows[row].content else { unreachable!() };
+                            Some(&group.approvals[approval]).filter(|approval| approval.resolved.is_some())
+                        }).collect();
+                        let decided_open = run.map_or(group.decided_open, |run| run.decided_open(&chat.rows));
+                        if let Some(first) = decided.first() {
                             body = body.child(summary_toggle(
                                 format!("decided-approvals-{}", first.request_id).into(),
                                 Disclosure::DecidedApprovals,
-                                group.decided_open,
-                                tr!("chat-decided-approvals", count = decided.clone().count()),
+                                decided_open,
+                                tr!("chat-decided-approvals", count = decided.len()),
                                 theme.muted_foreground,
                             ));
-                            if group.decided_open {
+                            if decided_open {
                                 for approval in decided {
                                     let accepted = approval.resolved.as_deref() == Some("accept");
                                     let status = if approval.automatic {
@@ -2868,45 +2928,14 @@ impl Workbench {
                                 }
                             }
                         }
-                        for (index, approval) in group.approvals.iter().enumerate().filter(|(_, approval)| approval.resolved.is_none()) {
-                            let details = approval.summary.text();
-                            let preview: String = details.lines().take(3).collect::<Vec<_>>().join("\n").chars().take(180).collect();
-                            let clipped = preview.len() < details.trim_end_matches('\n').len();
-                            let mut header = h_flex().flex_wrap().gap_2().items_center()
-                                .child(div().text_color(theme.muted_foreground).text_sm().child(tr!("chat-approval-waiting")))
-                                .child(if approval.request_id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST) {
-                                    folder_approval_buttons(&approval.request_id, &entity, chat.busy).into_any_element()
-                                } else {
-                                    approval_buttons(&approval.request_id, &entity).into_any_element()
-                                });
-                            if approval.remember_shell {
-                                let request_id = approval.request_id.clone();
-                                let entity = entity.clone();
-                                header = header.child(Button::new(SharedString::from(format!("remember-{request_id}")))
-                                    .label(tr!("chat-remember-shell").to_owned()).secondary().on_click(move |_, _, cx| {
-                                        let _ = entity.read(cx).out.send(ClientMsg::RememberShellApproval {
-                                            request_id: request_id.clone(), prefix: None,
-                                        });
-                                    }));
-                            }
+                        // Pending cards live in the dock above the composer. The transcript
+                        // keeps one line at the request's place and the decision afterwards.
+                        for approval in group.approvals.iter().filter(|approval| approval.resolved.is_none()) {
+                            let first = approval.summary.text().lines().next().unwrap_or_default().to_owned();
                             body = body.child(
-                                v_flex().min_w_0().gap_2().items_start()
-                                    .child(header)
-                                    .children((approval.shell && !approval.remember_shell).then(|| {
-                                        div().text_xs().text_color(theme.muted_foreground).whitespace_normal()
-                                            .child(tr!("chat-approval-shell-once"))
-                                    }))
-                                    .children(clipped.then(|| summary_toggle(
-                                        format!("approval-details-{}", approval.request_id).into(),
-                                        Disclosure::ApprovalDetails(index), approval.details_open,
-                                        tr!("chat-approval-details").into(), theme.muted_foreground,
-                                    )))
-                                    .child(div()
-                                        .id(SharedString::from(format!("approval-preview-{}", approval.request_id)))
-                                        .w_full().min_w_0().text_sm().whitespace_normal()
-                                        .map(|details| if approval.shell { details.font(this.appearance.code_font.clone()) } else { details })
-                                        .max_h(px(if approval.details_open { 240. } else { 66. })).overflow_y_scroll()
-                                        .child(if clipped && !approval.details_open { format!("{preview}…") } else { details.into_owned() })),
+                                div().id(SharedString::from(format!("approval-in-dock-{}", approval.request_id)))
+                                    .w_full().min_w_0().text_sm().text_color(theme.muted_foreground).truncate()
+                                    .child(format!("{} · {first}", tr!("chat-approval-in-dock"))),
                             );
                         }
                         if open {
@@ -3522,7 +3551,7 @@ fn disclosure_row(
         })
 }
 
-fn folder_approval_buttons(request_id: &str, entity: &Entity<Workbench>, running: bool) -> impl IntoElement {
+pub(super) fn folder_approval_buttons(request_id: &str, entity: &Entity<Workbench>, running: bool) -> impl IntoElement {
     use fuzukue_proto::FolderGrantExpiry;
     let button = |expiry, label| {
         let id = match expiry {

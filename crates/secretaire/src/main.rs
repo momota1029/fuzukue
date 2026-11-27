@@ -27,6 +27,7 @@ mod agents;
 mod agent_usage;
 mod isolated_model;
 mod delegate;
+mod deferred_approvals;
 mod extensions;
 mod confined_fs;
 mod exploration;
@@ -162,6 +163,7 @@ pub struct Workspace {
     worker_codex: std::sync::Mutex<Vec<std::sync::Weak<Codex>>>,
     shell_approval_rules: worker_scope::shell_rules::Rules,
     drain: self_update::drain::Journal,
+    deferred: deferred_approvals::Runner,
     drain_codex: std::sync::Mutex<HashMap<String, i64>>,
     agent_usage: agent_usage::Log,
     plans: planner::Plans,
@@ -278,6 +280,7 @@ impl Workspace {
             shell_approval_rules: worker_scope::shell_rules::Rules::load(&state_dir),
             drain: Default::default(),
             drain_codex: Default::default(),
+            deferred: Default::default(),
             agent_usage: Default::default(),
             plans: Default::default(),
             agent_settings: std::sync::Mutex::new(state::load_agent_settings(&state_dir)),
@@ -344,6 +347,7 @@ impl Workspace {
             return;
         }
         self.hub.watch_approval_expiry();
+        deferred_approvals::watch(self);
         watch::start(self);
         handoff::watch(self);
         planner::restore(self);

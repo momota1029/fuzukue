@@ -158,6 +158,11 @@ impl<'a> Mutation<'a> {
         self.writing.store(true, Ordering::Relaxed);
     }
 
+    /// Whether a failed operation may have changed something.
+    pub(crate) fn wrote(&self) -> bool {
+        self.writing.load(Ordering::Relaxed)
+    }
+
     pub(crate) async fn run<T>(&self, action: impl Future<Output = Result<T>>) -> Result<T> {
         let journal = &self.app.drain;
         let dir = &self.app.state_dir;

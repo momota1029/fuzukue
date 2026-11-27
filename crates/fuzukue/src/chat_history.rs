@@ -1173,6 +1173,7 @@ impl Chat {
 #[cfg(all(test, target_os = "linux", feature = "headless-shot"))]
 mod tests {
     use super::*;
+    use crate::chat::Disclosure;
     use crate::conn::ConnEvent;
     use fuzukue_proto::{Actor, Envelope, PROTOCOL_VERSION};
     use gpui_kit::{AppContext as _, Window};
@@ -1230,7 +1231,7 @@ mod tests {
                 chat.record_approval_receipt(after.clone(), cx);
 
                 let verify = |chat: &Chat, expected: &[&str], linked: &[&str]| {
-                    let runs = ToolRuns::new(chat);
+                    let runs = ToolRuns::new(chat, |row| row.kind(false) != RowKind::Hidden);
                     let run = runs.at(chat.by_tool[expected[0]].0).unwrap();
                     assert_eq!(run.calls, expected.iter().map(|item| chat.by_tool[*item]).collect::<Vec<_>>());
                     let headers = (0..chat.rows.len()).filter(|&row| runs.at(row).is_some() && !runs.hides(row)).count();
@@ -1251,7 +1252,7 @@ mod tests {
                 chat.request_approval("pending".into(), Actor::Claude,
                     crate::i18n::Message { fallback: "Permission requested".into(), localized: None }, false, cx);
                 chat.apply_history_row(call("after-pending", "Read"), cx);
-                let runs = ToolRuns::new(chat);
+                let runs = ToolRuns::new(chat, |row| row.kind(false) != RowKind::Hidden);
                 for item in ["after-text", "after-pending"] {
                     let position = chat.by_tool[item];
                     assert_eq!(runs.at(position.0).unwrap().calls, [position]);
@@ -1265,6 +1266,75 @@ mod tests {
                 ], true, cx);
                 verify(&reloaded, &["first", "middle", "last"], &["first", "last"]);
                 assert_eq!(reloaded.rows.len(), 1);
+            })).unwrap();
+            cx.spawn(async move |cx| { let _ = cx.update(|cx| cx.quit()); }).detach();
+        });
+    }
+
+    #[test]
+    fn collapsed_rows_merge_across_hidden_turns_until_something_visible() {
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(|cx| {
+            gpui_kit::init(cx);
+            crate::math::init(cx);
+            let (window, view) = gpui_kit::open_window(gpui_kit::component::TitleBar::window_options(),
+                cx, |window, cx| cx.new(|cx| Workbench::new_with_target(window, cx, Some(Err("No socket fixture"))))).unwrap();
+            window.update(cx, |_, _, cx| view.update(cx, |view, cx| {
+                let chat = view.chat(A, cx);
+                let worker = |job: &str| Actor::Codex { thread_id: "fixture".into(), parent_tool_use: Some(job.into()) };
+                let decide = |chat: &mut Chat, id: &str, actor: Actor, cx: &mut Context<Workbench>| {
+                    chat.request_approval(id.into(), actor,
+                        crate::i18n::Message { fallback: "Permission requested".into(), localized: None }, false, cx);
+                    chat.resolve_approval(id, "accept", false, cx);
+                };
+                let hidden = |chat: &mut Chat, item: &str, cx: &mut Context<Workbench>| {
+                    chat.push_text(item.into(), Actor::Claude, " ".into(), cx);
+                    chat.end_turn(&Actor::Claude, cx);
+                };
+                let call = |item: &str| ServerEvent::ToolCall {
+                    session: A.into(), item: item.into(), actor: Actor::Claude,
+                    name: "Read".into(), input: serde_json::Value::Null,
+                };
+
+                decide(chat, "one", Actor::Claude, cx);
+                hidden(chat, "silent-1", cx);
+                decide(chat, "two", worker("delegate:a"), cx);
+                chat.end_turn(&worker("delegate:a"), cx);
+                chat.apply_history_row(call("first"), cx);
+                chat.end_turn(&Actor::Claude, cx);
+                hidden(chat, "silent-2", cx);
+                decide(chat, "three", Actor::Claude, cx);
+                chat.apply_history_row(call("second"), cx);
+                chat.apply_history_row(text(A, "reply", "A visible message"), cx);
+                decide(chat, "four", Actor::Claude, cx);
+
+                let layout = |chat: &Chat| ToolRuns::new(chat, |row| row.kind(false) != RowKind::Hidden);
+                let requests = |chat: &Chat, positions: &[(usize, usize)]| positions.iter().map(|&(row, index)| {
+                    let Content::Tools(group) = &chat.rows[row].content else { panic!("not a tool row") };
+                    group.approvals[index].request_id.clone()
+                }).collect::<Vec<_>>();
+                let runs = layout(chat);
+                let headers: Vec<_> = (0..chat.rows.len()).filter(|&row| runs.at(row).is_some() && !runs.hides(row)).collect();
+                assert_eq!(headers.len(), 2, "one summary on each side of the visible message");
+                let before = runs.at(headers[0]).unwrap();
+                assert_eq!(requests(chat, &before.decided), ["one", "two", "three"]);
+                assert_eq!(before.calls, [chat.by_tool["first"], chat.by_tool["second"]]);
+                assert_eq!(requests(chat, &runs.at(headers[1]).unwrap().decided), ["four"]);
+
+                // The one summary opens the details of every merged row.
+                chat.toggle(headers[0], Disclosure::DecidedApprovals, false, cx);
+                let runs = layout(chat);
+                assert!(runs.at(headers[0]).unwrap().decided_open(&chat.rows));
+                assert!(!runs.at(headers[1]).unwrap().decided_open(&chat.rows));
+                chat.toggle(headers[0], Disclosure::DecidedApprovals, false, cx);
+                assert!(!layout(chat).at(headers[0]).unwrap().decided_open(&chat.rows));
+
+                // An unanswered request keeps its place until it is decided.
+                chat.request_approval("waiting".into(), Actor::Claude,
+                    crate::i18n::Message { fallback: "Permission requested".into(), localized: None }, false, cx);
+                let row = chat.by_approval["waiting"].0;
+                assert!(layout(chat).at(row).is_none());
+                chat.resolve_approval("waiting", "decline", false, cx);
+                assert_eq!(requests(chat, &layout(chat).at(row).unwrap().decided), ["four", "waiting"]);
             })).unwrap();
             cx.spawn(async move |cx| { let _ = cx.update(|cx| cx.quit()); }).detach();
         });

@@ -115,7 +115,7 @@ internal fun ApprovalDock(
                         Text(pluralStringResource(R.plurals.approval_count, approvals.size, approvals.size),
                             style = MaterialTheme.typography.labelLarge)
                         Text(
-                            "${first.action.tool} · ${first.action.targetText()}",
+                            "${first.action.toolTitle()} · ${first.action.targetText()}",
                             style = MaterialTheme.typography.bodySmall,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -191,7 +191,7 @@ internal fun ApprovalDock(
                 Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     for (failure in progress.failures) {
-                        Text("${failure.approval.action.tool} · ${failure.approval.action.targetText()}")
+                        Text("${failure.approval.action.toolTitle()} · ${failure.approval.action.targetText()}")
                         Text(failure.message, style = MaterialTheme.typography.bodySmall)
                     }
                 }
@@ -216,9 +216,11 @@ private fun ApprovalDockRow(
 ) {
     var details by rememberSaveable { mutableStateOf(false) }
     val target = approval.action.targetText()
-    val context = "${approval.action.tool} · $target"
-    val expires = remember(approval.expiresAt) {
-        DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.MEDIUM).format(Date(approval.expiresAt))
+    val context = "${approval.action.toolTitle()} · $target"
+    val noDeadline = stringResource(R.string.approval_dock_no_deadline)
+    val expires = remember(approval.expiresAt, noDeadline) {
+        approval.deadline?.let { DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.MEDIUM).format(Date(it)) }
+            ?: noDeadline
     }
     Surface(color = MaterialTheme.colorScheme.surface, shape = MaterialTheme.shapes.medium) {
         Column(Modifier.fillMaxWidth().testTag("approval-row-${approval.id}").padding(horizontal = 12.dp, vertical = 8.dp)) {
@@ -227,14 +229,28 @@ private fun ApprovalDockRow(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text(approval.action.tool, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                Text(approval.action.toolTitle(), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
                 ApprovalRiskLabel(approval.risk)
             }
-            ApprovalField(R.string.approval_dock_target, target, lines = 2)
-            ApprovalField(R.string.approval_dock_scope, approval.action.scope.displayText(), lines = 2)
-            ApprovalField(R.string.approval_dock_reason, approval.reason, lines = if (details) Int.MAX_VALUE else 3)
+            val card = approval.action.integrateCard()
+            if (card != null) {
+                IntegrateSummary(card, listed = if (details) Int.MAX_VALUE else LISTED_LINES)
+            } else {
+                ApprovalField(R.string.approval_dock_target, target, lines = 2)
+                ApprovalField(R.string.approval_dock_scope, approval.action.scope.displayText(), lines = 2)
+                ApprovalField(R.string.approval_dock_reason, approval.reason, lines = if (details) Int.MAX_VALUE else 3)
+            }
             Text(stringResource(R.string.approval_dock_expires, expires), style = MaterialTheme.typography.bodySmall)
-            if (details) {
+            if (details && card != null) {
+                SelectionContainer {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        ApprovalField(R.string.approval_dock_requester, approval.requester)
+                        Text(stringResource(R.string.approval_integrate_patch, card.patch, card.head),
+                            style = MaterialTheme.typography.bodySmall)
+                        Text(stringResource(R.string.approval_integrate_once), style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            } else if (details) {
                 SelectionContainer {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         ApprovalField(R.string.approval_dock_target, target)
@@ -287,9 +303,56 @@ private fun approvalActionLabel(label: String, target: String): Modifier {
     return Modifier.heightIn(min = 48.dp).semantics { contentDescription = description }
 }
 
+/** A readable title for tools that have one. Other tools show their name. */
 @Composable
-private fun QueuedApprovalAction.targetText(): String =
-    targetLabel() ?: stringResource(R.string.approval_dock_no_target)
+internal fun QueuedApprovalAction.toolTitle(): String = when (tool) {
+    "git_integrate_patch" -> stringResource(R.string.approval_tool_integrate)
+    else -> tool
+}
+
+@Composable
+private fun QueuedApprovalAction.targetText(): String {
+    val files = integrateCard()?.files.orEmpty()
+    return when {
+        files.size > 1 -> stringResource(R.string.approval_dock_target_more, files.first(), files.size - 1)
+        files.size == 1 -> files.first()
+        else -> targetLabel() ?: stringResource(R.string.approval_dock_no_target)
+    }
+}
+
+private const val LISTED_LINES = 5
+
+@Composable
+private fun IntegrateSummary(card: IntegrateCard, listed: Int) {
+    Text(stringResource(R.string.approval_integrate_explanation), style = MaterialTheme.typography.bodySmall)
+    if (card.findings > 0) {
+        Text(pluralStringResource(R.plurals.approval_integrate_privacy, card.findings, card.findings),
+            color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+    }
+    ApprovalField(R.string.approval_dock_scope, card.workspace, lines = 1)
+    SelectionContainer {
+        Column {
+            ApprovalList(stringResource(R.string.approval_integrate_files, card.files.size), card.files, listed)
+            if (card.flagged.isNotEmpty()) {
+                ApprovalList(stringResource(R.string.approval_integrate_flagged), card.flagged, listed, card.unlisted)
+            }
+        }
+    }
+}
+
+/** A titled list with one entry per line. [unlisted] counts entries missing from [lines]. */
+@Composable
+private fun ApprovalList(title: String, lines: List<String>, listed: Int, unlisted: Int = 0) {
+    Text(title, style = MaterialTheme.typography.labelMedium)
+    for (line in lines.take(listed)) {
+        Text(line, Modifier.padding(start = 8.dp), style = MaterialTheme.typography.bodySmall)
+    }
+    val hidden = (lines.size - listed).coerceAtLeast(0) + unlisted
+    if (hidden > 0) {
+        Text(stringResource(R.string.approval_integrate_more, hidden), Modifier.padding(start = 8.dp),
+            style = MaterialTheme.typography.bodySmall)
+    }
+}
 
 @Composable
 private fun ApprovalField(label: Int, value: String, lines: Int = Int.MAX_VALUE) {
@@ -327,7 +390,7 @@ private fun BulkApprovalDialog(
         text = {
             Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(first.action.tool)
+                Text(first.action.toolTitle())
                 ApprovalField(R.string.approval_dock_scope, first.action.scope.displayText())
                 if (batch.accept) Text(stringResource(R.string.approval_dock_once_scope))
                 for (approval in batch.approvals) {

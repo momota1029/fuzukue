@@ -1,0 +1,30 @@
+{
+  "steps": [
+    {"action": "size", "width": 1180, "height": 860},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "ja"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "approval_queue"},
+    {"action": "new_thread"},
+    {"action": "seed_approval_dock"},
+    {"action": "wait_element", "id": "approval-row-fixture-0"},
+    {"action": "resolve_approval_dock"},
+    {"action": "seed_integrate_approval"},
+    {"action": "wait_element", "id": "approval-row-integrate-fixture"},
+    {"action": "assert_order", "above": "approval-dock", "below": "chat-input"},
+    {"action": "screenshot", "name": "approval-dock-pinned-no-deadline"},
+    {"action": "seed_approval_dock"},
+    {"action": "seed_integrate_approval"},
+    {"action": "seed_command_approval"},
+    {"action": "wait_element", "id": "accept-command-fixture"},
+    {"action": "wait_element", "id": "approval-in-dock-command-fixture"},
+    {"action": "assert_order", "above": "approval-dock", "below": "chat-input"},
+    {"action": "assert_order", "above": "approval-in-dock-command-fixture", "below": "approval-dock"},
+    {"action": "screenshot", "name": "approval-dock-pinned-mixed"},
+    {"action": "click", "id": "approval-toggle"},
+    {"action": "screenshot", "name": "approval-dock-pinned-collapsed"},
+    {"action": "click", "id": "approval-toggle"},
+    {"action": "resolve_approval_dock"},
+    {"action": "screenshot", "name": "approval-dock-pinned-resolved"}
+  ]
+}

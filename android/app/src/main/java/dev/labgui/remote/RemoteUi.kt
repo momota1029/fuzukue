@@ -675,7 +675,7 @@ private fun Conversation(
                     (it.value as? TimelineRow.Job)?.info?.detailsDeferred == true
                 }
             ) {
-                listState.requestScrollToItem(newestMessage + pending.size + approvals.size)
+                listState.requestScrollToItem(newestMessage + pending.size)
             }
             shownFirstPage = true
         }
@@ -683,7 +683,7 @@ private fun Conversation(
             // In a reversed list the highest visible index is the topmost row.
             // Keep its offset even when a page inserts rows around a sparse worker.
             val indices = visibleRows.mapIndexed { index, entry ->
-                "event/${entry.key}" to (index + pending.size + approvals.size)
+                "event/${entry.key}" to (index + pending.size)
             }.toMap()
             val anchor = listState.layoutInfo.visibleItemsInfo.lastOrNull {
                 (it.key as? String)?.let(indices::containsKey) == true
@@ -707,10 +707,6 @@ private fun Conversation(
                         items(pending.asReversed(), key = { "pending/${it.id}" }) { prompt ->
                             MessageBubble(TimelineRow.Message(prompt.text, user = true, paths = prompt.paths),
                                 target, attachmentView.sent, pending = true)
-                        }
-                        items(approvals.asReversed(), key = { "approval/${it.requestId}" }) { request ->
-                            ApprovalPanel(request, state.canSend && request.requestId !in state.resolving, onResolve,
-                                onRememberShellApproval.takeIf { state.shellApprovalRules != null })
                         }
                         items(visibleRows, key = { "event/${it.key}" }) { entry ->
                             val payload = state.toolPayload?.takeIf { it.session == session }
@@ -774,6 +770,11 @@ private fun Conversation(
                             style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant,
                             maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
+                }
+                // Pending live approvals stay pinned here, outside the scrolling transcript.
+                LiveApprovals(approvals, maxDockHeight * 0.5f) { request ->
+                    ApprovalPanel(request, state.canSend && request.requestId !in state.resolving, onResolve,
+                        onRememberShellApproval.takeIf { state.shellApprovalRules != null })
                 }
                 ApprovalDock(
                     queuedApprovals, state.approvalDock.decisions[session], state.canSend, maxDockHeight, openApprovalDock,
@@ -1204,6 +1205,30 @@ private fun elapsedSince(startedAt: Long?) =
 private fun elapsedLabel(millis: Long): String {
     val seconds = millis / 1_000
     return if (seconds < 60) stringResource(R.string.elapsed_seconds, seconds) else stringResource(R.string.elapsed_minutes, seconds / 60, seconds % 60)
+}
+
+/** A bounded, scrollable list of live approvals with a count, above the composer. */
+@Composable
+private fun LiveApprovals(
+    approvals: List<ServerEvent.ApprovalRequested>, maxHeight: androidx.compose.ui.unit.Dp,
+    content: @Composable (ServerEvent.ApprovalRequested) -> Unit,
+) {
+    if (approvals.isEmpty() || maxHeight <= 0.dp) return
+    Column(Modifier.fillMaxWidth().testTag("live-approvals")) {
+        if (approvals.size > 1) {
+            Text(stringResource(R.string.approval_live_pending, approvals.size),
+                Modifier.padding(horizontal = 16.dp, vertical = 2.dp), style = MaterialTheme.typography.labelMedium)
+        }
+        Column(
+            Modifier.fillMaxWidth().heightIn(max = maxHeight).verticalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            for (request in approvals) {
+                key(request.requestId) { content(request) }
+            }
+        }
+    }
 }
 
 @Composable

@@ -69,8 +69,32 @@ impl Hub {
             .context("approval queue is unavailable")
     }
 
-    // The MCP producers adopt this API in the next implementation step.
-    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn approval_record(&self, id: &str) -> Result<Option<(ApprovalSummary, Action)>> {
+        self.approval_queue()?.lookup(id)
+    }
+
+    pub(crate) fn register_deferred_approval(&self, mut registration: Registration, binding: String) -> Result<String> {
+        Self::prepare_approval_registration(&self.inner.lock().unwrap(), &mut registration);
+        self.approval_queue()?.register_deferred(registration, binding)
+    }
+
+    pub(crate) fn approval_binding(&self, id: &str) -> Result<Option<String>> {
+        self.approval_queue()?.binding(id)
+    }
+
+    pub(crate) fn withdraw_pending_approval(&self, id: &str, owner: &ApprovalOwner, reason: &str) -> Result<bool> {
+        self.approval_queue()?.withdraw_pending(id, owner, reason)
+    }
+
+    pub(crate) fn approval_ids_for_tool(&self, tool: &str) -> Result<Vec<String>> {
+        self.approval_queue()?.ids_for_tool(tool)
+    }
+
+    pub(crate) fn subscribe_approval_changes(&self) -> Result<broadcast::Receiver<ApprovalSummary>> {
+        Ok(self.approval_queue()?.subscribe())
+    }
+
+    #[cfg(test)]
     pub(crate) fn register_approval(&self, mut registration: Registration) -> Result<String> {
         Self::prepare_approval_registration(&self.inner.lock().unwrap(), &mut registration);
         self.approval_queue()?.register(registration)
@@ -361,7 +385,6 @@ impl Hub {
             .decide(id, decision, principal, reason)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn withdraw_own_approval(
         &self,
         id: &str,
@@ -384,7 +407,6 @@ impl Hub {
     }
 
     // The caller must recheck current tool permissions and preconditions before consumption.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn consume_once_approval(
         &self,
         id: &str,

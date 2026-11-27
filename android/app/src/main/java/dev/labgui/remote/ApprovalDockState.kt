@@ -1,5 +1,6 @@
 package dev.labgui.remote
 
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -73,3 +74,31 @@ internal fun QueuedApprovalAction.targetLabel(): String? {
 
 internal fun JsonElement.displayText(): String =
     if (this is JsonPrimitive && isString) content else toString()
+
+/** The readable parts of a deferred patch integration, shown in place of its raw arguments. */
+internal data class IntegrateCard(
+    val workspace: String,
+    val files: List<String>,
+    val flagged: List<String>,
+    val findings: Int,
+    val patch: String,
+    val head: String,
+) {
+    /** Flagged lines beyond the ones the server lists. */
+    val unlisted: Int get() = (findings - flagged.size).coerceAtLeast(0)
+}
+
+internal fun QueuedApprovalAction.integrateCard(): IntegrateCard? {
+    if (tool != "git_integrate_patch") return null
+    val values = args as? JsonObject ?: return null
+    fun text(value: JsonElement?) = (value as? JsonPrimitive)?.takeIf { it.isString }?.content
+    fun strings(key: String) = (values[key] as? JsonArray)?.mapNotNull(::text)
+    return IntegrateCard(
+        workspace = text((scope as? JsonObject)?.get("workspace")).orEmpty(),
+        files = strings("paths") ?: return null,
+        flagged = strings("locations").orEmpty(),
+        findings = (values["privacy_findings"] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0,
+        patch = text(values["patch_sha256"]).orEmpty().take(12),
+        head = text(values["head"]).orEmpty().take(12),
+    )
+}

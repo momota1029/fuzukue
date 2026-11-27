@@ -10,6 +10,19 @@
     <string name="approval_dock_scope">範囲　%1$s</string>
     <string name="approval_dock_reason">理由　%1$s</string>
     <string name="approval_dock_expires">期限　%1$s</string>
+    <string name="approval_dock_no_deadline">期限なし</string>
+    <string name="approval_tool_integrate">Git パッチの取り込み</string>
+    <string name="approval_integrate_explanation">許可すると、依頼時に保存したパッチを一度だけ適用してコミットする。プッシュはしない。</string>
+    <plurals name="approval_integrate_privacy">
+        <item quantity="other">個人情報らしい行が %1$d 行ある。意図した内容のときだけ許可する。</item>
+    </plurals>
+    <string name="approval_integrate_files">変更するファイル（%1$d 件）</string>
+    <string name="approval_integrate_flagged">検出された行</string>
+    <string name="approval_integrate_more">ほか %1$d 件</string>
+    <string name="approval_dock_target_more">%1$s ほか %2$d 件</string>
+    <string name="approval_integrate_patch">パッチ %1$s · 依頼時の HEAD %2$s</string>
+    <string name="approval_integrate_once">許可はこの取り込み一回だけに使う。</string>
+    <string name="approval_live_pending">承認待ち %1$d 件</string>
     <string name="approval_dock_arguments">引数　%1$s</string>
     <string name="approval_dock_diff">差分　%1$s</string>
     <string name="approval_dock_requester">依頼元　%1$s</string>

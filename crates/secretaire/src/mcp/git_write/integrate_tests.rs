@@ -5,6 +5,39 @@ use crate::mcp::workspace_read::git_read::tests::{git, Fixture};
 use crate::Hub;
 use fuzukue_proto::ServerEvent;
 
+/// A failure injected into a running integration on this test thread.
+#[derive(Clone)]
+enum Fault {
+    /// The index cannot be published after the branch moved.
+    LoseIndexLock(std::path::PathBuf),
+    /// The index cannot be published and the branch cannot be rolled back.
+    LoseIndexLockAndBlockRollback(std::path::PathBuf),
+    /// The execution deadline passes while worktree files are being restored.
+    RestoreTimeout,
+}
+
+thread_local! {
+    static FAULT: std::cell::RefCell<Option<Fault>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) async fn fault(point: &str) {
+    let Some(fault) = FAULT.with(|fault| fault.borrow().clone()) else { return };
+    match (point, fault) {
+        ("after_ref_update", Fault::LoseIndexLock(git)) => fs::remove_file(git.join("index.lock")).unwrap(),
+        ("after_ref_update", Fault::LoseIndexLockAndBlockRollback(git)) => {
+            fs::remove_file(git.join("index.lock")).unwrap();
+            fs::write(git.join("refs/heads/main.lock"), "").unwrap();
+        }
+        ("during_restore", Fault::RestoreTimeout) => {
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(600)).await;
+            tokio::time::resume();
+            std::future::pending::<()>().await;
+        }
+        _ => {}
+    }
+}
+
 fn setup(fixture: &Fixture, patch: &str) -> Result<(Arc<Workspace>, String)> {
     let state = fixture.temp.path().join("state");
     fs::create_dir(&state)?;
@@ -44,7 +77,7 @@ fn modification(path: &str, first_line: &str) -> String {
     )
 }
 
-async fn integrate(app: &Workspace, session: &str, args: Value) -> Result<Value> {
+async fn integrate(app: &Arc<Workspace>, session: &str, args: Value) -> Result<Value> {
     call(
         app,
         session,
@@ -405,118 +438,562 @@ async fn guarded_push_refuses_a_branch_or_tip_changed_before_approval() -> Resul
     Ok(())
 }
 
-#[tokio::test]
-async fn privacy_override_requires_human_approval_and_pins_the_checked_patch() -> Result<()> {
-    let fixture = Fixture::new()?;
-    let secret = "ghp_synthetic_example";
-    let (app, session) = setup(&fixture, &modification("tracked.txt", secret))?;
-    let mut request = args();
-    request["override_privacy"] = json!(true);
-    request["restore_worktree"] = json!(false);
+mod deferred {
+    use super::*;
+    use crate::deferred_approvals::{self as deferred, tests::crash_at, Phase, Status};
+    use crate::self_update::drain::Work;
+    use fuzukue_proto::{ApprovalDecision, ApprovalGrantScope, ApprovalState};
+    use std::time::Duration;
 
-    let (_, mut events) = app.hub.subscribe(u64::MAX);
-    let run = {
-        let app = app.clone();
-        tokio::spawn(async move {
-            call(
-                &app,
-                &session,
-                crate::mcp::parse_args(&request)?,
-                Some(Actor::System),
-                None,
-                false,
-                async { Ok(()) },
-            )
-            .await
-        })
-    };
-    let (id, summary) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let ServerEvent::ApprovalRequested {
-                request_id,
-                summary,
-                ..
-            } = events.recv().await?.event
-            {
-                return Ok::<_, anyhow::Error>((request_id, summary));
+    const SECRET: &str = "ghp_synthetic_example";
+    const GRANT: ApprovalDecision = ApprovalDecision::Grant { scope: ApprovalGrantScope::Once };
+
+    fn override_args() -> Value {
+        let mut request = args();
+        request["override_privacy"] = json!(true);
+        request["restore_worktree"] = json!(false);
+        request
+    }
+
+    async fn request(app: &Arc<Workspace>, session: &str, args: Value, actor: Option<Actor>, trusted: bool) -> Result<Value> {
+        // The call must return without waiting for anyone.
+        tokio::time::timeout(Duration::from_secs(20), call(
+            app, session, crate::mcp::parse_args(&args)?, actor, None, trusted, async { Ok(()) },
+        )).await?
+    }
+
+    async fn pending(app: &Arc<Workspace>, session: &str, args: Value) -> Result<String> {
+        let response = request(app, session, args, Some(Actor::Claude), false).await?;
+        assert_eq!(response["isError"], false, "{response}");
+        let data = &response["structuredContent"];
+        assert_eq!(data["status"], "pending", "{response}");
+        Ok(data["approval_id"].as_str().unwrap().to_owned())
+    }
+
+    fn results(app: &Workspace) -> Result<Vec<(String, String)>> {
+        Ok(app.drain.records(&app.state_dir)?.into_iter().filter_map(|record| match record.work {
+            Work::Desk(crate::delegate::DeskTurn::WorkshopReport { approval_id: Some(approval_id), text }) => {
+                assert_eq!(record.id, format!("{}{approval_id}", deferred::RESULT_PREFIX));
+                Some((approval_id, text))
             }
+            _ => None,
+        }).collect())
+    }
+
+    fn entry(app: &Workspace, id: &str) -> deferred::Entry {
+        let bytes = fs::read(app.state_dir.join("deferred-approvals").join(format!("{id}.json"))).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn outcome(app: &Workspace, id: &str) -> (Status, Value) {
+        match entry(app, id).phase {
+            Phase::HandedOff { outcome, .. } => (outcome.status, outcome.result),
+            phase => panic!("not handed off: {phase:?}"),
         }
-    })
-    .await??;
-    assert!(summary.contains("Privacy override"));
-    assert!(summary.contains("tracked.txt:1"));
-    assert!(!summary.contains(secret));
-    assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD"])?, fixture.head);
+    }
 
-    fs::write(
-        fixture.repo.join("target/job/change.patch"),
-        modification("tracked.txt", "replaced"),
-    )?;
-    crate::resolve_approval(&app, id, "accept".into(), false).await?;
-    let response = run.await??;
-    assert_eq!(response["isError"], false, "{response}");
-    assert_eq!(
-        git(&fixture.repo, &["show", "HEAD:tracked.txt"])?,
-        format!("{secret}\nsecond")
-    );
-    assert_eq!(response["structuredContent"]["restore"]["enabled"], false);
-    assert_eq!(
-        fs::read_to_string(fixture.repo.join("tracked.txt"))?,
-        "first\nsecond\n"
-    );
-    Ok(())
-}
+    fn reopen(fixture: &Fixture, app: Arc<Workspace>) -> Arc<Workspace> {
+        let state = app.state_dir.clone();
+        drop(app);
+        Arc::new(Workspace::new(fixture.repo.clone(), "".into(), state, Arc::new(Hub::new())))
+    }
 
-#[tokio::test]
-async fn privacy_override_expires_and_cannot_be_approved_later() -> Result<()> {
-    let fixture = Fixture::new()?;
-    let (app, session) = setup(&fixture, &modification("tracked.txt", "replacement"))?;
-    let mut request = args();
-    request["override_privacy"] = json!(true);
+    fn head(fixture: &Fixture) -> Result<String> {
+        git(&fixture.repo, &["rev-parse", "HEAD"])
+    }
 
-    let (_, mut events) = app.hub.subscribe(u64::MAX);
-    let run = tokio::spawn({
-        let app = app.clone();
-        async move {
-            call(
-                &app,
-                &session,
-                crate::mcp::parse_args(&request)?,
-                Some(Actor::Claude),
-                None,
-                true,
-                async { Ok(()) },
-            )
-            .await
+    #[tokio::test]
+    async fn returns_pending_without_deadline_and_runs_the_bound_patch_after_a_late_approval() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let response = request(&app, &session, override_args(), Some(Actor::Claude), true).await?;
+        let data = &response["structuredContent"];
+        assert_eq!(data["status"], "pending", "{response}");
+        assert!(data["what_to_do_next"]["result"].as_str().unwrap().contains("new message"));
+        let id = data["approval_id"].as_str().unwrap().to_owned();
+
+        // Nothing waits: no live approval, no Git lock, no change.
+        assert!(app.hub.live_approval_threads().is_empty());
+        assert!(app.git_lock.try_lock().is_ok());
+        assert_eq!(head(&fixture)?, fixture.head);
+        let (queue, _) = app.hub.pending_approvals()?;
+        let [summary] = queue.as_slice() else { panic!("one pending card: {}", queue.len()) };
+        assert_eq!(summary.approval_id, id);
+        assert_eq!(summary.deadline(), None);
+        assert_eq!(summary.unattended, ApprovalUnattended::NeverUnattended);
+        assert_eq!(summary.owner.thread, session);
+        assert!(summary.reason.contains("privacy override"));
+        assert_eq!(summary.action.args["locations"], json!(["tracked.txt:1"]));
+        assert!(!serde_json::to_string(summary)?.contains(SECRET));
+
+        // The worker file changes after the request. The approved bytes are used.
+        fs::write(fixture.repo.join("target/job/change.patch"), modification("tracked.txt", "replaced"))?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        deferred::process(&app, &id).await?;
+        assert_eq!(git(&fixture.repo, &["show", "HEAD:tracked.txt"])?, format!("{SECRET}\nsecond"));
+        assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD~1"])?, fixture.head);
+        let (status, result) = outcome(&app, &id);
+        assert_eq!(status, Status::Completed);
+        assert_eq!(result["commit_sha"], head(&fixture)?);
+        assert_eq!(result["restore"]["enabled"], false);
+        let results = results(&app)?;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("completed"));
+        assert!(deferred::ready_for_delivery(&app, &id));
+        assert!(entry(&app, &id).payload.is_null());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_after_restart_runs_once_and_a_second_decision_is_refused() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let id = pending(&app, &session, override_args()).await?;
+        let app = reopen(&fixture, app);
+        let (queue, _) = app.hub.pending_approvals()?;
+        assert_eq!(queue.iter().map(|item| &item.approval_id).collect::<Vec<_>>(), [&id]);
+
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        assert!(app.hub.decide_approval(&id, GRANT, "local_user", None).is_err());
+        assert!(app.hub.decide_approval(&id, ApprovalDecision::Deny, "local_user", None).is_err());
+        deferred::recover(&app).await?;
+        deferred::process(&app, &id).await?;
+        let app = reopen(&fixture, app);
+        deferred::recover(&app).await?;
+        assert_eq!(git(&fixture.repo, &["rev-list", "--count", "HEAD"])?, "2");
+        assert_eq!(results(&app)?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn denial_and_withdrawal_change_nothing_and_report_once() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let id = pending(&app, &session, override_args()).await?;
+        // The same snapshot reuses the pending card.
+        let again = request(&app, &session, override_args(), Some(Actor::Claude), false).await?;
+        assert_eq!(again["structuredContent"]["approval_id"], id);
+        assert_eq!(again["structuredContent"]["reused"], true);
+        assert_eq!(app.hub.pending_approvals()?.0.len(), 1);
+
+        app.hub.decide_approval(&id, ApprovalDecision::Deny, "local_user", None)?;
+        deferred::process(&app, &id).await?;
+        deferred::process(&app, &id).await?;
+        assert_eq!(outcome(&app, &id).0, Status::Denied);
+        assert_eq!(results(&app)?.len(), 1);
+        assert_eq!(head(&fixture)?, fixture.head);
+
+        // A new request after a denial is a new card. The desk withdraws it silently.
+        let second = pending(&app, &session, override_args()).await?;
+        assert_ne!(second, id);
+        let other = app.hub.edit_threads(|threads| threads.create(None))?;
+        assert!(deferred::withdraw(&app, &other, &second, None).await.is_err());
+        deferred::withdraw(&app, &session, &second, Some("No longer needed".into())).await?;
+        assert!(deferred::withdraw(&app, &session, &second, None).await.is_err());
+        assert!(app.hub.decide_approval(&second, GRANT, "local_user", None).is_err());
+        deferred::recover(&app).await?;
+        assert_eq!(outcome(&app, &second).0, Status::Withdrawn);
+        assert!(!deferred::ready_for_delivery(&app, &second));
+        assert_eq!(results(&app)?.len(), 1);
+        assert_eq!(head(&fixture)?, fixture.head);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_human_paths_cannot_approve_the_privacy_override() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        app.hub.set_full_approval(
+            fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour },
+            &crate::remote::SettingsPrincipal::fixture(),
+        )?;
+        // Full mode and a trusted turn still leave the override to a person.
+        let response = request(&app, &session, override_args(), Some(Actor::Claude), true).await?;
+        let id = response["structuredContent"]["approval_id"].as_str().unwrap().to_owned();
+        app.hub.sweep_thread_approvals(&session)?;
+        let app = reopen(&fixture, app);
+        deferred::recover(&app).await?;
+        let (queue, _) = app.hub.pending_approvals()?;
+        assert_eq!(queue.iter().map(|item| (&item.approval_id, item.state)).collect::<Vec<_>>(),
+            [(&id, ApprovalState::Pending)]);
+        // The legacy live-approval reply path does not know queue IDs.
+        assert!(crate::resolve_approval(&app, id.clone(), "accept".into(), false).await.is_err());
+        assert!(!app.delegates.resolve_approval(&id, "accept", false)?);
+        // A worker of the same thread cannot withdraw or claim it.
+        let worker = fuzukue_proto::ApprovalOwner { thread: session.clone(), job: "delegate:x".into(), requester: "worker".into() };
+        assert!(app.hub.withdraw_own_approval(&id, &worker, None).is_err());
+        let (_, action) = app.hub.approval_record(&id)?.unwrap();
+        assert!(!app.hub.consume_once_approval(&id, &deferred::owner(&session), &action)?);
+        deferred::process(&app, &id).await?;
+        assert_eq!(head(&fixture)?, fixture.head);
+        assert!(results(&app)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn head_moves_apply_cleanly_or_fail_without_changes() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let id = pending(&app, &session, override_args()).await?;
+        // An unrelated commit moves HEAD. The bound patch still applies.
+        fs::write(fixture.repo.join("unrelated.txt"), "unrelated\n")?;
+        git(&fixture.repo, &["add", "unrelated.txt"])?;
+        git(&fixture.repo, &["commit", "-m", "Unrelated"])?;
+        let moved = head(&fixture)?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        deferred::process(&app, &id).await?;
+        assert_eq!(outcome(&app, &id).0, Status::Completed);
+        assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD~1"])?, moved);
+
+        // A conflicting commit makes the next bound patch stale.
+        fs::write(fixture.repo.join("target/job/change.patch"), modification("tracked.txt", "other"))?;
+        git(&fixture.repo, &["reset", "--hard", &fixture.head])?;
+        let id = pending(&app, &session, args()).await?;
+        fs::write(fixture.repo.join("tracked.txt"), "conflict\nsecond\n")?;
+        git(&fixture.repo, &["commit", "-am", "Conflict"])?;
+        let conflicted = head(&fixture)?;
+        let index = fs::read(fixture.repo.join(".git/index"))?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        deferred::process(&app, &id).await?;
+        let (status, result) = outcome(&app, &id);
+        assert_eq!(status, Status::Failed);
+        assert!(result["message"].as_str().unwrap().contains("Nothing was changed"), "{result}");
+        assert_eq!(head(&fixture)?, conflicted);
+        assert_eq!(fs::read(fixture.repo.join(".git/index"))?, index);
+
+        // A staged change since the request is refused the same way.
+        git(&fixture.repo, &["reset", "--hard", &fixture.head])?;
+        let id = pending(&app, &session, args()).await?;
+        fs::write(fixture.repo.join("unrelated.txt"), "staged\n")?;
+        git(&fixture.repo, &["add", "unrelated.txt"])?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        deferred::process(&app, &id).await?;
+        let (status, result) = outcome(&app, &id);
+        assert_eq!(status, Status::Failed);
+        assert!(result["message"].as_str().unwrap().contains("staged"), "{result}");
+        assert_eq!(head(&fixture)?, fixture.head);
+        assert_eq!(results(&app)?.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn privacy_findings_beyond_the_approved_ones_are_refused() -> Result<()> {
+        let fixture = Fixture::new()?;
+        // The request has no findings, so no override was shown for the approval.
+        let (app, session) = setup(&fixture, &modification("tracked.txt", "plain"))?;
+        let id = pending(&app, &session, args()).await?;
+        let mut payload = entry(&app, &id).payload;
+        payload["patch"] = json!(modification("tracked.txt", SECRET));
+        payload["patch_sha256"] = json!(format!("{:x}", Sha256::digest(modification("tracked.txt", SECRET).as_bytes())));
+        let mutation = Mutation::new(&app, &session, "Approved operation".into())?;
+        let Err(error) = execute_snapshot(&app, &mutation, &payload).await else { panic!("unreviewed findings ran") };
+        assert!(error.to_string().contains("privacy findings"), "{error:#}");
+        assert_eq!(head(&fixture)?, fixture.head);
+        Ok(())
+    }
+
+    fn state(app: &Workspace, id: &str) -> ApprovalState {
+        app.hub.approval_record(id).unwrap().unwrap().0.state
+    }
+
+    fn save_entry(app: &Workspace, id: &str, entry: &deferred::Entry) -> Result<()> {
+        fs::write(app.state_dir.join("deferred-approvals").join(format!("{id}.json")), serde_json::to_vec(entry)?)?;
+        Ok(())
+    }
+
+    fn enable_full_mode(app: &Workspace) -> Result<()> {
+        app.hub.set_full_approval(
+            fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour },
+            &crate::remote::SettingsPrincipal::fixture(),
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_that_need_a_person_never_run_under_full_mode() -> Result<()> {
+        use fuzukue_proto::PermissionMode;
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", "changed"))?;
+        let thread = || app.hub.edit_threads(|threads| threads.create(None));
+        let message = |text: &str| {
+            let mut request = args();
+            request["message"] = json!(text);
+            request
+        };
+        let mut waiting = Vec::new();
+
+        // Requested before full mode was enabled: a trusted turn that still needed a person.
+        let response = request(&app, &session, message("Earlier"), Some(Actor::Claude), true).await?;
+        waiting.push(response["structuredContent"]["approval_id"].as_str().unwrap().to_owned());
+        enable_full_mode(&app)?;
+
+        // An untrusted or external session.
+        waiting.push(pending(&app, &thread()?, message("Untrusted")).await?);
+        // Thread modes that ask a person.
+        for mode in [PermissionMode::Default, PermissionMode::Plan] {
+            let session = thread()?;
+            app.hub.edit_threads(|threads| threads.set_partner_permission(&session, mode))?;
+            let response = request(&app, &session, message(&format!("{mode:?}")), Some(Actor::Claude), true).await?;
+            assert_eq!(response["structuredContent"]["status"], "pending", "{response}");
+            waiting.push(response["structuredContent"]["approval_id"].as_str().unwrap().to_owned());
         }
-    });
-    let id = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let ServerEvent::ApprovalRequested { request_id, .. } = events.recv().await?.event {
-                return Ok::<_, anyhow::Error>(request_id);
+        // A turn that has read external input.
+        let external = thread()?;
+        app.hub.publish_partner_turn_started(&external, None, false, None);
+        app.hub.mark_external_approval_input(&external);
+        let response = request(&app, &external, message("External input"), Some(Actor::Claude), true).await?;
+        assert_eq!(response["structuredContent"]["status"], "pending", "{response}");
+        waiting.push(response["structuredContent"]["approval_id"].as_str().unwrap().to_owned());
+
+        // Enabling the mode again, sweeping threads and reloading the queue grant nothing.
+        enable_full_mode(&app)?;
+        app.hub.sweep_thread_approvals(&session)?;
+        let app = reopen(&fixture, app);
+        deferred::recover(&app).await?;
+        for id in &waiting {
+            let (summary, _) = app.hub.approval_record(id)?.unwrap();
+            assert_eq!(summary.state, ApprovalState::Pending);
+            assert_eq!(summary.unattended, ApprovalUnattended::NeverUnattended);
+        }
+        assert_eq!(head(&fixture)?, fixture.head);
+        assert!(results(&app)?.is_empty());
+
+        // A trusted full-mode session still runs at once.
+        let trusted = app.hub.edit_threads(|threads| threads.create(None))?;
+        let response = request(&app, &trusted, message("Trusted"), Some(Actor::Claude), true).await?;
+        assert_eq!(response["isError"], false, "{response}");
+        assert_eq!(response["structuredContent"]["commit_sha"], head(&fixture)?);
+        assert!(waiting.iter().all(|id| state(&app, id) == ApprovalState::Pending));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_repeated_request_never_reports_a_decided_card_as_waiting() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let id = pending(&app, &session, override_args()).await?;
+        // Granted and not yet run: no second card, and the caller learns a result is coming.
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        let response = request(&app, &session, override_args(), Some(Actor::Claude), false).await?;
+        let data = &response["structuredContent"];
+        assert_eq!((&data["status"], &data["approval_id"]), (&json!("decided"), &json!(id)), "{response}");
+        assert!(app.hub.pending_approvals()?.0.is_empty());
+
+        // Consumed and handed off: the same request is a new decision.
+        deferred::process(&app, &id).await?;
+        assert_eq!(outcome(&app, &id).0, Status::Completed);
+        git(&fixture.repo, &["reset", "--hard", &fixture.head])?;
+        let response = request(&app, &session, override_args(), Some(Actor::Claude), false).await?;
+        let data = &response["structuredContent"];
+        assert_eq!(data["status"], "pending", "{response}");
+        assert_eq!(data["reused"], false);
+        let second = data["approval_id"].as_str().unwrap().to_owned();
+        assert_ne!(second, id);
+        assert_eq!(state(&app, &second), ApprovalState::Pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_moved_head_reuses_stored_values_or_replaces_outdated_findings() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fs::write(fixture.repo.join("notes.txt"), "a\nb\nc\nd\ne\n")?;
+        git(&fixture.repo, &["add", "notes.txt"])?;
+        git(&fixture.repo, &["commit", "-m", "Notes"])?;
+        let first_head = head(&fixture)?;
+        let patch = format!("diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -2,3 +2,3 @@\n b\n-c\n+{SECRET}\n d\n");
+        let (app, session) = setup(&fixture, &patch)?;
+        let id = pending(&app, &session, override_args()).await?;
+
+        // An unrelated commit leaves the card accurate. The reply repeats what it is bound to.
+        fs::write(fixture.repo.join("unrelated.txt"), "unrelated\n")?;
+        git(&fixture.repo, &["add", "unrelated.txt"])?;
+        git(&fixture.repo, &["commit", "-m", "Unrelated"])?;
+        let response = request(&app, &session, override_args(), Some(Actor::Claude), false).await?;
+        let data = &response["structuredContent"];
+        assert_eq!(data["approval_id"], id, "{response}");
+        assert_eq!(data["reused"], true);
+        assert_eq!(data["head"], first_head);
+        assert_eq!(data["locations"], json!(["notes.txt:3"]));
+
+        // A moved line makes the card outdated. It is replaced by one accurate card.
+        fs::write(fixture.repo.join("notes.txt"), "new\na\nb\nc\nd\ne\n")?;
+        git(&fixture.repo, &["commit", "-am", "Insert a line"])?;
+        let response = request(&app, &session, override_args(), Some(Actor::Claude), false).await?;
+        let data = &response["structuredContent"];
+        let second = data["approval_id"].as_str().unwrap().to_owned();
+        assert_ne!(second, id, "{response}");
+        assert_eq!(data["replaced_approval_id"], id);
+        assert_eq!(data["head"], head(&fixture)?);
+        assert_eq!(data["locations"], json!(["notes.txt:4"]));
+        assert_eq!(state(&app, &id), ApprovalState::Withdrawn);
+        let (queue, _) = app.hub.pending_approvals()?;
+        assert_eq!(queue.iter().map(|item| &item.approval_id).collect::<Vec<_>>(), [&second]);
+        assert_eq!(queue[0].action.args["locations"], json!(["notes.txt:4"]));
+        deferred::recover(&app).await?;
+        assert!(results(&app)?.is_empty(), "a replaced card reports nothing");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn errors_after_writing_began_need_review_and_are_never_retried() -> Result<()> {
+        for case in 0..3 {
+            let fixture = Fixture::new()?;
+            let add = "diff --git a/added.txt b/added.txt\nnew file mode 100644\n--- /dev/null\n+++ b/added.txt\n@@ -0,0 +1 @@\n+added\n";
+            let patch = format!("{add}{}", modification("tracked.txt", "changed"));
+            let (app, session) = setup(&fixture, &patch)?;
+            let id = pending(&app, &session, args()).await?;
+            app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+            let metadata = fixture.repo.join(".git");
+            FAULT.with(|fault| *fault.borrow_mut() = Some(match case {
+                0 => Fault::LoseIndexLockAndBlockRollback(metadata),
+                1 => Fault::LoseIndexLock(metadata),
+                _ => Fault::RestoreTimeout,
+            }));
+            let processed = deferred::process(&app, &id).await;
+            FAULT.with(|fault| *fault.borrow_mut() = None);
+            processed?;
+
+            let (status, result) = outcome(&app, &id);
+            assert_eq!(status, Status::Unknown, "case {case}: {result}");
+            assert_eq!(result["needs_review"], true);
+            assert_eq!(result["head_before"], fixture.head);
+            assert_eq!(result["head_now"], head(&fixture)?);
+            let landed = &result["landed"];
+            assert_eq!(landed["ref_updated"], true, "case {case}: {result}");
+            assert_eq!(landed["rolled_back"], case == 1);
+            assert_eq!(landed["index_published"], case == 2);
+            if case == 1 {
+                assert_eq!(head(&fixture)?, fixture.head);
+            } else {
+                assert_eq!(landed["commit_sha"], head(&fixture)?);
             }
-        }
-    })
-    .await??;
-    assert!(app.git_lock.try_lock().is_ok());
+            assert_eq!(landed["restored"], if case == 2 { json!(["added.txt"]) } else { json!([]) });
+            assert_eq!(fixture.repo.join("added.txt").exists(), case == 2);
 
-    // Keep the clock real until the Git subprocesses have finished preparing the patch.
-    tokio::time::pause();
-    tokio::time::advance(PRIVACY_OVERRIDE_TIMEOUT).await;
-    let response = tokio::time::timeout(Duration::from_secs(1), run).await???;
-    assert_eq!(
-        response["structuredContent"]["error"]["code"],
-        "approval_timed_out"
-    );
-    assert!(matches!(events.try_recv()?.event,
-        ServerEvent::ApprovalResolved { request_id, decision, automatic: false }
-            if request_id == id && decision == "cancelled"
-    ));
-    assert!(!app.delegates.resolve_approval(&id, "accept", false)?);
-    assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD"])?, fixture.head);
-    assert_eq!(
-        fs::read_to_string(fixture.repo.join("tracked.txt"))?,
-        "first\nsecond\n"
-    );
-    Ok(())
+            let delivered = results(&app)?;
+            assert_eq!(delivered.len(), 1);
+            assert!(delivered[0].1.contains("needs review"), "{}", delivered[0].1);
+            assert!(!delivered[0].1.contains("without changes"));
+            // Neither a later pass nor a restart runs it again.
+            let before = head(&fixture)?;
+            let app = reopen(&fixture, app);
+            deferred::recover(&app).await?;
+            deferred::process(&app, &id).await?;
+            assert_eq!(head(&fixture)?, before);
+            assert_eq!(results(&app)?.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_is_bound_to_the_approved_record() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (mut app, _) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        for case in 0..4 {
+            let session = app.hub.edit_threads(|threads| threads.create(None))?;
+            let id = pending(&app, &session, override_args()).await?;
+            app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+            let mut entry = entry(&app, &id);
+            match case {
+                0 => entry.payload["message"] = json!("Another message"),
+                1 => entry.payload["findings_locations"] = json!(["tracked.txt:99"]),
+                2 => entry.session = app.hub.edit_threads(|threads| threads.create(None))?,
+                // Even with a matching digest, the snapshot must describe the approved action.
+                _ => entry.payload["restore_worktree"] = json!(true),
+            }
+            save_entry(&app, &id, &entry)?;
+            if case == 3 {
+                let path = app.state_dir.join("async-approvals.json");
+                let mut queue: Value = serde_json::from_slice(&fs::read(&path)?)?;
+                let record = queue["records"].as_array_mut().unwrap().iter_mut()
+                    .find(|record| record["summary"]["approval_id"] == id.as_str()).unwrap();
+                record["binding"] = json!(deferred::binding(&entry.tool, &entry.session, &entry.payload));
+                fs::write(&path, serde_json::to_vec(&queue)?)?;
+                app = reopen(&fixture, app);
+            }
+            deferred::process(&app, &id).await?;
+            let (status, result) = outcome(&app, &id);
+            assert_eq!(status, Status::Failed, "case {case}: {result}");
+            assert!(result["message"].as_str().unwrap().contains("does not match the approved record"), "{result}");
+            assert_eq!(state(&app, &id), ApprovalState::Withdrawn);
+            assert_eq!(head(&fixture)?, fixture.head, "case {case}");
+            // The refusal goes to the thread that owns the approval.
+            let record = app.drain.records(&app.state_dir)?.into_iter()
+                .find(|record| record.id == format!("{}{id}", deferred::RESULT_PREFIX)).unwrap();
+            assert_eq!(record.session, session, "case {case}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn crash_windows_never_run_twice_and_report_once() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+
+        // Stopped after claiming the grant: the outcome is unknown and never replayed.
+        let id = pending(&app, &session, override_args()).await?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        crash_at(Some("after_consume"));
+        assert!(deferred::process(&app, &id).await.is_err());
+        crash_at(None);
+        assert!(matches!(entry(&app, &id).phase, Phase::Running { .. }));
+        let app = reopen(&fixture, app);
+        deferred::recover(&app).await?;
+        let (status, _) = outcome(&app, &id);
+        assert_eq!(status, Status::Unknown);
+        assert_eq!(head(&fixture)?, fixture.head);
+        assert_eq!(results(&app)?.len(), 1);
+
+        // Stopped after marking running but before claiming: the grant is still unused.
+        fs::write(fixture.repo.join("target/job/change.patch"), modification("tracked.txt", "fresh"))?;
+        let id = pending(&app, &session, args()).await?;
+        app.hub.decide_approval(&id, GRANT, "local_user", None)?;
+        let mut running = entry(&app, &id);
+        running.phase = Phase::Running { started_at: 0 };
+        fs::write(app.state_dir.join("deferred-approvals").join(format!("{id}.json")), serde_json::to_vec(&running)?)?;
+        let app = reopen(&fixture, app);
+        deferred::recover(&app).await?;
+        assert_eq!(outcome(&app, &id).0, Status::Completed);
+        assert_eq!(git(&fixture.repo, &["show", "HEAD:tracked.txt"])?, "fresh\nsecond");
+
+        // Stopped after queuing the result but before saving the hand-off.
+        fs::write(fixture.repo.join("target/job/change.patch"),
+            modification("tracked.txt", "again").replace("-first", "-fresh"))?;
+        let id = pending(&app, &session, args()).await?;
+        app.hub.decide_approval(&id, ApprovalDecision::Deny, "local_user", None)?;
+        crash_at(Some("after_enqueue"));
+        assert!(deferred::process(&app, &id).await.is_err());
+        crash_at(None);
+        assert!(matches!(entry(&app, &id).phase, Phase::Finished { .. }));
+        assert!(!deferred::ready_for_delivery(&app, &id));
+        let app = reopen(&fixture, app);
+        deferred::recover(&app).await?;
+        deferred::recover(&app).await?;
+        let delivered: Vec<_> = results(&app)?.into_iter().filter(|(approval, _)| approval == &id).collect();
+        assert_eq!(delivered.len(), 1);
+        assert!(deferred::ready_for_delivery(&app, &id));
+
+        // After delivery removes the journal record, recovery does not queue it again.
+        app.drain.finish(&app.state_dir, &session, &format!("{}{id}", deferred::RESULT_PREFIX), None);
+        let app = reopen(&fixture, app);
+        deferred::recover(&app).await?;
+        assert!(results(&app)?.iter().all(|(approval, _)| approval != &id));
+        assert_eq!(git(&fixture.repo, &["rev-list", "--count", "HEAD"])?, "2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_interrupted_before_the_snapshot_was_saved_are_withdrawn() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (app, session) = setup(&fixture, &modification("tracked.txt", SECRET))?;
+        let id = pending(&app, &session, override_args()).await?;
+        fs::remove_file(app.state_dir.join("deferred-approvals").join(format!("{id}.json")))?;
+        let app = reopen(&fixture, app);
+        deferred::recover(&app).await?;
+        let (summary, _) = app.hub.approval_record(&id)?.unwrap();
+        assert_eq!(summary.state, ApprovalState::Withdrawn);
+        assert!(app.hub.pending_approvals()?.0.is_empty());
+        assert_eq!(head(&fixture)?, fixture.head);
+        Ok(())
+    }
 }

@@ -2106,6 +2106,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("rename_job", &[("job", "string"), ("label", "string")], &["job", "label"]),
         ("desk_queue", &[("job_ids", "array"), ("offset", "integer"), ("limit", "integer")], &[]),
         ("desk_redeliver", &[("id", "string"), ("confirm", "boolean")], &["id", "confirm"]),
+        ("withdraw_approval", &[("approval_id", "string"), ("reason", "string")], &["approval_id"]),
         ("list_recipes", &[], &[]),
         ("run_recipe", &[("name", "string"), ("args", "object")], &["name"]),
         ("recipe_status", &[("request_id", "string")], &["request_id"]),

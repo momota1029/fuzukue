@@ -51,6 +51,10 @@ impl QuestionField {
 }
 
 impl QuestionCard {
+    pub(super) fn is_resolved(&self) -> bool {
+        self.outcome.is_some()
+    }
+
     pub(super) fn focused_input(&self, window: &Window, cx: &App) -> Option<&Entity<InputState>> {
         self.fields.iter().filter_map(|field| field.input.as_ref())
             .find(|input| input.read(cx).focus_handle(cx).is_focused(window))

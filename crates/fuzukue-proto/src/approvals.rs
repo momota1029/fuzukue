@@ -156,6 +156,17 @@ pub struct ApprovalSummary {
     pub action: ApprovalDisplayAction,
 }
 
+/// The `expires_at` of a request that waits for a human without a deadline.
+/// Clients show "no deadline" instead of a date for this value.
+pub const APPROVAL_NO_EXPIRY: i64 = i64::MAX;
+
+impl ApprovalSummary {
+    /// The request deadline, or `None` when it waits without one.
+    pub fn deadline(&self) -> Option<i64> {
+        (self.expires_at != APPROVAL_NO_EXPIRY).then_some(self.expires_at)
+    }
+}
+
 pub const APPROVAL_RECEIPT_KEY: &str = "approval-receipt";
 
 /// Compact display metadata sent next to the corresponding saved transcript item.

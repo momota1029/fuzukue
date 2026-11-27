@@ -105,6 +105,7 @@ enum Step {
     },
     ResolveApproval { decision: String },
     SeedApprovalDock,
+    SeedIntegrateApproval,
     SeedCommandApproval,
     SeedComposerContext,
     SeedGoalStatus { reason: String },
@@ -671,6 +672,10 @@ impl Runner {
             Step::SeedApprovalDock => {
                 ensure!(!self.read_only, "approval dock needs an isolated fixture");
                 self.update(cx, |view, window, cx| view.seed_approval_dock_fixture(window, cx))?;
+            }
+            Step::SeedIntegrateApproval => {
+                ensure!(!self.read_only, "approval dock needs an isolated fixture");
+                self.update(cx, |view, window, cx| view.seed_integrate_approval_fixture(window, cx))?;
             }
             Step::SeedCommandApproval => {
                 ensure!(!self.read_only, "command approval needs an isolated fixture");
@@ -2646,6 +2651,16 @@ mod tests {
                     runner.step(wait("accept-pending"), cx).await?;
                     runner.step(wait("decline-pending"), cx).await?;
                     runner.step(wait("approval-details-pending"), cx).await?;
+                    // The pending card is pinned in the dock above the composer, and
+                    // the transcript keeps a one-line marker at the request's place.
+                    assert!(runner.update(cx, |_, window, _| {
+                        let dock = window.shot_element_bounds("approval-dock").unwrap();
+                        let allow = window.shot_element_bounds("accept-pending").unwrap();
+                        let composer = window.shot_element_bounds("chat-input").unwrap();
+                        let marker = window.shot_element_bounds("approval-in-dock-pending").unwrap();
+                        allow.top() >= dock.top() && allow.bottom() <= dock.bottom()
+                            && dock.bottom() <= composer.top() && marker.bottom() <= dock.top()
+                    })?);
                     let collapsed = runner.update(cx, |_, window, _| {
                         (window.shot_element_bounds("accept-pending").unwrap(),
                             window.shot_element_bounds("approval-preview-pending").unwrap())

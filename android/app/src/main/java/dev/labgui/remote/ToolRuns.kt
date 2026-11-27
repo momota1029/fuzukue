@@ -11,9 +11,10 @@ private class ToolRun {
 internal fun groupToolRows(rows: Map<String, TimelineRow>, receipts: Collection<ApprovalReceipt>): Map<String, TimelineRow> {
     val runs = mutableMapOf<String, ToolRun>()
     var current: ToolRun? = null
+    // [rows] holds visible rows only, so a hidden turn never splits a run.
     for ((id, row) in rows) {
         if (row is TimelineRow.Tool) {
-            val run = current?.takeIf { it.tools.values.last().actor == row.actor } ?: ToolRun()
+            val run = current ?: ToolRun()
             run.tools[id] = row
             runs[id] = run
             current = run
@@ -38,6 +39,14 @@ internal fun groupToolRows(rows: Map<String, TimelineRow>, receipts: Collection<
                 else -> run.unlinked++
             }
         }
+    }
+
+    // A count with only tools after it joins their summary instead of adding a second one.
+    val ids = rows.keys.toList()
+    for ((anchor, next) in ids.zipWithNext()) {
+        val run = runs[next] ?: continue
+        if (anchor in denials) continue
+        run.unlinked += standalone.remove(anchor) ?: continue
     }
 
     return buildMap {

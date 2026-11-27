@@ -34,6 +34,29 @@ fn field(title: &str, value: String, theme: &Theme) -> Div {
     ).child(value)
 }
 
+/// Lines shown on a card before its details are opened.
+const LISTED: usize = 5;
+
+/// A titled list with one entry per line. `unlisted` counts entries missing from `lines`.
+fn list(title: String, lines: &[String], limit: usize, unlisted: usize, theme: &Theme) -> Div {
+    let hidden = lines.len().saturating_sub(limit) + unlisted;
+    v_flex().w_full().min_w_0().text_sm()
+        .child(div().text_color(theme.muted_foreground).child(title))
+        .children(lines.iter().take(limit).map(|line| div().min_w_0().whitespace_normal().pl_2().child(line.clone())))
+        .children((hidden > 0).then(|| div().pl_2().text_color(theme.muted_foreground)
+            .child(tr!("approval-dock-more", count = hidden))))
+}
+
+fn file_list(card: &IntegrateCard, limit: usize, theme: &Theme) -> Div {
+    list(tr!("approval-dock-files", count = card.files.len()), &card.files, limit, 0, theme)
+}
+
+fn flagged_list(card: &IntegrateCard, limit: usize, theme: &Theme) -> Option<Div> {
+    (!card.flagged.is_empty()).then(|| list(
+        tr!("approval-dock-flagged-lines").to_owned(), &card.flagged, limit, card.unlisted, theme,
+    ))
+}
+
 fn feedback_text(feedback: &Feedback) -> Option<String> {
     let mut parts = Vec::new();
     if feedback.bulk {
@@ -53,12 +76,20 @@ impl Workbench {
     pub(crate) fn render_approval_dock(
         &mut self, window: &mut Window, cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.active.is_empty() || !self.approvals.available {
+        if self.active.is_empty() {
+            return None;
+        }
+        // Live approvals and questions of this thread share the dock with the queue.
+        let (live, questions) = self.chats.get(&self.active)
+            .map(|chat| (chat.pending_live_approvals(), chat.pending_questions(cx)))
+            .unwrap_or_default();
+        let live_count = live.len() + questions.len();
+        if !self.approvals.available && live_count == 0 {
             return None;
         }
         let feedback = self.approvals.feedback.get(&self.active).and_then(feedback_text);
         let ids: Vec<_> = self.approvals.thread(&self.active).map(|item| item.approval_id.clone()).collect();
-        if ids.is_empty() && self.approvals.queue_error.is_none() && self.approvals.review.is_none()
+        if ids.is_empty() && live_count == 0 && self.approvals.queue_error.is_none() && self.approvals.review.is_none()
             && self.approvals.submitted.as_ref().is_none_or(|submission| submission.thread != self.active)
             && feedback.is_none()
         {
@@ -77,22 +108,33 @@ impl Workbench {
         self.approvals.last_focus = window.focused(cx);
         let groups = self.approvals.groups(&self.active);
 
+        let entity = cx.entity();
         let theme = cx.theme();
-        let heading = tr!("approval-dock-pending", count = ids.len());
-        let first = self.approvals.thread(&self.active).next();
+        let total = ids.len() + live_count;
+        let heading = tr!("approval-dock-pending", count = total);
+        let first = live.first().map(|approval| approval.summary.text().lines().next().unwrap_or_default().to_owned())
+            .or_else(|| (!questions.is_empty()).then(|| tr!("approval-dock-question").to_owned()))
+            .or_else(|| self.approvals.thread(&self.active).next()
+                .map(|item| format!("{} · {}", tool_title(&item.action.tool), target(item))));
         let expanded = !self.approvals.collapsed;
         let reviewing = self.approvals.review.is_some();
         let header = h_flex().w_full().min_w_0().gap_2().items_center().flex_wrap()
             .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_sm().child(heading))
-            .children(first.map(|item| div().min_w_0().flex_1().truncate().text_sm()
-                .text_color(theme.muted_foreground).child(format!("{} · {}", item.action.tool, target(item)))))
-            .when(!ids.is_empty() && !reviewing, |header| header.child(self.dock_button(
+            .children(first.map(|first| div().min_w_0().flex_1().truncate().text_sm()
+                .text_color(theme.muted_foreground).child(first)))
+            .when(total > 0 && !reviewing, |header| header.child(self.dock_button(
                 "", "toggle", if expanded { tr!("approval-dock-collapse") } else { tr!("approval-dock-expand") },
                 true, Tone::Default, cx,
                 |this, _, cx| { this.approvals.collapsed = !this.approvals.collapsed; cx.notify(); },
             ).aria_expanded(expanded)));
 
-        let body_height = (window.viewport_size().height * 0.34).min(px(252.));
+        // A question form needs more room than a row of buttons. Half the window
+        // still leaves the transcript and the composer visible.
+        let body_height = if questions.is_empty() {
+            (window.viewport_size().height * 0.34).min(px(252.))
+        } else {
+            window.viewport_size().height * 0.6
+        };
         let mut dock = v_flex().id("approval-dock").w_full().min_w_0().gap_1().p_2().flex_none()
             .rounded_md().border_1().border_color(theme.border).bg(theme.secondary)
             .role(Role::Region).aria_label(tr!("approval-dock-title"))
@@ -112,9 +154,17 @@ impl Workbench {
 
         if let Some(review) = &self.approvals.review {
             dock = dock.child(self.render_review(review, body_height, cx));
-        } else if expanded && !ids.is_empty() {
+        } else if expanded && total > 0 {
             let selected = self.approvals.selected_requests(&self.active);
             let mut rows = Self::dock_scroll(&self.approvals.scroll, body_height);
+            let busy = self.chats.get(&self.active).is_some_and(|chat| chat.busy());
+            for approval in &live {
+                rows = rows.child(self.render_live_approval(approval, busy, &entity, cx));
+            }
+            for card in questions {
+                rows = rows.child(div().w_full().min_w_0().p_2().rounded_md().border_1()
+                    .border_color(theme.border).bg(theme.popover).child(card));
+            }
             for group in groups {
                 for (index, item) in group.into_iter().enumerate() {
                     rows = rows.child(self.render_request(item, index == 0, selected.first().copied(), cx));
@@ -200,15 +250,37 @@ impl Workbench {
             ));
 
         let args = &item.action.args;
+        let card = integrate_card(item);
         let details = detail.then(|| {
-            let diff = args.get("diff").or_else(|| item.action.scope.get("diff"));
-            v_flex().id("approval-request-details").w_full().gap_1().p_2().rounded_md().bg(surface.code)
+            let details = v_flex().id("approval-request-details").w_full().gap_1().p_2().rounded_md().bg(surface.code)
                 .child(field(tr!("approval-dock-requester"), item.owner.requester.clone(), theme))
-                .child(field(tr!("approval-dock-grant-scope"), tr!("approval-dock-grant-once").to_owned(), theme))
+                .child(field(tr!("approval-dock-grant-scope"), tr!("approval-dock-grant-once").to_owned(), theme));
+            if let Some(card) = &card {
+                return details
+                    .child(file_list(card, usize::MAX, theme))
+                    .children(flagged_list(card, usize::MAX, theme))
+                    .child(div().text_sm().min_w_0().whitespace_normal().text_color(theme.muted_foreground)
+                        .child(tr!("approval-dock-patch", patch = card.patch.as_str(), head = card.head.as_str())));
+            }
+            let diff = args.get("diff").or_else(|| item.action.scope.get("diff"));
+            details
                 .child(field(tr!("approval-dock-scope"), scope.clone(), theme))
                 .child(field(tr!("approval-dock-arguments"), serde_json::to_string_pretty(args).unwrap_or_else(|_| json(args)), theme))
                 .children(diff.map(|diff| field(tr!("approval-dock-diff"), json(diff), theme)))
         });
+        let body = match &card {
+            Some(card) => v_flex().w_full().min_w_0().gap_1()
+                .child(div().text_sm().min_w_0().whitespace_normal().child(card.explanation))
+                .children(card.privacy.clone().map(|privacy| div().text_sm().min_w_0().whitespace_normal()
+                    .text_color(theme.warning).child(privacy)))
+                // The open details list everything, so the summary lists are not repeated.
+                .children(flagged_list(card, LISTED, theme).filter(|_| !detail)),
+            None => v_flex().w_full().min_w_0().gap_1()
+                .child(div().text_sm().min_w_0().whitespace_normal().child(target(item)))
+                .child(div().text_xs().min_w_0().truncate().text_color(theme.muted_foreground)
+                    .child(format!("{} · {scope}", tr!("approval-dock-scope"))))
+                .child(div().text_sm().min_w_0().whitespace_normal().child(item.reason.clone())),
+        };
 
         v_flex().w_full().min_w_0().gap_1()
             .children(first_in_job.then(|| div().text_sm().font_weight(FontWeight::SEMIBOLD).min_w_0().truncate()
@@ -216,21 +288,81 @@ impl Workbench {
                 .child(format!("{} · {}", tr!("approval-dock-job"), item.owner.job))))
             .child(
                 v_flex().id(SharedString::from(format!("approval-row-{id}")))
-                    .role(Role::Group).aria_label(format!("{} · {}", item.action.tool, target(item)))
+                    .role(Role::Group).aria_label(format!("{} · {}", tool_title(&item.action.tool), target(item)))
                     .w_full().min_w_0().gap_1().p_2().rounded_md()
                     .border_1().border_color(if selected { theme.ring } else { theme.border }).bg(theme.popover)
                     .child(h_flex().min_w_0().justify_between().items_start().gap_2()
-                        .child(div().font_weight(FontWeight::SEMIBOLD).min_w_0().truncate().child(item.action.tool.clone()))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).min_w_0().truncate().child(tool_title(&item.action.tool)))
                         .child(risk_badge(item.risk, theme)))
-                    .child(div().text_sm().min_w_0().whitespace_normal().child(target(item)))
-                    .child(div().text_xs().min_w_0().truncate().text_color(theme.muted_foreground)
-                        .child(format!("{} · {scope}", tr!("approval-dock-scope"))))
-                    .child(div().text_sm().min_w_0().whitespace_normal().child(item.reason.clone()))
+                    .child(body)
                     .child(div().text_xs().text_color(theme.muted_foreground)
-                        .child(format!("{} · {}", tr!("approval-dock-expires"), expiry(item))))
+                        .child(match &card {
+                            Some(card) => format!("{} · {} · {} · {}", tr!("approval-dock-scope"), card.workspace,
+                                tr!("approval-dock-expires"), expiry(item)),
+                            None => format!("{} · {}", tr!("approval-dock-expires"), expiry(item)),
+                        }))
                     .child(controls)
+                    // The file list follows the buttons so that they stay in reach in the dock.
+                    .children(card.as_ref().filter(|_| !detail).map(|card| file_list(card, LISTED, theme)))
                     .children(details),
             )
+    }
+
+    /// A live approval: the same controls that used to sit in the transcript.
+    fn render_live_approval(
+        &self, approval: &crate::chat::PendingLiveApproval, busy: bool,
+        entity: &gpui_kit::Entity<Workbench>, cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let id = approval.request_id.clone();
+        let details = approval.summary.text();
+        let preview: String = details.lines().take(3).collect::<Vec<_>>().join("\n").chars().take(180).collect();
+        let clipped = preview.len() < details.trim_end_matches('\n').len();
+        let open = self.approvals.live_details.contains(&id);
+        let mut header = h_flex().flex_wrap().gap_2().items_center()
+            .child(div().text_color(theme.muted_foreground).text_sm().child(tr!("chat-approval-waiting")))
+            .child(if id.starts_with(fuzukue_proto::FOLDER_ACCESS_REQUEST) {
+                crate::chat::folder_approval_buttons(&id, entity, busy).into_any_element()
+            } else {
+                crate::chat::approval_buttons(&id, entity).into_any_element()
+            });
+        if approval.remember_shell {
+            let request_id = id.clone();
+            let entity = entity.clone();
+            use gpui_kit::component::button::{Button, ButtonVariants as _};
+            header = header.child(Button::new(SharedString::from(format!("remember-{request_id}")))
+                .label(tr!("chat-remember-shell").to_owned()).secondary()
+                .on_click(move |_, _, cx| {
+                    let _ = entity.read(cx).out.send(ClientMsg::RememberShellApproval {
+                        request_id: request_id.clone(), prefix: None,
+                    });
+                }));
+        }
+        let toggle = id.clone();
+        let code_font = self.appearance.code_font.clone();
+        v_flex().id(SharedString::from(format!("approval-live-{id}")))
+            .role(Role::Group).aria_label(preview.clone())
+            .w_full().min_w_0().gap_2().p_2().rounded_md().border_1().border_color(theme.border).bg(theme.popover)
+            .child(header)
+            .children((approval.shell && !approval.remember_shell).then(|| {
+                div().text_xs().text_color(theme.muted_foreground).whitespace_normal().child(tr!("chat-approval-shell-once"))
+            }))
+            .children(clipped.then(|| div().id(SharedString::from(format!("approval-details-{id}")))
+                .role(Role::Button).aria_expanded(open).cursor_pointer()
+                .text_sm().text_color(theme.muted_foreground)
+                .child(format!("{} {}", if open { "▾" } else { "▸" }, tr!("chat-approval-details")))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.approvals.live_details.remove(&toggle) {
+                        this.approvals.live_details.insert(toggle.clone());
+                    }
+                    cx.notify();
+                }))))
+            .child(div()
+                .id(SharedString::from(format!("approval-preview-{id}")))
+                .w_full().min_w_0().text_sm().whitespace_normal()
+                .when(approval.shell, |details| details.font(code_font))
+                .max_h(px(if open { 240. } else { 66. })).overflow_y_scroll()
+                .child(if clipped && !open { format!("{preview}…") } else { details.into_owned() }))
     }
 
     fn decide_one(&mut self, id: &str, decision: ApprovalDecision) {

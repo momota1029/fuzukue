@@ -31,10 +31,11 @@ pub(crate) enum Tool {
     RenameJob,
     Queue,
     Redeliver,
+    WithdrawApproval,
 }
 
 impl Tool {
-    pub(super) const ALL: [Self; 15] = [
+    pub(super) const ALL: [Self; 16] = [
         Self::ListThreads,
         Self::ArchiveThread,
         Self::PinThread,
@@ -50,6 +51,7 @@ impl Tool {
         Self::RenameJob,
         Self::Queue,
         Self::Redeliver,
+        Self::WithdrawApproval,
     ];
 
     pub(super) fn name(self) -> &'static str {
@@ -69,6 +71,7 @@ impl Tool {
             Self::RenameJob => "rename_job",
             Self::Queue => "desk_queue",
             Self::Redeliver => "desk_redeliver",
+            Self::WithdrawApproval => "withdraw_approval",
         }
     }
 
@@ -173,6 +176,11 @@ impl Tool {
             ), json!({"job": job(), "label": {"type": "string", "minLength": 1}}), &["job", "label"]),
             Self::Queue => front_desk_light::queue_schema(),
             Self::Redeliver => front_desk_light::redeliver_schema(),
+            Self::WithdrawApproval => (harness_text!(
+                "Withdraw an approval request you started in this thread while it is still pending, for example when the user asks you to cancel it or the work no longer needs it. No result message follows.",
+                "このスレッドで依頼した承認がまだ保留中のとき、取り下げる。利用者に取り消しを頼まれたときや、作業に不要になったときに使う。結果の通知は届かない。"
+            ), json!({"approval_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                "reason": {"type": "string", "maxLength": 500}}), &["approval_id"]),
             Self::BlockStep => (harness_text!(
                 "Mark a single planned step as needing user input. Continue with the other unblocked steps. If this is the last runnable step, use replan to find independent work or conclude with a verification summary.",
                 "方針の一つの手順に利用者の確認が必要と記録し、残りの手順を進める。実行できる手順がこれだけなら replan で独立した作業を探すか、確認事項を添えて完了する。"
@@ -216,6 +224,13 @@ impl Tool {
             }
             Self::Queue => front_desk_light::queue(app, args)?,
             Self::Redeliver => front_desk_light::redeliver(app, session, args)?,
+            Self::WithdrawApproval => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Withdraw { approval_id: String, reason: Option<String> }
+                let Withdraw { approval_id, reason } = parse_args(args)?;
+                crate::deferred_approvals::withdraw(app, session, &approval_id, reason).await?
+            }
             Self::CancelJob => {
                 let Cancel { job, reason } = parse_args(args)?;
                 app.delegates.cancel_job(&job, &reason)?

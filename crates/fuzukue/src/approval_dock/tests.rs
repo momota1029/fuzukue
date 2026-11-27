@@ -29,6 +29,31 @@ fn item(id: &str, thread: &str, job: &str, risk: ApprovalRisk) -> ApprovalSummar
 }
 
 #[test]
+fn integrate_cards_list_files_and_flagged_lines_as_plain_text() {
+    let mut request = item("integrate", "thread", "front_desk", ApprovalRisk::High);
+    request.action.tool = "git_integrate_patch".into();
+    request.action.args = json!({
+        "paths": ["docs/a.md", "docs/b.md"], "privacy_findings": 3, "locations": ["docs/b.md:14"],
+        "patch_sha256": "0123456789abcdef", "head": "fedcba9876543210",
+    });
+    request.action.scope = json!({"workspace": "handbook"});
+    let card = integrate_card(&request).unwrap();
+    assert_eq!(card.files, ["docs/a.md", "docs/b.md"]);
+    assert_eq!(card.flagged, ["docs/b.md:14"]);
+    assert_eq!(card.unlisted, 2);
+    assert_eq!((card.workspace.as_str(), card.patch.as_str(), card.head.as_str()), ("handbook", "0123456789ab", "fedcba987654"));
+    assert_eq!(card.explanation, tr!("approval-dock-integrate-explanation"));
+    assert!(card.privacy.unwrap().contains('3'));
+    let shown = target(&request);
+    assert!(shown.contains("docs/a.md") && !shown.contains(['[', '"']), "{shown}");
+
+    // Other tools and redacted records keep the generic card.
+    assert!(integrate_card(&item("other", "thread", "job", ApprovalRisk::Low)).is_none());
+    request.action.args = json!("[redacted]");
+    assert!(integrate_card(&request).is_none());
+}
+
+#[test]
 fn preserves_arrival_order_within_each_job_and_counts_by_thread() {
     let mut dock = ApprovalDock { fetching: Some(1), ..ApprovalDock::default() };
     dock.snapshot(1, Ok(vec![
@@ -106,6 +131,23 @@ fn fresh_snapshot_reconciles_after_disconnect_and_stale_replies_are_ignored() {
         dock.thread("a").map(|item| item.approval_id.as_str()).collect::<Vec<_>>(),
         ["new", "live"]
     );
+}
+
+#[test]
+fn requests_without_a_deadline_and_the_integration_have_readable_labels() {
+    let mut waiting = item("waiting", "thread", "front_desk", ApprovalRisk::High);
+    waiting.expires_at = fuzukue_proto::APPROVAL_NO_EXPIRY;
+    assert_eq!(waiting.deadline(), None);
+    assert_eq!(expiry(&waiting), tr!("approval-dock-no-deadline"));
+    let dated = item("dated", "thread", "job", ApprovalRisk::Low);
+    assert_ne!(expiry(&dated), tr!("approval-dock-no-deadline"));
+    assert_eq!(tool_title("git_integrate_patch"), tr!("approval-dock-tool-integrate"));
+    assert_eq!(tool_title("fs_write"), "fs_write");
+    for locale in [Locale::JAPANESE, Locale::supported("en").unwrap()] {
+        for key in ["approval-dock-no-deadline", "approval-dock-tool-integrate", "approval-dock-question"] {
+            assert_ne!(locale.text(key), key);
+        }
+    }
 }
 
 #[test]

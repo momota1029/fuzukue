@@ -18,7 +18,7 @@ use super::workspace_read::git_read::{self, Git};
 use super::workspace_read::{git_metadata, open_no_symlinks, open_regular_source};
 use super::workspace_write::Scope;
 
-pub(super) mod integrate;
+pub(crate) mod integrate;
 
 pub(crate) const NAME: &str = "git_commit_scoped";
 const MAX_MESSAGE: usize = 16 * 1024;

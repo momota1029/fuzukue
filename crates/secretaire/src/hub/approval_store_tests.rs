@@ -292,6 +292,40 @@ fn consumed_full_approval_is_idempotent_across_toggles_and_restart() -> Result<(
 }
 
 #[test]
+fn deferred_requests_wait_for_a_person_and_never_return_a_decided_record() -> Result<()> {
+    let dir = TestDir::new();
+    let queue = Queue::new("workspace".into(), dir.path());
+    queue.set_full_mode(ENABLE_FULL, "desktop", vec![], vec![])?;
+    // The same operation was already granted by full mode and consumed.
+    let earlier = queue.register(request())?;
+    assert_eq!(queue.authorize_full(request())?, FullAuthorization::Granted);
+
+    let first = queue.register_deferred(request(), "digest".into())?;
+    assert_ne!(first, earlier);
+    let state = |queue: &Queue, id: &str| queue.lookup(id).unwrap().unwrap().0;
+    assert_eq!(state(&queue, &first).state, ApprovalState::Pending);
+    assert_eq!(state(&queue, &first).unattended, ApprovalUnattended::NeverUnattended);
+    assert_eq!(queue.binding(&first)?.as_deref(), Some("digest"));
+
+    // Enabling the mode again and loading the saved queue leave it to a person.
+    queue.set_full_mode(ENABLE_FULL, "desktop", vec![], vec![])?;
+    drop(queue);
+    let queue = Queue::new("workspace".into(), dir.path());
+    assert_eq!(state(&queue, &first).state, ApprovalState::Pending);
+
+    let owner = request().owner;
+    queue.decide(&first, ApprovalDecision::Grant { scope: ApprovalGrantScope::Once }, "desktop", None)?;
+    assert!(!queue.withdraw_pending(&first, &owner, "too late")?);
+    let second = queue.register_deferred(request(), "digest".into())?;
+    assert_ne!(second, first);
+    assert!(queue.consume_once(&first, &owner, &request().action)?);
+    assert!(!queue.consume_once(&first, &owner, &request().action)?);
+    assert!(queue.withdraw_pending(&second, &owner, "superseded")?);
+    assert_ne!(queue.register_deferred(request(), "digest".into())?, second);
+    Ok(())
+}
+
+#[test]
 fn earlier_leases_with_duplicate_full_grants_cannot_run_twice() -> Result<()> {
     let dir = TestDir::new();
     let queue = Queue::new("workspace".into(), dir.path());

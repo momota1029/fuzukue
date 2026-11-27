@@ -1,4 +1,10 @@
-use super::{Actor, Chat, Content, Row, RowKind};
+//! Merge the tool and approval summaries that nothing visible separates.
+//!
+//! Hidden rows and turn boundaries keep a run going. A visible message, card or
+//! unanswered approval ends it. Rows stay as they are. The first row of a run
+//! shows one summary of all its calls and decided approvals.
+
+use super::{Chat, Content, Row, ToolGroup};
 use fuzukue_proto::ApprovalState;
 use std::collections::HashMap;
 
@@ -8,6 +14,8 @@ type Position = (usize, usize);
 pub(super) struct ToolRun {
     pub rows: Vec<usize>,
     pub calls: Vec<Position>,
+    /// Decided approval requests, in transcript order.
+    pub decided: Vec<Position>,
     pub attached: HashMap<Position, usize>,
     pub unlinked: usize,
 }
@@ -24,6 +32,16 @@ impl ToolRun {
     pub fn open(&self, rows: &[Row]) -> bool {
         self.rows.iter().any(|&row| matches!(&rows[row].content, Content::Tools(group) if group.open))
     }
+
+    pub fn decided_open(&self, rows: &[Row]) -> bool {
+        self.rows.iter().any(|&row| matches!(&rows[row].content, Content::Tools(group) if group.decided_open))
+    }
+}
+
+/// An unanswered request keeps its own line where it was asked.
+fn mergeable(group: &ToolGroup) -> bool {
+    (!group.calls.is_empty() || !group.approvals.is_empty())
+        && group.approvals.iter().all(|approval| approval.resolved.is_some())
 }
 
 pub(super) struct ToolRuns {
@@ -34,28 +52,23 @@ pub(super) struct ToolRuns {
 }
 
 impl ToolRuns {
-    pub fn new(chat: &Chat) -> Self {
+    /// `visible` says whether the transcript shows a row at all.
+    pub fn new(chat: &Chat, visible: impl Fn(&Row) -> bool) -> Self {
         let rows = &chat.rows;
         let mut layout = Self {
             run_by_row: vec![None; rows.len()], runs: Vec::new(),
             standalone: HashMap::new(), denials: HashMap::new(),
         };
         let mut current = None::<usize>;
-        let mut actor = None::<&Actor>;
         for (row_index, row) in rows.iter().enumerate() {
             let group = match &row.content {
-                Content::Tools(group) if group.approvals.is_empty() && !group.calls.is_empty() => group,
-                _ if row.kind(false) == RowKind::Hidden => continue,
+                Content::Tools(group) if mergeable(group) => group,
+                _ if !visible(row) => continue,
                 _ => {
                     current = None;
-                    actor = None;
                     continue;
                 }
             };
-            if actor.is_some_and(|previous| previous != &row.actor) {
-                current = None;
-            }
-            actor = Some(&row.actor);
             let run_index = *current.get_or_insert_with(|| {
                 layout.runs.push(ToolRun::default());
                 layout.runs.len() - 1
@@ -64,10 +77,7 @@ impl ToolRuns {
             let run = &mut layout.runs[run_index];
             run.rows.push(row_index);
             run.calls.extend((0..group.calls.len()).map(|call| (row_index, call)));
-            if row.ends_tool_run {
-                current = None;
-                actor = None;
-            }
+            run.decided.extend((0..group.approvals.len()).map(|approval| (row_index, approval)));
         }
 
         for receipt in chat.approval_receipts.values().filter(|receipt| receipt.job().is_none()) {

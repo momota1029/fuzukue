@@ -29,6 +29,19 @@ approval-dock-arguments = Arguments
 approval-dock-diff = Diff
 approval-dock-job = Job
 approval-dock-expires = Expires
+approval-dock-no-deadline = No deadline
+approval-dock-tool-integrate = Integrate Git patch
+approval-dock-integrate-explanation = Allowing applies the patch saved with this request once and commits it. Nothing is pushed.
+approval-dock-integrate-privacy = { $count ->
+    [one] { $count } line may contain private data. Allow only if it is intended.
+   *[other] { $count } lines may contain private data. Allow only if they are intended.
+}
+approval-dock-files = Files to change ({ $count })
+approval-dock-flagged-lines = Flagged lines
+approval-dock-more = { $count } more
+approval-dock-target-more = { $path } and { $count } more
+approval-dock-patch = Patch { $patch } · HEAD at request { $head }
+approval-dock-question = Question to answer
 approval-dock-bulk-allow = Allow selected
 approval-dock-bulk-deny = Deny selected
 approval-dock-clear-selection = Clear selection

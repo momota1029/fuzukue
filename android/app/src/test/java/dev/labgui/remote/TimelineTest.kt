@@ -59,6 +59,35 @@ class TimelineTest {
         assertEquals(listOf("first", "middle", "last"), reloaded.rows.keys.toList())
     }
 
+    @Test fun collapsedRowsMergeAcrossHiddenTurnsUntilSomethingVisible() {
+        fun call(item: String, actor: String) = ServerEvent.ToolCall(
+            "s", item, Actor(actor), "Read", kotlinx.serialization.json.JsonObject(emptyMap()),
+        )
+        fun grant(id: String, item: String? = null, anchor: String? = null) = ApprovalReceipt(
+            id, "front_desk", "Bash", toolItem = item, anchorItem = anchor,
+            state = ApprovalQueueState.Granted, automatic = true, updatedAt = 1,
+        )
+        val timeline = Timeline()
+            .reduce(ServerEvent.UserPrompt("s", "ask", "Check the files"))
+            .recordApproval(grant("waiting", anchor = "ask"))
+            .reduce(call("first", "claude"))
+            .recordApproval(grant("one", "first"))
+            .reduce(ServerEvent.TextDelta("s", "silent", Actor("claude"), "  "))
+            .reduce(ServerEvent.TurnEnded("s", Actor("claude")))
+            .reduce(call("second", "codex"))
+            .recordApproval(grant("two", "second"))
+
+        assertEquals(listOf("user/ask", "first"), timeline.displayRows.keys.toList())
+        val run = timeline.displayRows["first"] as TimelineRow.ToolRun
+        assertEquals(listOf("first", "second"), run.tools.map { it.first.item })
+        assertEquals(3, run.approvalCount)
+
+        val replied = timeline
+            .reduce(ServerEvent.TextDelta("s", "reply", Actor("claude"), "Done"))
+            .reduce(call("third", "claude"))
+        assertEquals(listOf("user/ask", "first", "reply", "third"), replied.displayRows.keys.toList())
+    }
+
     @Test fun composerNoticesReplaceOneStatusWithoutAddingRows() {
         val waiting = """{"type":"local_notice","session":"s","item":"composer-status","text":"Wait for Claude"}"""
         val stopped = """{"type":"local_notice","session":"s","item":"composer-status","text":"Codex stopped"}"""

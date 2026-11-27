@@ -67,6 +67,18 @@ fn question_card_wraps_preserves_drafts_and_supports_keyboard_submission() {
                             .collect::<Vec<_>>()
                     };
                     runner.step(wait("question-send"), cx).await?;
+                    // The open card is pinned in the dock above the composer.
+                    runner.update(cx, |_, window, _| {
+                        let dock = window.shot_element_bounds("approval-dock").unwrap();
+                        let card = window.shot_element_bounds("question-card").unwrap();
+                        let composer = window.shot_element_bounds("chat-input").unwrap();
+                        assert!(card.top() >= dock.top() && dock.bottom() <= composer.top());
+                        // Long option labels wrap inside the card instead of widening it.
+                        let label = window.shot_element_bounds("question-option-0-0-label").unwrap();
+                        assert!(label.right() <= card.right() && card.right() <= dock.right());
+                        assert!(window.shot_element_bounds("question-in-dock-0").is_some()
+                            || window.shot_element_bounds("question-in-dock-1").is_some());
+                    })?;
                     let height = |runner: &Runner, cx: &mut AsyncApp| {
                         runner.update(cx, |_, window, _| {
                             window
@@ -76,7 +88,7 @@ fn question_card_wraps_preserves_drafts_and_supports_keyboard_submission() {
                                 .height
                         })
                     };
-                    let wide = height(&runner, cx)?;
+                    assert!(height(&runner, cx)? > px(0.));
                     let settings = |runner: &Runner, cx: &mut AsyncApp, open| -> Result<()> {
                         runner.update(cx, |view, _, cx| {
                             view.settings_open = open;
@@ -84,10 +96,6 @@ fn question_card_wraps_preserves_drafts_and_supports_keyboard_submission() {
                         })?;
                         runner.frame(cx)
                     };
-                    // The headless platform fixes window size. The real right pane narrows the chat viewport.
-                    settings(&runner, cx, true)?;
-                    assert!(height(&runner, cx)? > wide);
-                    settings(&runner, cx, false)?;
                     runner.step(click("question-option-0-0"), cx).await?;
                     runner.step(click("question-send"), cx).await?;
                     runner.key(cx, "Enter")?;

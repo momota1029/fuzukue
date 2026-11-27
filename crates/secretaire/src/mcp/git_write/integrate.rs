@@ -1,28 +1,28 @@
 //! Integrate a checked worker patch into the front desk's checkout.
 
+use std::collections::BTreeSet;
 use std::future::Future;
-use std::time::Duration;
+use std::sync::Arc;
 
-use fuzukue_proto::Actor;
+use fuzukue_proto::{Actor, ApprovalRisk, ApprovalUnattended};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
-use tokio::time::{sleep_until, Instant};
 
+use crate::hub::approval_store::{Action, FullAuthorization, Registration};
 use crate::mcp::{data_result, harness_candidates::sanitize, workspace_read::worktree_relative};
 use crate::mutations::Mutation;
 
 use super::{
     bail, check_ref_paths, current_commit, ensure, fs, git_output, git_read, input_file, json, oid,
     open_regular_source, run, symbolic_head, symlink, Context, ErrorKind, File, Git, Identity,
-    IndexLock, Path, Read, Result, Value, Workspace, MAX_MESSAGE, MAX_PATHS, MAX_PATH_BYTES,
+    IndexLock, Path, PathBuf, Read, Result, Value, Workspace, MAX_MESSAGE, MAX_PATHS, MAX_PATH_BYTES,
 };
 
-pub(in crate::mcp) const NAME: &str = "git_integrate_patch";
+pub(crate) const NAME: &str = "git_integrate_patch";
 const MAX_PATCH: usize = 768 * 1024;
 const MAX_DIFF: usize = 2 * 1024 * 1024;
 const MAX_INDEX: usize = 16 * 1024 * 1024;
 const MAX_LOCATIONS: usize = 40;
-const PRIVACY_OVERRIDE_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub(in crate::mcp) fn definition() -> Value {
     json!({
@@ -42,7 +42,7 @@ pub(in crate::mcp) fn definition() -> Value {
                 "allow_paths": {"type": "array", "maxItems": MAX_PATHS,
                     "items": {"type": "string", "minLength": 1, "maxLength": 4096}},
                 "override_privacy": {"type": "boolean", "default": false,
-                    "description": "Proceed with privacy findings only after explicit user approval."}
+                    "description": "Proceed with privacy findings only after explicit user approval. When approval is needed the call returns status pending with an approval_id at once. The result arrives later as a new message. Continue other work meanwhile."}
             },
             "required": ["patch", "message"],
             "additionalProperties": false
@@ -71,7 +71,13 @@ fn default_restore() -> bool {
 
 impl Args {
     fn allow_paths(&self) -> Result<Option<GlobSet>> {
-        let Some(patterns) = &self.allow_paths else {
+        globs(self.allow_paths.as_deref())
+    }
+}
+
+fn globs(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
+    {
+        let Some(patterns) = patterns else {
             return Ok(None);
         };
         ensure!(
@@ -96,7 +102,9 @@ impl Args {
             set.build().context("Could not compile allow_paths globs")?,
         ))
     }
+}
 
+impl Args {
     fn commit_message(&self, state: &Path) -> Result<String> {
         let mut message = self.message.clone();
         ensure!(
@@ -263,6 +271,8 @@ fn safe_path(path: &str) -> String {
 struct Findings {
     locations: Vec<String>,
     count: usize,
+    /// Every flagged file, including those beyond the displayed locations.
+    paths: BTreeSet<String>,
 }
 
 fn scan(diff: &[u8], changes: &[Change]) -> Result<Findings> {
@@ -299,8 +309,9 @@ fn scan(diff: &[u8], changes: &[Change]) -> Result<Findings> {
                 let text = text.strip_suffix('\r').unwrap_or(text);
                 if sanitize::patch_line_has_private_data(text, MAX_DIFF) {
                     findings.count += 1;
+                    let path = &file.context("Missing path for added line")?.path;
+                    findings.paths.insert(path.clone());
                     if findings.locations.len() < MAX_LOCATIONS {
-                        let path = &file.context("Missing path for added line")?.path;
                         findings
                             .locations
                             .push(format!("{}:{number}", safe_path(path)));
@@ -397,13 +408,20 @@ async fn prepare(root: &Path, state: &Path, args: &Args) -> Result<Prepared> {
     let message = args.commit_message(state)?;
     let allow_paths = args.allow_paths()?;
     let patch = read_patch(root, state, &args.patch)?;
+    prepare_bytes(root, state, patch, message, allow_paths.as_ref(), args.push).await
+}
+
+/// Check exact patch bytes against the current HEAD and a clean index.
+async fn prepare_bytes(
+    root: &Path, state: &Path, patch: Vec<u8>, message: String, allow_paths: Option<&GlobSet>, push: bool,
+) -> Result<Prepared> {
     let patch_sha256 = format!("{:x}", Sha256::digest(&patch));
     let git = Git::open(root, root)?;
     git.prepare_config().await?;
     check_repository(&git)?;
     let reference = symbolic_head(git.command()).await?;
     ensure!(
-        !args.push || reference != "HEAD",
+        !push || reference != "HEAD",
         "Push requires an attached branch"
     );
     check_ref_paths(&git, &reference)?;
@@ -472,9 +490,7 @@ async fn prepare(root: &Path, state: &Path, args: &Args) -> Result<Prepared> {
             "The patch changes a protected path"
         );
         ensure!(
-            allow_paths
-                .as_ref()
-                .is_none_or(|globs| globs.is_match(path)),
+            allow_paths.is_none_or(|globs| globs.is_match(path)),
             "Changed path is outside allow_paths: {}",
             safe_path(&change.path)
         );
@@ -519,7 +535,7 @@ async fn prepare(root: &Path, state: &Path, args: &Args) -> Result<Prepared> {
 }
 
 impl Prepared {
-    async fn publish(&self, state: &Path, begin_write: impl FnOnce()) -> Result<String> {
+    async fn publish(&self, state: &Path, begin_write: impl FnOnce(), progress: &Progress) -> Result<String> {
         let git = &self.git;
         let mut lock = IndexLock::new(&git.metadata)?;
         check_repository(git)?;
@@ -581,12 +597,16 @@ impl Prepared {
             ]);
             command
         };
+        progress.record(|landed| landed.commit_sha = Some(commit.clone()));
         begin_write();
         git_output(
             update_ref(&commit, &self.head, "fuzukue: integrate patch"),
             "publish the patch commit",
         )
         .await?;
+        progress.record(|landed| landed.ref_updated = true);
+        #[cfg(test)]
+        tests::fault("after_ref_update").await;
         if let Err(error) = lock.publish(&git.metadata.join("index")) {
             git_output(
                 update_ref(&self.head, &commit, "fuzukue: roll back patch integration"),
@@ -594,9 +614,50 @@ impl Prepared {
             )
             .await
             .with_context(|| format!("Could not publish the index: {error}"))?;
+            progress.record(|landed| landed.rolled_back = true);
             return Err(error).context("Could not publish the index");
         }
+        progress.record(|landed| landed.index_published = true);
         Ok(commit)
+    }
+}
+
+/// The confirmed steps of one commit attempt. It lives outside the cancellable
+/// operation, so an interrupted attempt can still say what landed.
+#[derive(Default)]
+struct Progress(std::sync::Mutex<Landed>);
+
+#[derive(Clone, Default, serde::Serialize)]
+struct Landed {
+    /// The commit object this attempt created. See `ref_updated` for the branch.
+    commit_sha: Option<String>,
+    ref_updated: bool,
+    index_published: bool,
+    rolled_back: bool,
+    restored: Vec<String>,
+}
+
+impl Progress {
+    fn record(&self, change: impl FnOnce(&mut Landed)) {
+        change(&mut self.0.lock().unwrap());
+    }
+
+    /// Describe an attempt that stopped after writing began.
+    async fn review(&self, prepared: &Prepared, error: anyhow::Error) -> Value {
+        let landed = self.0.lock().unwrap().clone();
+        let head_now = tokio::time::timeout(std::time::Duration::from_secs(10), current_commit(&prepared.git))
+            .await.ok().and_then(Result::ok).flatten();
+        let paths = prepared.changes.iter().map(|change| &change.path).collect::<Vec<_>>();
+        json!({
+            "needs_review": true,
+            "message": format!(
+                "{error:#}. Writing had begun, so changes may have landed. It was not retried. Compare HEAD, the index and the listed paths with this report before doing anything else."
+            ),
+            "head_before": prepared.head,
+            "head_now": head_now,
+            "paths": paths,
+            "landed": landed,
+        })
     }
 }
 
@@ -607,8 +668,227 @@ fn failure(code: &str, message: impl ToString) -> Value {
     )
 }
 
+/// The operation bound to a deferred approval. Execution never rereads the
+/// workspace patch file or the server configuration.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Snapshot {
+    patch: String,
+    patch_sha256: String,
+    message: String,
+    restore_worktree: bool,
+    allow_paths: Option<Vec<String>>,
+    override_privacy: bool,
+    push_requested: bool,
+    findings_count: usize,
+    findings_locations: Vec<String>,
+    findings_paths: BTreeSet<String>,
+    paths: BTreeSet<String>,
+    root: PathBuf,
+    head: String,
+}
+
+impl Snapshot {
+    fn new(root: &Path, args: &Args, prepared: &Prepared) -> Result<Self> {
+        Ok(Self {
+            patch: String::from_utf8(prepared.patch.clone()).context("The patch must be UTF-8 text")?,
+            patch_sha256: prepared.patch_sha256.clone(),
+            message: prepared.message.clone(),
+            restore_worktree: args.restore_worktree,
+            allow_paths: args.allow_paths.clone(),
+            override_privacy: args.override_privacy,
+            push_requested: args.push,
+            findings_count: prepared.findings.count,
+            findings_locations: prepared.findings.locations.clone(),
+            findings_paths: prepared.findings.paths.clone(),
+            paths: prepared.changes.iter().map(|change| change.path.clone()).collect(),
+            root: root.into(),
+            head: prepared.head.clone(),
+        })
+    }
+
+    /// The snapshot fields the card shows. A pending card is reused only while they match.
+    const REVIEWED: [&'static str; 4] = ["paths", "findings_count", "findings_locations", "findings_paths"];
+
+    /// The decision identity. A pending request with the same identity is reused.
+    fn action(&self) -> Action {
+        Action {
+            tool: NAME.into(),
+            args: json!({
+                "patch_sha256": self.patch_sha256,
+                "message": crate::full_approval::fingerprint(&json!(self.message)),
+                "restore_worktree": self.restore_worktree,
+                "allow_paths": self.allow_paths,
+                "override_privacy": self.override_privacy,
+                "push": self.push_requested,
+            }),
+            scope: json!({"root": self.root}),
+        }
+    }
+
+    fn registration(&self, session: &str) -> Registration {
+        let short = |value: &str| value.chars().take(12).collect::<String>();
+        let reason = if self.override_privacy {
+            format!(
+                "Integrate Git patch {} into {} files with a privacy override ({} flagged lines). Approve only if the flagged lines are intended.",
+                short(&self.patch_sha256), self.paths.len(), self.findings_count,
+            )
+        } else {
+            format!("Integrate Git patch {} into {} files.", short(&self.patch_sha256), self.paths.len())
+        };
+        Registration {
+            owner: crate::deferred_approvals::owner(session),
+            thread_auto: false,
+            tool_item: None,
+            anchor_item: None,
+            risk: if self.override_privacy { ApprovalRisk::High } else { ApprovalRisk::Mid },
+            // Every deferred request is left to a person, even if full approval mode is enabled later.
+            unattended: ApprovalUnattended::NeverUnattended,
+            reason,
+            expires_at: fuzukue_proto::APPROVAL_NO_EXPIRY,
+            action: self.action(),
+            display_args: json!({
+                "paths": self.paths,
+                "patch_sha256": self.patch_sha256,
+                "head": self.head,
+                "override_privacy": self.override_privacy,
+                "privacy_findings": self.findings_count,
+                "locations": self.findings_locations,
+                "restore_worktree": self.restore_worktree,
+                "push": self.push_requested,
+            }),
+            display_scope: json!({"workspace": self.root.file_name().and_then(|name| name.to_str()).unwrap_or_default()}),
+        }
+    }
+}
+
+/// The decision identity of a saved snapshot, used to check it against the approval record.
+pub(crate) fn snapshot_action(payload: &Value) -> Result<Action> {
+    let snapshot: Snapshot = serde_json::from_value(payload.clone())
+        .context("The saved patch snapshot is unreadable")?;
+    Ok(snapshot.action())
+}
+
+/// Describe a deferred request from the snapshot bound to its card.
+fn deferred(registered: crate::deferred_approvals::Registered) -> Result<Value> {
+    use crate::deferred_approvals::Registered;
+    let (id, payload, waiting) = match registered {
+        Registered::Pending { id, payload, reused, replaced } => (id, payload, Some((reused, replaced))),
+        Registered::Decided { id, payload } => (id, payload, None),
+    };
+    let snapshot: Snapshot = serde_json::from_value(payload)?;
+    let mut data = json!({
+        "status": if waiting.is_some() { "pending" } else { "decided" },
+        "approval_id": id,
+        "patch_sha256": snapshot.patch_sha256,
+        "head": snapshot.head,
+        "paths": snapshot.paths,
+        "privacy_findings": snapshot.findings_count,
+        "locations": snapshot.findings_locations,
+        "push": if snapshot.push_requested {
+            "not run after a deferred approval; request a push separately after the result"
+        } else {
+            "disabled"
+        }
+    });
+    data["what_to_do_next"] = match waiting {
+        Some((reused, replaced)) => {
+            data["reused"] = json!(reused);
+            if let Some(replaced) = replaced {
+                data["replaced_approval_id"] = json!(replaced);
+            }
+            json!({
+                "continue": "The approval card waits for the user without a deadline. Nothing has been committed yet. Tell the user briefly, then continue independent work or end the turn.",
+                "result": "When the user decides, the result arrives as a new message in this thread. Do not call again to poll. The same request returns the same approval ID while its card shows the current findings.",
+                "withdraw": "Call withdraw_approval with this approval_id if the user asks to cancel it or it is no longer needed."
+            })
+        }
+        None => json!({
+            "result": "The user has already decided this request, so no card is waiting. Its result arrives as a new message in this thread. Do not request it again before that message."
+        }),
+    };
+    Ok(data_result(data, false))
+}
+
+/// How an approved snapshot ended once execution started. An error means nothing was written.
+pub(crate) enum Execution {
+    Completed(Value),
+    /// Writing began and completion was not confirmed.
+    NeedsReview(Value),
+}
+
+/// Run an approved snapshot once against the current HEAD and a clean index.
+pub(crate) async fn execute_snapshot(
+    app: &Arc<Workspace>, mutation: &Mutation<'_>, payload: &Value,
+) -> Result<Execution> {
+    let snapshot: Snapshot = serde_json::from_value(payload.clone())
+        .context("The saved patch snapshot is unreadable. Nothing was changed")?;
+    let root = app.project_dir.canonicalize()?;
+    ensure!(snapshot.root == root, "The workspace moved after the approval was requested. Nothing was changed.");
+    ensure!(
+        format!("{:x}", Sha256::digest(snapshot.patch.as_bytes())) == snapshot.patch_sha256,
+        "The saved patch does not match its approved hash. Nothing was changed."
+    );
+    let allow_paths = globs(snapshot.allow_paths.as_deref())?;
+    let prepared = mutation.prepare(async {
+        let _guard = app.git_lock.lock().await;
+        prepare_bytes(&root, &app.state_dir, snapshot.patch.clone().into_bytes(), snapshot.message.clone(),
+            allow_paths.as_ref(), false).await
+    }).await.context("The approved patch cannot be applied to the current HEAD and index. Nothing was changed")?;
+    let paths: BTreeSet<_> = prepared.changes.iter().map(|change| change.path.clone()).collect();
+    ensure!(
+        paths == snapshot.paths,
+        "Against the current HEAD the patch would change other paths than approved. Nothing was changed."
+    );
+    let findings = &prepared.findings;
+    ensure!(
+        findings.count == 0 || snapshot.override_privacy
+            && findings.count <= snapshot.findings_count
+            && findings.paths.is_subset(&snapshot.findings_paths),
+        "Against the current HEAD the patch has privacy findings that were not shown for approval. Nothing was changed."
+    );
+    let progress = Progress::default();
+    let mut result = match commit(app, mutation, &root, &prepared, snapshot.restore_worktree, &progress).await {
+        Ok(result) => result,
+        Err(error) if mutation.wrote() => {
+            let mut review = progress.review(&prepared, error).await;
+            review["head_at_request"] = json!(snapshot.head);
+            return Ok(Execution::NeedsReview(review));
+        }
+        Err(error) => return Err(error.context("Nothing was changed")),
+    };
+    if snapshot.push_requested {
+        result["push"] = json!({"status": "not_run",
+            "message": "Push is not run after a deferred approval. Request it separately if the user still wants it."});
+    }
+    result["head_at_request"] = json!(snapshot.head);
+    Ok(Execution::Completed(result))
+}
+
+async fn commit(
+    app: &Workspace, mutation: &Mutation<'_>, root: &Path, prepared: &Prepared, restore_worktree: bool,
+    progress: &Progress,
+) -> Result<Value> {
+    let local = mutation
+        .run(async {
+            let _guard = app.git_lock.lock().await;
+            let commit = prepared
+                .publish(&app.state_dir, || mutation.begin_write(), progress)
+                .await?;
+            let restore = restore::report(root, &prepared.git, &prepared.changes, restore_worktree, progress).await;
+            Ok((commit, restore))
+        })
+        .await;
+    app.git_changed();
+    let (commit, restore) = local?;
+    let paths = prepared.changes.iter().map(|change| &change.path).collect::<Vec<_>>();
+    Ok(json!({
+        "commit_sha": commit, "paths": paths, "restore": restore,
+        "push": {"status": "disabled"}
+    }))
+}
+
 pub(in crate::mcp) async fn call(
-    app: &Workspace,
+    app: &Arc<Workspace>,
     session: &str,
     args: Args,
     local_approval: Option<Actor>,
@@ -616,8 +896,6 @@ pub(in crate::mcp) async fn call(
     trusted: bool,
     recheck: impl Future<Output = Result<()>>,
 ) -> Result<Value> {
-    // Expire the override before a five-minute caller timeout, including preparation.
-    let override_deadline = Instant::now() + PRIVACY_OVERRIDE_TIMEOUT;
     let mutation = Mutation::new(app, session, "Git patch integration".into())?;
     let root = app.project_dir.canonicalize()?;
     let prepared = match mutation
@@ -659,98 +937,43 @@ pub(in crate::mcp) async fn call(
                 }),
             ));
     if args.override_privacy || local_approval.is_some() {
-        let actor = local_approval.context("Privacy override requires front desk approval")?;
-        let details = format!(
-            "Integrate Git patch SHA-256 {} at HEAD {} ({} files){}",
-            prepared.patch_sha256,
-            prepared.head,
-            prepared.changes.len(),
-            if args.override_privacy {
-                format!(
-                    ". Privacy override ({} flagged lines): {}",
-                    findings.count,
-                    findings
-                        .locations
-                        .join(", ")
-                        .chars()
-                        .take(1000)
-                        .collect::<String>()
-                )
-            } else {
-                String::new()
-            }
-        );
-        let approval = crate::delegate::request_approval_with_full(
-            app,
-            session,
-            fuzukue_proto::GIT_APPROVAL,
-            actor,
-            details,
-            full,
-        );
-        let decision = if args.override_privacy {
-            tokio::select! {
-                biased;
-                _ = sleep_until(override_deadline) => {
-                    return Ok(failure(
-                        "approval_timed_out",
-                        "Privacy override approval expired. Review the patch before requesting approval again.",
-                    ));
-                }
-                decision = approval => decision,
-            }
-        } else {
-            approval.await
+        local_approval.context("Privacy override requires front desk approval")?;
+        let automatic = match full {
+            Some(full) => app.hub.authorize_full_approval(full)?,
+            None => FullAuthorization::Human,
         };
-        match decision {
-            Ok(decision) if decision == "accept" => {}
-            Ok(_) => {
-                return Ok(failure(
-                    "approval_denied",
-                    "The user did not approve the integration",
-                ));
+        match automatic {
+            FullAuthorization::Granted => recheck.await?,
+            FullAuthorization::AlreadyConsumed => return Ok(failure(
+                "approval_failed",
+                "This full approval was already consumed. Check the original operation before retrying.",
+            )),
+            FullAuthorization::Human => {
+                // Bind the checked bytes and return at once. The user decides without a deadline.
+                let snapshot = Snapshot::new(&root, &args, &prepared)?;
+                let request = crate::deferred_approvals::Request {
+                    registration: snapshot.registration(session),
+                    payload: serde_json::to_value(&snapshot)?,
+                    reviewed: &Snapshot::REVIEWED,
+                };
+                let registered = crate::deferred_approvals::register(app, session, request).await?;
+                return deferred(registered);
             }
-            Err(error) => return Ok(failure("approval_failed", error)),
         }
-        recheck.await?;
     } else if let Some(full) = full {
         crate::full_approval::authorize(&app.hub, full)?;
     }
 
     let mutation = Mutation::new(app, session, "Git patch integration".into())?;
-    let local = mutation
-        .run(async {
-            let _guard = app.git_lock.lock().await;
-            let commit = prepared
-                .publish(&app.state_dir, || mutation.begin_write())
-                .await?;
-            let restore = restore::report(
-                &root,
-                &prepared.git,
-                &prepared.changes,
-                args.restore_worktree,
-            )
-            .await;
-            Ok((commit, restore))
-        })
-        .await;
-    app.git_changed();
-    let (commit, restore) = match local {
-        Ok(local) => local,
+    let committed = commit(app, &mutation, &root, &prepared, args.restore_worktree, &Progress::default()).await;
+    drop(mutation);
+    let mut result = match committed {
+        Ok(result) => result,
         Err(error) => return Ok(failure("commit_failed", error)),
     };
-
-    let paths = prepared
-        .changes
-        .iter()
-        .map(|change| &change.path)
-        .collect::<Vec<_>>();
-    let mut result = json!({
-        "commit_sha": commit, "paths": paths, "restore": restore,
-        "push": {"status": "disabled"}
-    });
     if args.push {
         let actor = push_actor.context("Push requires front desk approval")?;
+        let commit = result["commit_sha"].as_str().unwrap_or_default().to_owned();
         result["push"] = match app
             .git_remote_expected(
                 session,

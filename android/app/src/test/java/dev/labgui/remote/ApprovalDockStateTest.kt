@@ -1,6 +1,8 @@
 package dev.labgui.remote
 
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.*
@@ -55,6 +57,40 @@ class ApprovalDockStateTest {
         assertFalse(a.canBatchWith(b.copy(action = b.action.copy(tool = "git_commit_scoped"))))
         assertFalse(a.canBatchWith(b.copy(action = b.action.copy(scope = buildJsonObject { put("directory", "/elsewhere") }))))
         assertFalse(a.copy(action = a.action.copy(scope = JsonNull)).let { it.canBatchWith(it) })
+    }
+
+    @Test fun integrateCardsListFilesAndFlaggedLinesAsPlainText() {
+        val action = queuedApprovalFixture("integrate").action.copy(
+            tool = "git_integrate_patch",
+            args = Json.parseToJsonElement(
+                """{"paths":["docs/a.md","docs/b.md"],"privacy_findings":3,"locations":["docs/b.md:14"],
+                    "patch_sha256":"0123456789abcdef","head":"fedcba9876543210"}""",
+            ),
+            scope = buildJsonObject { put("workspace", "handbook") },
+        )
+        val card = action.integrateCard()!!
+        assertEquals(listOf("docs/a.md", "docs/b.md"), card.files)
+        assertEquals(listOf("docs/b.md:14"), card.flagged)
+        assertEquals(2, card.unlisted)
+        assertEquals(listOf("handbook", "0123456789ab", "fedcba987654"), listOf(card.workspace, card.patch, card.head))
+        // Other tools and redacted records keep the generic card.
+        assertNull(action.copy(tool = "fs_write").integrateCard())
+        assertNull(action.copy(args = JsonPrimitive("[redacted]")).integrateCard())
+    }
+
+    @Test fun requestsWithoutADeadlineRoundTripTheServerSentinel() {
+        val waiting = queuedApprovalFixture("integrate", risk = ApprovalRisk.High, expiresAt = APPROVAL_NO_EXPIRY)
+            .let { it.copy(unattended = "never-unattended", action = it.action.copy(tool = "git_integrate_patch")) }
+        val json = kotlinx.serialization.json.Json.encodeToString(QueuedApproval.serializer(), waiting)
+        // fuzukue_proto::APPROVAL_NO_EXPIRY is i64::MAX.
+        assertTrue(json.contains("\"expires_at\":9223372036854775807"))
+        val decoded = kotlinx.serialization.json.Json.decodeFromString(QueuedApproval.serializer(), json)
+        assertNull(decoded.deadline)
+        assertEquals(3_800_000_000_000L, queuedApprovalFixture("dated").deadline)
+        // A request without a deadline stays pending in the dock until it is decided.
+        val dock = ApprovalDockState().replace("lab", listOf(decoded))
+        assertEquals(listOf(decoded), dock.forThread("s"))
+        assertFalse(decoded.canBatchWith(decoded))
     }
 
     @Test fun decisionRepliesAreCorrelatedAndInterruptionLeavesTheOutcomeUnknown() {

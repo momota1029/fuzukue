@@ -76,7 +76,8 @@ pub(crate) struct GitHubHold {
 impl Work {
     fn tracks_submission(&self) -> bool {
         use crate::delegate::DeskTurn;
-        matches!(self, Self::Desk(DeskTurn::Report { .. }) | Self::Claude(_))
+        matches!(self, Self::Desk(DeskTurn::Report { .. } | DeskTurn::WorkshopReport { approval_id: Some(_), .. })
+            | Self::Claude(_))
     }
 
     pub(crate) fn is_planner(&self) -> bool {
@@ -746,6 +747,51 @@ mod tests {
         assert_eq!(submitting.id, "submitting");
         assert!(submitting.claimed && submitting.retry.is_none());
         assert_eq!(submitting.review.as_deref(), Some(INTERRUPTED));
+        Ok(())
+    }
+
+    #[test]
+    fn older_builds_load_a_journal_holding_approval_results() -> Result<()> {
+        // The desk turns and records that builds before approval results decode.
+        #[derive(Serialize, Deserialize)]
+        enum OldDeskTurn {
+            Question { id: String, job: String, text: String, replanned: bool },
+            Report { job: String, text: String, plan_failed: bool },
+            WorkshopReport { text: String },
+            WatchEvent { watch: String, text: String },
+            HandoffReport { worker: String, text: String },
+            Plan { resumed: bool },
+        }
+        #[derive(Serialize, Deserialize)]
+        enum OldWork {
+            Desk(OldDeskTurn),
+        }
+        #[derive(Serialize, Deserialize)]
+        struct OldRecord {
+            id: String,
+            session: String,
+            work: OldWork,
+            claimed: bool,
+        }
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path();
+        Journal::default().enqueue(path, "thread-fixture", "approval-result-fixture".into(),
+            Work::Desk(crate::delegate::DeskTurn::WorkshopReport {
+                text: "Approval completed".into(), approval_id: Some("apr_fixture".into()),
+            }))?;
+        let current = Journal::default().records(path)?;
+        assert!(current[0].work.tracks_submission());
+        assert!(matches!(&current[0].work, Work::Desk(turn) if turn.is_approval_result()));
+
+        let old: Vec<OldRecord> = serde_json::from_slice(&fs::read(path.join(FILE))?)?;
+        assert!(matches!(&old[0].work, OldWork::Desk(OldDeskTurn::WorkshopReport { text }) if text == "Approval completed"));
+        // What an older build saves again stays readable, as an ordinary report.
+        fs::write(path.join(FILE), serde_json::to_vec(&old)?)?;
+        let returned = Journal::default().records(path)?;
+        assert!(matches!(&returned[0].work, Work::Desk(crate::delegate::DeskTurn::WorkshopReport {
+            text, approval_id: None,
+        }) if text == "Approval completed"));
         Ok(())
     }
 

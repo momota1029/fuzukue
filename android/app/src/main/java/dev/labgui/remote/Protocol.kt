@@ -270,7 +270,13 @@ data class QueuedApproval(
     val automatic: Boolean = false,
     @SerialName("tool_item") val toolItem: String? = null,
     @SerialName("anchor_item") val anchorItem: String? = null,
-)
+) {
+    /** The request deadline, or null when it waits for the user without one. */
+    val deadline: Long? get() = expiresAt.takeIf { it != APPROVAL_NO_EXPIRY }
+}
+
+/** Mirrors fuzukue_proto::APPROVAL_NO_EXPIRY. */
+const val APPROVAL_NO_EXPIRY: Long = Long.MAX_VALUE
 
 @Serializable
 data class ApprovalReceipt(

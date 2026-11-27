@@ -69,6 +69,9 @@ struct Record {
     summary: ApprovalSummary,
     action: Action,
     history: Vec<AuditEntry>,
+    /// Digest of the server-side snapshot a deferred request is bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -498,8 +501,42 @@ impl Queue {
         self.commit(store, next, changed)
     }
 
+    #[cfg(test)]
     pub(crate) fn register(&self, request: Registration) -> Result<String> {
-        Ok(self.register_inner(request, false, true, false, None)?.0)
+        Ok(self.register_inner(request, false, true, false, None, None)?.0)
+    }
+
+    /// Register a request that runs a saved snapshot after its caller has returned.
+    /// Only a person can grant it, whatever mode is active now or enabled later.
+    /// The result never names a request that was already decided.
+    pub(crate) fn register_deferred(&self, mut request: Registration, binding: String) -> Result<String> {
+        request.unattended = ApprovalUnattended::NeverUnattended;
+        request.thread_auto = false;
+        Ok(self.register_inner(request, false, false, false, None, Some(binding))?.0)
+    }
+
+    pub(crate) fn binding(&self, id: &str) -> Result<Option<String>> {
+        self.with_store(now, |store, _| Ok(store.records.iter()
+            .find(|record| record.summary.approval_id == id)
+            .and_then(|record| record.binding.clone())))
+    }
+
+    /// Withdraw the owner's request only while no decision has been made.
+    pub(crate) fn withdraw_pending(&self, id: &str, owner: &ApprovalOwner, reason: &str) -> Result<bool> {
+        self.with_store(now, |store, now| {
+            let Some(index) = store.records.iter().position(|record| {
+                let summary = &record.summary;
+                summary.approval_id == id && summary.owner == *owner && summary.state == ApprovalState::Pending
+            }) else { return Ok(false) };
+            let mut next = store.clone();
+            let record = &mut next.records[index];
+            record.summary.state = ApprovalState::Withdrawn;
+            record.summary.updated_at = now;
+            record.audit(now, &owner.requester, Some(reason.into()), AuditEvent::Withdrawn);
+            let summary = record.summary.clone();
+            self.commit(store, next, [summary])?;
+            Ok(true)
+        })
     }
 
     /// Grant and claim the exact operation of a live caller in one durable mutation.
@@ -511,11 +548,12 @@ impl Queue {
     pub(crate) fn authorize_automatic(
         &self, request: Registration, full: bool, thread: bool, legacy_id: Option<&str>,
     ) -> Result<FullAuthorization> {
-        Ok(self.register_inner(request, true, full, thread, legacy_id)?.1)
+        Ok(self.register_inner(request, true, full, thread, legacy_id, None)?.1)
     }
 
     fn register_inner(
         &self, mut request: Registration, live: bool, full: bool, thread: bool, legacy_id: Option<&str>,
+        binding: Option<String>,
     ) -> Result<(String, FullAuthorization)> {
         self.with_store(now, |store, now| {
             ensure!(
@@ -536,10 +574,12 @@ impl Queue {
 
             // A grant's operation identity outlives its lease and process. A
             // finalized grant stops replay even if its original deadline passed.
-            if let Some(index) = store.records.iter().position(|record| {
+            // A deferred request needs a new decision once an earlier one is final.
+            let replayed = binding.is_none().then(|| store.records.iter().position(|record| {
                 record.same_operation(&request.owner, &request.action)
                     && (record.was_granted_by_full_mode() || mode.is_some() && record.was_granted())
-            }) {
+            })).flatten();
+            if let Some(index) = replayed {
                 let record = &store.records[index];
                 let id = record.summary.approval_id.clone();
                 if !live {
@@ -569,6 +609,7 @@ impl Queue {
                     && record.same_operation(&request.owner, &request.action)
                     && summary.risk == request.risk
                     && summary.unattended == request.unattended
+                    && record.binding.is_some() == binding.is_some()
             }) {
                 let id = record.summary.approval_id.clone();
                 record.audit(now, &request.owner.requester, None, AuditEvent::Deduplicated);
@@ -598,6 +639,7 @@ impl Queue {
                 }
             });
             let mut record = self.new_record(approval_id.clone(), request, now);
+            record.binding = binding;
             let mut authorization = FullAuthorization::Human;
             if let Some((principal, mode_id)) = &mode {
                 record.grant_automatic(now, principal, mode_id);
@@ -640,6 +682,7 @@ impl Queue {
             },
             action: request.action,
             history: Vec::new(),
+            binding: None,
         };
         record.audit(now, &requester, None, AuditEvent::Registered);
         record
@@ -692,6 +735,25 @@ impl Queue {
                 .collect();
             Ok((pending, self.updates.subscribe()))
         })
+    }
+
+    /// The current summary of one request and its exact server-side action.
+    pub(crate) fn lookup(&self, id: &str) -> Result<Option<(ApprovalSummary, Action)>> {
+        self.with_store(now, |store, _| Ok(store.records.iter()
+            .find(|record| record.summary.approval_id == id)
+            .map(|record| (record.summary.clone(), record.action.clone()))))
+    }
+
+    /// IDs of every request registered for a tool, in registration order.
+    pub(crate) fn ids_for_tool(&self, tool: &str) -> Result<Vec<String>> {
+        self.with_store(now, |store, _| Ok(store.records.iter()
+            .filter(|record| record.action.tool == tool)
+            .map(|record| record.summary.approval_id.clone())
+            .collect()))
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ApprovalSummary> {
+        self.updates.subscribe()
     }
 
     pub(crate) fn decide(
@@ -829,7 +891,8 @@ impl Queue {
                 full_grant |= record.was_granted_by_full_mode();
                 consumed |= record.summary.consumed_at.is_some();
             }
-            if full_grant && consumed {
+            // A deferred request is a new human decision and its record is consumed once.
+            if full_grant && consumed && store.records[index].binding.is_none() {
                 return Ok(false);
             }
             let mut next = store.clone();

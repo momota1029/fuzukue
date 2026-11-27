@@ -72,7 +72,8 @@ impl Journal {
             ensure!(
                 matches!(
                     &record.work,
-                    Work::Desk(DeskTurn::Report { .. }) | Work::Claude(_) | Work::Delegate(_)
+                    Work::Desk(DeskTurn::Report { .. } | DeskTurn::WorkshopReport { approval_id: Some(_), .. })
+                        | Work::Claude(_) | Work::Delegate(_)
                 ),
                 "This held work kind does not support redelivery"
             );
@@ -99,6 +100,7 @@ impl Journal {
 fn desk_kind(work: &Work) -> Option<&'static str> {
     match work {
         Work::Desk(DeskTurn::Report { .. }) => Some("Desk Report"),
+        Work::Desk(DeskTurn::WorkshopReport { approval_id: Some(_), .. }) => Some("Approval Result"),
         Work::Claude(_) => Some("Claude"),
         Work::Delegate(_) => Some("Delegate"),
         Work::Checkpoint { .. } => Some("Checkpoint"),
