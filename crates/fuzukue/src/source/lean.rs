@@ -11,7 +11,7 @@ use gpui_kit::{
     component::{h_flex, scroll::ScrollableElement as _, text::TextView, v_flex, ActiveTheme as _},
     div,
     prelude::*,
-    px, App, Context, MouseButton, SharedString, Task, Window,
+    px, App, Context, MouseButton, MouseDownEvent, SharedString, Task, Window,
 };
 use fuzukue_proto::{ClientMsg, LspOutcome, LspQuery};
 use fuzukue_view::lean::{self, Declaration, Item, Page, Step};
@@ -312,9 +312,11 @@ impl Workbench {
                 )
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, _| {
+                    cx.listener(|this, event: &MouseDownEvent, _, _| {
                         if !this.lean_running {
-                            let _ = this.out.send(ClientMsg::CheckLean);
+                            // Shift-click rechecks every package.
+                            let full = event.modifiers.shift;
+                            let _ = this.out.send(ClientMsg::CheckLean { full });
                         }
                     }),
                 ),

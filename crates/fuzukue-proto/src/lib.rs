@@ -1251,7 +1251,11 @@ pub enum ClientMsg {
     RunTests { suite: String, filter: Option<String> },
     StopTests { suite: String },
     /// カードが指す Lean の宣言を確かめ直す。答えは `LeanStatus`。
-    CheckLean,
+    /// 入力が変わったパッケージを確かめる。`full` なら保存した結果を捨てて全部やり直す。
+    CheckLean {
+        #[serde(default)]
+        full: bool,
+    },
     GetLeanReadingCards {
         request: u64,
         deck: String,

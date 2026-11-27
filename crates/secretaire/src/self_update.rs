@@ -427,6 +427,14 @@ impl Update {
         Duration::from_secs(self.config.orphan_approval_seconds)
     }
 
+    /// Whether new work would be admitted. Unlike `admit`, this never holds the
+    /// gate, so polling it cannot make a planned operation see active work.
+    pub(crate) fn admission_open(&self) -> bool {
+        !self.trial_pending()
+            && matches!(*self.wait_control.lock().unwrap(), WaitControl::Closed)
+            && !*self.swapping.borrow()
+    }
+
     pub(crate) fn admit(&self) -> Result<OwnedRwLockReadGuard<()>> {
         self.admit_mutation(None).map(|(permit, _)| permit)
     }

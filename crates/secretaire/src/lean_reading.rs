@@ -1,6 +1,6 @@
 //! Source-level checks shared by Lean status, reviewer prompts and branch review.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -76,6 +76,8 @@ pub(crate) async fn doc_check(project: &Path) -> Result<DocCheck> {
     let repo = Repo::open(project).await.ok();
     let mut base = None;
     let mut renames = BTreeMap::new();
+    // Files that differ from the base. `None` when Git cannot list them.
+    let mut changed = None;
     if let Some(repo) = &repo {
         for reference in ["refs/heads/main", "refs/remotes/origin/HEAD", "HEAD"] {
             if let Ok(output) = repo.git(&["merge-base", reference, "HEAD"]).await {
@@ -89,11 +91,15 @@ pub(crate) async fn doc_check(project: &Path) -> Result<DocCheck> {
                 .await
             {
                 let mut fields = names.split_terminator('\0');
+                let changed = changed.insert(BTreeSet::new());
                 while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
                     if status.starts_with(['R', 'C']) {
                         if let Some(new) = fields.next() {
                             renames.insert(new.to_owned(), path.to_owned());
+                            changed.insert(new.to_owned());
                         }
+                    } else {
+                        changed.insert(path.to_owned());
                     }
                 }
             }
@@ -114,7 +120,9 @@ pub(crate) async fn doc_check(project: &Path) -> Result<DocCheck> {
                 .filter(|d| d.needs_doc() && d.doc.is_empty())
                 .map(|d| finding(&label, d, "missing_docstring")),
         );
-        if let (Some(repo), Some(base)) = (&repo, &base) {
+        // An unchanged file cannot have a stale docstring. Skip its Git read.
+        let differs = changed.as_ref().is_none_or(|changed| changed.contains(label.as_ref()));
+        if let (Some(repo), Some(base), true) = (&repo, &base, differs) {
             let old_path = renames
                 .get(label.as_ref())
                 .map_or(label.as_ref(), String::as_str);
@@ -321,6 +329,48 @@ pub(crate) fn card_links(project: &Path) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reports_stale_docstrings_in_modified_and_renamed_files_only() -> Result<()> {
+        let project = crate::test_support::TestDir::new();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test"])
+                .args(args)
+                .current_dir(project.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        let source = |name: &str, claim: &str| {
+            format!("/-- Same prose. -/\ntheorem {name} : {claim} := by\n  first\n  | trivial\n  | rfl\n")
+        };
+        git(&["init", "-q", "-b", "main"]);
+        for name in ["kept", "edited", "moved"] {
+            project.write(&format!("{name}.lean"), &source(name, "True"));
+        }
+        git(&["add", "."]);
+        git(&["commit", "-qm", "Add claims"]);
+        git(&["switch", "-qc", "work"]);
+        project.write("edited.lean", &source("edited", "1 = 1"));
+        git(&["mv", "moved.lean", "renamed.lean"]);
+        project.write("renamed.lean", &source("moved", "2 = 2"));
+        project.write("new.lean", &source("new", "True"));
+
+        let mut found: Vec<_> = doc_check(project.path())
+            .await?
+            .findings
+            .into_iter()
+            .map(|finding| (finding.path, finding.code))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [("edited.lean", "unchanged_docstring"), ("renamed.lean", "unchanged_docstring")]
+                .map(|(path, code)| (path.to_owned(), code.to_owned()))
+        );
+        Ok(())
+    }
 
     #[test]
     fn compares_claims_and_proofs_independently() {

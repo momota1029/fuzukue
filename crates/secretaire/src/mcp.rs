@@ -707,8 +707,11 @@ impl Tool {
                 &[],
             ),
             Self::LeanStatus => (
-                harness_text!("Return status per Lean declaration. Set refresh to rerun checks and update the interface.", "Lean の宣言ごとの状態を返す。refresh を指定すると検査をやり直し、画面の状態も更新する。"),
-                json!({ "refresh": { "type": "boolean", "default": false, "description": harness_text!("Rerun the checks.", "検査をやり直すか") } }),
+                harness_text!("Return status per Lean declaration. Set refresh to check packages whose inputs changed and update the interface.", "Lean の宣言ごとの状態を返す。refresh を指定すると入力が変わったパッケージを確かめ、画面の状態も更新する。"),
+                json!({
+                    "refresh": { "type": "boolean", "default": false, "description": harness_text!("Check changed packages and retry failures that were not saved.", "変わったパッケージと、保存していない失敗を確かめ直すか") },
+                    "full": { "type": "boolean", "default": false, "description": harness_text!("Discard saved results and recheck every package. This can take a long time.", "保存した結果を捨てて全パッケージを確かめ直すか。長くかかることがある") },
+                }),
                 &[],
             ),
             Self::ListDecks => (
@@ -1615,6 +1618,8 @@ struct LocateArgs {
 struct LeanArgs {
     #[serde(default)]
     refresh: bool,
+    #[serde(default)]
+    full: bool,
 }
 
 #[derive(Deserialize)]
@@ -2471,9 +2476,10 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
             json!({ "file": hit.file, "line": hit.line, "card": hit.card })
         }
         Tool::LeanStatus => {
-            let LeanArgs { refresh } = parse_args(args)?;
-            let decls = if refresh {
-                app.check_lean().await?.context("Lean の検査に失敗した")?
+            let LeanArgs { refresh, full } = parse_args(args)?;
+            let decls = if refresh || full {
+                let run = crate::lean::Run::Manual { full };
+                app.check_lean(run).await?.context("Lean の検査に失敗した")?
             } else {
                 app.lean_status.lock().unwrap().clone()
             };

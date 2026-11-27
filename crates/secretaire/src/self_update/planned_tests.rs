@@ -16,6 +16,61 @@ fn start_requester(workspace: &Workspace, session: &str) -> RequestingTurn {
 }
 
 #[tokio::test]
+async fn a_lean_sweep_yields_to_a_planned_shutdown_and_resumes_after_cancel() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (app, update, desk) = load(dir.path())?;
+    let package = desk.project_dir.join("lean/A");
+    fs::create_dir_all(desk.project_dir.join("cards"))?;
+    fs::create_dir_all(&package)?;
+    fs::write(desk.project_dir.join("deck.toml"), "title = 'Synthetic deck'\n")?;
+    fs::write(desk.project_dir.join("cards/example.md"),
+        "---\nid: example\nkind: definition\nlean: [A.x]\n---\n")?;
+    fs::write(package.join("lakefile.toml"), "name = 'A'\n")?;
+    // The first audit hangs. Later audits finish at once.
+    let tools = tempfile::tempdir()?;
+    let lake = tools.path().join("lake");
+    fs::write(&lake, r#"ctl=$(dirname "$0")
+[ "$1" = build ] && exit 0
+cat >/dev/null
+if [ ! -f "$ctl/child" ]; then
+  sleep 300 & echo $! > "$ctl/pid"; mv "$ctl/pid" "$ctl/child"; wait
+fi
+echo "'A.x' does not depend on any axioms"
+echo 'fuzukue audit complete'
+"#)?;
+    assert!(desk.lean.lake.set(vec!["/bin/sh".into(), lake.into()]).is_ok());
+
+    let sweep = desk.check_lean(crate::lean::Run::Open);
+    let child = tools.path().join("child");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !child.is_file() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await?;
+    update.check_planned(&app, None).map(drop).expect("a Lean sweep must not count as active work");
+    update.begin_planned_wait(&app, DrainReason::Shutdown, None)?;
+    let decls = tokio::time::timeout(Duration::from_secs(10), sweep).await???;
+    assert!(decls.iter().any(|(name, _)| name == "(lean)"), "{decls:?}");
+    let pid = fs::read_to_string(&child)?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+            .is_ok_and(|stat| stat.rsplit_once(") ").is_some_and(|(_, tail)| !tail.starts_with(['Z', 'X'])))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await?;
+
+    // Reopen admission, as a cancelled drain does.
+    *update.wait_control.lock().unwrap() = WaitControl::Closed;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !desk.lean_status.lock().unwrap().contains(&("A.x".into(), "proved".into())) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn preflight_exempts_only_the_authenticated_requesting_turn() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (app, update, desk) = load(dir.path())?;

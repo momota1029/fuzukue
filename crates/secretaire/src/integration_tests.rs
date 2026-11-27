@@ -510,7 +510,7 @@ async fn sample_pdf_builds_and_locates_first_definition() -> Result<()> {
 #[ignore = "requires Lake and the sample's Lean toolchain"]
 async fn lean_checks_sample_hamming_theorem() -> Result<()> {
     let project = TempProject::copy_lab()?;
-    let statuses = lean::check(project.path()).await?;
+    let statuses = lean::check_all(project.path()).await?;
     assert_eq!(
         statuses
             .get("LabSample.Hamming.hamming_le_length")
@@ -1994,7 +1994,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             ],
             &["pdf", "page", "x", "y"],
         ),
-        ("lean_status", &[("refresh", "boolean")], &[]),
+        ("lean_status", &[("refresh", "boolean"), ("full", "boolean")], &[]),
         ("lean_doc_check", &[], &[]),
         ("list_decks", &[], &[]),
         (
@@ -3760,24 +3760,21 @@ async fn mcp_refreshes_lean_status_and_updates_the_cache_and_gui() -> Result<()>
             ["LabSample.Hamming.hamming_triangle", "proved"],
         ])
     );
-    for expected in [true, false] {
+    // Progress arrives per package while the check runs.
+    let mut running_events = 0;
+    loop {
         let event = events.try_recv()?;
         assert_eq!(event.seq, 0);
         match event.event {
-            ServerEvent::LeanStatus {
-                decls: published,
-                running,
-                ..
-            } => {
-                assert_eq!(running, expected);
-                assert_eq!(
-                    json!(published),
-                    if running { json!([]) } else { decls.clone() }
-                );
+            ServerEvent::LeanStatus { running: true, .. } => running_events += 1,
+            ServerEvent::LeanStatus { decls: published, .. } => {
+                assert_eq!(&json!(published), decls);
+                break;
             }
             other => panic!("expected LeanStatus, got {other:?}"),
         }
     }
+    assert!(running_events > 0);
     let cached = mcp_call(&app, "lean_status", json!({ "refresh": false })).await;
     assert_eq!(&mcp_data(&cached)["decls"], decls);
     assert!(events.try_recv().is_err());

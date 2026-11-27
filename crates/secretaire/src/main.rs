@@ -191,8 +191,7 @@ pub struct Workspace {
     graph: graph::WorkspaceGraph,
     library: std::sync::Mutex<library::Index>,
     extensions: extensions::Extensions,
-    lean_check: Mutex<()>,
-    lean_check_started: std::sync::OnceLock<()>,
+    lean: lean::State,
     /// Lean の宣言ごとの状態（最後に確かめた結果）
     lean_status: std::sync::Mutex<Vec<(String, String)>>,
     lean_doc_findings: std::sync::Mutex<Vec<fuzukue_proto::LeanDocFinding>>,
@@ -264,8 +263,7 @@ impl Workspace {
             graph: Default::default(),
             library: Default::default(),
             extensions: Default::default(),
-            lean_check: Mutex::new(()),
-            lean_check_started: Default::default(),
+            lean: Default::default(),
             lean_status: std::sync::Mutex::new(Vec::new()),
             lean_doc_findings: std::sync::Mutex::new(Vec::new()),
             comment_edit: Mutex::new(()),
@@ -527,35 +525,6 @@ impl Workspace {
                 }
             }
         });
-    }
-
-    #[cfg(not(test))]
-    fn check_lean_on_open(self: &Arc<Self>) {
-        // A workspace with no editor attached does not need to build Lean packages.
-        if !canary() && self.lean_check_started.set(()).is_ok() {
-            self.check_lean();
-        }
-    }
-
-    fn check_lean(self: &Arc<Self>) -> tokio::task::JoinHandle<anyhow::Result<Vec<(String, String)>>> {
-        let _ = self.lean_check_started.set(());
-        let app = self.clone();
-        tokio::spawn(async move {
-            let _check = app.lean_check.lock().await;
-            let _work = app.admit_work()?;
-            let current = app.lean_status.lock().unwrap().clone();
-            app.hub.publish_snapshot(ServerEvent::LeanStatus { decls: current, running: true, doc_findings: Vec::new() });
-            let doc_findings = lean_reading::doc_check(&app.project_dir).await.map(|check| check.findings).unwrap_or_default();
-            let result = lean::check_reading(&app.project_dir).await.map(|m| m.into_iter().collect::<Vec<_>>());
-            let decls = match &result {
-                Ok(decls) => decls.clone(),
-                Err(e) => vec![("(lean)".into(), format!("error: {e:#}"))],
-            };
-            *app.lean_status.lock().unwrap() = decls.clone();
-            *app.lean_doc_findings.lock().unwrap() = doc_findings.clone();
-            app.hub.publish_snapshot(ServerEvent::LeanStatus { decls, running: false, doc_findings });
-            result
-        })
     }
 }
 
@@ -3950,8 +3919,8 @@ async fn handle_from_client(
         | ClientMsg::LspBuffer { .. } | ClientMsg::LspRequest { .. } => {}
         ClientMsg::CancelBuild { deck } => app.cancel_build(&deck),
         ClientMsg::CancelReview { deck, kind } => app.cancel_review(&deck, &kind)?,
-        ClientMsg::CheckLean => {
-            app.check_lean();
+        ClientMsg::CheckLean { full } => {
+            app.check_lean(lean::Run::Manual { full });
         }
         ClientMsg::RequestReview { deck, kind } => {
             if let Err(e) = app.request_review(deck.clone(), &kind, None).await {
