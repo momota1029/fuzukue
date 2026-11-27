@@ -15,6 +15,7 @@ menu-link-issue = Link to an issue…
 menu-check-updates = Check for updates
 
 menu-button-tooltip = Menu (Alt / Alt+F10)
+search-button-tooltip = Search ({ $shortcut })
 
 menu-open-file = Open file…
 file-browser-root = Workspace

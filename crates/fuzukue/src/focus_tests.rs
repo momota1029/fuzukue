@@ -168,6 +168,42 @@ fn palette_dismissal_returns_to_previous_field() {
 }
 
 #[test]
+fn title_bar_search_returns_focus_to_the_previous_field() {
+    with_workbench(|view, window, cx| {
+        let composer = composer(view, cx);
+        let search = |view: &Entity<Workbench>, cx: &App| {
+            view.read(cx).palette.as_ref().map(|input| input.read(cx).focus_handle(cx))
+        };
+
+        click(window, cx, menu_bar::SEARCH_BUTTON);
+        assert!(search(view, cx).expect("the button opens search").is_focused(window));
+        key(window, cx, "escape");
+        assert!(view.read(cx).palette.is_none());
+        assert!(composer.is_focused(window), "closing search lost the original focus");
+
+        // A second press is a press outside the search box, so it closes it.
+        click(window, cx, menu_bar::SEARCH_BUTTON);
+        click(window, cx, menu_bar::SEARCH_BUTTON);
+        assert!(view.read(cx).palette.is_none());
+        assert!(composer.is_focused(window), "the second press lost the original focus");
+
+        // The expanded app menu holds focus until the button collapses it.
+        click(window, cx, menu_bar::MENU_BUTTON);
+        click(window, cx, menu_bar::SEARCH_BUTTON);
+        assert!(search(view, cx).expect("search opens over the menu").is_focused(window));
+        assert!(!view.read(cx).app_menu.is_expanded());
+        key(window, cx, "escape");
+        assert!(composer.is_focused(window), "the app menu kept the focus search should return");
+
+        // These tests only build on Linux.
+        key(window, cx, "ctrl-k");
+        assert!(search(view, cx).expect("the shortcut opens search").is_focused(window));
+        key(window, cx, "escape");
+        assert!(composer.is_focused(window), "the shortcut lost the original focus");
+    });
+}
+
+#[test]
 fn approval_updates_keep_composer_focus_and_recover_removed_controls() {
     with_workbench(|view, window, cx| {
         let focus = composer(view, cx);

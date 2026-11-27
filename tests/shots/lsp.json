@@ -2,7 +2,7 @@
   {"action": "size", "width": 1440, "height": 900},
   {"action": "theme", "theme": "light"},
   {"action": "connect"},
-  {"action": "click", "id": "tool-search"},
+  {"action": "click", "id": "title-bar-search"},
   {"action": "type", "text": "file: main.rs"},
   {"action": "key", "key": "Enter"},
   {"action": "wait_element", "id": "source-editor"},

@@ -15,6 +15,7 @@ menu-link-issue = Issue に紐づける…
 menu-check-updates = 更新の確認
 
 menu-button-tooltip = メニュー（Alt / Alt+F10）
+search-button-tooltip = 検索（{ $shortcut }）
 
 menu-open-file = ファイルを開く…
 file-browser-root = ワークスペース

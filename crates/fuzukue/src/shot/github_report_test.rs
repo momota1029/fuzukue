@@ -245,6 +245,72 @@ fn screenshot_button_opens_the_report_and_shows_unavailable_states() {
 }
 
 #[test]
+fn title_bar_controls_fit_narrow_windows() {
+    let (result, completed) = std::sync::mpsc::channel();
+    gpui_kit::platform::headless()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            math::init(cx);
+            cx.spawn(async move |cx| {
+                let outcome: Result<()> = async {
+                    for (width, canary) in [(360., false), (360., true), (800., true)] {
+                        let (handle, view) =
+                            cx.update(|cx| open_workbench_at_size(cx, width, 600.))?;
+                        let mut runner = Runner {
+                            handle,
+                            view,
+                            target: None,
+                            output: PathBuf::new(),
+                            read_only: false,
+                            seen: HashMap::new(),
+                        };
+                        if canary {
+                            let preview = Step::SelfUpdatePreview {
+                                canary: true,
+                                waiting: false,
+                            };
+                            runner.step(preview, cx).await?;
+                        }
+                        runner.frame(cx)?;
+                        runner.click(
+                            cx,
+                            ClickTarget::Element {
+                                id: crate::menu_bar::MENU_BUTTON.into(),
+                            },
+                        )?;
+                        runner.frame(cx)?;
+                        let bounds = |cx: &mut AsyncApp, id: &str| {
+                            runner
+                                .update(cx, |_, window, _| window.shot_element_bounds(id))?
+                                .with_context(|| format!("missing {id} at {width} px, canary: {canary}"))
+                        };
+                        let menu = bounds(cx, "workbench-menu-bar")?;
+                        let search = bounds(cx, crate::menu_bar::SEARCH_BUTTON)?;
+                        let github = bounds(cx, "github-title-button")?;
+                        let gear = bounds(cx, crate::menu_bar::SETTINGS_BUTTON)?;
+                        ensure!(
+                            menu.right() <= search.left()
+                                && search.right() <= github.left()
+                                && github.right() <= gear.left()
+                                && gear.right() <= px(width),
+                            "title controls overlap at {width} px (canary: {canary}): \
+                             menu {menu:?}, search {search:?}, GitHub {github:?}, gear {gear:?}"
+                        );
+                        runner.update(cx, |_, window, _| window.remove_window())?;
+                    }
+                    Ok(())
+                }
+                .await;
+                let _ = result.send(outcome);
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    completed.recv().unwrap().unwrap();
+}
+
+#[test]
 fn github_title_menu_and_chat_card_share_device_actions_and_account_state() {
     use base64::Engine as _;
     use fuzukue_proto::{GitHubAvatar, GitHubConnectState as State, GITHUB_CONNECT_PROTOCOL};
@@ -303,6 +369,13 @@ fn github_title_menu_and_chat_card_share_device_actions_and_account_state() {
                     ensure!(
                         (gear.left() - github.right() - px(8.)).abs() < px(1.),
                         "GitHub must sit immediately to the left of Settings with an 8 px gap"
+                    );
+                    let search = bounds(cx, crate::menu_bar::SEARCH_BUTTON)?
+                        .context("Search title button")?;
+                    ensure!(
+                        search.size == gear.size
+                            && (github.left() - search.right() - px(8.)).abs() < px(1.),
+                        "Search must sit immediately to the left of GitHub with the same size and gap"
                     );
                     assert!(bounds(cx, "github-title-mark")?.is_some());
                     assert!(bounds(cx, "github-title-disconnected")?.is_some());

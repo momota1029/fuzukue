@@ -2997,7 +2997,7 @@ mod tests {
                         cx.notify();
                     })?;
                     runner.frame(cx)?;
-                    runner.click(cx, ClickTarget::Element { id: "tool-search".into() })?;
+                    runner.click(cx, ClickTarget::Element { id: crate::menu_bar::SEARCH_BUTTON.into() })?;
                     runner.frame(cx)?;
                     let bounds = runner.update(cx, |_, window, _| {
                         window.shot_element_bounds("title-search")
@@ -3106,7 +3106,7 @@ mod tests {
 
                     click(cx, crate::menu_bar::MENU_BUTTON)?;
                     click(cx, "menu-view")?;
-                    click(cx, "tool-search")?;
+                    click(cx, crate::menu_bar::SEARCH_BUTTON)?;
                     assert!(!visible(cx, "menu-view")?);
                     runner.key(cx, "escape")?;
                     runner.frame(cx)?;
@@ -6841,7 +6841,7 @@ mod tests {
                     runner.frame(cx)?;
                     assert!(runner.update(cx, |_, window, _| window.shot_element_bounds("workspace-account-menu").is_none())?);
                     click(cx, "workspace-account")?;
-                    click(cx, "tool-search")?;
+                    click(cx, crate::menu_bar::SEARCH_BUTTON)?;
                     runner.frame(cx)?;
                     assert!(runner.update(cx, |_, window, _| window.shot_element_bounds("workspace-account-menu").is_none())?);
                     runner.key(cx, "escape")?;
@@ -6989,7 +6989,7 @@ mod tests {
 
                     use crate::sidebar::{SIDEBAR_ICON_GAP, SIDEBAR_ROW_INSET};
                     let icon = bounds(cx, "thread-row-icon-a")?;
-                    assert_eq!(icon.left(), bounds(cx, "tool-search")?.left() + SIDEBAR_ROW_INSET);
+                    assert_eq!(icon.left(), bounds(cx, "new-thread")?.left() + SIDEBAR_ROW_INSET);
                     assert_eq!(bounds(cx, "thread-row-title-a")?.left(), icon.right() + SIDEBAR_ICON_GAP);
                     let a = bounds(cx, "thread-row-title-a")?.center();
                     assert!(runner.update(cx, |_, window, _| {

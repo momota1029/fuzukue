@@ -367,6 +367,8 @@ impl Workbench {
             |deck| self.paper_deck(deck),
         );
 
+        // An empty block would still take a gap above the thread list.
+        let has_navigation = self.protocol >= 4 || paper.is_some() || collection.is_some();
         let navigation = v_flex()
             .flex_none()
             .gap_0p5()
@@ -379,17 +381,6 @@ impl Workbench {
                     ),
                 )
             })
-            .child(
-                action(
-                    "tool-search",
-                    Symbol::Search,
-                    tr!("sidebar-search"),
-                    self.palette.is_some(),
-                    cx,
-                )
-                .child(div().text_xs().text_color(theme.muted_foreground).child(crate::menu_bar::SEARCH_SHORTCUT))
-                .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
-            )
             .children(paper.map(|deck| {
                 let deck = deck.to_owned();
                 action("sidebar-edit-paper", Symbol::FilePenLine, tr!("sidebar-edit-paper"),
@@ -409,7 +400,7 @@ impl Workbench {
             .bg(theme.sidebar)
             .p_3()
             .gap_2()
-            .child(navigation)
+            .when(has_navigation, |sidebar| sidebar.child(navigation))
             .child(
                 div()
                     .id("workspace-navigation")

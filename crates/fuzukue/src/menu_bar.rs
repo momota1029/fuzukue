@@ -26,6 +26,7 @@ const MENU_OFFSET: Pixels = px(4.);
 const MENU_WINDOW_MARGIN: Pixels = px(8.);
 pub(super) const MENU_BUTTON: &str = "app-menu";
 pub(super) const SETTINGS_BUTTON: &str = "title-bar-settings";
+pub(super) const SEARCH_BUTTON: &str = "title-bar-search";
 
 pub(super) fn is_menu_shortcut(key: &Keystroke) -> bool {
     // GPUI emits an unmodified "alt" on release when Alt is pressed alone.
@@ -225,116 +226,143 @@ impl Workbench {
                 let _ = view.update(cx, |this, cx| this.close_workbench(window, cx));
             })
             .child(
+                // The title bar will not shrink below its content, which would push
+                // the last controls out of a narrow window. A zero base width lets
+                // the menu scroll instead.
                 h_flex()
-                    .id("workbench-menu-bar")
-                    .role(Role::MenuBar)
-                    .track_focus(&self.app_menu.focus)
-                    .occlude()
                     .h_full()
+                    .flex_1()
+                    .w_0()
                     .min_w_0()
-                    .gap_0p5()
-                    .overflow_x_scroll()
-                    .when(keep_quote, |bar| bar.keep_text_selection("keep-menu-quote"))
-                    .on_prepaint(move |bounds, _, _| menu_bounds.set(bounds))
-                    .when(expanded && open_group.is_none(), |bar| {
-                        bar.on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                            this.change_app_menu(MenuInput::Outside, window, cx);
-                        }))
-                    })
+                    .justify_between()
                     .child(
-                        Button::new(MENU_BUTTON)
-                            .ghost()
-                            .small()
-                            .compact()
-                            .open(expanded)
-                            .toggled(expanded)
-                            .icon(Symbol::Menu.icon())
-                            .accessibility_label(tr!("menu-button"))
-                            .tooltip(tr!("menu-button-tooltip"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.change_app_menu(
-                                    MenuInput::Toggle { from_button: true },
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .when_some(self.app_menu_group(), |bar, selected| {
-                        bar.children(Menu::ALL.map(|group| {
-                            let id = group.id();
-                            Popup::new(
-                                ("title-bar-menu-group", group as usize),
-                                Button::new(id)
+                        h_flex()
+                            .id("workbench-menu-bar")
+                            .role(Role::MenuBar)
+                            .track_focus(&self.app_menu.focus)
+                            .occlude()
+                            .h_full()
+                            .min_w_0()
+                            .gap_0p5()
+                            .overflow_x_scroll()
+                            .when(keep_quote, |bar| bar.keep_text_selection("keep-menu-quote"))
+                            .on_prepaint(move |bounds, _, _| menu_bounds.set(bounds))
+                            .when(expanded && open_group.is_none(), |bar| {
+                                bar.on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                                    this.change_app_menu(MenuInput::Outside, window, cx);
+                                }))
+                            })
+                            .child(
+                                Button::new(MENU_BUTTON)
                                     .ghost()
                                     .small()
                                     .compact()
-                                    .role(Role::MenuItem)
-                                    .label(tr!(id))
-                                    .open(selected == group)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        // A mouse move can open the menu before the click
-                                        // arrives. Use the dropdown shown in this frame.
-                                        this.change_app_menu(state.click(group), window, cx);
-                                    }))
-                                    .on_hover(cx.listener(move |this, &hovered, window, cx| {
-                                        if hovered {
-                                            this.change_app_menu(
-                                                MenuInput::Hover(group),
-                                                window,
-                                                cx,
-                                            );
-                                        }
+                                    .open(expanded)
+                                    .toggled(expanded)
+                                    .icon(Symbol::Menu.icon())
+                                    .accessibility_label(tr!("menu-button"))
+                                    .tooltip(tr!("menu-button-tooltip"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.change_app_menu(
+                                            MenuInput::Toggle { from_button: true },
+                                            window,
+                                            cx,
+                                        );
                                     })),
                             )
-                            .offset(MENU_OFFSET)
-                            .when(
-                                open_group == Some(group),
-                                |trigger| {
-                                    let (popup, _) =
-                                        self.app_menu.popup.as_ref().expect("open dropdown");
-                                    if keep_quote && group == Menu::Edit {
-                                        trigger.content(div().relative().child(popup.clone())
-                                            .keep_text_selection("keep-edit-menu-quote"))
-                                    } else {
-                                        trigger.content(popup.clone())
-                                    }
-                                },
-                            )
-                        }))
-                    }),
-            )
-            .when(
-                self.self_update
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.canary),
-                |bar| {
-                    bar.child(
-                        crate::chat::chat_activity::status_row(
-                            tr!("self-update-canary-notice"), cx.theme().muted_foreground,
-                        )
-                            .id("self-update-canary-notice")
-                            .text_sm(),
+                            .when_some(self.app_menu_group(), |bar, selected| {
+                                bar.children(Menu::ALL.map(|group| {
+                                    let id = group.id();
+                                    Popup::new(
+                                        ("title-bar-menu-group", group as usize),
+                                        Button::new(id)
+                                            .ghost()
+                                            .small()
+                                            .compact()
+                                            .role(Role::MenuItem)
+                                            .label(tr!(id))
+                                            .open(selected == group)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                // A mouse move can open the menu before the click
+                                                // arrives. Use the dropdown shown in this frame.
+                                                this.change_app_menu(state.click(group), window, cx);
+                                            }))
+                                            .on_hover(cx.listener(move |this, &hovered, window, cx| {
+                                                if hovered {
+                                                    this.change_app_menu(
+                                                        MenuInput::Hover(group),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            })),
+                                    )
+                                    .offset(MENU_OFFSET)
+                                    .when(
+                                        open_group == Some(group),
+                                        |trigger| {
+                                            let (popup, _) =
+                                                self.app_menu.popup.as_ref().expect("open dropdown");
+                                            if keep_quote && group == Menu::Edit {
+                                                trigger.content(div().relative().child(popup.clone())
+                                                    .keep_text_selection("keep-edit-menu-quote"))
+                                            } else {
+                                                trigger.content(popup.clone())
+                                            }
+                                        },
+                                    )
+                                }))
+                            }),
                     )
-                },
-            )
-            .child(
-                h_flex().occlude().h_full().flex_none().pr_1().gap_2()
-                    .child(self.render_github_title_button(cx))
+                    .when(
+                        self.self_update
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.canary),
+                        |bar| {
+                            bar.child(
+                                crate::chat::chat_activity::status_row(
+                                    tr!("self-update-canary-notice"), cx.theme().muted_foreground,
+                                )
+                                    .id("self-update-canary-notice")
+                                    .overflow_hidden()
+                                    .text_sm(),
+                            )
+                        },
+                    )
                     .child(
-                    Button::new(SETTINGS_BUTTON)
-                        .ghost()
-                        .small()
-                        .compact()
-                        .toggled(self.settings_open)
-                        .icon(Symbol::Settings.icon())
-                        .accessibility_label(tr!("settings-title"))
-                        .tooltip(tr!("settings-title"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.change_app_menu(MenuInput::Outside, window, cx);
-                            this.toggle_settings(cx);
-                        })),
-                ),
+                        h_flex().occlude().h_full().flex_none().pr_1().gap_2()
+                            .child(
+                                Button::new(SEARCH_BUTTON)
+                                    .ghost()
+                                    .small()
+                                    .compact()
+                                    .toggled(self.palette.is_some())
+                                    .icon(Symbol::Search.icon())
+                                    .accessibility_label(tr!("sidebar-search"))
+                                    .tooltip(tr!("search-button-tooltip", shortcut = SEARCH_SHORTCUT))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.change_app_menu(MenuInput::Outside, window, cx);
+                                        this.close_sidebar_menu(cx);
+                                        this.open_palette(window, cx);
+                                    })),
+                            )
+                            .child(self.render_github_title_button(cx))
+                            .child(
+                            Button::new(SETTINGS_BUTTON)
+                                .ghost()
+                                .small()
+                                .compact()
+                                .toggled(self.settings_open)
+                                .icon(Symbol::Settings.icon())
+                                .accessibility_label(tr!("settings-title"))
+                                .tooltip(tr!("settings-title"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.change_app_menu(MenuInput::Outside, window, cx);
+                                    this.toggle_settings(cx);
+                                })),
+                        ),
+                    )
             )
     }
 

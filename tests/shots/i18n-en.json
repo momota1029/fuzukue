@@ -24,7 +24,7 @@
     {"action": "open_paper", "deck": "papers/levy-families"},
     {"action": "scroll_to_card", "id": "intro"},
     {"action": "screenshot", "name": "paper"},
-    {"action": "click", "id": "tool-search"},
+    {"action": "click", "id": "title-bar-search"},
     {"action": "type", "text": "file: lean/LabSample/LabSample/Hamming.lean"},
     {"action": "key", "key": "Enter"},
     {"action": "wait_element", "id": "source-editor"},

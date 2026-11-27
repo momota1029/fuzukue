@@ -5,7 +5,7 @@
     {"action": "theme", "theme": "light"},
     {"action": "connect"},
     {"action": "open_paper", "deck": "papers/levy-families"},
-    {"action": "click", "id": "tool-search"},
+    {"action": "click", "id": "title-bar-search"},
     {"action": "type", "text": "file: lean/LabSample/LabSample/Literate.lean"},
     {"action": "key", "key": "Enter"},
     {"action": "wait_element", "id": "literate-lean-toggle"},
