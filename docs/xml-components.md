@@ -1,6 +1,8 @@
 # 会話の Markdown に XML UI 部品を埋め込む
 
-返信本文に、`~~~fuzukue-v1` と `~~~` で囲んだ XML を置くと、対応するデスクトップクライアントが組み立てて表示します。フェンスは行頭から書き、前後を空行で区切ります。一つのフェンスには最上位の要素を一つ置き、閉じる `~~~` の行も改行で終えます。受信中はその改行が届くまでコードとして表示し、解釈できた時点で部品に切り替えます。返信の末尾で改行が削られる場合は、フェンスの後に空行と説明文を続けてください。
+返信本文の行頭に `<fuzukue:…>` で始まる XML 要素を一つ置くと、対応するデスクトップクライアントが部品として表示します。前後を空行で区切り、閉じタグの行には続けて文章を書かないでください。返信の先頭や末尾にも置けます。比較、分岐、進捗など、構造が理解を助けるときに使い、普段の返信は普通の Markdown で書きます。
+
+受信中は終端の行が確定するまで小さな待機表示を出します。返信が終わった時点で解釈できない入力は元のテキストを表示します。既存の `~~~fuzukue-v1` フェンスも引き続き使えます。
 
 ## 進捗カードの例
 
@@ -9,7 +11,6 @@
 
 `proof_status` で I-65 Step 1 の残りを一覧にできる。
 
-~~~fuzukue-v1
 <fuzukue:card xmlns:fuzukue="urn:fuzukue:ui:v1" title="I-65 Step 1の証明状況">
   <fuzukue:grid columns="2">
     <fuzukue:stat label="部分証明あり" value="10" unit="件" tone="warn"/>
@@ -24,7 +25,6 @@
     <fuzukue:item>S09：極限と積分の交換</fuzukue:item>
   </fuzukue:list>
 </fuzukue:card>
-~~~
 
 部分証明のある10件は、それぞれの残りの仮定を確認する。
 
@@ -34,7 +34,6 @@ OPEN：S01、S05、S09 の証明方針を決める。
 ## 手順とチェックリストの例
 
 ````markdown
-~~~fuzukue-v1
 <fuzukue:card title="原稿を確認する" tone="info">
   <fuzukue:text><fuzukue:badge tone="info">草稿</fuzukue:badge> を開き、<fuzukue:kbd>Enter</fuzukue:kbd> で <fuzukue:code>proof_status</fuzukue:code> を実行します。</fuzukue:text>
   <fuzukue:steps>
@@ -53,10 +52,23 @@ OPEN：S01、S05、S09 の証明方針を決める。
     <fuzukue:segment value="20" tone="info"/>
   </fuzukue:progress>
 </fuzukue:card>
-~~~
 
 次は評価の参照を付けます。
 ````
+
+## 分岐付きフローチャートの例
+
+````markdown
+<fuzukue:flowchart>
+  <fuzukue:step label="原稿を確認する"/>
+  <fuzukue:decision question="すべての確認が終わった？">
+    <fuzukue:branch label="はい" tone="success">原稿を公開する</fuzukue:branch>
+    <fuzukue:branch label="いいえ" tone="warn">残りを確認してから見直す</fuzukue:branch>
+  </fuzukue:decision>
+</fuzukue:flowchart>
+````
+
+手順と判断を記載順に上から並べます。判断の直下に二つ以上の分岐を置き、それぞれの条件と結果を表示します。幅の狭い画面でも縦に並べ、長いラベルや結果は折り返します。
 
 ## コールアウト・表・指摘参照の例
 
@@ -98,6 +110,7 @@ MCP ツールの結果を使う場合も、返信本文に同じ記法を書き�
 | `badge`、`kbd`、`code` | 短い一行のテキスト。バッジには任意の `tone`。キー名とコードには等幅書体を使います。XML 外の通常の Markdown ではバッククォートでインラインコードを書けます。 |
 | `list` | `kind="unordered"`（既定）、`ordered`、`checklist` のいずれか。各 `item` にテキストと部品を置けます。チェックリストの `item` は `checked="true"` または `"false"`（既定）を指定できます。 |
 | `steps` | 一つ以上の `step`。各手順に `title` と任意の `status`（`pending` が既定、`current`、`done`）、本文にテキストと部品を置けます。 |
+| `flowchart` | 一つ以上の `step` や `decision`。フローチャートの `step` は `label` と任意の `tone` を持つ空要素です。`decision` に `question` と二つ以上の `branch` を置きます。各 `branch` に `label`、任意の `tone`、一行の結果を書きます。 |
 | `details`、`accordion` | 同じ折りたたみ部品です。`title` と任意の `open="true"` または `"false"`（既定）。本文にテキストと部品を置けます。ボタンをクリックするか、Tab で移動して Enter や Space を押すと開閉できます。 |
 | `divider` | 区切り線です。 |
 | `callout` | `severity` は `info`、`warn`、`error` のいずれか。`title` と本文を置きます。従来の接頭辞なしの書き方は本文をプレーンテキストとして扱います。 |
@@ -110,11 +123,9 @@ MCP ツールの結果を使う場合も、返信本文に同じ記法を書き�
 
 新しい部品は `fuzukue:` 接頭辞を使い、最上位の要素に `xmlns:fuzukue="urn:fuzukue:ui:v1"` を任意で指定できます。この URI は語彙と版を識別します。名前空間を分けると、将来 `<trpg:dice>` のような別の語彙が加わっても意味を区別できます。
 
-CommonMark の `<scheme:rest>` は、自動リンクの文法に一致します。デスクトップの `vendor/gpui-base/src/text` が使う `markdown` クレートの GFM 設定でも、空白を含まない `<fuzukue:table>` はリンクになります。コロンを含むタグ名は CommonMark の HTML タグの文法に入らないため、同名の閉じタグや属性付きの開始タグはテキストとして扱われます。フェンスに入れると、対応するクライアントはコードブロック全体から一つの部品を読み、ほかの Markdown レンダラーでは同じソースをコードとして読めます。
+CommonMark は `<fuzukue:table>` を自動リンクとして解釈します。そのため、クライアントは通常の Markdown を組み立てる前に部品の範囲を取り出します。対象は列 1 から始まる最上位ブロックです。インラインコード、フェンス付きコード、字下げコード、引用、リストの内部は通常の Markdown として扱います。引用符 `>` のない継続行も、CommonMark 上で引用内なら対象外です。旧形式のフェンス内では従来どおり `callout`・`table`・`finding` の接頭辞を省略できます。
 
-将来フェンスを省略する形式を加えるなら、Markdown の解析前に、空行で区切られた最上位の XML ブロックを探します。その形式では名前空間宣言を必須にし、開始タグと対応する終端が行単位で確定した範囲を同じ XML パーサーへ渡します。既存のコード、引用、リスト内部は探索の対象から外し、元のバイト範囲をコピーやエラー時のテキスト表示に使います。現在の入力形式はフェンス付きです。
-
-デスクトップは `Hello.markdown_components` で対応タグのローカル名とスキーマ版（例 `{"tag":"card","version":1}`）を通知します。従来の項目にも同じ版を使い、新しい名前を追加します。項目を省略する Android では XML をコードとして表示します。サーバーと履歴は元の本文をそのまま配信します。結論などの重要事項は周りの Markdown にも書くと、どの表示でも読めます。
+対応クライアントは `Hello.markdown_components` で `{"tag":"reply-blocks","version":1}` を通知します。その接続から受付への直接の会話では、Claude と Codex に短い記法案内が付きます。作業役への依頼や、ファイル、GitHub、メールなどに出す内容には会話用の記法を使いません。サーバーは履歴に元の本文を保存し、同じスレッドを Android などから見ると部品を読み取れるテキストに置き換えて配信します。デスクトップの発言全体をコピーする操作でも、部品は読み取れるテキストになります。Markdown を全選択してコピーする場合は元の記述を保持します。
 
 ## 同じツリーの JSON 表現
 
@@ -138,29 +149,29 @@ XML と JSON は Rust の同じ部品ツリーに変換されます。JSON は�
 }
 ````
 
-将来の `ui_render` MCP ツールは、この形の JSON をスキーマとモデルの制約で検証する想定です。不正な XML は会話上でコードに戻り、エージェントにエラーが届きません。ツール呼び出しならエラーをすぐ返せるため、エージェントがその場で入力を直せます。また、ツール由来の部品をタイムラインイベントとして保存し、既存の部品を ID で参照して進捗などをその場で更新でき、Markdown の自動リンクと競合しません。
-
-フェンス付き XML は周りの説明と一緒に任意のバックエンドから送れます。会話をコピーしたり、エクスポートしたり、GitHub のコメントに貼ったりしても、元の記述が残ります。
+将来の `ui_render` MCP ツールは、この形の JSON をスキーマとモデルの制約で検証する想定です。不正な XML は会話上で元の記述に戻り、エージェントにエラーが届きません。ツール呼び出しならエラーをすぐ返せるため、エージェントがその場で入力を直せます。また、ツール由来の部品をタイムラインイベントとして保存し、既存の部品を ID で参照して進捗などをその場で更新でき、Markdown の自動リンクと競合しません。
 
 ## 入力の上限
 
-XML のタグ名と属性名は小文字で、属性値は一重または二重引用符で囲みます。`&amp;`、`&lt;`、`&gt;`、`&quot;`、`&apos;` を使えます。XML のフェンス内は 16 KiB、JSON の入力は 128 KiB までです。
+XML のタグ名と属性名は小文字で、属性値は一重または二重引用符で囲みます。`&amp;`、`&lt;`、`&gt;`、`&quot;`、`&apos;` を使えます。一つの XML ブロックは 16 KiB、JSON の入力は 128 KiB までです。
 
 共通の上限は部品 8 階層・合計 256 個、各子配列（本文、項目、手順、区間、インライン要素）24 件、文字列の合計 16 KiB です。テキスト部品はインラインの要素を合わせて 2,048 UTF-8 バイトまでで、タイトルなどの属性相当の文字列、キー名・コード・バッジ、表のセルは各 512 バイトまでです。表は 24 行・6 列までです。JSON Schema に加え、モデルの検証で UTF-8 のバイト数、階層、セル数の一致、進捗の合計などを確かめます。
 
-部品のテキストを HTML や Markdown として再解釈することはありません。`href` や `src` などの属性、リンク、画像、スクリプト、外部実体、ネットワークアクセスは語彙に含まれません。未知の版・タグ・属性、上限を超えた入力、不正な入れ子や未完成のフェンスは XML のコード表示になります。JSON を読む関数はエラーを返します。
+部品のテキストを HTML や Markdown として再解釈することはありません。`href` や `src` などの属性、リンク、画像、スクリプト、外部実体、ネットワークアクセスは語彙に含まれません。未知の版・タグ・属性、上限を超えた入力、不正な入れ子や未完成のブロックは元の記述を表示します。JSON を読む関数はエラーを返します。
 
 ## 検証
 
 ````sh
 scripts/shot.sh examples/lab tests/shots/xml-components.json
 scripts/shot.sh examples/lab tests/shots/ui-kit.json
+scripts/shot.sh examples/lab tests/shots/reply-flowchart.json
 ````
 
 新しい例の PNG は既定で `$TMPDIR/lab-shots/ui-kit/ui-kit-dark.png` と `ui-kit-light.png` に出力されます（`TMPDIR` を設定していない場合は `/tmp`）。[ヘッドレス撮影](headless.md)に依存関係とソケットの条件を記載しています。
 
 ````sh
 cargo test --locked -p fuzukue-view -p fuzukue-proto -p fuzukue-i18n
+cargo test --locked -p secretaire reply_components
 cargo test --locked --manifest-path crates/fuzukue/Cargo.toml --features headless-shot xml_components_test
 (cd android && ./gradlew :app:testDebugUnitTest --tests dev.labgui.remote.MarkdownComponentsTest)
 ````

@@ -88,6 +88,7 @@
         {"$ref": "#/$defs/text"},
         {"$ref": "#/$defs/list"},
         {"$ref": "#/$defs/steps"},
+        {"$ref": "#/$defs/flowchart"},
         {"$ref": "#/$defs/details"},
         {"$ref": "#/$defs/divider"},
         {"$ref": "#/$defs/callout"},
@@ -170,6 +171,49 @@
       "properties": {
         "type": {"const": "steps"},
         "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}, "minItems": 1, "maxItems": 24}
+      }
+    },
+    "flowchart": {
+      "type": "object",
+      "required": ["type", "nodes"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "flowchart"},
+        "nodes": {"type": "array", "items": {"$ref": "#/$defs/flowNode"}, "minItems": 1, "maxItems": 24}
+      }
+    },
+    "flowNode": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "label"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {"const": "step"},
+            "label": {"$ref": "#/$defs/label"},
+            "tone": {"$ref": "#/$defs/tone"}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "question", "branches"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {"const": "decision"},
+            "question": {"$ref": "#/$defs/label"},
+            "branches": {"type": "array", "items": {"$ref": "#/$defs/flowBranch"}, "minItems": 2, "maxItems": 24}
+          }
+        }
+      ]
+    },
+    "flowBranch": {
+      "type": "object",
+      "required": ["label", "result"],
+      "additionalProperties": false,
+      "properties": {
+        "label": {"$ref": "#/$defs/label"},
+        "result": {"$ref": "#/$defs/label"},
+        "tone": {"$ref": "#/$defs/tone"}
       }
     },
     "details": {

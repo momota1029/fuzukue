@@ -261,6 +261,7 @@ async fn active_queue_refuses_close_and_archived_github_and_held_input_do_not() 
         drain::Work::Prompt {
             text: "queued input".into(),
             paths: vec![],
+            reply_blocks: false,
         },
     )?;
     assert!(update

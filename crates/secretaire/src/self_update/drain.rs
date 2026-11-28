@@ -41,6 +41,8 @@ pub(crate) enum Work {
     Prompt {
         text: String,
         paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reply_blocks: bool,
     },
     Compact { instructions: String },
     WatchWake {

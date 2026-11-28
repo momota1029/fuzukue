@@ -268,6 +268,7 @@ impl PartialEq for MarkdownNode {
 /// Registry for custom Markdown parsing and rendering.
 #[derive(Clone, Default)]
 pub struct MarkdownExtensions {
+    pub(super) source_blocks: Option<MarkdownSourceBlocks>,
     pub(super) inline_spacing: Option<InlineSpacing>,
     pub(super) escape_selection_dollars: bool,
     enable_mdx: bool,
@@ -294,7 +295,17 @@ pub enum InlineSpacingEdge<'a> {
 /// Extra horizontal advance, in ems, at a boundary between inline neighbors.
 pub type InlineSpacing = fn(InlineSpacingEdge<'_>, InlineSpacingEdge<'_>) -> f32;
 
+/// Recognize custom blocks before CommonMark interprets their syntax.
+pub type MarkdownSourceBlocks = fn(&str, &ParseOptions) -> Vec<(Range<usize>, MarkdownNode)>;
+
 impl MarkdownExtensions {
+    /// Register a parser for sorted, disjoint whole-line ranges in the original source.
+    pub fn source_blocks(mut self, parse: MarkdownSourceBlocks) -> Self {
+        self.source_blocks = Some(parse);
+        self.bump_revision();
+        self
+    }
+
     /// Set a layout-only spacing rule. The advance is omitted at soft wraps
     /// and occupies no bytes in selection, copy, or source coordinates.
     pub fn inline_spacing(mut self, spacing: InlineSpacing) -> Self {
@@ -475,6 +486,11 @@ impl MarkdownExtensions {
     /// stable; render handles may be refreshed without reparsing the document.
     pub(crate) fn has_same_parser_configuration(&self, other: &Self) -> bool {
         self.parser_revision == other.parser_revision
+            && match (self.source_blocks, other.source_blocks) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::ptr::fn_addr_eq(a, b),
+                _ => false,
+            }
             && self.enable_mdx == other.enable_mdx
             && self.enable_frontmatter == other.enable_frontmatter
             && self.disable_raw_html == other.disable_raw_html

@@ -152,6 +152,8 @@ pub(super) struct Chat {
     disclosure_press: Rc<Cell<Option<Point<Pixels>>>>,
     math_macros: Vec<MathMacro>,
     markdown: MarkdownExtensions,
+    streaming_markdown: MarkdownExtensions,
+    streaming_replies: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -612,6 +614,8 @@ impl Chat {
             quote_position: None,
             disclosure_press: Rc::default(),
             math_macros: Vec::new(),
+            streaming_markdown: super::chat_components::streaming_extensions(&markdown),
+            streaming_replies: HashSet::new(),
             markdown,
         }
     }
@@ -654,6 +658,7 @@ impl Chat {
         }
         if is_partner(&actor) && !is_worker_message(&actor, Some(&item)) {
             self.set_busy(true, cx);
+            self.streaming_replies.insert(item.clone());
             if let Some(turn) = &mut self.turn {
                 turn.update_phase(|turn| turn.writing = true);
             }
@@ -1348,6 +1353,11 @@ impl Chat {
                 pending_approvals: Vec::new(),
             });
         } else if let Some(turn) = self.turn.take() {
+            for item in self.streaming_replies.drain() {
+                if let Some(&row) = self.by_item.get(&item) {
+                    self.scroller.remeasure_items(row..row + 1);
+                }
+            }
             for item in turn.tools {
                 if let Some(&(row, _)) = self.by_tool.get(&item) {
                     if let Content::Tools(group) = &mut self.rows[row].content {
@@ -1700,7 +1710,7 @@ fn message_has_no_visible_text(text: &str, extensions: &MarkdownExtensions) -> b
         return false;
     }
     // Use TextView's parser so literal tags in code and visible HTML contents still count.
-    parse_markdown(&fuzukue_view::link_card_refs(text), extensions.clone().into())
+    parse_markdown(&fuzukue_view::xml_components::link_card_refs(text), extensions.clone().into())
         .is_ok_and(|blocks| blocks.iter().all(block_is_empty))
 }
 
@@ -2306,6 +2316,7 @@ impl Workbench {
             if chat.math_macros != thread.math_macros {
                 chat.math_macros.clone_from(&thread.math_macros);
                 chat.markdown = super::chat_components::extensions(&chat.math_macros, cx.weak_entity());
+                chat.streaming_markdown = super::chat_components::streaming_extensions(&chat.markdown);
                 chat.transcript.invalidate_markdown();
                 chat.scroller.remeasure_items(0..chat.scroller.item_count());
             }
@@ -2313,13 +2324,14 @@ impl Workbench {
     }
 
     pub(super) fn chat_markdown(&self, id: SharedString, source: String, chat: &Chat, cx: &gpui_kit::App) -> TextView {
-        self.style_chat_markdown(TextView::markdown(id, source), chat, cx)
+        self.style_chat_markdown(
+            TextView::markdown(id, source).markdown_extensions(chat.markdown.clone()), cx,
+        )
     }
 
-    fn style_chat_markdown(&self, view: TextView, chat: &Chat, cx: &gpui_kit::App) -> TextView {
+    fn style_chat_markdown(&self, view: TextView, cx: &gpui_kit::App) -> TextView {
         self.chat_code_style(view, cx)
             .selection_format(SelectionFormat::PlainWithSourceSelectAll)
-            .markdown_extensions(chat.markdown.clone())
             .on_link_click(self.markdown_link_handler())
     }
 
@@ -2461,13 +2473,18 @@ impl Workbench {
                         });
                     });
                 let markdown = |part, text: &str| {
+                    let extensions = match &row.content {
+                        Content::Message(message) if message.item.as_ref()
+                            .is_some_and(|item| chat.streaming_replies.contains(item)) => {
+                            chat.streaming_markdown.clone()
+                        }
+                        _ => chat.markdown.clone(),
+                    };
                     let entity = entity.clone();
-                    let session = session.clone();
                     div().w_full().min_w_0().text_base().line_height(UI_LINE_HEIGHT)
                         .child(chat.transcript.markdown(
-                            row.id, part, text, chat.markdown.clone(), move |view, cx| {
-                                let this = entity.read(cx);
-                                this.style_chat_markdown(view, &this.chats[&session], cx)
+                            row.id, part, text, extensions, move |view, cx| {
+                                entity.read(cx).style_chat_markdown(view, cx)
                             },
                         ))
                 };
@@ -3041,14 +3058,19 @@ impl Workbench {
                             let text = chat.rows[group.first..=group.last].iter().filter_map(|row| {
                                 match &row.content {
                                     Content::Message(message) if row.kind(show_worker_messages) == RowKind::AssistantText => {
-                                        Some(message.text.as_str())
+                                        Some(fuzukue_view::xml_components::text_fallback(&message.text, false))
                                     }
                                     _ => None,
                                 }
                             }).collect::<Vec<_>>().join("\n\n");
                             copy_message_action(&ix.to_string(), &text)
                         } else {
-                            copy_message_action(&ix.to_string(), &message.text)
+                            let text = if is_partner(&row.actor) {
+                                fuzukue_view::xml_components::text_fallback(&message.text, false)
+                            } else {
+                                message.text.clone()
+                            };
+                            copy_message_action(&ix.to_string(), &text)
                         };
                         let memo = message.item.as_ref().filter(|_| {
                             this.protocol >= fuzukue_proto::MEMOS_PROTOCOL && !message.text.trim().is_empty()

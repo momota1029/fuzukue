@@ -2742,6 +2742,9 @@ pub enum ServerEvent {
     },
     /// ストリーミング中のテキスト断片。同じ `item` に追記していく。
     TextDelta { session: String, item: String, actor: Actor, text: String },
+    /// Journal boundary for a reply with a buffered text projection. The server
+    /// sends this to clients as a TextDelta, with the same sequence number.
+    ReplyFinalized { session: String, item: String, actor: Actor },
     MessageDetails { session: String, item: String, details: RunDetails },
     Agents { agents: Vec<AgentInfo> },
     AgentSettingsChanged { settings: AgentSettings },
@@ -2986,7 +2989,8 @@ impl ServerEvent {
         match self {
             Self::LocalNotice { session, item, .. } if item != COMPOSER_NOTICE_ITEM => Some(session),
             Self::TextDelta { session, .. } | Self::UserPrompt { session, .. }
-            | Self::ReplySuperseded { session, .. } | Self::GitHubActivity { session, .. }
+            | Self::ReplyFinalized { session, .. } | Self::ReplySuperseded { session, .. }
+            | Self::GitHubActivity { session, .. }
             | Self::CommentApplication { session, .. } | Self::DelegateProgress { session, .. }
             | Self::DelegateRenamed { session, .. } | Self::DelegateDismissed { session, .. }
             | Self::ToolCall { session, .. } | Self::ToolResult { session, .. }

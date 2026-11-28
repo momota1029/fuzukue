@@ -20,13 +20,30 @@ use crate::text::{
 /// Parse Markdown into a tree of nodes.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
     let options = cx.markdown_extensions.parse_options();
+    let custom = cx.markdown_extensions.source_blocks
+        .map_or_else(Vec::new, |parse| parse(source, &options));
+    let masked;
+    let input = if custom.is_empty() {
+        source
+    } else {
+        let mut bytes = source.as_bytes().to_vec();
+        for (range, _) in &custom {
+            for byte in &mut bytes[range.clone()] {
+                if !matches!(*byte, b'\r' | b'\n') {
+                    *byte = b' ';
+                }
+            }
+        }
+        masked = String::from_utf8(bytes).expect("custom blocks cover whole source ranges");
+        &masked
+    };
     let mut root =
-        parse_markdown_ast(source, &options).map_err(|e| SharedString::from(e.to_string()))?;
+        parse_markdown_ast(input, &options).map_err(|e| SharedString::from(e.to_string()))?;
     let mut prose = options;
     prose.constructs.math_text = false;
     prose.constructs.math_flow = false;
     flatten_unclaimed_math(&mut root, source, &prose, cx);
-    Ok(ast_to_document(source, root, cx))
+    Ok(ast_to_document(source, root, custom, cx))
 }
 
 /// Math parsing is on by default, so prose that merely contains two dollar
@@ -1101,7 +1118,12 @@ fn collect_definitions(node: &Node, definitions: &mut BTreeMap<String, LinkMark>
     }
 }
 
-fn ast_to_document(source: &str, root: mdast::Node, cx: &mut NodeContext) -> ParsedDocument {
+fn ast_to_document(
+    source: &str,
+    root: mdast::Node,
+    custom: Vec<(Range<usize>, crate::text::markdown_ext::MarkdownNode)>,
+    cx: &mut NodeContext,
+) -> ParsedDocument {
     let mut definitions = BTreeMap::new();
     collect_definitions(&root, &mut definitions);
     for (identifier, definition) in definitions {
@@ -1114,14 +1136,25 @@ fn ast_to_document(source: &str, root: mdast::Node, cx: &mut NodeContext) -> Par
     };
 
     let has_surfaces = cx.markdown_extensions.has_block_surfaces();
-    let blocks = root
-        .children
-        .into_iter()
-        .map(|node| match node {
+    let mut blocks = Vec::with_capacity(root.children.len() + custom.len());
+    let mut custom = custom.into_iter().peekable();
+    let offset = cx.offset;
+    let to_custom = |(range, mut node): (Range<usize>, crate::text::markdown_ext::MarkdownNode)| {
+        node.set_span(Some(Span { start: offset + range.start, end: offset + range.end }));
+        BlockNode::Custom { node, state: Default::default() }
+    };
+    for node in root.children {
+        if let Some(position) = node.position() {
+            while custom.peek().is_some_and(|(range, _)| range.start < position.start.offset) {
+                blocks.push(to_custom(custom.next().unwrap()));
+            }
+        }
+        blocks.push(match node {
             Node::Blockquote(quote) if has_surfaces => blockquote_to_node(source, quote, cx),
             node => ast_to_node(source, node, cx),
-        })
-        .collect();
+        });
+    }
+    blocks.extend(custom.map(to_custom));
     ParsedDocument {
         source: source.to_string().into(),
         blocks: Arc::new(blocks),

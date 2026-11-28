@@ -53,13 +53,14 @@ fn xml_components_render_only_after_the_stream_closes_the_fence() {
                     runner
                         .step(
                             Step::WaitElement {
-                                id: "chat-code-copy".into(),
+                                id: "xml-component-pending".into(),
                             },
                             cx,
                         )
                         .await?;
                     runner.update(cx, |_, window, _| {
                         assert!(window.shot_element_bounds(&callout).is_none());
+                        assert!(window.shot_element_bounds("chat-code-copy").is_none());
                     })?;
 
                     runner.update(cx, |view, _, cx| view.on_event(delta(suffix), cx))?;
@@ -182,6 +183,7 @@ fn ui_kit_lays_out_nested_components_and_toggles_details() {
                 },
                 cx,
             );
+            view.on_event(ServerEvent::TurnEnded { session: SESSION.into(), actor: Actor::Claude }, cx);
         });
     };
     let (result, completed) = std::sync::mpsc::channel();
@@ -302,5 +304,49 @@ fn ui_kit_lays_out_nested_components_and_toggles_details() {
             })
             .detach();
         });
+    completed.recv().unwrap().unwrap();
+}
+
+
+#[test]
+fn flowchart_streams_and_lays_out_branches_at_narrow_width() {
+    let scenario: Scenario =
+        serde_json::from_str(include_str!("../../../../tests/shots/reply-flowchart.json")).unwrap();
+    let (result, completed) = std::sync::mpsc::channel();
+    gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+        gpui_kit::init(cx);
+        math::init(cx);
+        let (handle, view) = open_workbench_at_size(cx, 680., 790.).unwrap();
+        cx.spawn(async move |cx| {
+            let mut runner = Runner {
+                handle, view, target: None, output: PathBuf::new(), read_only: false,
+                seen: HashMap::new(),
+            };
+            let outcome: Result<()> = async {
+                for step in scenario.steps {
+                    match step {
+                        Step::Screenshot { name } => {
+                            runner.update(cx, |_, window, _| {
+                                let pending = window.shot_element_bounds("xml-component-pending").is_some();
+                                assert_eq!(pending, name == "flowchart-streaming");
+                                assert!(window.shot_element_bounds("xml-component-literal").is_none());
+                            })?;
+                        }
+                        step => runner.step(step, cx).await?,
+                    }
+                }
+                runner.step(Step::SeedChatReply {
+                    text: "\n\n<fuzukue:card title=\"Broken\">Missing closing tag".into(),
+                    streaming: true,
+                }, cx).await?;
+                runner.step(Step::WaitElement { id: "xml-component-pending".into() }, cx).await?;
+                runner.step(Step::SeedChatReply { text: String::new(), streaming: false }, cx).await?;
+                runner.step(Step::WaitElement { id: "xml-component-literal".into() }, cx).await?;
+                Ok(())
+            }.await;
+            result.send(outcome).unwrap();
+            cx.update(|cx| cx.quit());
+        }).detach();
+    });
     completed.recv().unwrap().unwrap();
 }

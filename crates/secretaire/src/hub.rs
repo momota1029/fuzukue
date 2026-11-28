@@ -768,6 +768,14 @@ impl Hub {
             // Reserve the gap between TurnEnded and the replacement turn's start.
             inner.handoffs_ready.insert(session.into());
         }
+        let pending = inner.threads.as_ref()
+            .map(|threads| threads.pending_reply_components(session, &actor))
+            .unwrap_or_default();
+        for item in pending {
+            self.publish_locked(&mut inner, ServerEvent::ReplyFinalized {
+                session: session.into(), item, actor: actor.clone(),
+            }, None, ApprovalWaiter::Backend);
+        }
         let event = ServerEvent::TurnEnded { session: session.into(), actor };
         let title = self.publish_locked(&mut inner, event,
             (completed && handoff.is_none()).then_some(session), ApprovalWaiter::Backend);
@@ -1626,6 +1634,34 @@ impl Hub {
             epoch: self.epoch.clone(), through, reset_sessions: reset_sessions.into_iter().collect(),
         }));
         (initial, live)
+    }
+
+    pub(crate) fn reply_fallback_at(&self, after: u64) -> crate::reply_components::Fallback {
+        let mut fallback = crate::reply_components::Fallback::default();
+        if after == 0 {
+            return fallback;
+        }
+        let mut unfinished = Vec::new();
+        let mut ended = HashSet::new();
+        {
+            let inner = self.inner.lock().unwrap();
+            for env in inner.log.iter().rev().skip_while(|env| env.seq > after) {
+                if !crate::reply_components::Fallback::stream_event(&env.event) {
+                    continue;
+                }
+                match &env.event {
+                    ServerEvent::TurnEnded { session, .. } => { ended.insert(session.as_str()); }
+                    event if event.transcript_session().is_some_and(|session| !ended.contains(session)) => {
+                        unfinished.push(env.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for mut env in unfinished.into_iter().rev() {
+            fallback.apply(&mut env, |_| false);
+        }
+        fallback
     }
 
     pub fn subscribe_client(&self, after: u64, include_threads: bool) -> (Vec<Envelope>, broadcast::Receiver<Envelope>) {

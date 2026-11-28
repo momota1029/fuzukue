@@ -211,7 +211,7 @@ impl TranscriptView {
             view.source = if code {
                 fuzukue_view::markdown_code::fenced_output(source).into()
             } else {
-                fuzukue_view::link_card_refs(source).into()
+                fuzukue_view::xml_components::link_card_refs(source).into()
             };
         }
         view.activation = activation;

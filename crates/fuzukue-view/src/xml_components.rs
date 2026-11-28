@@ -1,11 +1,21 @@
-//! Fenced XML transport for the canonical UI tree.
+//! XML reply components and their canonical UI tree.
 
 use crate::ui_kit::{
-    self, Component, ListItem, ListKind, Segment, Severity, Span, Step, StepStatus, TextKind, Tone,
+    self, Component, FlowBranch, FlowNode, ListItem, ListKind, Segment, Severity, Span, Step,
+    StepStatus, TextKind, Tone,
     MAX_CELLS, MAX_CHILDREN, MAX_DEPTH, MAX_LABEL, MAX_ROWS, MAX_TEXT,
 };
 use fuzukue_proto::MarkdownComponentCapability;
 use markdown::mdast::Node;
+
+mod source;
+pub use source::{
+    BlockContent, ReplyBlock, has_pending_block, link_card_refs, markdown_fallback, reply_blocks,
+    text_fallback,
+};
+
+/// Capability token for fence-less blocks and the current native component set.
+pub const REPLY_BLOCKS_CAPABILITY: &str = "reply-blocks";
 
 const FENCE_LANGUAGE: &str = "fuzukue-v1";
 const NAMESPACE: &str = "urn:fuzukue:ui:v1";
@@ -22,6 +32,8 @@ const TAGS: &[&str] = &[
     "badge",
     "list",
     "steps",
+    "flowchart",
+    REPLY_BLOCKS_CAPABILITY,
     "details",
     "accordion",
     "divider",
@@ -221,6 +233,39 @@ impl<'a> Xml<'a> {
                     })
                 })?;
                 Component::Steps { steps }
+            }
+            "flowchart" => {
+                tag.allowed(&[])?;
+                let nodes = self.members(&tag, MAX_CHILDREN, |xml, node| {
+                    match node.name {
+                        "fuzukue:step" if node.empty => {
+                            node.allowed(&["label", "tone"])?;
+                            Some(FlowNode::Step {
+                                label: node.get("label")?.into(),
+                                tone: node.tone()?,
+                            })
+                        }
+                        "fuzukue:decision" => {
+                            node.allowed(&["question"])?;
+                            let branches = xml.members(&node, MAX_CHILDREN, |xml, branch| {
+                                if branch.name != "fuzukue:branch" || branch.empty {
+                                    return None;
+                                }
+                                branch.allowed(&["label", "tone"])?;
+                                let result = xml.text(MAX_LABEL)?.trim().to_owned();
+                                xml.close(branch.name)?;
+                                Some(FlowBranch {
+                                    label: branch.get("label")?.into(),
+                                    result,
+                                    tone: branch.tone()?,
+                                })
+                            })?;
+                            Some(FlowNode::Decision { question: node.get("question")?.into(), branches })
+                        }
+                        _ => None,
+                    }
+                })?;
+                Component::Flowchart { nodes }
             }
             "details" | "accordion" => {
                 tag.allowed(&["title", "open"])?;
@@ -787,10 +832,13 @@ mod tests {
             .skip(1)
             .map(|rest| {
                 let example = rest.split_once("\n````").unwrap().0;
-                components(example).len()
+                reply_blocks(example, false, &markdown::ParseOptions::gfm())
+                    .into_iter()
+                    .filter(|block| matches!(block.content, BlockContent::Component(_)))
+                    .count()
             })
             .collect();
-        assert_eq!(counts, [1, 1, 3]);
+        assert_eq!(counts, [1, 1, 1, 3]);
         let example = docs.split_once("````json\n").unwrap().1;
         let json = example.split_once("\n````").unwrap().0;
         assert!(matches!(

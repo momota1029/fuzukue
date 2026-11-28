@@ -2,14 +2,12 @@
 
 use fuzukue_proto::MathMacro;
 use fuzukue_view::{
-    ui_kit::{Component, ListKind, Segment, Severity, Span, StepStatus, TextKind, Tone},
+    ui_kit::{Component, FlowNode, ListKind, Segment, Severity, Span, StepStatus, TextKind, Tone},
     xml_components,
 };
-use gpui_kit::base::text::{
-    MarkdownExtensions, MarkdownNode, MarkdownParseContext, MarkdownPlugin,
-};
+use gpui_kit::base::text::{MarkdownExtensions, MarkdownNode};
 use gpui_kit::base::{
-    markdown_ast, AccordionPanel, AccordionTrigger, GlobalState, Progress, StyledExt as _,
+    AccordionPanel, AccordionTrigger, GlobalState, Progress, StyledExt as _,
 };
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Theme};
 use gpui_kit::{
@@ -25,47 +23,70 @@ pub(super) fn extensions(
     macros: &[MathMacro],
     workbench: WeakEntity<Workbench>,
 ) -> MarkdownExtensions {
-    math::extensions_with_macros(macros).plugin(XmlComponents(workbench))
+    math::extensions_with_macros(macros)
+        .block_renderer(PLUGIN, move |node, window, cx| render_block(&workbench, node, window, cx))
+        .source_blocks(|source, options| source_blocks(source, false, options))
 }
 
-struct XmlComponents(WeakEntity<Workbench>);
+pub(super) fn streaming_extensions(extensions: &MarkdownExtensions) -> MarkdownExtensions {
+    extensions.clone().source_blocks(|source, options| source_blocks(source, true, options))
+}
 
-impl MarkdownPlugin for XmlComponents {
-    fn is_block(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &str {
-        PLUGIN
-    }
-
-    fn parse(
-        &self,
-        node: &markdown_ast::Node,
-        cx: &MarkdownParseContext<'_>,
-    ) -> Option<MarkdownNode> {
-        let component = xml_components::parse_block(node, cx.source())?;
-        let text = component.plain_text();
-        Some(
-            MarkdownNode::new(PLUGIN, component)
-                .text(text)
-                .markdown(cx.node_source(node)?.to_owned())
-                .with_atomic_selection(),
-        )
-    }
-
-    fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Some(component) = node.data::<Component>() else {
-            return div().child(node.as_text().to_owned()).into_any_element();
+fn source_blocks(
+    source: &str,
+    streaming: bool,
+    options: &markdown::ParseOptions,
+) -> Vec<(std::ops::Range<usize>, MarkdownNode)> {
+    xml_components::reply_blocks(source, streaming, options).into_iter().filter_map(|block| {
+        use xml_components::BlockContent;
+        let literal = &source[block.range.clone()];
+        let node = match block.content {
+            BlockContent::Component(component) => {
+                let text = component.plain_text();
+                MarkdownNode::new(PLUGIN, component).text(text).markdown(literal.to_owned())
+            }
+            BlockContent::Pending => MarkdownNode::new(PLUGIN, Pending).text(""),
+            BlockContent::Literal if literal.starts_with("~~~") => return None,
+            BlockContent::Literal => MarkdownNode::new(PLUGIN, ())
+                .text(literal.to_owned())
+                .markdown(literal.to_owned()),
         };
-        let offset = node.source_range().map_or(0, |range| range.start);
-        UiTree {
-            workbench: &self.0,
-            window,
-            cx,
-        }
-        .component(component, &offset.to_string())
+        Some((block.range, node.with_atomic_selection()))
+    }).collect()
+}
+
+struct Pending;
+
+fn render_block(
+    workbench: &WeakEntity<Workbench>,
+    node: &MarkdownNode,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    if node.data::<Pending>().is_some() {
+        return div()
+            .id("xml-component-pending")
+            .w_full()
+            .min_h(px(26.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .children((0..3).map(|_| {
+                div().size(px(4.)).rounded_full().bg(cx.theme().muted_foreground)
+            }))
+            .into_any_element();
     }
+    let Some(component) = node.data::<Component>() else {
+        return div().id("xml-component-literal").w_full().min_w_0().whitespace_normal()
+            .font_family("monospace").child(node.as_text().to_owned()).into_any_element();
+    };
+    let offset = node.source_range().map_or(0, |range| range.start);
+    UiTree {
+        workbench,
+        window,
+        cx,
+    }
+    .component(component, &offset.to_string())
 }
 
 struct UiTree<'a> {
@@ -266,6 +287,32 @@ impl UiTree<'_> {
                             )
                     }))
                     .into_any_element()
+            }
+            Component::Flowchart { nodes } => {
+                let mut flow = v_flex().id(id("flowchart")).role(Role::List).w_full().min_w_0();
+                for (index, node) in nodes.iter().enumerate() {
+                    if index > 0 {
+                        flow = flow.child(div().ml_4().text_color(theme.muted_foreground).child("↓"));
+                    }
+                    let item = panel(id("flow-node") + &format!("-{index}"), theme)
+                        .role(Role::ListItem).w_full().min_w_0().rounded_md().p_2().gap_2();
+                    flow = flow.child(match node {
+                        FlowNode::Step { label, tone } => item
+                            .when_some(*tone, |item, tone| item.border_color(tone_color(theme, tone)))
+                            .child(div().min_w_0().whitespace_normal().child(label.clone())),
+                        FlowNode::Decision { question, branches } => item
+                            .border_color(tone_color(theme, Tone::Accent))
+                            .child(div().font_semibold().whitespace_normal().child(question.clone()))
+                            .children(branches.iter().enumerate().map(|(branch_index, branch)| {
+                                let tone = branch.tone.unwrap_or(Tone::Muted);
+                                div().id(id("flow-branch") + &format!("-{index}-{branch_index}"))
+                                    .min_w_0().border_l_2().border_color(tone_color(theme, tone))
+                                    .pl_2().whitespace_normal()
+                                    .child(format!("{} → {}", branch.label, branch.result))
+                            })),
+                    });
+                }
+                flow.into_any_element()
             }
             Component::Steps { steps } => {
                 let border = theme.border;

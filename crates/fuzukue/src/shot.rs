@@ -133,7 +133,11 @@ enum Step {
         title: String,
     },
     SeedThreadSwitch,
-    SeedChatReply { text: String },
+    SeedChatReply {
+        text: String,
+        #[serde(default)]
+        streaming: bool,
+    },
     AssertThreadSwitch {
         session: String,
         restore: bool,
@@ -844,7 +848,7 @@ impl Runner {
                 })??;
             }
             Step::SeedThreadSwitch => self.update(cx, |view, _, cx| seed_thread_switch(view, cx))?,
-            Step::SeedChatReply { text } => {
+            Step::SeedChatReply { text, streaming } => {
                 ensure!(!self.read_only, "seed_chat_reply needs an isolated fixture");
                 self.update(cx, |view, _, cx| {
                     let session = String::from("chat-reply-fixture");
@@ -858,7 +862,9 @@ impl Runner {
                         actor: actor.clone(),
                         text,
                     }, cx);
-                    view.on_event(ServerEvent::TurnEnded { session, actor }, cx);
+                    if !streaming {
+                        view.on_event(ServerEvent::TurnEnded { session, actor }, cx);
+                    }
                 })?;
             }
             Step::AssertThreadSwitch { session, restore } => self.assert_thread_switch(cx, &session, restore)?,

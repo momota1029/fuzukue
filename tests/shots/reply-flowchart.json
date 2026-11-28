@@ -1,0 +1,52 @@
+{
+  "steps": [
+    {
+      "action": "size",
+      "width": 680,
+      "height": 790
+    },
+    {
+      "action": "locale",
+      "locale": "en"
+    },
+    {
+      "action": "theme",
+      "theme": "light"
+    },
+    {
+      "action": "seed_chat_reply",
+      "streaming": true,
+      "text": "Here's how to decide whether to publish the report.\n\n<fuzukue:flowchart>\n  <fuzukue:step label=\"Review the report\"/>\n  <fuzukue:decision question=\"Are the checks complete?\">\n    <fuzukue:branch label=\"Yes\" tone=\"success\">"
+    },
+    {
+      "action": "wait_element",
+      "id": "xml-component-pending"
+    },
+    {
+      "action": "screenshot",
+      "name": "flowchart-streaming"
+    },
+    {
+      "action": "seed_chat_reply",
+      "text": "Publish the report.</fuzukue:branch>\n    <fuzukue:branch label=\"No\" tone=\"warn\">Finish the missing checks and review again.</fuzukue:branch>\n  </fuzukue:decision>\n</fuzukue:flowchart>"
+    },
+    {
+      "action": "wait_element",
+      "id": "xml-component-flowchart-53"
+    },
+    {
+      "action": "assert_order",
+      "above": "xml-component-flow-node-53-0",
+      "below": "xml-component-flow-branch-53-1-0"
+    },
+    {
+      "action": "assert_order",
+      "above": "xml-component-flow-branch-53-1-0",
+      "below": "xml-component-flow-branch-53-1-1"
+    },
+    {
+      "action": "screenshot",
+      "name": "flowchart"
+    }
+  ]
+}

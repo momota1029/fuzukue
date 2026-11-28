@@ -1965,6 +1965,7 @@ pub fn history_session(event: &ServerEvent) -> Option<&str> {
     match event {
         ServerEvent::LocalNotice { session, .. }
         | ServerEvent::TextDelta { session, .. }
+        | ServerEvent::ReplyFinalized { session, .. }
         | ServerEvent::ReplySuperseded { session, .. }
         | ServerEvent::ThreadRestored { session, .. }
         | ServerEvent::GitHubActivity { session, .. }
@@ -3581,13 +3582,25 @@ impl Store {
         Ok(true)
     }
 
-    pub fn partner_message_items(&self, session: &str, actor: &Actor) -> Vec<String> {
-        self.threads.get(session).into_iter().flat_map(|thread| {
+    fn partner_messages<'a>(&'a self, session: &str, actor: &'a Actor) -> impl Iterator<Item = &'a Entry> {
+        self.threads.get(session).into_iter().flat_map(move |thread| {
             thread.transcript.items.iter().rev()
-                .take_while(|entry| !entry.meta.turn_ends.contains(actor))
-                .filter(|entry| &entry.meta.actor == actor && entry.meta.tool.is_none() && !entry.meta.superseded)
-                .map(|entry| entry.meta.item.clone())
-        }).collect()
+                .take_while(move |entry| !entry.meta.turn_ends.contains(actor))
+                .filter(move |entry| &entry.meta.actor == actor && entry.meta.tool.is_none() && !entry.meta.superseded)
+        })
+    }
+
+    pub fn partner_message_items(&self, session: &str, actor: &Actor) -> Vec<String> {
+        self.partner_messages(session, actor).map(|entry| entry.meta.item.clone()).collect()
+    }
+
+    pub(crate) fn pending_reply_components(&self, session: &str, actor: &Actor) -> Vec<String> {
+        let mut items: Vec<_> = self.partner_messages(session, actor)
+            .filter(|entry| fuzukue_view::xml_components::has_pending_block(&entry.text))
+            .map(|entry| entry.meta.item.clone())
+            .collect();
+        items.reverse();
+        items
     }
 
     pub(crate) fn reload_model_defaults(&mut self) -> bool {

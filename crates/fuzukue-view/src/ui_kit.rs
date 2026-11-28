@@ -110,6 +110,24 @@ pub struct Step {
     pub body: Vec<Component>,
 }
 
+/// One labeled outcome of a decision.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlowBranch {
+    pub label: String,
+    pub result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tone: Option<Tone>,
+}
+
+/// A step or a branching decision in a top-to-bottom flowchart.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FlowNode {
+    Step { label: String, #[serde(skip_serializing_if = "Option::is_none")] tone: Option<Tone> },
+    Decision { question: String, branches: Vec<FlowBranch> },
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Segment {
@@ -165,6 +183,9 @@ pub enum Component {
     },
     Steps {
         steps: Vec<Step>,
+    },
+    Flowchart {
+        nodes: Vec<FlowNode>,
     },
     Details {
         title: String,
@@ -294,6 +315,19 @@ impl Component {
             Self::Steps { steps } => {
                 for step in steps {
                     body_lines(&step.title, &step.body);
+                }
+            }
+            Self::Flowchart { nodes } => {
+                for node in nodes {
+                    match node {
+                        FlowNode::Step { label, .. } => lines.push(format!("↓ {label}")),
+                        FlowNode::Decision { question, branches } => {
+                            lines.push(format!("↓ {question}"));
+                            for branch in branches {
+                                lines.push(format!("{} → {}", branch.label, branch.result));
+                            }
+                        }
+                    }
                 }
             }
             Self::Table { rows } => lines.extend(rows.iter().map(|row| row.join(" · "))),
@@ -431,6 +465,25 @@ impl Validator {
                 for step in steps {
                     self.label(&step.title)?;
                     self.children(&step.body, depth + 1, false)?;
+                }
+            }
+            Component::Flowchart { nodes } => {
+                count(nodes, true)?;
+                for node in nodes {
+                    match node {
+                        FlowNode::Step { label, .. } => self.label(label)?,
+                        FlowNode::Decision { question, branches } => {
+                            self.label(question)?;
+                            count(branches, true)?;
+                            if branches.len() < 2 {
+                                return Err("A flowchart decision needs at least two branches");
+                            }
+                            for branch in branches {
+                                self.label(&branch.label)?;
+                                self.label(&branch.result)?;
+                            }
+                        }
+                    }
                 }
             }
             Component::Table { rows } => {

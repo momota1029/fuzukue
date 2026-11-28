@@ -6,6 +6,7 @@
 mod harness;
 
 mod screenshots;
+mod reply_components;
 mod capture;
 
 mod l10n;
@@ -1009,12 +1010,11 @@ async fn client_loop(
     github_report_client: bool, grant_principal: String, settings: Option<remote::SettingsPrincipal>,
 ) {
     let (mut tx, mut rx) = socket.split();
-    let (protocol, resume_from, requested, locale, platform, build_id, thread_history, mut transcripts) = match rx.next().await {
+    let (protocol, resume_from, requested, locale, platform, build_id, thread_history, mut transcripts, reply_blocks) = match rx.next().await {
         Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(&t) {
             Ok(ClientMsg::Hello {
                 protocol, resume_from, workspace, locale, platform, build_id, thread_history,
-                // Component fences already travel as ordinary Markdown code blocks.
-                selection_scoped_transcripts, epoch, cached_sessions, ..
+                selection_scoped_transcripts, epoch, cached_sessions, markdown_components, ..
             }) => {
                 let agreed = protocol.min(PROTOCOL_VERSION);
                 let thread_history = thread_history && agreed >= fuzukue_proto::THREAD_HISTORY_PROTOCOL;
@@ -1023,7 +1023,7 @@ async fn client_loop(
                 (
                     agreed, resume_from.unwrap_or(0), workspace,
                     l10n::negotiate(protocol, locale.as_deref()), platform, build_id,
-                    thread_history, transcripts,
+                    thread_history, transcripts, reply_components::supported(&markdown_components),
                 )
             }
             _ => return,
@@ -1099,7 +1099,7 @@ async fn client_loop(
     let mut notices = (protocol >= fuzukue_proto::NOTIFICATIONS_PROTOCOL).then(|| registry.notices.subscribe());
     let mut first = true;
     loop {
-        let Some(next) = serve_workspace(&mut tx, &mut rx, &registry, app, (protocol, resume, first, thread_history), transcripts.as_ref(), &locale, manifest.take(), &mut distribution, (platform.as_deref(), build_id.as_deref()), github_report_client, &grant_principal, settings.as_ref(), &mut notices).await else { break };
+        let Some(next) = serve_workspace(&mut tx, &mut rx, &registry, app, (protocol, resume, first, thread_history), transcripts.as_ref(), reply_blocks, &locale, manifest.take(), &mut distribution, (platform.as_deref(), build_id.as_deref()), github_report_client, &grant_principal, settings.as_ref(), &mut notices).await else { break };
         first = false;
         app = next;
         resume = 0;
@@ -1162,6 +1162,12 @@ fn wire_event(env: &Envelope, protocol: u32, workspace: Option<&str>, locale: fu
                 status.cancelled = false;
             }
             converted = ServerEvent::SelfUpdateStatus { status };
+            &converted
+        }
+        ServerEvent::ReplyFinalized { session, item, actor } => {
+            converted = ServerEvent::TextDelta {
+                session: session.clone(), item: item.clone(), actor: actor.clone(), text: String::new(),
+            };
             &converted
         }
         ServerEvent::UserPrompt { session, item, text, paths, .. } if protocol < 5 => {
@@ -1402,6 +1408,7 @@ async fn serve_workspace(
     app: Arc<Workspace>,
     (protocol, resume_from, first, thread_history): (u32, u64, bool, bool),
     transcripts: Option<&hub::TranscriptResume>,
+    reply_blocks: bool,
     locale: &std::sync::RwLock<fuzukue_i18n::Locale>,
     client_manifest: Option<fuzukue_proto::ClientManifest>,
     distribution: &mut Option<(std::net::IpAddr, tokio::sync::broadcast::Receiver<Option<std::net::IpAddr>>)>,
@@ -1520,6 +1527,16 @@ async fn serve_workspace(
         }
     }
     let send = |env: &Envelope| wire_event(env, protocol, Some(&app.id), locale_for_wire());
+    let mut fallback = (!reply_blocks).then(|| app.hub.reply_fallback_at(resume_from));
+    let transcript_frames = |env: &Envelope, fallback: &mut Option<reply_components::Fallback>| {
+        let Some(fallback) = fallback else { return vec![send(env)] };
+        if !reply_components::Fallback::relevant(&env.event) {
+            return vec![send(env)];
+        }
+        let mut envelope = env.clone();
+        let preceding = fallback.apply(&mut envelope, |session| app.hub.thread_running(session));
+        preceding.iter().chain(std::iter::once(&envelope)).map(send).collect()
+    };
     if request_recovery {
         for event in registry.workspace_requests.draft_events(registry, &app.id) {
             tx.send(send(&snapshot(event))).await.ok()?;
@@ -1669,7 +1686,9 @@ async fn serve_workspace(
             let (projected, update) = project_job(env.seq, env.event.clone());
             if let Some(event) = projected {
                 let projected = Envelope { workspace: env.workspace.clone(), seq: env.seq, event };
-                tx.send(send(&projected)).await.ok()?;
+                for frame in transcript_frames(&projected, &mut fallback) {
+                    tx.send(frame).await.ok()?;
+                }
             }
             if let Some(update) = update {
                 tx.send(send(&update)).await.ok()?;
@@ -1995,8 +2014,10 @@ async fn serve_workspace(
                         if matches!(env.event, ServerEvent::DeckCardsChanged { .. }) {
                             env.event = deck_event(&project, protocol, env.event).await;
                         }
-                        if tx.send(send(&env)).await.is_err() {
-                            break;
+                        for frame in transcript_frames(&env, &mut fallback) {
+                            if tx.send(frame).await.is_err() {
+                                break 'write;
+                            }
                         }
                     }
                     let refresh_findings = supports_findings && match &env.event {
@@ -2730,7 +2751,7 @@ async fn serve_workspace(
                         continue;
                     }
                     let session = session.to_owned();
-                    let handle = handle_from_client(&app, prompt, Some(&screenshot_client));
+                    let handle = handle_from_client(&app, prompt, Some((&screenshot_client, reply_blocks)));
                     if let Err(e) = send_latency::Received::scope(received, handle).await {
                         let _ = reply.send(backend_switch_notice(&session, &e)
                             .unwrap_or_else(|| ServerEvent::Error { message: format!("{e:#}") }));
@@ -2914,7 +2935,7 @@ async fn serve_workspace(
                         _ => None,
                     };
                     let received = send_latency::Received::for_message(received, &m);
-                    let handle = handle_from_client(&app, m, Some(&screenshot_client));
+                    let handle = handle_from_client(&app, m, Some((&screenshot_client, reply_blocks)));
                     match send_latency::Received::scope(received, handle).await {
                         Ok(()) => {
                             if let Some(event) = confirmation {
@@ -3692,10 +3713,13 @@ async fn replay_prompts(app: &Arc<Workspace>) {
                     commands::start_compaction(app, session, instructions, record.id, work);
                 }
             }
-            Work::Prompt { text, paths } => {
+            Work::Prompt { text, paths, reply_blocks } => {
                 if !matches!(app.drain.claim(&app.state_dir, session, &record.id), Ok(true)) { continue; }
                 let result = match with_attachments(&app.project_dir, &app.state_dir, &text, &paths) {
-                    Ok((prompt, images)) => start_user_prompt(app, session.clone(), settings, prompt, None, images).await,
+                    Ok((prompt, images)) => {
+                        let prompt = reply_components::guide(prompt, reply_blocks);
+                        start_user_prompt(app, session.clone(), settings, prompt, None, images).await
+                    }
                     Err(error) => Err(error),
                 };
                 app.drain.finish(&app.state_dir, session, &record.id, result.err().map(|error| format!("{error:#}")));
@@ -3772,8 +3796,10 @@ impl Workspace {
 }
 
 async fn handle_from_client(
-    app: &Arc<Workspace>, msg: ClientMsg, client: Option<&screenshots::Connection<'_>>,
+    app: &Arc<Workspace>, msg: ClientMsg, client: Option<(&screenshots::Connection<'_>, bool)>,
 ) -> anyhow::Result<()> {
+    let reply_blocks = client.is_some_and(|(_, supported)| supported);
+    let client = client.map(|(connection, _)| connection);
     match msg {
         ClientMsg::ListPendingApprovals { .. } | ClientMsg::DecideApproval { .. } | ClientMsg::WorkspaceRequest { .. } | ClientMsg::WorkspaceRequestSurface { .. } => {}
         ClientMsg::SaveScreenshot { .. } | ClientMsg::ClientScreenshotResponse { .. }
@@ -3931,7 +3957,7 @@ async fn handle_from_client(
                         "Wait for the current turn and queued messages to finish");
                     let _work = work?;
                     let selection = app.escalation_model(&session).await?;
-                    prompt_escalated_partner(app, &session, selection, prompt, user_event, images).await
+                    prompt_escalated_partner(app, &session, selection, reply_components::guide(prompt, reply_blocks), user_event, images).await
                 }.await;
                 if let Err(error) = result {
                     commands::escalation_unavailable(&app.hub, &session, format!("{error:#}"));
@@ -3946,7 +3972,8 @@ async fn handle_from_client(
                     .and_then(|record| record.codex_thread_id.clone()).context("Codex のスレッドが見つからない")?;
                 let codex = app.running_codex().await.context("Codex が停止した")?;
                 // The hub knows whether the running turn has received external input.
-                let (steering, notices) = app.partner_input(&session, prompt.clone(), false).await?;
+                let input = reply_components::guide(prompt.clone(), reply_blocks);
+                let (steering, notices) = app.partner_input(&session, input, false).await?;
                 let selection = preferences::for_turn(app, &session, TurnKind::UserConversation, false, &prompt, &preferences::Inheritance::Desk)?;
                 let preferences = preferences::load_selection(selection, app, &session).await?;
                 codex.steer_desk(&thread, &steering, &images, &preferences).await?;
@@ -3968,7 +3995,7 @@ async fn handle_from_client(
                     _ => unreachable!("user prompt event"),
                 };
                 let store = || app.drain.enqueue(&app.state_dir, &session, item.clone(),
-                    self_update::drain::Work::Prompt { text: text.clone(), paths });
+                    self_update::drain::Work::Prompt { text: text.clone(), paths, reply_blocks });
                 match app.registry.upgrade().and_then(|registry| registry.self_update.get().cloned()) {
                     Some(update) => { update.hold_input(store)?; }
                     None => { store()?; }
@@ -3985,6 +4012,7 @@ async fn handle_from_client(
                 AgentBackend::Codex => "codex",
             };
             send_latency::expect_echo(user_event.as_ref().unwrap(), route);
+            let prompt = reply_components::guide(prompt, reply_blocks);
             start_user_prompt(app, session, settings, prompt, user_event, images).await?;
         }
         ClientMsg::Interrupt { session } => {
