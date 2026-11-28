@@ -1,5 +1,6 @@
 //! Workspace-local Git watches and their durable delivery queue.
 
+mod history;
 mod model;
 mod poll;
 #[cfg(test)]
@@ -367,7 +368,7 @@ fn schedule(app: &Arc<Workspace>) -> Result<()> {
                     let runtime = app.watches.lock().map(|store| store.runtime(&watch));
                     match runtime {
                         Ok(runtime) => {
-                            let observed = poll::observe(&watch, &runtime).await;
+                            let observed = history::observe(watch.clone(), runtime).await;
                             finish_poll(&app, &watch, observed)
                         }
                         Err(error) => Err(error),
@@ -424,6 +425,8 @@ fn finish_poll(app: &Workspace, watch: &Watch, observed: poll::Observation) -> R
         Instant::now() + Duration::from_secs(interval + jitter),
     );
     store.edit(|state| state.runtime.insert(watch.id.clone(), runtime))?;
+    #[cfg(test)]
+    tests::delivery_checkpoint(app, "after-poll");
     Ok(())
 }
 

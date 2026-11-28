@@ -513,6 +513,8 @@ pub(super) struct Runtime {
     pub last_error: Option<String>,
     pub failures: u32,
     pub states: BTreeMap<String, Seen>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub report_checkpoints: BTreeMap<String, String>,
     pub last_event: Option<Event>,
     pub outbox: VecDeque<Event>,
     pub last_wake: Option<i64>,
@@ -657,7 +659,7 @@ impl Runtime {
                 }
                 Some(Seen::BranchHeads(heads))
             }
-            (Source::NewFile { .. }, Sample::Reports(reports)) => {
+            (Source::NewFile { .. }, Sample::Reports { reports, checkpoint }) => {
                 let last = match previous {
                     Some(Seen::Report(last)) => last,
                     _ => None,
@@ -689,6 +691,10 @@ impl Runtime {
                         .map(|line| excerpt(&report.text, line, 40, 5500));
                         self.emit(event);
                     }
+                }
+                // The scheduler saves this checkpoint and the queued events together.
+                if let Some(checkpoint) = checkpoint {
+                    self.report_checkpoints.insert(key.clone(), checkpoint);
                 }
                 Some(Seen::Report(latest))
             }

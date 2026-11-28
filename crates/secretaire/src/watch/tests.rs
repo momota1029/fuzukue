@@ -31,8 +31,8 @@ fn sample(head: &str, reports: &[u64], heartbeat: Option<Heartbeat>) -> Observat
         } else {
             BTreeMap::from([("work/dots-main".into(), head.into())])
         })),
-        Ok(Sample::Reports(
-            reports
+        Ok(Sample::Reports {
+            reports: reports
                 .iter()
                 .map(|&number| Report {
                     number,
@@ -40,7 +40,8 @@ fn sample(head: &str, reports: &[u64], heartbeat: Option<Heartbeat>) -> Observat
                     text: format!("# C{number}\nSynthetic report"),
                 })
                 .collect(),
-        )),
+            checkpoint: None,
+        }),
         Ok(Sample::Heartbeat(heartbeat)),
     ])
 }
@@ -205,11 +206,14 @@ fn attention_requires_explicit_marked_lines_and_supports_custom_substrings() -> 
                 "work/dots-main".into(),
                 "sha".into(),
             )]))),
-            Ok(Sample::Reports(vec![Report {
-                number: offset as u64 + 2,
-                path: "sample.md".into(),
-                text: report.into(),
-            }])),
+            Ok(Sample::Reports {
+                reports: vec![Report {
+                    number: offset as u64 + 2,
+                    path: "sample.md".into(),
+                    text: report.into(),
+                }],
+                checkpoint: None,
+            }),
             Ok(Sample::Heartbeat(None)),
         ]);
         state.apply(&watch, sample, 101);
@@ -236,7 +240,7 @@ fn wake_policy_and_persisted_rate_limit() -> Result<()> {
     state.apply(&watch, sample("", &[], Some(heartbeat(1))), 1);
     let mut next = sample("first", &[2, 3], Some(heartbeat(1)));
     if let Observation::Sources(samples) = &mut next {
-        if let Ok(Sample::Reports(reports)) = &mut samples[1] {
+        if let Ok(Sample::Reports { reports, .. }) = &mut samples[1] {
             reports[1].text = format!(
                 "{}## 決定待ち\nA or B\nB を推奨。",
                 "synthetic line\n".repeat(45)
@@ -951,6 +955,7 @@ async fn watch_delivery_crash_child() -> Result<()> {
 async fn kill_at_checkpoint(root: &Path, boundary: &str, thread: &str, reply: Option<&str>) -> Result<()> {
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command.args(["--exact", "watch::tests::watch_delivery_crash_child"])
+        .env("HOME", root)
         .env("FUZUKUE_TEST_WATCH_CRASH_DIR", root)
         .env("FUZUKUE_TEST_WATCH_CRASH_BOUNDARY", boundary)
         .env("FUZUKUE_TEST_WATCH_CRASH_THREAD", thread)
@@ -1215,5 +1220,90 @@ async fn legacy_wakes_stay_available_for_review() -> Result<()> {
     assert!(records.iter().any(|record| record.id == unclaimed
         && record.review.is_some()
         && matches!(&record.work, Work::WatchWake { text, .. } if text == "unclaimed legacy excerpt")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_includes_report_removed_before_tip_after_restart() -> Result<()> {
+    let root = TestDir::new();
+    let author = root.path().join("author");
+    fs::create_dir(&author)?;
+    command(root.path(), &["init", "--bare", "remote.git"]).await?;
+    command(&author, &["init", "-b", "work/dots-main"]).await?;
+    command(&author, &["remote", "add", "origin", "../remote.git"]).await?;
+    let now = Utc::now().timestamp();
+    push_cycle(&root, &author, 1, now).await?;
+    command(
+        root.path(),
+        &["clone", "-b", "work/dots-main", "remote.git", "clone"],
+    )
+    .await?;
+
+    let app = workspace(root.path());
+    let thread = app.hub.edit_threads(|store| store.create(None))?;
+    let mut watch = dots(&root.path().join("clone"), &thread);
+    watch.sources.retain(|source| matches!(source, super::model::Source::NewFile { .. }));
+    let source = watch.sources[0].key(&watch);
+    app.watches.lock()?.edit(|state| state.watches.insert(watch.id.clone(), watch.clone()))?;
+    let baseline = observe_fixture(&watch, &Runtime::default(), root.path()).await?;
+    finish_poll(&app, &watch, baseline)?;
+    let before = app.watches.lock()?.runtime(&watch);
+    let baseline = command(&author, &["rev-parse", "HEAD"]).await?;
+    assert_eq!(before.report_checkpoints[&source], baseline.trim());
+    assert!(before.outbox.is_empty());
+    drop(app);
+
+    push_cycle(&root, &author, 10, now).await?;
+    push_cycle(&root, &author, 2, now).await?;
+    command(&author, &["rm", "notes/handoff/dots-cycle-2.md"]).await?;
+    command(
+        &author,
+        &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "-c", "core.hooksPath=/dev/null", "commit", "-m", "Remove intermediate report"],
+    )
+    .await?;
+    command(&author, &["push", "origin", "HEAD:refs/heads/work/dots-main"]).await?;
+    let tip = command(&author, &["rev-parse", "HEAD"]).await?;
+
+    // Acquiring Git history alone leaves the durable checkpoint at the baseline.
+    drop(observe_fixture(&watch, &before, root.path()).await?);
+    let app = workspace(root.path());
+    assert_eq!(app.watches.lock()?.runtime(&watch).report_checkpoints[&source], baseline.trim());
+    drop(app);
+
+    // With no client, the startup scheduler catches up and saves the outbox and checkpoint.
+    kill_at_checkpoint(root.path(), "after-poll", &thread, None).await?;
+    fs::remove_file(root.path().join("ready"))?;
+    let app = workspace(root.path());
+    let caught_up = app.watches.lock()?.runtime(&watch);
+    assert_eq!(caught_up.report_checkpoints[&source], tip.trim());
+    assert_eq!(caught_up.outbox.len(), 2);
+    assert!(caught_up.outbox[0].detail.contains("# C2: synthetic"));
+    assert!(caught_up.outbox[1].detail.contains("# C10: synthetic"));
+    drop(app);
+
+    // Restart, save the first note, and interrupt before its acknowledgment.
+    kill_at_checkpoint(root.path(), "after-note", &thread, None).await?;
+    let app = workspace(root.path());
+    let before = app.watches.lock()?.runtime(&watch);
+    let observed = observe_fixture(&watch, &before, root.path()).await?;
+    finish_poll(&app, &watch, observed)?;
+    {
+        let mut store = app.watches.lock()?;
+        deliver(&app, &mut store, &watch)?;
+        assert!(store.runtime(&watch).outbox.is_empty());
+    }
+    let (events, _, _) = app.hub.read_threads(|threads| {
+        threads.history_tail(&thread, &Default::default(), false, |event| event).unwrap()
+    });
+    let reports: Vec<_> = events.iter().filter_map(|event| match event {
+        fuzukue_proto::ServerEvent::TextDelta { text, .. } if text.contains("synthetic") => {
+            Some(text.as_str())
+        }
+        _ => None,
+    }).collect();
+    assert_eq!(reports.len(), 2);
+    assert!(reports[0].contains("# C2: synthetic"));
+    assert!(reports[1].contains("# C10: synthetic"));
     Ok(())
 }

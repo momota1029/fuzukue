@@ -4,11 +4,12 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use anyhow::{Context, Result, ensure};
 
+use super::history;
 use super::model::{Heartbeat, Runtime, Source, Watch, report_matcher, report_number};
 use crate::git;
 
 const REF_PREFIX: &str = "refs/fuzukue/watch/";
-const TREE_LIMIT: usize = 16 * 1024 * 1024;
+pub(super) const TREE_LIMIT: usize = 16 * 1024 * 1024;
 const REPORT_LIMIT: usize = 4 * 1024 * 1024;
 const HEARTBEAT_LIMIT: usize = 64 * 1024;
 
@@ -23,7 +24,10 @@ pub(super) enum Observation {
 
 pub(super) enum Sample {
     BranchHeads(BTreeMap<String, String>),
-    Reports(Vec<Report>),
+    Reports {
+        reports: Vec<Report>,
+        checkpoint: Option<String>,
+    },
     Heartbeat(Option<Heartbeat>),
 }
 
@@ -114,7 +118,7 @@ pub(super) async fn observe_in(
     } else {
         remote_heads(&repo, &args).await
     };
-    let mut trees = HashMap::new();
+    let mut snapshots = HashMap::new();
     let mut samples = Vec::new();
     for source in &watch.sources {
         let sample = match source {
@@ -145,27 +149,25 @@ pub(super) async fn observe_in(
             .map(Sample::BranchHeads),
             _ => {
                 let branch = source.branch().unwrap();
-                if !trees.contains_key(branch) {
-                    let tree = match &heads {
+                if !snapshots.contains_key(branch) {
+                    let snapshot = match &heads {
                         Ok(heads) if heads.contains_key(branch) => {
-                            fetch_tree(&repo, &watch.remote, branch).await
+                            fetch_snapshot(&repo, &watch.remote, branch).await.map(Some)
                         }
-                        Ok(_) => Ok(BTreeSet::new()),
+                        Ok(_) => Ok(None),
                         Err(error) => Err(anyhow::anyhow!("{error:#}")),
                     };
-                    trees.insert(branch, tree);
+                    snapshots.insert(branch, snapshot);
                 }
-                match &trees[branch] {
-                    Ok(tree) => {
-                        sample_files(
-                            &repo,
-                            branch,
-                            tree,
-                            source,
-                            runtime.last_report(watch, source),
-                        )
-                        .await
+                match &snapshots[branch] {
+                    Ok(Some((tip, tree))) => {
+                        sample_files(&repo, tip, tree, watch, source, runtime).await
                     }
+                    Ok(None) if matches!(source, Source::NewFile { .. }) => Ok(Sample::Reports {
+                        reports: Vec::new(),
+                        checkpoint: None,
+                    }),
+                    Ok(None) => Ok(Sample::Heartbeat(None)),
                     Err(error) => Err(anyhow::anyhow!("{error:#}")),
                 }
             }
@@ -186,7 +188,11 @@ async fn remote_heads(repo: &Path, args: &[&str]) -> Result<BTreeMap<String, Str
         .collect())
 }
 
-async fn fetch_tree(repo: &Path, remote: &str, branch: &str) -> Result<BTreeSet<String>> {
+async fn fetch_snapshot(
+    repo: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<(String, BTreeSet<String>)> {
     let reference = format!("{REF_PREFIX}{branch}");
     let refspec = format!("+refs/heads/{branch}:{reference}");
     git_output(
@@ -212,60 +218,66 @@ async fn fetch_tree(repo: &Path, remote: &str, branch: &str) -> Result<BTreeSet<
         8192,
     )
     .await?;
-    let output = complete_bytes(
-        repo,
-        &["ls-tree", "-rz", "--name-only", &reference],
-        TREE_LIMIT,
-    )
-    .await?;
-    Ok(output
+    let tip = git_output(repo, &["rev-parse", "--verify", &reference], 128).await?;
+    let tip = tip.trim().to_owned();
+    let output = complete_bytes(repo, &["ls-tree", "-rz", "--name-only", &tip], TREE_LIMIT).await?;
+    let tree = git_paths(&output).map(str::to_owned).collect();
+    Ok((tip, tree))
+}
+
+fn git_paths(output: &[u8]) -> impl Iterator<Item = &str> {
+    output
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_owned))
-        .collect())
+        .filter_map(|path| std::str::from_utf8(path).ok())
 }
 
 async fn sample_files(
     repo: &Path,
-    branch: &str,
+    tip: &str,
     tree: &BTreeSet<String>,
+    watch: &Watch,
     source: &Source,
-    last: Option<Option<u64>>,
+    runtime: &Runtime,
 ) -> Result<Sample> {
     match source {
         Source::NewFile { glob, regex, .. } => {
             let matcher = report_matcher(glob.as_deref(), regex.as_deref())?;
+            let last = runtime.last_report(watch, source);
+            let checkpoint = runtime.report_checkpoints.get(&source.key(watch));
             let mut paths = BTreeMap::new();
-            for path in tree {
-                if let Some(number) = report_number(&matcher, path) {
-                    paths.entry(number).or_insert(path);
+            if checkpoint.is_none_or(|checkpoint| checkpoint != tip) {
+                for path in tree {
+                    if let Some(number) = report_number(&matcher, path)
+                        .filter(|number| last.flatten().is_none_or(|last| *number > last))
+                    {
+                        paths.entry(number).or_insert_with(|| (tip.to_owned(), path.clone()));
+                    }
+                }
+                if let Some(checkpoint) = checkpoint {
+                    for commit in history::commits(repo, checkpoint, tip).await?.lines() {
+                        if commit != tip {
+                            collect_added_reports(repo, commit, &matcher, last.flatten(), &mut paths)
+                                .await?;
+                        }
+                    }
                 }
             }
             let mut reports = Vec::new();
-            if let Some(last) = last {
-                for (number, path) in paths {
-                    if last.is_none_or(|last| number > last) {
-                        let text = show(repo, branch, path, REPORT_LIMIT, false).await?;
-                        reports.push(Report {
-                            number,
-                            path: path.clone(),
-                            text,
-                        });
-                    }
+            if last.is_some() {
+                for (number, (commit, path)) in paths {
+                    let text = show(repo, &commit, &path, REPORT_LIMIT, false).await?;
+                    reports.push(Report { number, path, text });
                 }
-            } else if let Some((number, path)) = paths.into_iter().next_back() {
-                reports.push(Report {
-                    number,
-                    path: path.clone(),
-                    text: String::new(),
-                });
+            } else if let Some((number, (_, path))) = paths.into_iter().next_back() {
+                reports.push(Report { number, path, text: String::new() });
             }
-            Ok(Sample::Reports(reports))
+            Ok(Sample::Reports { reports, checkpoint: Some(tip.to_owned()) })
         }
         Source::Heartbeat { file, .. } => {
             let heartbeat = if tree.contains(file) {
                 Some(Heartbeat::parse(
-                    &show(repo, branch, file, HEARTBEAT_LIMIT, true).await?,
+                    &show(repo, tip, file, HEARTBEAT_LIMIT, true).await?,
                 )?)
             } else {
                 None
@@ -276,14 +288,42 @@ async fn sample_files(
     }
 }
 
+// Files still at the tip keep their current content. For a deleted report,
+// take the first addition in parent-before-child order.
+async fn collect_added_reports(
+    repo: &Path,
+    commit: &str,
+    matcher: &regex::Regex,
+    last: Option<u64>,
+    paths: &mut BTreeMap<u64, (String, String)>,
+) -> Result<()> {
+    let output = complete_bytes(
+        repo,
+        &[
+            "diff-tree", "--root", "-m", "--no-commit-id", "-r", "-z",
+            "--name-only", "--diff-filter=A", "--no-renames", commit, "--",
+        ],
+        TREE_LIMIT,
+    )
+    .await?;
+    for path in git_paths(&output) {
+        if let Some(number) = report_number(matcher, path)
+            .filter(|number| last.is_none_or(|last| *number > last))
+        {
+            paths.entry(number).or_insert_with(|| (commit.to_owned(), path.to_owned()));
+        }
+    }
+    Ok(())
+}
+
 async fn show(
     repo: &Path,
-    branch: &str,
+    commit: &str,
     path: &str,
     limit: usize,
     require_complete: bool,
 ) -> Result<String> {
-    let spec = format!("{REF_PREFIX}{branch}:{path}");
+    let spec = format!("{commit}:{path}");
     let mut bytes = git_bytes(repo, &["show", "--no-textconv", &spec, "--"], limit).await?;
     if require_complete {
         ensure!(bytes.len() <= limit, "ハートビートのファイルが大きすぎる");
@@ -292,7 +332,7 @@ async fn show(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-async fn git_output(repo: &Path, args: &[&str], limit: usize) -> Result<String> {
+pub(super) async fn git_output(repo: &Path, args: &[&str], limit: usize) -> Result<String> {
     Ok(String::from_utf8(complete_bytes(repo, args, limit).await?)?)
 }
 
