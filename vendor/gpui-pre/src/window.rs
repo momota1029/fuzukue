@@ -6319,6 +6319,16 @@ impl Window {
         self.reset_cursor_style(cx);
     }
 
+    /// Whether the focused text input has an active IME preedit.
+    pub fn has_marked_text(&mut self, cx: &mut App) -> bool {
+        let Some(mut input) = self.platform_window.take_input_handler() else {
+            return false;
+        };
+        let composing = input.focus_id() == self.focus && input.has_marked_text(self, cx);
+        self.platform_window.set_input_handler(input);
+        composing
+    }
+
     // If modifiers are not excessive (e.g. AltGr), and the input handler is accepting text input,
     // we prefer the text input over bindings.
     fn input_preference(&mut self, event: &dyn Any, cx: &mut App) -> InputPreference {

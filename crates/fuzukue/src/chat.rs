@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use gpui_kit::base::{Disableable as _, ElementExt as _, ScrollBounce, Selectable, StyledExt as _, TextSelection, TextSelectionScopeId};
-use gpui_kit::base::actions::{SelectDown, SelectUp};
 use gpui_kit::base::input::{Enter, MoveDown, MoveUp, RopeExt as _};
 use gpui_kit::base::text::editor_host::{parse_markdown, BlockNode};
 use gpui_kit::base::text::MarkdownExtensions;
@@ -50,7 +49,7 @@ use serde_json::Value;
 use super::appearance::{ThemeSurfaces, UI_LINE_HEIGHT};
 use super::chat_quote::quote_insertion;
 use super::chat_question::QuestionCard;
-use super::composer_markdown::{command_candidates, continue_line, visual_edge_target, CommandKey};
+use super::composer_markdown::{command_candidates, continue_line, CommandKey};
 use super::icons::Symbol;
 use super::settings_file;
 use super::{composing, scroll_list_by_key, Workbench};
@@ -4587,7 +4586,7 @@ impl Workbench {
         }
     }
 
-    fn composer_arrow(&mut self, down: bool, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn composer_arrow(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
         }
@@ -4595,19 +4594,12 @@ impl Workbench {
             cx.stop_propagation();
             return;
         }
-        let input = self.input.read(cx);
-        if !extend && input.vertical_arrow_at_edge(down, cx) {
+        if self.input.read(cx).vertical_arrow_at_edge(down, cx) {
             let line = window.line_height();
             self.chats[&self.active].scroller.scroll_by(if down { line } else { -line });
             self.history_scrolled(cx);
             cx.stop_propagation();
             cx.notify();
-            return;
-        }
-        let Some((row, rows)) = input.visual_cursor_row(cx) else { return };
-        if let Some(target) = visual_edge_target(row, rows, down, input.text().len()) {
-            self.input.update(cx, |state, cx| state.move_caret_to(target, extend, cx));
-            cx.stop_propagation();
         }
     }
 
@@ -4832,16 +4824,10 @@ impl Workbench {
         let input = div().flex_1().min_w_0().py(input_padding)
             .capture_action(cx.listener(Self::composer_enter))
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                this.composer_arrow(false, false, window, cx);
+                this.composer_arrow(false, window, cx);
             }))
             .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
-                this.composer_arrow(true, false, window, cx);
-            }))
-            .capture_action(cx.listener(|this, _: &SelectUp, window, cx| {
-                this.composer_arrow(false, true, window, cx);
-            }))
-            .capture_action(cx.listener(|this, _: &SelectDown, window, cx| {
-                this.composer_arrow(true, true, window, cx);
+                this.composer_arrow(true, window, cx);
             }))
             .child(input);
         #[cfg(all(target_os = "linux", feature = "headless-shot"))]

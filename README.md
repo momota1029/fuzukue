@@ -6,6 +6,15 @@ fuzukue is a workbench for writing mathematics and doing research with AI agents
 
 The project is early. The maintainer uses it for daily work, and setup and workflows may change.
 
+## Desktop keyboard shortcuts
+
+| Action | Windows / Linux | macOS |
+| --- | --- | --- |
+| Previous / next pinned or current thread | Alt+Up / Down | Control+Command+Up / Down |
+| Switch to workspace 1–9 by name, including the current workspace | Ctrl+1–9 | Command+1–9 |
+| Jump to the next thread awaiting a reply or approval in this workspace | Ctrl+Shift+J | Command+Shift+J |
+| Reorder a focused sidebar thread | Ctrl+Shift+Up / Down | Command+Shift+Up / Down |
+
 ## Install on Mac
 
 Paste this into Terminal on macOS 15 or later once a release with the Mac packages is published.

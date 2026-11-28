@@ -792,28 +792,31 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// The active caret's visual row and total row count, taking soft-wrap
     /// affinity into account. Leave arrow keys to the input's completion UI.
     pub fn visual_cursor_row(&self, cx: &App) -> Option<(usize, usize)> {
-        if self.last_layout.is_none()
-            || M::is_context_menu_open(self, cx)
-            || M::has_inline_completion(self)
-        {
+        if M::is_context_menu_open(self, cx) || M::has_inline_completion(self) {
             return None;
         }
-        let point = self.display_map.offset_to_wrap_display_point_with_affinity(
-            self.cursor(),
-            self.cursor_line_end_affinity,
-        );
+        self.visual_row_at(self.cursor(), self.cursor_line_end_affinity)
+    }
+
+    pub(super) fn visual_row_at(&self, offset: usize, affinity: bool) -> Option<(usize, usize)> {
+        if self.is_single_line() {
+            return Some((0, 1));
+        }
+        self.last_layout.as_ref()?;
+        let point = self.display_map.offset_to_wrap_display_point_with_affinity(offset, affinity);
         Some((
             self.display_map.wrap_row_to_display_row(point.row)?,
             self.display_map.display_row_count(),
         ))
     }
 
-    /// Whether a plain vertical arrow can be handed off at the first or last
-    /// visual row. Selection, IME preedit and completion keep the arrow in the input.
+    /// Whether a plain vertical arrow has reached the document endpoint in its
+    /// direction. Selection, IME preedit and completion keep the arrow in the input.
     pub fn vertical_arrow_at_edge(&self, down: bool, cx: &App) -> bool {
         self.selections.is_single()
             && self.active_selection().is_empty()
             && self.ime_marked_range.is_none()
+            && self.cursor() == if down { self.text.len() } else { 0 }
             && self.visual_cursor_row(cx).is_some_and(|(row, rows)| {
                 if down { row + 1 == rows } else { row == 0 }
             })
@@ -1839,7 +1842,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_single_line() {
+        if self.ime_marked_range.is_some() {
             return;
         }
         self.select_all_cursors_to_with_affinity(
@@ -1857,7 +1860,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_single_line() {
+        if self.ime_marked_range.is_some() {
             return;
         }
         self.select_all_cursors_to_with_affinity(
@@ -5439,12 +5442,12 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
             .on_action(window.listener_for(&entity, InputBaseState::right))
             .on_action(window.listener_for(&entity, InputBaseState::select_left))
             .on_action(window.listener_for(&entity, InputBaseState::select_right))
+            .on_action(window.listener_for(&entity, InputBaseState::up))
+            .on_action(window.listener_for(&entity, InputBaseState::down))
+            .on_action(window.listener_for(&entity, InputBaseState::select_up))
+            .on_action(window.listener_for(&entity, InputBaseState::select_down))
             .when(self.is_multi_line(), |this| {
-                this.on_action(window.listener_for(&entity, InputBaseState::up))
-                    .on_action(window.listener_for(&entity, InputBaseState::down))
-                    .on_action(window.listener_for(&entity, InputBaseState::select_up))
-                    .on_action(window.listener_for(&entity, InputBaseState::select_down))
-                    .on_action(window.listener_for(&entity, InputBaseState::page_up))
+                this.on_action(window.listener_for(&entity, InputBaseState::page_up))
                     .on_action(window.listener_for(&entity, InputBaseState::page_down))
                     .on_action(window.listener_for(&entity, InputBaseState::add_cursor_above))
                     .on_action(window.listener_for(&entity, InputBaseState::add_cursor_below))

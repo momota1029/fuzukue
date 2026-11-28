@@ -21,6 +21,9 @@ pub(super) const SEARCH_SHORTCUT: &str = if cfg!(target_os = "macos") {
     "Ctrl+K"
 };
 const SCREENSHOT_SHORTCUT: &str = "Ctrl+Shift+S";
+const THREAD_SHORTCUT: &str = if cfg!(target_os = "macos") { "⌃⌘↑/↓" } else { "Alt+↑/↓" };
+const WORKSPACE_SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘1–9" } else { "Ctrl+1–9" };
+const WAITING_THREAD_SHORTCUT: &str = if cfg!(target_os = "macos") { "⌘⇧J" } else { "Ctrl+Shift+J" };
 const MENU_OFFSET: Pixels = px(4.);
 // Match the popup positioner's margin at the window edge.
 const MENU_WINDOW_MARGIN: Pixels = px(8.);
@@ -706,6 +709,10 @@ impl Workbench {
                 None,
                 |this, window, cx| this.open_github_report(window, cx),
             ),
+            PopupMenuItem::separator(),
+            PopupMenuItem::label(tr!("menu-shortcut-threads", shortcut = THREAD_SHORTCUT)),
+            PopupMenuItem::label(tr!("menu-shortcut-workspaces", shortcut = WORKSPACE_SHORTCUT)),
+            PopupMenuItem::label(tr!("menu-shortcut-waiting", shortcut = WAITING_THREAD_SHORTCUT)),
         ]
     }
 
@@ -870,7 +877,7 @@ mod tests {
                 238.,
             ),
             (Menu::Thread, 2, 0, 62.),
-            (Menu::Help, 3, 0, 90.),
+            (Menu::Help, 6, 1, 182.),
         ];
         for (group, items, separators, height) in cases {
             let rows = MenuRows { items, separators };

@@ -11,9 +11,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     div, prelude::*, px, relative, transparent_black, Anchor, AnyElement, Context,
-    Focusable, MouseButton, Pixels, Point, SharedString, Window,
+    Focusable, InputPreference, KeystrokeEvent, MouseButton, Pixels, Point, SharedString, Window,
 };
 use fuzukue_proto::{ClientCommand, ClientMsg, TabView, ThreadGroup as ThreadSection, ThreadView};
+
+use gpui_kit::component::WindowExt as _;
 
 use crate::sidebar::{section_header, sidebar_icon, sidebar_row, SIDEBAR_ICON_GAP, SIDEBAR_ROW_INSET};
 use crate::{appearance::UI_LINE_HEIGHT, icons::Symbol, wire_deck, Workbench};
@@ -36,6 +38,12 @@ fn archive_section(has_archived_threads: bool, can_drop_thread: bool) -> Archive
         (false, true) => ArchiveSection::DropZone,
         (false, false) => ArchiveSection::Hidden,
     }
+}
+
+enum NavigationShortcut {
+    Thread(bool),
+    Workspace(usize),
+    Waiting,
 }
 
 fn apply_thread_order<'a>(threads: &'a [ThreadView], order: &[String]) -> Vec<&'a ThreadView> {
@@ -108,6 +116,97 @@ impl Render for ThreadDragPreview {
 }
 
 impl Workbench {
+    pub(super) fn workbench_navigation_shortcut(
+        &mut self, event: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>,
+    ) -> bool {
+        let key = &event.keystroke;
+        let mods = key.modifiers;
+        let exact_primary = mods.secondary(cx) && mods.number_of_modifiers() == 1;
+        let thread_modifier = if cfg!(target_os = "macos") {
+            // Option+arrows edit text, and Command+Option+arrows add cursors.
+            mods.control && mods.platform && mods.number_of_modifiers() == 2
+        } else {
+            mods.alt && mods.number_of_modifiers() == 1
+        };
+        let command = match key.key.as_bytes() {
+            b"up" if thread_modifier => NavigationShortcut::Thread(false),
+            b"down" if thread_modifier => NavigationShortcut::Thread(true),
+            [digit @ b'1'..=b'9'] if exact_primary => NavigationShortcut::Workspace(usize::from(*digit - b'1')),
+            [b'j' | b'J'] if mods.secondary(cx) && mods.shift && mods.number_of_modifiers() == 2 => {
+                NavigationShortcut::Waiting
+            }
+            _ => return false,
+        };
+        if event.input_preference == InputPreference::CharacterInput
+            || window.has_active_dialog(cx)
+            || window.has_active_sheet(cx)
+            || window.has_marked_text(cx)
+            || cx.has_active_drag()
+            || self.workspaces.pending
+            || self.workspace_browser_open()
+            || self.palette.is_some()
+            || self.history.is_open()
+            || self.screenshots.preview_open()
+            || self.app_menu.is_expanded()
+            || (self.paper_pdf_visible() && self.paper_pdf.popup.is_some())
+            || event.context_stack.iter().any(|context| {
+                context.contains("PopupMenu") || context.contains("WorkbenchJobList")
+            })
+        {
+            return false;
+        }
+        match command {
+            NavigationShortcut::Thread(down) => self.navigate_thread(down, false, window, cx),
+            NavigationShortcut::Waiting => self.navigate_thread(true, true, window, cx),
+            NavigationShortcut::Workspace(index) => self.switch_workspace_slot(index, cx),
+        }
+        true
+    }
+
+    fn navigate_thread(&mut self, down: bool, waiting: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.threads_loaded {
+            return;
+        }
+        let ordered = apply_thread_order(&self.threads, self.thread_manual_order());
+        let groups = [ThreadSection::Pinned, ThreadSection::Current, ThreadSection::Archived];
+        let threads: Vec<_> = groups.into_iter().flat_map(|group| {
+            ordered.iter().copied().filter(move |thread| ThreadSection::of(thread) == group)
+        }).filter(|thread| waiting || !thread.archived).collect();
+        let active = threads.iter().position(|thread| thread.id == self.active);
+        let target = if waiting {
+            let start = active.map_or(0, |index| index + 1);
+            threads[start..].iter().chain(&threads[..start]).find(|thread| {
+                thread.id != self.active && self.thread_needs_input(&thread.id, cx)
+            })
+        } else if let Some(index) = active {
+            index.checked_add_signed(if down { 1 } else { -1 }).and_then(|index| threads.get(index))
+        } else if down {
+            threads.first()
+        } else {
+            threads.last()
+        };
+        let Some(target) = target else { return };
+        let id = target.id.clone();
+        let group = ThreadSection::of(target);
+        let sidebar_focused = self.sidebar.thread_focus.values().any(|focus| focus.is_focused(window));
+        self.select_thread(id.clone(), cx);
+        if waiting {
+            self.reveal_approval_dock();
+        }
+        if sidebar_focused && self.thread_group_open(group) {
+            if let Some(focus) = self.sidebar.thread_focus.get(&id) {
+                focus.focus(window, cx);
+            }
+        }
+    }
+
+    fn thread_needs_input(&self, id: &str, cx: &gpui_kit::App) -> bool {
+        self.thread_info.plans.get(id).is_some_and(|(plan, _)| {
+            plan.status == fuzukue_proto::PlanStatus::WaitingForUser
+        }) || self.approval_count(id) > 0
+            || self.chats.get(id).is_some_and(|chat| !chat.pending_questions(cx).is_empty())
+    }
+
     pub(super) fn select_thread(&mut self, id: String, cx: &mut Context<Self>) {
         if matches!(self.right, super::RightPane::Library | super::RightPane::Handoff | super::RightPane::ResearchIssues | super::RightPane::ResearchIssue(_) | super::RightPane::Exploration) {
             self.close_right_pane(cx);
@@ -573,7 +672,11 @@ impl Workbench {
             .gap(SIDEBAR_ICON_GAP)
             .cursor_pointer()
             .aria_label(title.clone())
-            .aria_description(tr!("threads-reorder"))
+            .aria_description(tr!("threads-reorder", shortcut = if cfg!(target_os = "macos") {
+                "⌘⇧↑/↓"
+            } else {
+                "Ctrl+Shift+↑/↓"
+            }))
             .child(sidebar_icon(mark_icon).id(SharedString::from(format!("thread-row-icon-{id}"))))
             .child(v_flex().min_w_0().flex_1().line_height(UI_LINE_HEIGHT)
                 .child(div().id(SharedString::from(format!("thread-row-title-{id}")))
@@ -600,7 +703,8 @@ impl Workbench {
             .capture_key_down(cx.listener(move |this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 let key = &event.keystroke;
                 match key.key.as_str() {
-                    "up" | "down" if key.modifiers.alt && key.modifiers.number_of_modifiers() == 1 => {
+                    "up" | "down" if key.modifiers.secondary(cx) && key.modifiers.shift
+                        && key.modifiers.number_of_modifiers() == 2 => {
                         this.move_thread_with_key(&keyboard_id, key.key == "down", cx);
                     }
                     "enter" | "space" if key.modifiers.number_of_modifiers() == 0 => {

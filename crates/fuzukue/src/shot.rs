@@ -29,6 +29,8 @@ mod approval_dock_test;
 #[cfg(test)]
 mod approval_shortcut_test;
 #[cfg(test)]
+mod navigation_shortcuts_test;
+#[cfg(test)]
 mod workspace_requests_test;
 #[cfg(test)]
 mod file_browser_test;
@@ -4564,7 +4566,7 @@ mod tests {
                         runner.click(cx, ClickTarget::Element { id: "chat-input".into() })?;
                         for (text, offset, key, selected) in [
                             ("- a", 3, "shift-enter", 4..4),
-                            ("abcd\n0123", 7, "down", 7..7),
+                            ("abcd\n0123", 7, "down", 9..9),
                             ("abcd\n0123", 2, "shift-up", 0..2),
                             ("abcd\n0123", 7, "shift-down", 7..9),
                         ] {
@@ -4598,7 +4600,7 @@ mod tests {
                         runner.frame(cx)?;
                         runner.key(cx, "down")?;
                         let caret = runner.update(cx, |view, _, cx| view.input.read(cx).cursor())?;
-                         ensure!(caret == wrapped.len() - 1, "Down on the last wrapped row should preserve the caret");
+                        ensure!(caret == wrapped.len(), "Down on the last wrapped row should move to the end");
                         Ok(())
                     }.await;
                     let _ = result.send(outcome);
@@ -4857,7 +4859,7 @@ mod tests {
                         }))?;
                         runner.frame(cx)?;
                         let before = scroll(cx)?;
-                        for (key, edge) in [("down", (false, true)), ("up", (true, false))] {
+                        for (key, edge) in [("down", (false, false)), ("up", (false, false))] {
                             runner.key(cx, key)?;
                             runner.frame(cx)?;
                             ensure!(edges(cx)? == edge && composer_focused(cx)? && scroll(cx)? == before,
@@ -4870,9 +4872,9 @@ mod tests {
                             input.set_selected_range(2..2, cx);
                         }))?;
                         runner.frame(cx)?;
-                        ensure!(edges(cx)? == (true, false), "caret is inside the first wrapped row");
+                        ensure!(edges(cx)? == (false, false), "caret can still move on the first wrapped row");
                         let before = scroll(cx)?;
-                        for key in ["alt-up", "ctrl-up", "shift-up"] {
+                        for key in ["ctrl-up", "shift-up"] {
                             runner.key(cx, key)?;
                             ensure!(composer_focused(cx)?, "{key} must stay in the composer");
                         }
@@ -4883,7 +4885,7 @@ mod tests {
                             let caret = wrapped.len() - 1;
                             input.set_selected_range(caret..caret, cx);
                         }))?;
-                        ensure!(edges(cx)? == (false, true), "caret is inside the last wrapped row");
+                        ensure!(edges(cx)? == (false, false), "caret can still move on the last wrapped row");
                         runner.update(cx, |view, _, cx| view.input.update(cx, |input, cx| {
                             input.set_selected_range(2..2, cx);
                         }))?;
@@ -4891,14 +4893,17 @@ mod tests {
                         runner.frame(cx)?;
                         ensure!(edges(cx)? == (false, false), "second of several wrapped rows has no edge");
                         runner.key(cx, "up")?;
-                        ensure!(composer_focused(cx)? && edges(cx)?.0, "Up from the second wrapped row must move the caret");
+                        ensure!(composer_focused(cx)? && !edges(cx)?.0, "Up from the second wrapped row must move the caret");
                         ensure!(scroll(cx)? == before, "navigation inside the wrapped draft scrolled the transcript");
-                        let first_caret = caret(cx)?;
+                        runner.key(cx, "up")?;
+                        runner.frame(cx)?;
+                        ensure!(scroll(cx)? == before && composer_focused(cx)? && caret(cx)? == 0,
+                            "Up on the first wrapped row must move to the start before scrolling");
                         runner.key(cx, "up")?;
                         runner.frame(cx)?;
                         let after_up = scroll(cx)?.0;
-                        ensure!(after_up < before.0 && composer_focused(cx)? && caret(cx)? == first_caret,
-                            "Up on the first wrapped row must scroll and preserve the focused caret");
+                        ensure!(after_up < before.0 && composer_focused(cx)? && caret(cx)? == 0,
+                            "Up at the start must scroll and preserve the focused caret");
                         let last_caret = wrapped.len() - 1;
                         runner.update(cx, |view, _, cx| view.input.update(cx, |input, cx| {
                             input.set_selected_range(last_caret..last_caret, cx);
@@ -4906,8 +4911,12 @@ mod tests {
                         runner.frame(cx)?;
                         runner.key(cx, "down")?;
                         runner.frame(cx)?;
-                        ensure!(scroll(cx)?.0 > after_up && composer_focused(cx)? && caret(cx)? == last_caret,
-                            "Down on the last wrapped row must scroll and preserve the focused caret");
+                        ensure!(scroll(cx)?.0 == after_up && composer_focused(cx)? && caret(cx)? == wrapped.len(),
+                            "Down on the last wrapped row must move to the end before scrolling");
+                        runner.key(cx, "down")?;
+                        runner.frame(cx)?;
+                        ensure!(scroll(cx)?.0 > after_up && composer_focused(cx)? && caret(cx)? == wrapped.len(),
+                            "Down at the end must scroll and preserve the focused caret");
 
                         runner.update(cx, |view, window, cx| view.input.update(cx, |input, cx| {
                             input.set_value("", window, cx);
@@ -4930,16 +4939,16 @@ mod tests {
                             input.set_selected_range(2..2, cx);
                         }))?;
                         runner.frame(cx)?;
-                        let before = scroll(cx)?.0;
-                        for (key, direction) in [("up", -1.), ("down", 1.)] {
-                            let previous = scroll(cx)?.0;
+                        let before = scroll(cx)?;
+                        for (key, expected) in [("up", 0), ("down", 5)] {
                             runner.key(cx, key)?;
                             runner.frame(cx)?;
-                            ensure!((scroll(cx)?.0 - previous) * direction > px(0.)
-                                && composer_focused(cx)? && caret(cx)? == 2,
-                                "{key} in a single-line draft must scroll and preserve the focused caret");
+                            ensure!(scroll(cx)? == before && composer_focused(cx)? && caret(cx)? == expected,
+                                "{key} in a single-line draft must move the caret before scrolling");
                         }
-                        ensure!((scroll(cx)?.0 - before).abs() < px(1.), "opposite arrows must return to the same offset");
+                        runner.update(cx, |view, _, cx| view.input.update(cx, |input, cx| {
+                            input.set_selected_range(2..2, cx);
+                        }))?;
                         for key in ["enter", "escape"] {
                             runner.click(cx, ClickTarget::Element { id: "chat-keyboard-thread".into() })?;
                             runner.frame(cx)?;
@@ -7040,7 +7049,7 @@ mod tests {
                     assert_eq!(order(cx)?, ["b", "c", "a"]);
 
                     runner.click(cx, ClickTarget::Element { id: "thread-row-title-a".into() })?;
-                    runner.key(cx, "Alt+Up")?;
+                    runner.key(cx, "Ctrl+Shift+Up")?;
                     runner.frame(cx)?;
                     assert_eq!(order(cx)?, ["b", "a", "c"]);
                     let settings = crate::settings_file::read(&path.with_extension("state.toml"))?;

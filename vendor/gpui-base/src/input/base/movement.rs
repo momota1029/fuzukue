@@ -174,9 +174,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         (new_offset, new_affinity)
     }
 
-    /// Extend to the document edge when there is no further visual row. Plain
-    /// movement retains its column there, but selection must still reach the
-    /// remaining text on the first or last row.
+    /// Reach the document endpoint when an arrow cannot move to another visual row.
     pub(super) fn vertical_selection_target(
         &self,
         offset: usize,
@@ -184,18 +182,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         line_end_affinity: bool,
         move_lines: isize,
     ) -> (usize, bool) {
-        let target = self.vertical_target(offset, column_anchor, line_end_affinity, move_lines);
-        if self.last_layout.is_some() {
-            let row = |offset, affinity| {
-                self.display_map
-                    .offset_to_wrap_display_point_with_affinity(offset, affinity)
-                    .row
-            };
-            if row(offset, line_end_affinity) == row(target.0, target.1) {
-                return (if move_lines < 0 { 0 } else { self.text.len() }, false);
-            }
+        if let Some(endpoint) = self.vertical_arrow_endpoint(offset, line_end_affinity, move_lines > 0) {
+            return (endpoint, false);
         }
-        target
+        self.vertical_target(offset, column_anchor, line_end_affinity, move_lines)
+    }
+
+    fn vertical_arrow_endpoint(&self, offset: usize, affinity: bool, down: bool) -> Option<usize> {
+        let (row, rows) = self.visual_row_at(offset, affinity)?;
+        match down {
+            true if row + 1 == rows => Some(self.text.len()),
+            false if row == 0 => Some(0),
+            _ => None,
+        }
     }
 
     /// Move every cursor through `f`, which maps each selection to a
@@ -248,9 +247,6 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_single_line() {
-            return;
-        }
         self.pause_blink_cursor(cx);
 
         let direction = if move_lines < 0 {
@@ -279,6 +275,11 @@ impl<M: InputModeKind> InputBaseState<M> {
                         affinity,
                     )
                 };
+                if collapse {
+                    if let Some(endpoint) = s.vertical_arrow_endpoint(effective, affinity, move_lines > 0) {
+                        return (endpoint, None, false);
+                    }
+                }
                 let anchor =
                     anchor.or_else(|| s.preferred_column_for_with_affinity(effective, affinity));
                 let (offset, affinity) = s.vertical_target(effective, anchor, affinity, move_lines);
@@ -368,19 +369,31 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn up(&mut self, action: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
-        if M::handle_context_menu_action(self, Box::new(action.clone()), window, cx) {
+        if self.ime_marked_range.is_some()
+            || M::handle_context_menu_action(self, Box::new(action.clone()), window, cx)
+        {
             return;
         }
 
-        self.move_vertical(-1, true, window, cx);
+        self.move_arrow(false, window, cx);
     }
 
     pub(super) fn down(&mut self, action: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
-        if M::handle_context_menu_action(self, Box::new(action.clone()), window, cx) {
+        if self.ime_marked_range.is_some()
+            || M::handle_context_menu_action(self, Box::new(action.clone()), window, cx)
+        {
             return;
         }
 
-        self.move_vertical(1, true, window, cx);
+        self.move_arrow(true, window, cx);
+    }
+
+    fn move_arrow(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vertical_arrow_at_edge(down, cx) {
+            cx.propagate();
+            return;
+        }
+        self.move_vertical(if down { 1 } else { -1 }, true, window, cx);
     }
 
     pub(super) fn page_up(&mut self, _: &MovePageUp, window: &mut Window, cx: &mut Context<Self>) {

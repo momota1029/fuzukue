@@ -438,15 +438,6 @@ fn in_code_fence(source: &str, offset: usize) -> bool {
     false
 }
 
-pub(super) fn visual_edge_target(row: usize, rows: usize, down: bool, end: usize) -> Option<usize> {
-    match (down, rows) {
-        (_, 0) => None,
-        (true, _) if row == rows - 1 => Some(end),
-        (false, _) if row == 0 => Some(0),
-        _ => None,
-    }
-}
-
 use fuzukue_proto::{slash::{Spec, COMMANDS}, AgentBackend};
 
 #[derive(Default)]
@@ -814,19 +805,6 @@ mod tests {
             continue_line(&source, source.len()..source.len()),
             Some((source.len()..source.len(), "\n- ".to_owned())),
         );
-    }
-
-    #[test]
-    fn arrows_use_the_first_and_last_visual_rows() {
-        assert_eq!(visual_edge_target(0, 0, false, 0), None);
-        assert_eq!(visual_edge_target(0, 1, false, 12), Some(0));
-        assert_eq!(visual_edge_target(0, 1, true, 12), Some(12));
-        // One logical line can span three visual rows.
-        assert_eq!(visual_edge_target(0, 3, true, 12), None);
-        assert_eq!(visual_edge_target(1, 3, false, 12), None);
-        assert_eq!(visual_edge_target(1, 3, true, 12), None);
-        assert_eq!(visual_edge_target(2, 3, true, 12), Some(12));
-        assert_eq!(visual_edge_target(0, 3, false, 12), Some(0));
     }
 
     fn ranges(text: &str, line: Option<usize>, style: Style) -> Vec<Range<usize>> {

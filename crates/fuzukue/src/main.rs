@@ -527,6 +527,10 @@ impl Workbench {
                 this.approval_shortcut_key(&event.keystroke, window, cx)
             }).unwrap_or(false) {
                 cx.stop_propagation();
+            } else if view.update(cx, |this, cx| {
+                this.workbench_navigation_shortcut(event, window, cx)
+            }).unwrap_or(false) {
+                cx.stop_propagation();
             } else if matches!(event.keystroke.key.as_str(), "home" | "end" | "pageup" | "pagedown")
                 && view.update(cx, |this, cx| {
                     this.thread_navigation_key(event, window, cx)

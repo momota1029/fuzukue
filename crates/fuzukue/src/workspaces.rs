@@ -140,6 +140,15 @@ impl Workbench {
         self.workspaces.error = Some(message.into());
     }
 
+    pub(super) fn switch_workspace_slot(&mut self, index: usize, cx: &mut Context<Self>) {
+        // The server lists workspaces by recency, which changes after every switch.
+        let mut entries: Vec<_> = self.workspaces.entries.iter().collect();
+        entries.sort_unstable_by(|a, b| (&a.title, &a.id).cmp(&(&b.title, &b.id)));
+        if let Some(entry) = entries.get(index) {
+            self.switch_workspace(entry.id.clone(), cx);
+        }
+    }
+
     pub(super) fn switch_workspace(&mut self, id: String, cx: &mut Context<Self>) {
         if self.workspaces.active.as_ref() != Some(&id) && !self.workspaces.pending {
             self.request_workspace(ClientMsg::SwitchWorkspace { id }, cx);
