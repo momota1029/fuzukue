@@ -247,8 +247,9 @@ async fn a_deletion_under_another_jobs_declaration_stays_listed() -> Result<()> 
 }
 
 #[tokio::test]
-async fn only_untracked_ignored_files_under_target_are_counted() -> Result<()> {
-    let writes = "rm target/old\necho new > target/tracked\necho a > target/other/a\necho b > target/other/b\necho c > notes.txt\n";
+async fn target_changes_with_an_unconfirmed_writer_stay_listed() -> Result<()> {
+    let writes = "rm target/old\necho new > target/tracked\necho c > notes.txt\n\
+        for n in 01 02 03 04 05 06 07 08 09 10 11 12 13; do echo file > target/other/$n; done\n";
     let fixture = Fixture::new(&format!("{writes}{PROSE}{RESULT}"))?;
     for (path, text) in [(".gitignore", "target/\n"), ("target/tracked", "old\n"), ("target/old", "old\n"),
         ("target/other/.keep", "")] {
@@ -266,9 +267,10 @@ async fn only_untracked_ignored_files_under_target_are_counted() -> Result<()> {
         assert!(changed.contains(path), "{report}");
         assert!(report.contains(&format!("- \"{path}\" — ")), "{report}");
     }
-    let summary = "target/other/: 2 untracked ignored files (writer unconfirmed)";
-    assert!(changed.contains(summary), "{report}");
-    assert!(report.contains(&format!("- {summary}")), "{report}");
-    assert!(!report.contains("target/other/a") && !report.contains("target/other/b"), "{report}");
+    for n in 1..=13 {
+        let path = format!("target/other/{n:02}");
+        assert!(changed.contains(&format!("{path} (writer unconfirmed)")), "{report}");
+        assert!(report.contains(&format!("- \"{path}\" — ")), "{report}");
+    }
     Ok(())
 }

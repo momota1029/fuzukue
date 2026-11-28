@@ -113,7 +113,7 @@ async fn read(app: &Workspace, path: &str) -> Result<Cached> {
     };
     if saved
         .as_ref()
-        .is_some_and(|saved| saved.poll_after > Utc::now().timestamp_millis())
+        .is_some_and(|saved| saved.poll_interval > 0 && saved.poll_after > Utc::now().timestamp_millis())
     {
         return Ok(saved.unwrap());
     }

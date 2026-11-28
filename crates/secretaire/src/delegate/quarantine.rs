@@ -14,7 +14,6 @@ use crate::mcp::{workspace_read, workspace_write};
 
 const MAX_FILE: u64 = 32 * 1024 * 1024;
 const MAX_JOB: u64 = 128 * 1024 * 1024;
-const REPORT_LIMIT: usize = 12;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Fingerprint {
@@ -93,7 +92,7 @@ pub(super) struct Attribution {
 
 impl Attribution {
     /// Label every path. Only files in `present` under `target/` that git
-    /// ignores, and that this job is not known to have written, are summarized.
+    /// ignores, and that another job declared or wrote, are summarized.
     /// Deletions, tracked files and protected paths stay listed.
     pub(super) fn new<'a>(
         root: &Path,
@@ -103,15 +102,10 @@ impl Attribution {
     ) -> Self {
         let writers: BTreeMap<_, _> = paths.map(|path| (path.clone(), writer(path))).collect();
         let protected = protection();
-        // The outer repository calls a nested repository's tracked files ignored.
-        let nested = |path: &Path| {
-            path.ancestors().skip(1).filter(|dir| !dir.as_os_str().is_empty())
-                .any(|dir| root.join(dir).join(".git").symlink_metadata().is_ok())
-        };
         let candidates: Vec<_> = writers.iter()
             .filter(|(path, writer)| {
-                path.starts_with("target") && **writer != Writer::Own && present.contains_key(*path)
-                    && !protected(&root.join(path)) && !nested(path)
+                path.starts_with("target") && **writer == Writer::Other && present.contains_key(*path)
+                    && !protected(&root.join(path))
             })
             .map(|(path, _)| path.as_path())
             .collect();
@@ -313,10 +307,7 @@ impl Review {
             }
             .into(),
         );
-        let listed: Vec<_> = self.entries.iter()
-            .filter(|entry| !attribution.summarized(Path::new(&entry.path)))
-            .collect();
-        for entry in listed.iter().take(REPORT_LIMIT) {
+        for entry in self.entries.iter().filter(|entry| !attribution.summarized(Path::new(&entry.path))) {
             let action = match (&entry.action, japanese) {
                 (Action::Copied { backup }, false) => format!("copied to quarantine ({backup})"),
                 (Action::Copied { backup }, true) => format!("隔離先にコピーした（{backup}）"),
@@ -342,26 +333,8 @@ impl Review {
                 format!("- {:?} — {action} ({writer})", entry.path)
             });
         }
-        let more = |remaining| {
-            if japanese {
-                format!("ほか {remaining} 件。")
-            } else {
-                format!("{remaining} more paths.")
-            }
-        };
-        if listed.len() > REPORT_LIMIT {
-            lines.push(more(listed.len() - REPORT_LIMIT));
-        }
         let summaries = attribution.summaries(self.entries.iter().map(|entry| Path::new(&entry.path)), japanese);
-        lines.extend(summaries.iter().take(REPORT_LIMIT).map(|summary| format!("- {summary}")));
-        if summaries.len() > REPORT_LIMIT {
-            let remaining = summaries.len() - REPORT_LIMIT;
-            lines.push(if japanese {
-                format!("ほか {remaining} ディレクトリー。")
-            } else {
-                format!("{remaining} more directories.")
-            });
-        }
+        lines.extend(summaries.iter().map(|summary| format!("- {summary}")));
         if let Some(manifest) = &self.manifest {
             lines.push(if japanese {
                 format!("隔離の記録とコピーの保存先は {manifest:?}。")
@@ -377,5 +350,43 @@ impl Review {
             });
         }
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    #[test]
+    fn nested_clone_summarizes_only_confirmed_other_present_ignored_paths() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(root).status()?.success());
+        fs::write(root.join(".gitignore"), "target/\n")?;
+        let nested = root.join("target/job/src");
+        fs::create_dir_all(&nested)?;
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&nested).status()?.success());
+        let mut paths: Vec<PathBuf> = ["other", "own", "unknown", "deleted"].into_iter()
+            .map(|name| PathBuf::from("target/job/src").join(name)).collect();
+        paths.extend(["target/tracked", "target/job/src/.env"].map(PathBuf::from));
+        for path in paths.iter().filter(|path| !path.ends_with("deleted")) {
+            fs::write(root.join(path), "content")?;
+        }
+        assert!(std::process::Command::new("git").args(["add", "-f", "target/tracked"])
+            .current_dir(root).status()?.success());
+        let present = paths.iter().filter_map(|path| fs::metadata(root.join(path)).ok()
+            .map(|metadata| (path.clone(), Fingerprint::from(&metadata)))).collect();
+        let attribution = Attribution::new(root, paths.iter(), &present, |path| {
+            if path.ends_with("own") { Writer::Own }
+            else if path.ends_with("unknown") { Writer::Unconfirmed }
+            else { Writer::Other }
+        });
+        assert!(attribution.summarized(&paths[0]));
+        for path in &paths[1..] { assert!(!attribution.summarized(path), "{path:?}"); }
+        assert_eq!(attribution.summaries(paths.iter().map(PathBuf::as_path), false),
+            ["target/job/: 1 untracked ignored files (declared or written by another job)"]);
+        let unavailable = Attribution::new(&root.join("missing"), paths.iter(), &present, |_| Writer::Other);
+        assert!(paths.iter().all(|path| !unavailable.summarized(path)));
+        Ok(())
     }
 }

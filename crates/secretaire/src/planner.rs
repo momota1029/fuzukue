@@ -901,6 +901,7 @@ fn wake_goal_for(app: &Arc<Workspace>, session: &str, starts_turn: bool) -> Resu
         state.decision = None;
     }
     monitor_goal(app, session, &thread);
+    delegate::restore_desk(app);
     Ok(true)
 }
 
@@ -1601,7 +1602,11 @@ pub(crate) fn after_job(app: &Arc<Workspace>, session: &str, report: JobReport<'
     };
     {
         let mut state = thread.state.lock().unwrap();
-        if !state.active_goal() || !state.report_updates.enqueue(report.into()) {
+        if !state.active_goal() {
+            return;
+        }
+        state.decision = None;
+        if !state.report_updates.enqueue(report.into()) {
             return;
         }
     }

@@ -180,6 +180,10 @@ impl DeskTurn {
         matches!(self, Self::Plan { .. })
     }
 
+    pub(crate) fn is_worker_report(&self) -> bool {
+        matches!(self, Self::Report { .. } | Self::HandoffReport { .. })
+    }
+
     pub(crate) fn is_approval_result(&self) -> bool {
         matches!(self, Self::WorkshopReport { approval_id: Some(_), .. })
     }
@@ -1396,7 +1400,7 @@ async fn launch_assignment(
                 let writer = |path: &Path| {
                     if path.to_str().is_some_and(|name| written.contains(name)) {
                         quarantine::Writer::Own
-                    } else if others.cover(&root.join(path)) {
+                    } else if !writes_to_check.declares(path) && others.cover(&root.join(path)) {
                         quarantine::Writer::Other
                     } else {
                         quarantine::Writer::Unconfirmed
@@ -1506,7 +1510,6 @@ async fn launch_assignment(
         invocation.routed(decision, attempts);
         invocation.finish(&app, &result, Default::default());
         if let Some(ticket) = ticket { ticket.finished(); }
-        planner::goal_event(&app, &session, worktree.is_none() || caller.is_some());
         app.hub.publish(ServerEvent::ToolResult {
             session: session.clone(), item: job.clone(), ok: result.is_ok(), output: serde_json::to_string(&report)?,
         });
@@ -1709,7 +1712,7 @@ fn enqueue_desk(app: &Arc<App>, session: &str, turn: DeskTurn) {
             if planner::is_paused(app, session) { return; }
         }
         DeskTurn::Question { .. } | DeskTurn::WorkerDigest(_) | DeskTurn::WatchEvent { .. }
-        | DeskTurn::HandoffReport { .. } | DeskTurn::WorkshopReport { .. } => {
+        | DeskTurn::WorkshopReport { .. } => {
             planner::goal_event(app, session, true);
         }
         _ => {}
@@ -1720,6 +1723,7 @@ fn enqueue_desk(app: &Arc<App>, session: &str, turn: DeskTurn) {
         let id = mail::session_key();
         let job = if let DeskTurn::Report { job, .. } = &turn { Some(job.clone()) } else { None };
         let plan_review = turn.is_plan_review();
+        let worker_report = turn.is_worker_report();
         let work = Work::Desk(turn);
         match app.drain.enqueue(&app.state_dir, session, id.clone(), work.clone()) {
             Ok(id) => {
@@ -1728,7 +1732,9 @@ fn enqueue_desk(app: &Arc<App>, session: &str, turn: DeskTurn) {
                         queue.relay.discard(&job);
                     }
                 }
-                if !plan_review || !app.planner_work_held() {
+                if (!plan_review || !app.planner_work_held())
+                    && (!worker_report || !planner::is_paused(app, session))
+                {
                     queue_desk(app, session, DeskTurn::Durable(id));
                 }
             }
@@ -1775,7 +1781,9 @@ pub(crate) fn restore_desk(app: &Arc<App>) {
         let now = crate::self_update::drain::delivery_now();
         for record in records {
             if record.ready(now)
-                && matches!(&record.work, Work::Desk(turn) if !turn.is_plan_review() || !app.planner_work_held())
+                && matches!(&record.work, Work::Desk(turn)
+                    if (!turn.is_plan_review() || !app.planner_work_held())
+                        && (!turn.is_worker_report() || !planner::is_paused(app, &record.session)))
             {
                 queue_desk(app, &record.session, DeskTurn::Durable(record.id));
             }
@@ -1902,9 +1910,15 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
                 // turns on this thread eligible for delivery in the meantime.
                 continue;
             }
-            if plan_review && planner::is_paused(&app, &session) {
-                app.drain.finish(&app.state_dir, &session, &id, None);
-                continue;
+            if planner::is_paused(&app, &session) {
+                if plan_review {
+                    app.drain.finish(&app.state_dir, &session, &id, None);
+                    continue;
+                }
+                if turn.is_worker_report() {
+                    // Leave the report in the journal until the goal resumes.
+                    continue;
+                }
             }
             if matches!(turn, DeskTurn::Plan { resumed: true }) {
                 match planner::resume_eligible(&app, &session) {
@@ -2638,22 +2652,18 @@ impl ChangedFiles {
             }
             list
         }
-        let listed: Vec<_> = self.paths.iter().filter(|path| !self.attribution.summarized(path)).collect();
-        let summaries = self.attribution.summaries(self.paths.iter().map(PathBuf::as_path), japanese);
-        let mut files = compact(&listed, japanese, |path| {
-            let writer = self.attribution.writer(path).label(japanese);
-            if japanese { format!("{}（{writer}）", path.display()) } else { format!("{} ({writer})", path.display()) }
-        });
-        if !summaries.is_empty() {
-            let summaries = compact(&summaries, japanese, String::clone);
-            files = if listed.is_empty() {
-                summaries
-            } else if japanese {
-                format!("{files}、{summaries}")
-            } else {
-                format!("{files}, {summaries}")
-            };
-        }
+        let mut files: Vec<_> = self.paths.iter()
+            .filter(|path| !self.attribution.summarized(path))
+            .map(|path| {
+                let writer = self.attribution.writer(path).label(japanese);
+                if japanese { format!("{}（{writer}）", path.display()) } else { format!("{} ({writer})", path.display()) }
+            }).collect();
+        files.extend(self.attribution.summaries(self.paths.iter().map(PathBuf::as_path), japanese));
+        let files = if files.is_empty() {
+            (if japanese { "なし" } else { "none" }).into()
+        } else {
+            files.join(if japanese { "、" } else { ", " })
+        };
         let cards = compact(&self.cards, japanese, String::clone);
         if japanese {
             format!("変更ファイル（作業中）: {files}\n変更カード: {cards}")

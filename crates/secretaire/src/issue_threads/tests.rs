@@ -471,11 +471,21 @@ async fn tracking_issue_updates_notify_even_with_an_allow_policy() -> Result<()>
     poll.poll_item(&app, &link).await?;
     assert_eq!(app.hub.read_threads(|store| store.github_pending(&session)).len(), 1);
 
+    // Model a backward wall-clock adjustment since the last request.
+    // With no server poll interval, the cached response still needs revalidation.
+    use sha2::{Digest, Sha256};
+    let cache = app.state_dir.join("github-rest")
+        .join(format!("{:x}.json", Sha256::digest(endpoint(&link))));
+    let mut cached: Value = load_json(&cache)?.context("missing cached issue")?;
+    cached["poll_after"] = json!(Utc::now().timestamp_millis() + 60_000);
+    save_json(&cache, &cached)?;
+
     let mut issue = opened_issue(12, "fixture", "Internal tracking", &[TRACKING_LABEL]);
     issue["activity"] = json!([queued, authored(2, "Do the work now.", "fixture")]);
     fixture.write(json!({"issues": [issue]}));
-    poll.poll_item(&app, &link).await?;
-    assert!(app.hub.read_threads(|store| store.github_pending(&session)).is_empty());
+    let item = poll.poll_item(&app, &link).await?;
+    let pending = app.hub.read_threads(|store| store.github_pending(&session));
+    assert!(pending.is_empty(), "labels: {:?}, pending: {pending:?}, requests: {}", item.labels, fixture.log());
     dispatch(&app).await?;
     let state = app.hub.read_threads(|store| store.github_state(&session)).unwrap();
     assert_eq!(state.unread, 2);

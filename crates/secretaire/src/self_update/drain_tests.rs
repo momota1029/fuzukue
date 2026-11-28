@@ -12,11 +12,7 @@ async fn until(test: impl Fn() -> bool) -> Result<()> {
     .context("fixture did not reach expected state")
 }
 
-fn install_desk_fixture(app: &crate::App, dir: &Path) -> Result<()> {
-    let program = dir.join("mock-claude");
-    fs::write(
-        &program,
-        r#"#!/bin/sh
+const DESK_FIXTURE: &str = r#"#!/bin/sh
 case "$1" in --help) echo 'Claude'; exit 0;; esac
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture"}'
 while IFS= read -r input; do
@@ -25,8 +21,11 @@ while IFS= read -r input; do
         printf '%s\n' '{"type":"result","is_error":false,"result":"saved result"}'
         ;; esac
 done
-"#,
-    )?;
+"#;
+
+fn install_desk_fixture(app: &crate::App, dir: &Path) -> Result<()> {
+    let program = dir.join("mock-claude");
+    fs::write(&program, DESK_FIXTURE)?;
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
     assert!(app.test_claude_program.set(program).is_ok());
     Ok(())
@@ -326,7 +325,6 @@ async fn planner_assignments_queue_during_drain_and_retry_after_startup_once() -
 async fn planner_work_held_during_build_and_test_replays_after_startup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (app, update, workspace) = load(dir.path())?;
-    drain::start(&workspace);
     let task = "Planner assignment submitted during build";
     let session = planner_thread(&workspace, task)?;
     let review = planner_thread(&workspace, "Review the saved goal")?;
@@ -356,6 +354,13 @@ async fn planner_work_held_during_build_and_test_replays_after_startup() -> Resu
     let manual = "Explicit request sent by the front desk";
     let manual_job = assign(&workspace, &user, manual, AgentCaller::FrontDesk).await?;
     assert_assignment_replayed(&workspace, &manual_job, manual).await?;
+    // The assignment journal is cleared while the desk is still receiving its
+    // report. Planned preflight needs the desk's startup and turn to finish.
+    let heading = harness_format!("Worker job finished ({manual_job}).", "作業役の仕事が終わった（ジョブ {manual_job}）。");
+    until(|| prompt_count(&workspace, &heading) == 1 && !workspace.hub.thread_active(&user)
+        && workspace.sessions.try_lock().is_ok_and(|sessions|
+            sessions.get(&user).is_some_and(|desk| desk.swap_activity() == Some((false, false, false)))))
+        .await.context("waiting for the manual assignment's desk turn to finish")?;
     assert!(!workspace.delegates.is_running(&session));
     assert_eq!(prompt_count(&workspace, task), 0);
     assert_eq!(prompt_count(&workspace, "Resume test goal"), 0);
@@ -1683,6 +1688,55 @@ async fn paused_goal_keeps_a_retry_waiting_until_it_resumes() -> Result<()> {
     assert!(crate::planner::wake_goal(&fixture.workspace, &fixture.session)?);
     until(|| prompt_count(&fixture.workspace, "fixture evidence") == 1).await?;
     fixture.assert_retried().await
+}
+
+#[tokio::test]
+async fn paused_goal_keeps_finished_job_reports_until_resume() -> Result<()> {
+    enum Finish { Complete, CancelRetry, DrainRetry }
+
+    for finish in [Finish::Complete, Finish::CancelRetry, Finish::DrainRetry] {
+        let mut fixture = RetryFixture::start().await?;
+        crate::planner::pause_goal(&fixture.workspace, &fixture.session)?;
+        let update = fixture.update.clone();
+        let mut wait = None;
+        match finish {
+            Finish::Complete => fixture.release()?,
+            Finish::CancelRetry | Finish::DrainRetry => {
+                fixture.fail_attempt()?;
+                until(|| fixture.status().is_ok_and(|status| status["wait"]["kind"] == "goal_paused"))
+                    .await.context("retry did not wait for the paused goal")?;
+                if matches!(finish, Finish::CancelRetry) {
+                    fixture.workspace.delegates.cancel_job(&fixture.job, "fixture cancel")?;
+                } else {
+                    wait = Some(begin(&update)?);
+                }
+            }
+        }
+        let (ok, report) = fixture.report().await?;
+        assert_eq!(ok, matches!(finish, Finish::Complete));
+        until(|| !fixture.workspace.delegates.is_running(&fixture.session)).await?;
+        let records = fixture.workspace.drain.records(&fixture.workspace.state_dir)?;
+        let held = records.iter().find(|record| matches!(&record.work,
+            drain::Work::Desk(delegate::DeskTurn::Report { job, .. }) if job == &fixture.job))
+            .context("completed report was not journaled")?;
+        assert!(!held.claimed);
+        assert!(crate::planner::is_paused(&fixture.workspace, &fixture.session));
+        let job = &fixture.job;
+        let heading = harness_format!("Worker job finished ({job}).", "作業役の仕事が終わった（ジョブ {job}）。");
+        assert_eq!(prompt_count(&fixture.workspace, &heading), 0);
+        drop(wait);
+
+        // The worker has exited. Restore the desk mock so it handles the report
+        // without waiting for a worker-attempt release file.
+        fs::write(fixture._dir.path().join("mock-claude"), DESK_FIXTURE)?;
+        let session = &fixture.session;
+        crate::handle_from_client(&fixture.workspace, ClientMsg::ResumeNow { session: session.clone() }, None).await?;
+        until(|| prompt_count(&fixture.workspace, &heading) == 1)
+            .await.with_context(|| format!("report not submitted after resume: {}", report.text))?;
+        until(|| fixture.workspace.drain.records(&fixture.workspace.state_dir).is_ok_and(|records|
+            records.iter().all(|record| record.id != held.id))).await.context("report was not acknowledged")?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

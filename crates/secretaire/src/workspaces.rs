@@ -605,7 +605,9 @@ impl App {
                             && (!planned || background || record.ready(now) && is_live(&record.session)
                                 && !deferred_review
                                 && (!record.work.is_planner()
-                                    || !planner_held && !crate::planner::is_paused(workspace, &record.session)))
+                                    || !planner_held && !crate::planner::is_paused(workspace, &record.session))
+                                && (!matches!(&record.work, Work::Desk(turn) if turn.is_worker_report())
+                                    || !crate::planner::is_paused(workspace, &record.session)))
                         {
                             update_thread_reason(workspace, &mut reason, &record.session).queued = true;
                         }
