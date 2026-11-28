@@ -1455,6 +1455,14 @@ async fn post_comment(
     ensure!(!body.trim().is_empty(), "Enter a GitHub reply");
     let body = format!("{}\n\n{MARKER}", body.trim());
     let _serial = if session.is_some() { Some(app.issue_threads.serial.lock().await) } else { None };
+    if let Some(session) = session {
+        // Check the original destination after waiting for the write lock.
+        ensure!(
+            app.hub.read_threads(|store| store.github_state(session))
+                .is_some_and(|state| state.links.contains(link)),
+            "Link this GitHub item to the thread first"
+        );
+    }
     let at = Utc::now().timestamp();
     let output = if let Some(parent) = parent {
         let path = format!(

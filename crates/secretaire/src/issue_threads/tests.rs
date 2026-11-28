@@ -1467,3 +1467,97 @@ async fn intake_moves_between_workspaces_without_a_second_route() -> Result<()> 
     assert!(!intake::designated(&primary, repo));
     Ok(())
 }
+
+#[tokio::test]
+async fn reassociation_while_comment_waits_cannot_redirect_write() -> Result<()> {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    let fixture = Fixture::new()?;
+    let (_registry, app) = fixture.workspace()?;
+    let session = app.hub.edit_threads(|store| store.create(None))?;
+    let original = link(&app, 12)?;
+    let replacement = link(&app, 13)?;
+    attach(&app, &session, original)?;
+    app.hub.edit_threads(|store| store.github_edit(&session, |state| {
+        state.policy = GitHubPolicy::Allow;
+    }))?;
+
+    let serial = app.issue_threads.serial.lock().await;
+    let args = json!({"number":12,"body":"verified destination","confirm":false});
+    let post = Tool::Comment.call(&app, &session, Actor::Claude, &args);
+    tokio::pin!(post);
+    // Poll until the write is blocked on the held lock, before the live check.
+    poll_fn(|cx| match post.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("comment did not wait for the write lock"),
+    }).await;
+    app.hub.edit_threads(|store| store.github_edit(&session, |state| {
+        state.links = vec![replacement];
+    }))?;
+    drop(serial);
+
+    assert!(post.await.unwrap_err().to_string().contains("Link this GitHub item"));
+    let writes: Vec<Value> = fixture.log().lines()
+        .map(serde_json::from_str).collect::<std::result::Result<_, _>>()?;
+    assert!(!writes.iter().any(|v| v[1] == "comment"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn approved_comment_requires_current_association_and_reaches_issue() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let (_registry, app) = fixture.workspace()?;
+    let session = app.hub.edit_threads(|store| store.create(None))?;
+    let body = "Verification: the Issue is associated with this conversation.";
+    let args = json!({"number":12,"body":body,"confirm":true});
+    assert!(Tool::Comment.call(&app, &session, Actor::Claude, &args).await
+        .unwrap_err().to_string().contains("Link this GitHub item"));
+    Tool::Link.call(&app, &session, Actor::Claude, &json!({"reference":"#12"})).await?;
+
+    let (_, mut live) = app.hub.subscribe(u64::MAX);
+    let post = tokio::spawn({
+        let app = app.clone();
+        let session = session.clone();
+        let args = args.clone();
+        async move { Tool::Comment.call(&app, &session, Actor::Claude, &args).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let ServerEvent::ApprovalRequested { request_id, .. } = live.recv().await?.event {
+                Tool::Unlink.call(&app, &session, Actor::Claude, &json!({"number":12})).await?;
+                app.delegates.resolve_approval(&request_id, "accept", false)?;
+                break Ok::<_, anyhow::Error>(());
+            }
+        }
+    }).await??;
+    assert!(post.await?.unwrap_err().to_string().contains("Link this GitHub item"));
+
+    Tool::Link.call(&app, &session, Actor::Claude, &json!({"reference":"#12"})).await?;
+    let post = tokio::spawn({
+        let app = app.clone();
+        let session = session.clone();
+        async move { Tool::Comment.call(&app, &session, Actor::Claude, &args).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let ServerEvent::ApprovalRequested { request_id, .. } = live.recv().await?.event {
+                app.delegates.resolve_approval(&request_id, "accept", false)?;
+                break Ok::<_, anyhow::Error>(());
+            }
+        }
+    }).await??;
+    post.await??;
+    let stored: Value = serde_json::from_str(&std::fs::read_to_string(
+        fixture.dir.path().join("project/github-activity-fixture.json")
+    )?)?;
+    assert_eq!(stored["issues"][0]["number"], 12);
+    assert_eq!(stored["issues"][0]["comments"], json!([{"body":format!("{body}\n\n{MARKER}")}]));
+    let writes: Vec<Value> = fixture.log().lines()
+        .map(serde_json::from_str).collect::<std::result::Result<_, _>>()?;
+    let comments: Vec<_> = writes.iter().filter(|v| v[1] == "comment").collect();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0][0], "issue");
+    assert_eq!(comments[0][2], "12");
+    Ok(())
+}

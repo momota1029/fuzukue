@@ -134,6 +134,11 @@ if activity_path.exists() and args[1] in ("comment", "edit"):
     if fixture.get("post_error"):
         print("posting failed", file=sys.stderr)
         sys.exit(1)
+    if args[1] == "comment":
+        row = next(row for row in issues if row["number"] == int(args[2]))
+        assert (args[0] == "pr") == ("pull_request" in row), args
+        row.setdefault("comments", []).append({"body": option("--body")})
+        activity_path.write_text(json.dumps(fixture))
     sys.exit()
 
 operation = args[1]
