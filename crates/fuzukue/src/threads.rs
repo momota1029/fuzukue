@@ -193,7 +193,7 @@ impl Workbench {
         if waiting {
             self.reveal_approval_dock();
         }
-        if sidebar_focused && self.thread_group_open(group) {
+        if sidebar_focused && (self.thread_needs_input(&id, cx) || self.thread_group_open(group)) {
             if let Some(focus) = self.sidebar.thread_focus.get(&id) {
                 focus.focus(window, cx);
             }
@@ -488,12 +488,27 @@ impl Workbench {
                 (drag.workspace == self.workspaces.active).then(|| drag.clone())
             });
         let is_dragged = |thread: &ThreadView| active_drag.as_ref().is_some_and(|drag| drag.id == thread.id);
+        let needs_input: std::collections::HashSet<_> = threads.iter()
+            .filter(|thread| self.thread_needs_input(&thread.id, cx))
+            .map(|thread| thread.id.clone())
+            .collect();
         let section = |section| threads.iter().copied()
+            .filter(|thread| !needs_input.contains(&thread.id))
             .filter(move |thread| ThreadSection::of(thread) == section);
         let pinned = section(ThreadSection::Pinned);
         let current = section(ThreadSection::Current);
         let archived = section(ThreadSection::Archived);
         let mut list = v_flex().gap_0p5();
+        if !needs_input.is_empty() {
+            list = list.child(sidebar_row()
+                .id("needs-response-header")
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(tr!("threads-needs-response")))
+                .children(threads.iter().copied()
+                    .filter(|thread| needs_input.contains(&thread.id))
+                    .map(|thread| self.render_thread(thread, is_dragged(thread), cx)));
+        }
         if pinned.clone().next().is_some() {
             let open = self.thread_group_open(ThreadSection::Pinned);
             list = list.child(section_header("pinned-threads-toggle", tr!("threads-pinned"), open, cx)

@@ -3,6 +3,7 @@ threads-archive-drop-zone = Drop here to archive
 threads-cancel = Cancel
 threads-confirm-attach = Attach to “{ $title }”?
 threads-detach = Detach { $deck }
+threads-needs-response = Needs response
 threads-no-decks-available = No decks available
 threads-open = Open { $deck }
 threads-pinned = Pinned

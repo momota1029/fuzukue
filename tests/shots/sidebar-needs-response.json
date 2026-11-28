@@ -1,0 +1,30 @@
+{
+  "steps": [
+    {"action": "size", "width": 1440, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "locale", "locale": "en"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "approval_queue"},
+    {"action": "screenshot", "name": "sidebar-needs-response-empty"},
+    {"action": "new_thread"},
+    {"action": "click", "id": "chat-input"},
+    {"action": "type", "text": "球面の集中について調べる"},
+    {"action": "key", "key": "Ctrl+Enter"},
+    {"action": "wait_event", "event": "turn_ended"},
+    {"action": "wait_idle"},
+    {"action": "new_thread"},
+    {"action": "select_thread", "title": "作業の途中経過を確認中"},
+    {"action": "open_thread_menu"},
+    {"action": "key", "key": "down"},
+    {"action": "key", "key": "down"},
+    {"action": "key", "key": "enter"},
+    {"action": "wait_thread_pinned", "title": "作業の途中経過を確認中"},
+    {"action": "new_thread"},
+    {"action": "seed_approval_dock"},
+    {"action": "assert_order", "above": "needs-response-header", "below": "pinned-threads-toggle"},
+    {"action": "assert_order", "above": "pinned-threads-toggle", "below": "recent-threads-toggle"},
+    {"action": "screenshot", "name": "sidebar-needs-response-present"},
+    {"action": "resolve_approval_dock"},
+    {"action": "screenshot", "name": "sidebar-needs-response-resolved"}
+  ]
+}

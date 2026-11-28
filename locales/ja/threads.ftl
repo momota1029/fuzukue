@@ -3,6 +3,7 @@ threads-archive-drop-zone = ここにドロップしてアーカイブ
 threads-cancel = キャンセル
 threads-confirm-attach = 「{ $title }」に付ける？
 threads-detach = { $deck } を外す
+threads-needs-response = 返事・承認待ち
 threads-no-decks-available = 付けられるデッキがありません
 threads-open = { $deck } を開く
 threads-pinned = ピン留め
