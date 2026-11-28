@@ -113,6 +113,8 @@ enum Step {
     SeedCommandApproval,
     SeedComposerContext,
     SeedGoalStatus { reason: String },
+    SeedCrowdedActivity,
+    AssertCrowdedActivity,
     AssertApprovalDockScrolled,
     ResolveApprovalDock,
     WaitResearchIssue { number: u64, state: fuzukue_proto::ResearchIssueState },
@@ -693,6 +695,38 @@ impl Runner {
                     }, cx);
                 })?;
             }
+            Step::AssertCrowdedActivity => {
+                self.update(cx, |_, window, _| {
+                    let command = window.shot_element_bounds("chat-tail-activity-command-0")
+                        .context("missing command row")?;
+                    let job = window.shot_element_bounds("chat-tail-activity-job-label-0")
+                        .context("missing job row")?;
+                    ensure!(command.size.height >= px(16.), "command row is clipped: {command:?}");
+                    ensure!(command.bottom() <= job.top(), "command overlaps the first job");
+                    Ok::<_, anyhow::Error>(())
+                })??;
+            }
+            Step::SeedCrowdedActivity => self.update(cx, |view, _, cx| {
+                let session = view.active.clone();
+                view.on_event(ServerEvent::TurnActivity { session: session.clone(), running: true }, cx);
+                view.on_event(ServerEvent::BackgroundCommands { threads: [(session.clone(), vec![
+                    fuzukue_proto::BackgroundCommand {
+                        id: "fixture-command".into(), summary: "cargo test -q -p secretaire".into(),
+                        started_at_ms: 1_000, state: fuzukue_proto::BackgroundCommandState::Running,
+                    },
+                ])].into() }, cx);
+                let jobs = (0..12).map(|index| serde_json::from_value(serde_json::json!({
+                    "id": format!("delegate:fixture-{index}"), "position": index, "status": "running",
+                    "job": {
+                        "title": format!("Worker job {index}"), "model": "gpt-6.2-sol",
+                        "started_at_ms": 1_000,
+                        "selection": {"backend": "codex", "model": "gpt-6.2-sol", "effort": "high"},
+                        "routing": {"tier": "heavy", "reason": "fixture"}
+                    },
+                    "tools": 0, "had_tool_error": false
+                })).unwrap()).collect();
+                view.update_thread_jobs(&session, 1, true, jobs, cx);
+            })?,
             Step::SeedComposerContext => self.update(cx, |view, _, cx| seed_composer_context(view, cx))?,
             Step::SeedGoalStatus { reason } => self.update(cx, |view, _, cx| {
                 let session = view.active.clone();

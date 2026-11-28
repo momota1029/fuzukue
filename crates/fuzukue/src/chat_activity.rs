@@ -507,19 +507,21 @@ impl Workbench {
             .pr_4()
             .children(turn.as_ref().map(|turn| {
                 h_flex()
+                    .flex_none()
                     .items_center()
                     .gap_1()
                     .child(activity_spinner(activity_id("turn-icon"), theme.ring))
                     .child(status_row(&turn_activity_detail(turn), theme.muted_foreground).truncate())
             }))
-            .children(waiting.map(|wait| status_row(&waiting_label(wait, now_ms), theme.muted_foreground).truncate()))
-            .children(goal.map(|goal| goal_activity_row(goal, activity_id("goal"), cx)))
+            .children(waiting.map(|wait| status_row(&waiting_label(wait, now_ms), theme.muted_foreground).flex_none().truncate()))
+            .children(goal.map(|goal| goal_activity_row(goal, activity_id("goal"), cx).flex_none()))
             .children(commands.iter().enumerate().map(|(index, command)| {
                 let label = command_title(command);
                 let state = command_state(command.state);
                 let elapsed = command_elapsed(command, now_ms);
                 let full = label.to_owned();
                 h_flex().id(activity_id(&format!("command-{index}")))
+                    .flex_none()
                     .min_w_0()
                     .overflow_hidden()
                     .role(Role::Group)

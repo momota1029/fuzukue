@@ -1,0 +1,14 @@
+{
+  "steps": [
+    {"action": "size", "width": 1000, "height": 700},
+    {"action": "theme", "theme": "dark"},
+    {"action": "connect"},
+    {"action": "wait_event", "event": "chat_capabilities"},
+    {"action": "new_thread", "deck": "papers/levy-families"},
+    {"action": "seed_crowded_activity"},
+    {"action": "click", "id": "chat-tail-activity-trigger"},
+    {"action": "wait_element", "id": "chat-tail-activity-job-label-0"},
+    {"action": "assert_crowded_activity"},
+    {"action": "screenshot", "name": "activity-crowded"}
+  ]
+}
