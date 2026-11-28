@@ -69,6 +69,8 @@ server-parallel-limit = Parallel limit reached ({ $running } of { $limit } runni
     [economy] economy
    *[full] full
     })
+server-usage-hold = Held because { $backend } usage is projected to run out before reset (resets { $reset }; starts sooner if the pace eases)
+server-usage-parallel = { $backend } usage is tight, so fewer jobs run at once ({ $running } of { $limit } running)
 server-parallel-start-delay = Waiting between job starts ({ $running } of { $limit } running; this thread's setting: { $setting ->
     [normal] normal
     [economy] economy

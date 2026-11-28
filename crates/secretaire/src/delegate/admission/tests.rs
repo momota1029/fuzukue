@@ -20,7 +20,41 @@ fn entry(id: &str, globs: Option<&[&str]>, phase: Phase) -> Entry {
         label: id.into(),
         writes: writes(globs),
         phase,
+        lane: None,
     }
+}
+
+#[test]
+fn a_tight_backend_lowers_its_own_parallelism_only() {
+    use fuzukue_proto::AgentBackend::{Claude, Codex};
+
+    let mut queue = Queue::default();
+    let mut active = entry("active", Some(&[]), Phase::Running);
+    active.lane = Some(Lane { backend: Codex, limit: None });
+    queue.jobs.push_back(active);
+    let mut next = entry("next", Some(&[]), Phase::Ready);
+    next.lane = Some(Lane { backend: Codex, limit: Some(1) });
+    assert!(matches!(
+        queue.can_run(&next, Config::default()),
+        Err(WaitReason::UsageParallel { running: 1, limit: 1, .. })
+    ));
+    next.lane = Some(Lane { backend: Claude, limit: Some(1) });
+    assert!(queue.can_run(&next, Config::default()).is_ok());
+}
+
+#[test]
+fn usage_settings_come_from_the_delegate_section() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    assert!(Config::load(root.path(), Default::default())?.usage.reroute);
+    std::fs::write(
+        root.path().join("fuzukue.toml"),
+        "[delegate]\nusage_reroute = false\nusage_pacing_from = 0.5\nusage_pacing_running = 2\n",
+    )?;
+    let usage = Config::load(root.path(), Default::default())?.usage;
+    assert_eq!((usage.reroute, usage.pacing, usage.pacing_from, usage.tight_running), (false, true, 0.5, 2));
+    std::fs::write(root.path().join("fuzukue.toml"), "[delegate]\nusage_pacing_from = 2.0\n")?;
+    assert!(Config::load(root.path(), Default::default()).is_err());
+    Ok(())
 }
 
 #[test]

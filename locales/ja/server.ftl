@@ -69,6 +69,8 @@ server-parallel-limit = 並行数の上限に達している（{ $running }/{ $l
     [economy] 節約
    *[full] 全力
     }）
+server-usage-hold = { $backend } の使用量がリセット前に尽きる見込みのため保留中（リセット: { $reset }。消費が緩めば先に開始する）
+server-usage-parallel = { $backend } の使用量に余裕がないため並行数を制限中（{ $running }/{ $limit } 件が実行中）
 server-parallel-start-delay = 次の作業の開始間隔を確保中（{ $running }/{ $limit } 件が実行中。このスレッドの設定: { $setting ->
     [normal] 標準
     [economy] 節約

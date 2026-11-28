@@ -1510,3 +1510,165 @@ async fn compaction_admitted_after_draining_reopens() -> Result<()> {
     }).await??;
     Ok(())
 }
+
+const RETRY_TASK: &str = "Planner assignment that reports a failed check";
+
+struct RetryFixture {
+    _dir: tempfile::TempDir,
+    /// Workspaces reach the update through the app.
+    _app: Arc<crate::App>,
+    update: Arc<Update>,
+    workspace: Arc<Workspace>,
+    session: String,
+    job: String,
+    events: tokio::sync::broadcast::Receiver<fuzukue_proto::Envelope>,
+}
+
+impl RetryFixture {
+    /// Starts a planner step whose attempts each wait for `release`.
+    async fn start() -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+        let (app, update, workspace) = load(dir.path())?;
+        // No update is preparing yet, so the first attempt can start.
+        update.status.send_modify(|status| status.active = false);
+        let program = dir.path().join("mock-claude");
+        let script = fs::read_to_string(&program)?.replace(
+            "printf '%s\\n' \"$input\" >> prompts",
+            "printf '%s\\n' \"$input\" >> prompts\n        while [ ! -f release ]; do sleep 0.02; done; rm -f release",
+        );
+        fs::write(program, script)?;
+        workspace.agent_settings.lock().unwrap().tiers.max_escalations = 1;
+        let session = planner_thread(&workspace, RETRY_TASK)?;
+        let (_, events) = workspace.hub.subscribe(u64::MAX);
+        let job = assign(&workspace, &session, RETRY_TASK, AgentCaller::Planner).await?;
+        until(|| prompt_count(&workspace, RETRY_TASK) == 1).await?;
+        Ok(Self { _dir: dir, _app: app, update, workspace, session, job, events })
+    }
+
+    fn release(&self) -> Result<()> {
+        fs::write(self.workspace.project_dir.join("release"), "")?;
+        Ok(())
+    }
+
+    fn fail_attempt(&self) -> Result<()> {
+        self.workspace.delegates.escalate(&self.session, &self.job,
+            crate::tiers::Retry::Rejected("fixture evidence".into()))?;
+        self.release()
+    }
+
+    fn status(&self) -> Result<serde_json::Value> {
+        self.workspace.delegates.job_status(&self.workspace, &self.job, delegate::JobView::Full)
+    }
+
+    /// Fails the first attempt while no worker slot is free for its retry.
+    async fn hold_retry(&self) -> Result<delegate::admission::Hold> {
+        let workspace = self.workspace.clone();
+        let slots = tokio::spawn(async move { delegate::hold_all_slots(&workspace).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.fail_attempt()?;
+        let slots = tokio::time::timeout(Duration::from_secs(12), slots).await??;
+        until(|| self.status().is_ok_and(|status| status["state"] == "waiting")).await?;
+        Ok(slots)
+    }
+
+    async fn report(&mut self) -> Result<(bool, fuzukue_proto::DelegateReport)> {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if let ServerEvent::ToolResult { item, ok, output, .. } = self.events.recv().await?.event {
+                    if item == self.job {
+                        return Ok((ok, serde_json::from_str(&output)?));
+                    }
+                }
+            }
+        }).await?
+    }
+
+    async fn assert_retried(mut self) -> Result<()> {
+        until(|| self.status().is_ok_and(|status| status["state"] == "running")).await?;
+        self.release()?;
+        let (ok, report) = self.report().await?;
+        assert!(ok, "{}", report.text);
+        assert_eq!(report.attempts.len(), 2);
+        assert!(report.attempts[0].escalation_reason.as_deref().is_some_and(|reason| reason.contains("fixture evidence")));
+        Ok(())
+    }
+}
+
+fn assert_no_retry(report: &fuzukue_proto::DelegateReport) {
+    assert_eq!(report.attempts.len(), 1);
+    assert!(report.attempts[0].escalation_reason.is_none());
+}
+
+#[tokio::test]
+async fn claimed_planner_retry_continues_while_an_update_holds_planner_work() -> Result<()> {
+    let fixture = RetryFixture::start().await?;
+    fixture.update.status.send_modify(|status| status.active = true);
+    fixture.update.step(Step::Test, State::Running);
+    assert!(fixture.workspace.planner_work_held());
+    fixture.fail_attempt()?;
+    until(|| prompt_count(&fixture.workspace, "fixture evidence") == 1).await?;
+    assert!(fixture.workspace.planner_work_held());
+    fixture.assert_retried().await
+}
+
+#[tokio::test]
+async fn paused_goal_keeps_a_retry_waiting_until_it_resumes() -> Result<()> {
+    let fixture = RetryFixture::start().await?;
+    crate::planner::pause_goal(&fixture.workspace, &fixture.session)?;
+    fixture.fail_attempt()?;
+    until(|| fixture.status().is_ok_and(|status| status["state"] == "waiting")).await?;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(prompt_count(&fixture.workspace, "fixture evidence"), 0);
+    assert_eq!(fixture.status()?["wait"]["kind"], "goal_paused");
+    assert_eq!(fixture.status()?["quiet"], false);
+    assert!(crate::planner::wake_goal(&fixture.workspace, &fixture.session)?);
+    until(|| prompt_count(&fixture.workspace, "fixture evidence") == 1).await?;
+    fixture.assert_retried().await
+}
+
+#[tokio::test]
+async fn delayed_retry_repeats_the_start_checks() -> Result<()> {
+    let mut fixture = RetryFixture::start().await?;
+    let slots = fixture.hold_retry().await?;
+    fixture.workspace.hub.edit_threads(|threads| threads.set_archived(&fixture.session, true))?;
+    drop(slots);
+    let (ok, report) = fixture.report().await?;
+    assert!(!ok);
+    assert!(report.text.contains("The retry did not start") && report.text.contains("thread is closed"), "{}", report.text);
+    assert_no_retry(&report);
+    assert_eq!(prompt_count(&fixture.workspace, "fixture evidence"), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn drain_during_a_retry_wait_leaves_an_interrupted_job_record() -> Result<()> {
+    let mut fixture = RetryFixture::start().await?;
+    let _slots = fixture.hold_retry().await?;
+    let update = fixture.update.clone();
+    let wait = begin(&update)?;
+    let (ok, report) = fixture.report().await?;
+    assert!(!ok);
+    assert_no_retry(&report);
+    until(|| !fixture.workspace.delegates.is_running(&fixture.session)).await?;
+    let records = fixture.workspace.drain.records(&fixture.workspace.state_dir)?;
+    assert!(records.iter().any(|record| record.id == fixture.job && record.review.is_some()));
+    let checkpoint = format!("drain-{}-{}-", wait.id, fixture.job);
+    assert!(records.iter().any(|record| record.id.starts_with(&checkpoint)
+        && matches!(&record.work, drain::Work::Checkpoint { result, .. } if result.starts_with("Review required"))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_a_waiting_retry_records_no_retry_or_review() -> Result<()> {
+    let mut fixture = RetryFixture::start().await?;
+    let _slots = fixture.hold_retry().await?;
+    assert!(fixture.workspace.delegates.interrupt_job(&fixture.session, &fixture.job));
+    let (ok, report) = fixture.report().await?;
+    assert!(!ok);
+    assert_no_retry(&report);
+    until(|| !fixture.workspace.delegates.is_running(&fixture.session)).await?;
+    let records = fixture.workspace.drain.records(&fixture.workspace.state_dir)?;
+    assert!(!records.iter().any(|record| record.id == fixture.job
+        || matches!(record.work, drain::Work::Checkpoint { .. })));
+    Ok(())
+}

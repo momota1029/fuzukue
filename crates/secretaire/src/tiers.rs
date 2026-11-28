@@ -1,9 +1,13 @@
 use fuzukue_proto::{
-    AgentOutcome, AgentSelection, AgentSettings, GoalPace, Tier, TierAttempt, TierDecision,
-    TierModel, TierRequest, UsageWindow,
+    AgentBackend, AgentOutcome, AgentSelection, AgentSettings, GoalPace, Tier, TierAttempt,
+    TierDecision, TierModel, TierRequest, UsageWindow,
 };
 
-use crate::{agent_usage::RunMetadata, Workspace};
+use crate::{
+    agent_usage::RunMetadata,
+    usage::pacing::{self, Candidates, Cause, Choice, Outcome},
+    Workspace,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) enum Retry {
@@ -41,6 +45,36 @@ pub(crate) struct Route {
     primary: AgentSelection,
     pinned: bool,
     configured_default: bool,
+    /// Someone is waiting for the result, so usage pacing does not hold it back.
+    pub urgent: bool,
+    /// High-risk work keeps its tier and waits instead.
+    pub sensitive: bool,
+}
+
+/// Where a queued job goes now, given current usage.
+pub(crate) struct Routed {
+    pub decision: TierDecision,
+    pub model: TierModel,
+    /// Why usage moved the job to another model or tier.
+    pub note: Option<String>,
+    /// Jobs allowed to run at once on the backend while its usage is tight.
+    pub limit: Option<usize>,
+    /// Set when no suitable model can start yet.
+    pub hold: Option<(AgentBackend, Option<i64>, Cause)>,
+}
+
+/// Whether an assignment must not be moved to a cheaper tier without being asked.
+pub(crate) fn sensitive(text: &str, request: TierRequest) -> bool {
+    let text = text.to_lowercase();
+    request.tier == Some(Tier::Heavy)
+        || request.min_tier > Some(Tier::Light)
+        || [
+            "security", "vulnerab", "architecture", "design judgement", "design review", "cross-cutting",
+            "lean proof", "formaliz", "proof", "セキュリティ", "脆弱", "設計判断", "設計の査読", "横断",
+            "証明", "形式化",
+        ]
+        .iter()
+        .any(|term| text.contains(term))
 }
 
 pub(crate) fn classify(
@@ -204,50 +238,144 @@ impl Route {
             primary,
             pinned,
             configured_default: role != crate::planner::ROLE && app.hub.read_threads(|store| store.worker_default_configured),
+            urgent: false,
+            sensitive: min > Tier::Light,
         }
     }
 
+    /// A worker model fixed on the thread stays when it also applies to a named agent,
+    /// which happens once a worker default replaces the agent definitions' models.
+    pub fn keep_thread_model(&mut self, app: &Workspace, session: &str, named: bool) {
+        self.pinned |= app.hub.read_threads(|store| {
+            store.worker_pinned(session) && (!named || store.worker_default_configured)
+        });
+    }
+
     pub fn initial(&self, app: &Workspace, pace: Option<GoalPace>) -> (TierDecision, TierModel) {
+        let routed = self.plan(app, pace);
+        (routed.decision, routed.model)
+    }
+
+    pub fn plan(&self, app: &Workspace, pace: Option<GoalPace>) -> Routed {
+        let usage = app.worker_admission().usage_pacing();
+        // Planning runs outside the job queue and keeps its own model.
+        let queued = self.role != crate::planner::ROLE;
+        // The threshold of a paced goal, matching its pause progress.
+        let threshold = pace.map(|pace| match pace {
+            GoalPace::Full => 1.0,
+            GoalPace::Normal => 0.90,
+            GoalPace::Economy => 0.80,
+        });
+        let condition = |backend: AgentBackend| app.usage.condition(backend.usage_key(), threshold, usage.pacing_from);
         let settings = app.agent_settings.lock().unwrap();
         let windows = app.usage.current();
         let mut decision = self.decision.clone();
-        let initial = self.model(
-            &settings,
-            &windows,
-            decision.tier,
-            pace,
-        );
-        let nearly_exhausted = windows.iter().any(|window| {
-            window.agent == initial.selection.backend.usage_key()
-                && (window.rejected || window.used >= 0.90)
-        });
-        if pace == Some(GoalPace::Economy) || nearly_exhausted {
+        let mut model = self.model(&settings, &windows, decision.tier, pace);
+        // Planning, and queued work with rerouting off, choose a tier from usage alone.
+        let rerouted = queued && usage.reroute;
+        let nearly_exhausted = (usage.pacing || !queued) && !(rerouted && self.sensitive)
+            && windows.iter().any(|window| {
+                window.agent == model.selection.backend.usage_key()
+                    && (window.rejected || window.used >= 0.90)
+            })
+            // A paused backend looks for room at the same tier first.
+            && !(rerouted && matches!(condition(model.selection.backend), pacing::Condition::Paused { .. }));
+        let economy = pace == Some(GoalPace::Economy) && !(rerouted && self.sensitive);
+        let mut lowered = false;
+        if economy || nearly_exhausted {
             let lower = decision.tier.lower().max(self.min);
             if lower < decision.tier {
+                lowered = true;
                 decision.tier = lower;
                 decision.reason.push_str(harness_text!(
                     "; reduced for pacing or usage",
                     "。ペースまたは使用枠に合わせて一段下げた"
                 ));
-                let model = self.model(&settings, &windows, lower, pace);
-                return (decision, model);
+                model = self.model(&settings, &windows, lower, pace);
             }
         }
-        (decision, initial)
+        let mut routed = Routed { decision, model, note: None, limit: None, hold: None };
+        if !queued {
+            return routed;
+        }
+        // An ordered list may already have skipped a nearly full backend.
+        let preferred = self.model(&settings, &[], routed.decision.tier, pace).selection;
+        if preferred != routed.model.selection {
+            routed.note = Some(switch_note(&preferred, &routed.model.selection, None, None));
+        }
+        let tier = routed.decision.tier;
+        let current = routed.model.selection.clone();
+        let can_lower = !self.sensitive && !lowered && tier > self.min && tier > Tier::Light;
+        let candidates = Candidates {
+            same: self.alternatives(app, &settings, tier, &current),
+            lower: if can_lower {
+                let lower = tier.lower();
+                self.alternatives(app, &settings, lower, &current).into_iter()
+                    .map(|model| Choice { tier: lower, model }).collect()
+            } else {
+                Vec::new()
+            },
+            current: Choice { tier, model: routed.model.clone() },
+            pinned: self.pinned,
+            urgent: self.urgent || pace == Some(GoalPace::Full),
+        };
+        let rules = pacing::Settings { pacing: usage.pacing && pace != Some(GoalPace::Full), ..usage };
+        match pacing::decide(candidates, rules, condition) {
+            Outcome::Start { choice, changed, limit } => {
+                routed.limit = limit;
+                if let Some(cause) = changed {
+                    let lowered = (choice.tier != tier).then_some(choice.tier);
+                    let note = switch_note(&current, &choice.model.selection, Some(cause), lowered);
+                    routed.decision.tier = choice.tier;
+                    routed.model = choice.model;
+                    routed.note = Some(note);
+                }
+            }
+            Outcome::Wait { backend, resume_at, cause } => routed.hold = Some((backend, resume_at, cause)),
+        }
+        if let Some(note) = &routed.note {
+            routed.decision.reason.push_str(harness_text!("; ", "。"));
+            routed.decision.reason.push_str(note);
+        }
+        routed
     }
 
-    pub fn retry(&self, app: &Workspace, tier: Tier, retries: usize) -> Option<(Tier, TierModel)> {
-        let settings = app.agent_settings.lock().unwrap();
-        let next = next_tier(tier, retries, settings.tiers.max_escalations)?;
-        Some((
-            next,
-            self.model(
-                &settings,
-                &app.usage.current(),
-                next,
-                None,
-            ),
-        ))
+    /// Configured models for a tier, then the built-in ones when no ordered list is set.
+    fn alternatives(
+        &self, app: &Workspace, settings: &AgentSettings, tier: Tier, current: &AgentSelection,
+    ) -> Vec<TierModel> {
+        let listed = settings.tiers.models.get(&tier).filter(|models| !models.is_empty());
+        let plain = |selection: &AgentSelection| TierModel {
+            selection: selection.clone(),
+            cost_weight: listed.into_iter().flatten()
+                .find(|model| model.selection == *selection).and_then(|model| model.cost_weight),
+        };
+        let preferred = settings.tier_models.get(&tier).map(&plain);
+        // A role's fallback model is its light-tier choice. Heavier work reaches it only
+        // by lowering its tier, and high-risk work never takes it.
+        let role = settings.fallbacks.get(&self.role)
+            .filter(|_| tier == Tier::Light && !self.sensitive).map(&plain);
+        let defaults = listed.is_none().then(|| pacing::default_fallbacks(tier)).into_iter().flatten()
+            .filter(|model| app.usage.known(model.selection.backend.usage_key()));
+        preferred.into_iter()
+            .chain(listed.into_iter().flatten().cloned())
+            .chain(role)
+            .chain(defaults)
+            .filter(|model| {
+                model.selection.backend != current.backend || model.selection.model != current.model
+            })
+            .collect()
+    }
+
+    /// The route of the next attempt one tier up. It queues again, so the usage gate
+    /// and the model choice apply to it, and pacing never lowers it back.
+    pub fn retry(&self, app: &Workspace, tier: Tier, retries: usize, reason: &str) -> Option<Self> {
+        let limit = app.agent_settings.lock().unwrap().tiers.max_escalations;
+        let next = next_tier(tier, retries, limit)?;
+        let mut route = self.clone();
+        route.decision = TierDecision { tier: next, reason: reason.into() };
+        route.min = next;
+        Some(route)
     }
 
     fn model(
@@ -306,6 +434,32 @@ impl Route {
             cost_weight: None,
         }
     }
+}
+
+/// The line shown in job details and lists when usage changes a job's model.
+fn switch_note(from: &AgentSelection, to: &AgentSelection, cause: Option<Cause>, lowered: Option<Tier>) -> String {
+    let name = |selection: &AgentSelection| match &selection.model {
+        Some(model) => format!("{} {model}", selection.backend.label()),
+        None => selection.backend.label().into(),
+    };
+    let (backend, from, to) = (from.backend.label(), name(from), name(to));
+    let why = match cause {
+        Some(Cause::Paused) => harness_format!("{backend} usage is paused", "{backend} の使用量による一時停止"),
+        Some(Cause::Tight) => harness_format!(
+            "{backend} usage is projected to run out before reset",
+            "{backend} の使用量がリセット前に尽きる見込み"
+        ),
+        None => harness_format!("{backend} usage is near its limit", "{backend} の使用量が上限に近い"),
+    };
+    let mut note = harness_format!(
+        "switched from {from} to {to} because {why}",
+        "{why}ため、{from} から {to} に切り替えた"
+    );
+    if let Some(tier) = lowered {
+        let tier = tier.key();
+        note.push_str(&harness_format!(" (lowered to the {tier} tier)", "（段階を {tier} に下げた）"));
+    }
+    note
 }
 
 fn next_tier(tier: Tier, retries: usize, limit: u8) -> Option<Tier> {
@@ -411,6 +565,119 @@ mod tests {
             assert_eq!(decision.tier, expected, "{text}");
             assert!(!decision.reason.is_empty());
         }
+    }
+
+    #[test]
+    fn risk_keeps_the_tier_and_an_ordered_list_replaces_built_in_fallbacks() {
+        let request = TierRequest::default();
+        assert!(sensitive("Do a security review of the parser", request));
+        assert!(sensitive("承認の設計判断", request));
+        assert!(sensitive("Tidy", TierRequest { tier: None, min_tier: Some(Tier::Standard) }));
+        assert!(!sensitive("Run the tests and fix small failures", request));
+
+        let project = crate::test_support::TestDir::new();
+        let app = Workspace::new(project.path().into(), "127.0.0.1:0".into(),
+            project.path().join("state"), std::sync::Arc::new(crate::Hub::new()));
+        let reset = crate::usage::now() + 3600;
+        for (percent, expected) in [(20, "gpt-6.2-sol"), (96, "claude-sonnet-5-5")] {
+            app.usage.update_claude(&serde_json::json!({
+                "unifiedWindows": {"five_hour": {"utilization": 0.1, "resetsAt": reset}},
+            }));
+            app.usage.update_codex(&serde_json::json!({
+                "primary": {"usedPercent": percent, "windowDurationMins": 300, "resetsAt": reset},
+            }));
+            let route = Route::new(&app, "fixture", "worker",
+                AgentSelection::from_model(Some("gpt-6.2-sol".into()), None), false,
+                classify("Update the notes", None, request, 1));
+            let routed = route.plan(&app, None);
+            assert_eq!(routed.model.selection.model.as_deref(), Some(expected));
+            assert_eq!(routed.note.is_some(), percent == 96);
+            assert!(routed.hold.is_none());
+        }
+
+        // The configured list names only the paused backend, so the job waits.
+        app.agent_settings.lock().unwrap().tiers.models.insert(Tier::Standard, vec![TierModel {
+            selection: AgentSelection::from_model(Some("gpt-6.2-sol".into()), None),
+            cost_weight: None,
+        }]);
+        let mut route = Route::new(&app, "fixture", "worker",
+            AgentSelection::from_model(Some("gpt-6.2-sol".into()), None), false,
+            classify("Security review", Some(Tier::Standard), request, 1));
+        route.sensitive = true;
+        assert!(matches!(route.plan(&app, None).hold, Some((AgentBackend::Codex, Some(_), Cause::Paused))));
+    }
+
+    #[test]
+    fn a_thread_model_applied_to_a_named_agent_is_never_replaced() -> anyhow::Result<()> {
+        let project = crate::test_support::TestDir::new();
+        let app = Workspace::new(project.path().into(), "127.0.0.1:0".into(),
+            project.path().join("state"), std::sync::Arc::new(crate::Hub::new()));
+        app.hub.load_threads(project.path(), &app.state_dir);
+        let worker = fuzukue_proto::DelegateSettings { model: "gpt-6.2-sol".into(), effort: String::new() };
+        let session = app.hub.edit_threads(|store| {
+            store.worker_default_configured = true;
+            store.create_workshop_thread("fixture".into(), Vec::new(), worker)
+        })?;
+        let reset = crate::usage::now() + 3600;
+        app.usage.update_claude(&serde_json::json!({
+            "unifiedWindows": {"five_hour": {"utilization": 0.1, "resetsAt": reset}},
+        }));
+        app.usage.update_codex(&serde_json::json!({
+            "primary": {"usedPercent": 96, "windowDurationMins": 300, "resetsAt": reset},
+        }));
+        let mut route = Route::new(&app, &session, "reviewer",
+            AgentSelection::from_model(Some("gpt-6.2-sol".into()), None), false,
+            classify("Update the notes", None, TierRequest::default(), 1));
+        assert_eq!(route.plan(&app, None).model.selection.backend, AgentBackend::Claude);
+        route.keep_thread_model(&app, &session, true);
+        let routed = route.plan(&app, None);
+        assert_eq!(routed.model.selection.model.as_deref(), Some("gpt-6.2-sol"));
+        assert!(matches!(routed.hold, Some((AgentBackend::Codex, _, Cause::Paused))));
+        Ok(())
+    }
+
+    #[test]
+    fn a_role_fallback_serves_heavier_work_only_as_a_lower_tier() {
+        let project = crate::test_support::TestDir::new();
+        let selection = |model: &str| AgentSelection::from_model(Some(model.into()), None);
+        let workspace = |pacing: bool| {
+            let app = Workspace::new(project.path().into(), "127.0.0.1:0".into(),
+                project.path().join("state"), std::sync::Arc::new(crate::Hub::new()));
+            std::fs::write(project.path().join("fuzukue.toml"), format!("[delegate]\nusage_pacing = {pacing}\n")).unwrap();
+            app.delegates.set_test_admission(crate::delegate::admission::Scheduler::new(
+                crate::delegate::admission::Config::load(project.path(), Default::default()).unwrap()));
+            {
+                let mut settings = app.agent_settings.lock().unwrap();
+                // The ordered list leaves the role fallback as the only other model.
+                settings.tiers.models.insert(Tier::Standard,
+                    vec![TierModel { selection: selection("gpt-6.2-sol"), cost_weight: None }]);
+                settings.fallbacks.insert("worker".into(), selection("claude-haiku-5-5"));
+            }
+            app.usage.update_codex(&serde_json::json!({
+                "primary": {"usedPercent": 96, "windowDurationMins": 300, "resetsAt": crate::usage::now() + 3600},
+            }));
+            app
+        };
+        let route = |app: &Workspace, text: &str| {
+            let mut route = Route::new(app, "fixture", "worker", selection("gpt-6.2-sol"), false,
+                classify(text, Some(Tier::Standard), TierRequest::default(), 1));
+            route.sensitive |= sensitive(text, TierRequest::default());
+            route.plan(app, None)
+        };
+        let app = workspace(true);
+        let routed = route(&app, "Update the notes");
+        assert_eq!(routed.model.selection.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(routed.decision.tier, Tier::Light);
+        let lowered = harness_text!("lowered to the light tier", "段階を light に下げた");
+        assert!(routed.note.is_some_and(|note| note.contains(lowered)));
+
+        let risky = route(&app, "Check the security notes");
+        assert!(risky.hold.is_some());
+        assert_eq!(risky.model.selection.model.as_deref(), Some("gpt-6.2-sol"));
+
+        let unpaced = route(&workspace(false), "Update the notes");
+        assert!(unpaced.hold.is_some());
+        assert_eq!(unpaced.decision.tier, Tier::Standard);
     }
 
     #[test]

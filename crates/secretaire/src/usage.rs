@@ -11,6 +11,8 @@ use serde_json::Value;
 
 use crate::hub::Hub;
 
+pub(crate) mod pacing;
+
 pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -35,6 +37,8 @@ struct UsageEntry {
     window: UsageWindow,
     samples: VecDeque<(i64, f32)>,
     threshold_checks: Vec<ThresholdCheck>,
+    /// When the window was last projected to run out before its reset.
+    tight_at: Option<i64>,
 }
 
 struct ThresholdCheck {
@@ -48,6 +52,7 @@ impl UsageEntry {
         let same_reset = self.window.resets_at == window.resets_at;
         if !same_reset {
             self.threshold_checks.clear();
+            self.tight_at = None;
         }
         self.window = window;
         self.record_sample(at, same_reset, measured);
@@ -173,7 +178,7 @@ impl Usage {
         for (window, measured) in readings {
             windows.entry((window.agent.clone(), window.name.clone()))
                 .or_insert_with(|| UsageEntry {
-                    window: window.clone(), samples: VecDeque::new(), threshold_checks: Vec::new(),
+                    window: window.clone(), samples: VecDeque::new(), threshold_checks: Vec::new(), tight_at: None,
                 })
                 .record(window, at, measured);
         }

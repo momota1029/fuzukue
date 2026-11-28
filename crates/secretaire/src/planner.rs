@@ -22,7 +22,8 @@ use tokio::{
     time::Instant,
 };
 
-use crate::delegate::admission::WaitReason;
+use crate::delegate::admission::{Lane, WaitReason};
+use crate::usage::pacing::Cause;
 use crate::{delegate, front_desk::TurnKind, usage, Workspace};
 
 mod consult;
@@ -43,6 +44,7 @@ const PLANNER_BASE_SECONDS: usize = 120;
 const PLANNER_MAX_SECONDS: usize = 600;
 const PLANNER_SECONDS_PER_BLOCK: usize = 30;
 const PLANNER_CHARACTERS_PER_BLOCK: usize = 10_000;
+const USAGE_RECHECK: Duration = Duration::from_secs(60);
 
 #[derive(Serialize, Deserialize)]
 struct Front {
@@ -620,20 +622,26 @@ impl State {
             let primary = crate::agents::worker_default(app, self.next_default.clone(), worker);
             let classified = crate::tiers::classify(&next.task, None, next.routing, 1);
             let pinned = role == "worker" && app.hub.read_threads(|store| store.worker_pinned(session));
-            crate::tiers::Route::new(app, session, role, primary, pinned, classified)
-                .initial(app, Some(pace)).1.selection.backend
+            let mut route = crate::tiers::Route::new(app, session, role, primary, pinned, classified);
+            route.keep_thread_model(app, session, role != "worker");
+            route.sensitive |= crate::tiers::sensitive(&next.task, next.routing);
+            route.initial(app, Some(pace)).1.selection.backend
         });
-        let backends = self
-            .jobs
-            .values()
-            .filter(|job| !job.finished)
-            .map(|job| {
-                job.running
-                    .unwrap_or_else(|| job.route.initial(app, Some(pace)).1.selection.backend)
-            })
+        let active = || self.jobs.values().filter(|job| !job.finished);
+        let pending = active()
+            .filter(|job| job.running.is_none())
+            .map(|job| job.route.initial(app, Some(pace)).1.selection.backend)
             .chain(next_backend)
             .collect::<Vec<_>>();
-        Some(usage_progress(app, pace, &backends))
+        let backends = active().filter_map(|job| job.running).chain(pending.iter().copied()).collect::<Vec<_>>();
+        let progress = usage_progress(app, pace, &backends);
+        // With rerouting, new work can continue while a running job's backend is paused.
+        if matches!(progress, GoalProgress::Paused { .. }) && !pending.is_empty()
+            && app.worker_admission().usage_pacing().reroute
+        {
+            return Some(usage_progress(app, pace, &pending));
+        }
+        Some(progress)
     }
 
     fn event(&self, app: &Workspace, session: &str) -> Option<ServerEvent> {
@@ -1049,9 +1057,11 @@ impl Ticket {
         self.thread.changed.send_replace(());
     }
 
-    pub(crate) fn retrying(&self, backend: AgentBackend) {
+    /// Queues the job again on the route of its next attempt.
+    pub(crate) fn escalate(&self, route: crate::tiers::Route) {
         if let Some(job) = self.thread.state.lock().unwrap().jobs.get_mut(&self.id) {
-            job.running = Some(backend);
+            job.route = route;
+            job.running = None;
         }
         self.thread.changed.send_replace(());
     }
@@ -1073,29 +1083,35 @@ impl Ticket {
         &self,
         app: &Workspace,
         session: &str,
-        acquire: impl Fn() -> F,
+        acquire: impl Fn(Lane) -> F,
         waiting: impl Fn(WaitReason),
-    ) -> Result<(S, fuzukue_proto::TierDecision, fuzukue_proto::TierModel, bool)> {
+    ) -> Result<(S, crate::tiers::Routed, bool)> {
         let mut changed = self.thread.changed.subscribe();
         let mut usage = app.usage.subscribe();
         let mut codex_ready = false;
         loop {
-            let (backend, gate) = {
+            let (lane, gate) = {
                 let mut state = self.thread.state.lock().unwrap();
                 let progress = state.progress(app, session);
                 if state.active_goal() && progress != state.published && matches!(progress, Some(GoalProgress::Paused { .. })) {
                     publish(app, session, &mut state);
                 }
                 let route = &state.jobs.get(&self.id).context("待機中の仕事がなくなった")?.route;
-                let backend = route.initial(app, state.pace()).1.selection.backend;
-                (backend, Self::gate(app, &state, progress, backend))
+                let routed = route.plan(app, state.pace());
+                let lane = Lane { backend: routed.model.selection.backend, limit: routed.limit };
+                let gate = Self::gate(app, &state, progress, lane.backend)
+                    .or_else(|| routed.hold.map(Self::held));
+                (lane, gate)
             };
+            let backend = lane.backend;
+            // Usage estimates also change as they age, without a new reading.
             if let Some((reason, delay)) = gate {
                 waiting(reason);
                 tokio::select! {
                     _ = changed.changed() => {}
                     _ = usage.changed() => {}
                     _ = wait(delay) => {}
+                    _ = tokio::time::sleep(USAGE_RECHECK) => {}
                 }
                 continue;
             }
@@ -1111,14 +1127,15 @@ impl Ticket {
             let slot = tokio::select! {
                 _ = usage.changed() => continue,
                 _ = changed.changed() => continue,
-                slot = acquire() => slot,
+                _ = tokio::time::sleep(USAGE_RECHECK) => continue,
+                slot = acquire(lane) => slot,
             };
             let mut state = self.thread.state.lock().unwrap();
             let pace = state.pace();
             let route = &state.jobs.get(&self.id).context("待機中の仕事がなくなった")?.route;
-            let (decision, model) = route.initial(app, pace);
-            let backend = model.selection.backend;
-            if (backend == AgentBackend::Codex && !codex_ready)
+            let routed = route.plan(app, pace);
+            let backend = routed.model.selection.backend;
+            if backend != lane.backend || routed.limit != lane.limit || routed.hold.is_some()
                 || Self::gate(app, &state, state.progress(app, session), backend).is_some()
             {
                 continue;
@@ -1126,8 +1143,16 @@ impl Ticket {
             state.jobs.get_mut(&self.id).unwrap().running = Some(backend);
             state.last_activity = Some(Instant::now());
             self.thread.changed.send_replace(());
-            return Ok((slot, decision, model, pace.is_some()));
+            return Ok((slot, routed, pace.is_some()));
         }
+    }
+
+    fn held((backend, resume_at, cause): (AgentBackend, Option<i64>, Cause)) -> (WaitReason, Option<Duration>) {
+        let reason = match cause {
+            Cause::Paused => WaitReason::UsagePause { backend: Some(backend), resume_at },
+            Cause::Tight => WaitReason::UsageHold { backend, resume_at },
+        };
+        (reason, resume_at.map(delay_until))
     }
 
     fn gate(
@@ -1140,7 +1165,11 @@ impl Ticket {
             let (until, _) = app.usage.blocked(backend.usage_key())?;
             return Some((WaitReason::UsagePause { backend: Some(backend), resume_at: Some(until) }, Some(delay_until(until))));
         };
-        let progress = progress?;
+        let mut progress = progress?;
+        // A pause on another backend does not hold a job that was routed away from it.
+        if matches!(progress, GoalProgress::Paused { .. }) && app.worker_admission().usage_pacing().reroute {
+            progress = usage_progress(app, pace, &[backend]);
+        }
         if let GoalProgress::Paused { resume_at } = progress {
             return Some((WaitReason::UsagePause { backend: None, resume_at }, resume_at.map(delay_until)));
         }
@@ -1806,7 +1835,11 @@ async fn revise(
     let access = McpAccess::grant(&thread.mcp_key, &launch.key);
     let mut invocation = crate::agent_usage::Invocation::new(app, session, caller, ROLE, &job, &plan.goal, Some(selection.clone()));
     let (output, attempts) = run_revision_attempts(make_input(false), || make_input(true),
-        (decision.tier, model), |tier, tries| route.retry(app, tier, tries),
+        (decision.tier, model),
+        |tier, tries| route.retry(app, tier, tries, "").map(|next| {
+            let (decision, model) = next.initial(app, None);
+            (decision.tier, model)
+        }),
         |prompt, timeout, selection| {
             let launch = &launch;
             async move {
@@ -2084,6 +2117,10 @@ mod tests {
         Ticket::queue(app, session, id, route)
     }
 
+    fn mark_running(ticket: &Ticket) {
+        ticket.thread.state.lock().unwrap().jobs.get_mut(&ticket.id).unwrap().running = Some(AgentBackend::Claude);
+    }
+
     #[tokio::test]
     async fn plan_parallel_setting_preserves_history_and_releases_pending_job() -> Result<()> {
         let directory = crate::test_support::TestDir::new();
@@ -2105,11 +2142,11 @@ mod tests {
             .to_string().contains("replan"));
         let first = queue_test_job(&app, &session, "first")?;
         let second = queue_test_job(&app, &session, "second")?;
-        first.retrying(AgentBackend::Claude);
-        second.retrying(AgentBackend::Claude);
+        mark_running(&first);
+        mark_running(&second);
         let third = queue_test_job(&app, &session, "third")?;
         let wait_reason = std::cell::RefCell::new(None);
-        let admission = third.admit(&app, &session, || std::future::ready(()),
+        let admission = third.admit(&app, &session, |_| std::future::ready(()),
             |reason| { wait_reason.replace(Some(reason)); });
         tokio::pin!(admission);
         tokio::select! {
@@ -2140,6 +2177,144 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_paused_queued_job_moves_once_another_backend_reports_room() -> Result<()> {
+        let directory = crate::test_support::TestDir::new();
+        let app = Workspace::new(directory.path().into(), "127.0.0.1:7878".into(),
+            directory.path().join(".fuzukue"), Arc::new(crate::hub::Hub::new()));
+        app.delegates.set_test_admission(Scheduler::new(Config::default()));
+        app.hub.load_threads(directory.path(), &app.state_dir);
+        let session = app.hub.edit_threads(|store| store.create(None))?;
+        let reset = usage::now() + 4 * 3600;
+        app.usage.update_codex(&json!({"primary": {"usedPercent": 96, "windowDurationMins": 300, "resetsAt": reset}}));
+        let route = |pinned| crate::tiers::Route::new(
+            &app, &session, "worker", AgentSelection::from_model(Some("gpt-6.2-sol".into()), None), pinned,
+            crate::tiers::classify("Update the notes", None, Default::default(), 1),
+        );
+        let pinned = Ticket::queue(&app, &session, "pinned", route(true))?;
+        let routed = Ticket::queue(&app, &session, "routed", route(false))?;
+        let reasons = std::cell::RefCell::new(Vec::new());
+        let held = pinned.admit(&app, &session, |_| std::future::ready(()), |_| {});
+        let moved = routed.admit(&app, &session, |_| std::future::ready(()),
+            |reason| reasons.borrow_mut().push(reason));
+        tokio::pin!(held, moved);
+        tokio::select! {
+            biased;
+            _ = &mut held => panic!("a paused backend started a job"),
+            _ = &mut moved => panic!("a job started without another backend"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(matches!(reasons.borrow().first(), Some(WaitReason::UsagePause { .. })));
+
+        app.usage.update_claude(&json!({"unifiedWindows": {"five_hour": {"utilization": 0.2, "resetsAt": reset}}}));
+        let (_, chosen, _) = tokio::select! {
+            biased;
+            _ = &mut held => panic!("an explicit model was replaced"),
+            result = &mut moved => result?,
+            _ = std::future::ready(()) => panic!("the queued job was not re-evaluated"),
+        };
+        assert_eq!(chosen.model.selection.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(chosen.decision.tier, Tier::Standard);
+        assert!(chosen.note.is_some_and(|note| chosen.decision.reason.ends_with(&note)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_retry_passes_the_usage_gate_and_queues_on_its_new_backend() -> Result<()> {
+        let directory = crate::test_support::TestDir::new();
+        let app = Workspace::new(directory.path().into(), "127.0.0.1:7878".into(),
+            directory.path().join(".fuzukue"), Arc::new(crate::hub::Hub::new()));
+        let scheduler = Scheduler::new(Config::default());
+        app.delegates.set_test_admission(scheduler);
+        app.hub.load_threads(directory.path(), &app.state_dir);
+        let session = app.hub.edit_threads(|store| store.create(None))?;
+        let reset = usage::now() + 4 * 3600;
+        let codex = |percent: u8| app.usage.update_codex(
+            &json!({"primary": {"usedPercent": percent, "windowDurationMins": 300, "resetsAt": reset}}));
+        codex(20);
+        app.usage.update_claude(&json!({"unifiedWindows": {"five_hour": {"utilization": 0.2, "resetsAt": reset}}}));
+        let route = crate::tiers::Route::new(
+            &app, &session, "worker", AgentSelection::from_model(Some("gpt-6.2-sol".into()), None), false,
+            crate::tiers::classify("Update the notes", None, Default::default(), 1),
+        );
+        let ticket = Ticket::queue(&app, &session, "job", route.clone())?;
+        let lanes = std::cell::RefCell::new(Vec::new());
+        let acquire = |lane: Lane| {
+            lanes.borrow_mut().push((lane.backend, lane.limit));
+            std::future::ready(())
+        };
+        let escalated = route.retry(&app, Tier::Standard, 0, "Tests failed").context("one retry")?;
+
+        // The original backend pauses between the attempts.
+        codex(96);
+        ticket.escalate(escalated.clone());
+        let (_, routed, _) = ticket.admit(&app, &session, acquire, |_| {}).await?;
+        assert_eq!(routed.decision.tier, Tier::Heavy);
+        assert_eq!(routed.model.selection.backend, AgentBackend::Claude);
+        assert!(routed.note.is_some());
+        assert_eq!(*lanes.borrow(), [(AgentBackend::Claude, None)]);
+
+        // An ordered list without another backend holds the retry until usage recovers.
+        app.agent_settings.lock().unwrap().tiers.models.insert(Tier::Heavy, vec![fuzukue_proto::TierModel {
+            selection: AgentSelection::from_model(Some("gpt-6.2-sol".into()), None), cost_weight: None,
+        }]);
+        ticket.escalate(escalated);
+        let reasons = std::cell::RefCell::new(Vec::new());
+        let held = ticket.admit(&app, &session, acquire, |reason| reasons.borrow_mut().push(reason));
+        tokio::pin!(held);
+        tokio::select! {
+            biased;
+            _ = &mut held => panic!("a retry started on a paused backend"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(matches!(reasons.borrow().first(), Some(WaitReason::UsagePause { .. })));
+        assert_eq!(lanes.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_rerouting_a_goal_pauses_as_a_whole() -> Result<()> {
+        let directory = crate::test_support::TestDir::new();
+        fs::write(directory.path().join("fuzukue.toml"), "[delegate]\nusage_reroute = false\n")?;
+        let app = Workspace::new(directory.path().into(), "127.0.0.1:7878".into(),
+            directory.path().join(".fuzukue"), Arc::new(crate::hub::Hub::new()));
+        app.delegates.set_test_admission(Scheduler::new(Config::load(directory.path(), Default::default())?));
+        app.hub.load_threads(directory.path(), &app.state_dir);
+        let session = app.hub.edit_threads(|store| store.create(None))?;
+        let (mut plan, _) = parse_plan(saved_plan())?;
+        plan.pace = Some(GoalPace::Normal);
+        plan.next.clear();
+        write(&app, &session, &plan, true)?;
+        let reset = usage::now() + 4 * 3600;
+        app.usage.update_codex(&json!({"primary": {"usedPercent": 96, "windowDurationMins": 300, "resetsAt": reset}}));
+        app.usage.update_claude(&json!({"unifiedWindows": {"five_hour": {"utilization": 0.2, "resetsAt": reset}}}));
+        let route = |model: &str, pinned| crate::tiers::Route::new(
+            &app, &session, "worker", AgentSelection::from_model(Some(model.into()), None), pinned,
+            crate::tiers::classify("Update the notes", None, Default::default(), 1),
+        );
+        let _paused = Ticket::queue(&app, &session, "paused", route("gpt-6.2-sol", true))?;
+        let open = Ticket::queue(&app, &session, "open", route("claude-sonnet-5-5", true))?;
+        let reasons = std::cell::RefCell::new(Vec::new());
+        let admission = open.admit(&app, &session, |_| std::future::ready(()),
+            |reason| reasons.borrow_mut().push(reason));
+        tokio::pin!(admission);
+        tokio::select! {
+            biased;
+            _ = &mut admission => panic!("a paused goal started a job"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(matches!(reasons.borrow().first(), Some(WaitReason::UsagePause { backend: None, .. })));
+
+        // An ordered list still skips a full backend, as it did before rerouting.
+        app.agent_settings.lock().unwrap().tiers.models.insert(Tier::Standard,
+            ["gpt-6.2-sol", "claude-sonnet-5-5"].map(|model| fuzukue_proto::TierModel {
+                selection: AgentSelection::from_model(Some(model.into()), None), cost_weight: None,
+            }).to_vec());
+        let listed = route("gpt-6.2-sol", false).initial(&app, Some(GoalPace::Normal)).1;
+        assert_eq!(listed.selection.backend, AgentBackend::Claude);
+        Ok(())
+    }
+
     #[test]
     fn goal_parallel_limits_apply_server_settings_and_workspace_overrides() -> Result<()> {
         let directory = crate::test_support::TestDir::new();
@@ -2155,8 +2330,8 @@ mod tests {
         let first = queue_test_job(&app, &session, "first")?;
         let second = queue_test_job(&app, &session, "second")?;
         let third = queue_test_job(&app, &session, "third")?;
-        first.retrying(AgentBackend::Claude);
-        second.retrying(AgentBackend::Claude);
+        mark_running(&first);
+        mark_running(&second);
         let mut state = third.thread.state.lock().unwrap();
         let gate = |state: &State| Ticket::gate(&app, state, Some(GoalProgress::Ready), AgentBackend::Claude);
         assert!(gate(&state).is_none());

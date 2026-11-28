@@ -21,6 +21,10 @@ pub(crate) struct Overrides {
     goal_economy_running: Option<usize>,
     max_load_per_cpu: Option<f64>,
     min_available_memory_mib: Option<u64>,
+    usage_reroute: Option<bool>,
+    usage_pacing: Option<bool>,
+    usage_pacing_from: Option<f64>,
+    usage_pacing_running: Option<usize>,
     pub(crate) hold_planner_during_update: Option<bool>,
 }
 
@@ -49,6 +53,7 @@ pub(crate) struct Config {
     goal_economy_running: usize,
     max_load_per_cpu: f64,
     min_available_memory_mib: u64,
+    usage: crate::usage::pacing::Settings,
 }
 
 impl Default for Config {
@@ -60,6 +65,7 @@ impl Default for Config {
             goal_economy_running: GoalParallelLimits::default().economy,
             max_load_per_cpu: 1.5,
             min_available_memory_mib: 4096,
+            usage: Default::default(),
         }
     }
 }
@@ -76,6 +82,10 @@ impl Config {
         self.min_available_memory_mib = overrides
             .min_available_memory_mib
             .unwrap_or(self.min_available_memory_mib);
+        self.usage.reroute = overrides.usage_reroute.unwrap_or(self.usage.reroute);
+        self.usage.pacing = overrides.usage_pacing.unwrap_or(self.usage.pacing);
+        self.usage.pacing_from = overrides.usage_pacing_from.map_or(self.usage.pacing_from, |from| from as f32);
+        self.usage.tight_running = overrides.usage_pacing_running.unwrap_or(self.usage.tight_running);
     }
 
     pub(crate) fn load(project: &Path, server: Overrides) -> Result<Self> {
@@ -98,6 +108,11 @@ impl Config {
             config.min_available_memory_mib <= u64::MAX / 1024,
             "delegate.min_available_memory_mib is too large"
         );
+        ensure!(
+            (0.0..=1.0).contains(&config.usage.pacing_from),
+            "delegate.usage_pacing_from must be between 0 and 1"
+        );
+        ensure!(config.usage.tight_running > 0, "delegate.usage_pacing_running must be positive");
         Ok(config)
     }
 }
@@ -207,6 +222,31 @@ pub(crate) enum WaitReason {
     },
     SlotsHeld,
     QueueStorage,
+    /// A retry waits while the user has the goal paused.
+    GoalPaused,
+    /// Held because a window is projected to run out before it resets.
+    UsageHold {
+        backend: fuzukue_proto::AgentBackend,
+        resume_at: Option<i64>,
+    },
+    /// Fewer jobs run at once on a backend that is projected to run out.
+    UsageParallel {
+        backend: fuzukue_proto::AgentBackend,
+        running: usize,
+        limit: usize,
+    },
+}
+
+/// The backend a job is about to use, with its running limit while usage is tight.
+#[derive(Clone, Copy)]
+pub(crate) struct Lane {
+    pub backend: fuzukue_proto::AgentBackend,
+    pub limit: Option<usize>,
+}
+
+fn utc(time: Option<i64>) -> Option<String> {
+    time.and_then(|time| chrono::DateTime::from_timestamp(time, 0))
+        .map(|time| time.format("%Y-%m-%d %H:%M UTC").to_string())
 }
 
 impl WaitReason {
@@ -269,13 +309,31 @@ impl WaitReason {
                     .unwrap_or(harness_text!("goal", "目標"));
                 let message =
                     harness_format!("{label} usage pause", "{label} の使用量による一時停止");
-                match resume_at.and_then(|time| chrono::DateTime::from_timestamp(time, 0)) {
-                    Some(time) => {
-                        let reset = time.format("%Y-%m-%d %H:%M UTC");
-                        harness_format!("{message} (resumes {reset})", "{message}（再開 {reset}）")
-                    }
+                match utc(*resume_at) {
+                    Some(reset) => harness_format!("{message} (resumes {reset})", "{message}（再開 {reset}）"),
                     None => message,
                 }
+            }
+            Self::UsageHold { backend, resume_at } => {
+                let label = backend.label();
+                let message = harness_format!(
+                    "held: {label} usage is projected to run out before reset",
+                    "{label} の使用量がリセット前に尽きる見込みのため保留"
+                );
+                match utc(*resume_at) {
+                    Some(reset) => harness_format!(
+                        "{message} (resets {reset}; starts sooner if the pace eases)",
+                        "{message}（リセット {reset}。消費が緩めば先に開始する）"
+                    ),
+                    None => message,
+                }
+            }
+            Self::UsageParallel { backend, running, limit } => {
+                let label = backend.label();
+                harness_format!(
+                    "{label} usage is tight ({running}/{limit} running)",
+                    "{label} の使用量に余裕がないため並行数を制限中（{running}/{limit} 件実行中）"
+                )
             }
             Self::BackendBusy { backend } => {
                 let label = backend.label();
@@ -299,6 +357,7 @@ impl WaitReason {
                 "作業枠の解放待ち"
             )
             .into(),
+            Self::GoalPaused => harness_text!("the goal is paused", "目標が一時停止中").into(),
             Self::QueueStorage => harness_text!(
                 "waiting to claim the saved assignment",
                 "保存済みの依頼を開始できるまで待機"
@@ -308,6 +367,28 @@ impl WaitReason {
     }
 
     pub(crate) fn localized(&self) -> Option<LocalizedMessage> {
+        match self {
+            Self::UsageHold { backend, resume_at } => {
+                return Some(LocalizedMessage::new(
+                    "server-usage-hold",
+                    [
+                        ("backend", backend.label().into()),
+                        ("reset", utc(*resume_at).unwrap_or_else(|| "—".into())),
+                    ],
+                ))
+            }
+            Self::UsageParallel { backend, running, limit } => {
+                return Some(LocalizedMessage::new(
+                    "server-usage-parallel",
+                    [
+                        ("backend", backend.label().into()),
+                        ("running", running.to_string()),
+                        ("limit", limit.to_string()),
+                    ],
+                ))
+            }
+            _ => {}
+        }
         let Self::PlannerPace { pace, running, limit, delay_ms } = self else {
             return None;
         };
@@ -385,6 +466,7 @@ struct Entry {
     label: String,
     writes: Arc<WriteSet>,
     phase: Phase,
+    lane: Option<Lane>,
 }
 
 #[derive(Default)]
@@ -404,6 +486,14 @@ impl Queue {
         let count = running().count();
         if self.held > 0 {
             return Err(WaitReason::SlotsHeld);
+        }
+        if let Some(Lane { backend, limit: Some(limit) }) = job.lane {
+            let running = running()
+                .filter(|entry| entry.lane.is_some_and(|lane| lane.backend == backend))
+                .count();
+            if running >= limit {
+                return Err(WaitReason::UsageParallel { backend, running, limit });
+            }
         }
         if count < config.max_parallel {
             return Ok(());
@@ -476,6 +566,10 @@ impl Scheduler {
         }
     }
 
+    pub(crate) fn usage_pacing(&self) -> crate::usage::pacing::Settings {
+        self.config.usage
+    }
+
     pub(super) fn rename(&self, job: &str, label: &str) {
         if let Some(entry) = self.queue.lock().unwrap().jobs.iter_mut().find(|entry| entry.id == job) {
             label.clone_into(&mut entry.label);
@@ -494,6 +588,7 @@ impl Scheduler {
             label,
             writes,
             phase: Phase::Queued,
+            lane: None,
         });
         Request {
             scheduler: self.clone(),
@@ -538,6 +633,13 @@ pub(crate) struct Request {
 }
 
 impl Request {
+    pub(crate) async fn acquire_on(&self, lane: Lane, waiting: impl FnMut(WaitReason)) -> Slot<'_> {
+        if let Some(entry) = self.scheduler.queue.lock().unwrap().jobs.iter_mut().find(|entry| entry.id == self.id) {
+            entry.lane = Some(lane);
+        }
+        self.acquire(waiting).await
+    }
+
     pub(crate) async fn acquire(&self, mut waiting: impl FnMut(WaitReason)) -> Slot<'_> {
         let mut changed = self.scheduler.changed.subscribe();
         let mut ready = Ready(self, true);

@@ -41,6 +41,8 @@ pub(crate) enum Filter {
 pub(super) enum State {
     Queued,
     Running,
+    /// Started, and waiting to begin a retry.
+    Waiting,
     Finished,
     Failed,
 }
@@ -50,7 +52,7 @@ impl State {
         match filter {
             Filter::Active => self.active(),
             Filter::Queued => self == Self::Queued,
-            Filter::Running => self == Self::Running,
+            Filter::Running => matches!(self, Self::Running | Self::Waiting),
             Filter::Finished => self == Self::Finished,
             Filter::Failed => self == Self::Failed,
             Filter::All => true,
@@ -58,13 +60,14 @@ impl State {
     }
 
     pub(super) fn active(self) -> bool {
-        matches!(self, Self::Queued | Self::Running)
+        matches!(self, Self::Queued | Self::Running | Self::Waiting)
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Waiting => "waiting",
             Self::Finished => "finished",
             Self::Failed => "failed",
         }
@@ -97,6 +100,8 @@ pub(super) struct Job {
     pub(super) queued_at: i64,
     pub(super) started_at: Option<i64>,
     pub(super) wait: Option<WaitReason>,
+    /// Why usage moved the job to another model or tier.
+    pub(super) routing_note: Option<String>,
     pub(super) cancel_reason: Option<String>,
     pub(super) final_report: Option<DelegateReport>,
     pub(super) start_error: Option<String>,
@@ -169,6 +174,8 @@ impl Job {
             } else {
                 State::Finished
             }
+        } else if self.started_at.is_some() && self.wait.is_some() {
+            State::Waiting
         } else if self.started_at.is_some() {
             State::Running
         } else {
@@ -306,6 +313,9 @@ impl Job {
         status["backend"] = json!(self.selection.backend);
         status["model"] = json!(self.selection.model);
         status["effort"] = json!(self.selection.effort);
+        if let Some(note) = &self.routing_note {
+            status["routing_note"] = json!(note);
+        }
         if let Some(isolation) = self.isolation {
             status["isolation"] = json!(isolation);
         }
@@ -586,11 +596,14 @@ impl Inventory {
                 .as_str()
                 .or_else(|| row["last_activity"].as_str())
                 .unwrap_or("—");
-            let note = if note.is_empty() {
+            let mut note = if note.is_empty() {
                 String::new()
             } else {
                 format!(" · {note}")
             };
+            if let Some(routing) = &job.routing_note {
+                note.push_str(&format!(" · {routing}"));
+            }
             table.push(format!(
                 "{} | {}{note} | {} | {activity} | {}",
                 job.short_id(),
@@ -647,6 +660,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             wait: None,
+            routing_note: None,
             cancel_reason: None,
             final_report: None,
             start_error: None,
