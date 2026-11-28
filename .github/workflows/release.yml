@@ -121,7 +121,7 @@ jobs:
   macos:
     needs: source
     permissions:
-      contents: read
+      contents: write
     uses: ./.github/workflows/macos-dogfood.yml
     with:
       tag: ${{ needs.source.outputs.tag }}
