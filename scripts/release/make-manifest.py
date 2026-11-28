@@ -39,8 +39,13 @@ def main():
     if not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+", args.repository):
         parser.error("expected a GitHub OWNER/REPO")
 
-    source = (root / "crates/fuzukue-proto/src/lib.rs").read_text(encoding="utf-8")
-    constants = dict(re.findall(r"^pub const (\w+): u32 = (\w+);$", source, re.M))
+    constants = {}
+    for source_path in sorted((root / "crates/fuzukue-proto/src").glob("*.rs")):
+        source = source_path.read_text(encoding="utf-8")
+        for name, value in re.findall(r"^pub const (\w+): u32 = (\w+);$", source, re.M):
+            if name in constants and constants[name] != value:
+                parser.error(f"conflicting protocol constant {name} in {source_path}")
+            constants[name] = value
 
     def protocol(name):
         seen = set()

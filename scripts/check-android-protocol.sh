@@ -25,12 +25,12 @@ protocol_version() {
             }
             exit 1
         }
-    ' "$1"
+    ' "$@"
 }
 
-server_file="$root/crates/fuzukue-proto/src/lib.rs"
+server_dir="$root/crates/fuzukue-proto/src"
 android_file="$root/android/app/src/main/java/dev/labgui/remote/Protocol.kt"
-server=$(protocol_version "$server_file") || { printf 'Cannot resolve PROTOCOL_VERSION in %s\n' "$server_file" >&2; exit 1; }
+server=$(protocol_version "$server_dir"/*.rs) || { printf 'Cannot resolve PROTOCOL_VERSION in %s/*.rs\n' "$server_dir" >&2; exit 1; }
 android=$(protocol_version "$android_file") || { printf 'Cannot resolve PROTOCOL_VERSION in %s\n' "$android_file" >&2; exit 1; }
 
 if [ "$android" -lt "$server" ]; then

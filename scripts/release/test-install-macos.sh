@@ -20,6 +20,7 @@ for binary in secretaire fuzukue; do
     done
 done
 python3 "$root/scripts/release/make-manifest.py" "$FUZUKUE_VERSION" example/fuzukue "$assets" --macos --include-intel
+python3 -c 'import json, pathlib, sys; manifest = json.loads(pathlib.Path(sys.argv[1]).read_text()); assert manifest["protocol"] == 76, manifest["protocol"]' "$assets/macos-release-manifest.json"
 (cd "$assets" && sha256sum --strict --check SHA256SUMS-macos)
 for platform in macos-aarch64 macos-x86_64; do
     output=$(sh "$server" --fixture "$assets" --fixture-platform "$platform" --dry-run --launchd "$project")
