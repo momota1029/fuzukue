@@ -635,7 +635,8 @@ async fn run_server() -> anyhow::Result<()> {
         .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
         .from_env_lossy()
         .add_directive(hub::PAYLOAD_CONVERSION_DIRECTIVE.parse()?)
-        .add_directive(remote::AUDIT_DIRECTIVE.parse()?);
+        .add_directive(remote::AUDIT_DIRECTIVE.parse()?)
+        .add_directive(threads::timing::DIRECTIVE.parse()?);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let log_filter = if std::env::var_os("RUST_LOG").is_none() {
         log_filter.add_directive("secretaire::server_memory=info".parse()?)

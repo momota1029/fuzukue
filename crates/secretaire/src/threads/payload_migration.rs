@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(tool.full_output(&blobs)?.as_deref(), Some(output.as_str()));
         assert_eq!(tool.full_input(&blobs)?, Some(serde_json::from_str(&input)?));
         assert!(candidate(&path)?.stage().is_err());
-        thread.save()?;
+        thread.save("test")?;
         let tool = thread.transcript.items[1].meta.tool.as_ref().unwrap();
         assert_eq!(tool.full_output(&blobs)?.as_deref(), Some(output.as_str()));
         Ok(())
@@ -573,7 +573,7 @@ mod tests {
         let tool = saved.tool_detail(&session, &item).unwrap();
         assert_eq!(tool.input()?, Some(expected_input.clone()));
         assert_eq!(tool.output()?.as_deref(), Some(output.as_str()));
-        saved.threads.get_mut(&session).unwrap().save()?;
+        saved.threads.get_mut(&session).unwrap().save("test")?;
         assert!(fs::read_to_string(&path)?.contains("fuzukue:tool-payload:v1:"));
         drop(saved);
 

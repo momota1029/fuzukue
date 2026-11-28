@@ -18,6 +18,7 @@ pub(crate) mod approval_store;
 
 use crate::state::{BACKLOG, BACKLOG_BYTES};
 use crate::threads::payloads::{self, Refs, Source};
+use crate::threads::timing as transcript_timing;
 use crate::tool_guard::{Guard, Limits, Refusal};
 const HANDOFF_LIMIT: usize = 3;
 const HANDOFF_WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -750,6 +751,7 @@ impl Hub {
         &self, session: &str, actor: Actor, completed: bool,
     ) -> (Option<(usize, String)>, Option<(crate::front_desk::Escalation, crate::front_desk::Request)>) {
         let mut inner = self.inner.lock().unwrap();
+        let _held = transcript_timing::LockHold::start("turn_end");
         let handoff = inner.partner_started.get_mut(session)
             .and_then(|turn| turn.handoff.take().zip(turn.request.take()))
             .filter(|_| completed);
@@ -767,6 +769,7 @@ impl Hub {
         let mut timing = crate::send_latency::Publish::start(&event);
         let result = {
             let mut inner = self.inner.lock().unwrap();
+            let _held = transcript_timing::LockHold::start("publish");
             let timing = timing.as_mut().map(|timing| (timing, Instant::now()));
             self.publish_locked_timed(&mut inner, event, completed_session, ApprovalWaiter::Backend, timing)
         };
@@ -1019,8 +1022,10 @@ impl Hub {
     pub(crate) fn flush_dirty_transcripts(&self, idle_only: bool) -> anyhow::Result<()> {
         let mut inner = self.inner.try_lock()
             .map_err(|_| anyhow::anyhow!("transcript store is busy"))?;
+        let _held = transcript_timing::LockHold::start("flush");
         let Inner { threads, running, compactions, payload_holds, .. } = &mut *inner;
-        threads.as_mut().map_or(Ok(()), |threads| threads.flush_dirty_transcripts(|id| {
+        let trigger = if idle_only { "idle_flush" } else { "shutdown_flush" };
+        threads.as_mut().map_or(Ok(()), |threads| threads.flush_dirty_transcripts(trigger, |id| {
             idle_only && (running.contains(id) || compactions.contains_key(id) || payload_holds.contains_key(id))
         }))
     }

@@ -24,6 +24,7 @@ use crate::{durable, state, workspace};
 pub(crate) mod payloads;
 pub(crate) mod payload_migration;
 mod save_files;
+pub(crate) mod timing;
 use payloads::{Blobs, Record, Refs, Source};
 use save_files::SaveFiles;
 
@@ -1238,7 +1239,7 @@ impl TranscriptSlot {
         self.accessed.set(Instant::now());
         self.loaded.get_or_init(|| {
             let source = self.source.as_ref().expect("unloaded transcript has a source");
-            match source.read() {
+            match source.read("access") {
                 Ok(value) => LoadedTranscript { value, weight: Cell::new(None), error: None },
                 Err(error) => {
                     tracing::warn!(path=?source.path, %error, "could not open transcript");
@@ -1315,13 +1316,16 @@ impl DerefMut for TranscriptSlot {
 }
 
 impl TranscriptSource {
-    fn read(&self) -> Result<Transcript> {
+    fn read(&self, reason: &'static str) -> Result<Transcript> {
+        let mut measure = timing::Load::start(reason);
         let file = Arc::new(File::open(&self.path)?);
         let mut input = BufReader::new(file.as_ref());
         let (_, offset) = read_front(&mut input)?;
         let mut transcript = Transcript::read_buffered(&mut input, &file, offset)?;
+        measure.markdown_read(file.metadata().map_or(0, |metadata| metadata.len()));
         let mut recovered = Transcript::default();
         self.timeline.visit_session(&self.session, |mut env, refs, record| {
+            measure.journal.add(record.len);
             if env.seq > self.after && !transcript.supersedes_journal_payload(&env.event, &record) {
                 // A journal tail may begin with an update to a checkpointed tool or job.
                 let existing = match &env.event {
@@ -1341,9 +1345,12 @@ impl TranscriptSource {
                 recovered.capture_sources(&env.event, refs, source, false);
             }
         });
+        measure.journal_replayed();
         transcript.merge(recovered);
+        measure.merged();
         if let Some(legacy) = &self.legacy {
             self.timeline.visit_session(legacy, |mut env, refs, record| {
+                measure.legacy.add(record.len);
                 if env.seq > self.after && !transcript.supersedes_journal_payload(&env.event, &record) {
                     let source = (refs.is_empty() && payloads::bound_replay(&mut env.event))
                         .then_some(Source::Journal(record));
@@ -1352,8 +1359,10 @@ impl TranscriptSource {
                 }
             });
         }
+        measure.legacy_replayed();
         transcript.rebuild_job_facts();
         transcript.hide_saved_blank_replies();
+        measure.succeeded(transcript.items.len());
         Ok(transcript)
     }
 }
@@ -1413,14 +1422,19 @@ impl Thread {
     }
 
     fn read(path: PathBuf) -> Result<Self> {
+        let mut measure = timing::Load::start("full_read");
         let file = Arc::new(File::open(&path)?);
         let mut input = BufReader::new(file.as_ref());
         let (front, offset) = read_front(&mut input)?;
+        let file_version = FileVersion::read(file.metadata()?)?;
+        let transcript = Transcript::read_buffered(&mut input, &file, offset)?;
+        measure.markdown_read(file_version.length);
+        measure.succeeded(transcript.items.len());
         Ok(Self {
             path,
-            file_version: RefCell::new(Some(FileVersion::read(file.metadata()?)?)),
+            file_version: RefCell::new(Some(file_version)),
             front,
-            transcript: TranscriptSlot::new(Transcript::read_buffered(&mut input, &file, offset)?),
+            transcript: TranscriptSlot::new(transcript),
             page_revision: 0,
             library_revision: 0,
             library_updated: 0,
@@ -1450,12 +1464,24 @@ impl Thread {
         })
     }
 
-    fn save(&mut self) -> Result<()> {
+    /// `trigger` is a fixed label for the measurement log.
+    fn save(&mut self, trigger: &'static str) -> Result<()> {
         self.transcript.mark_activity();
-        self.save_with(SaveFiles::open)
+        self.save_with(trigger, SaveFiles::open)
     }
 
-    fn save_with(&mut self, open: impl FnOnce(&Path) -> Result<SaveFiles>) -> Result<()> {
+    fn save_with(&mut self, trigger: &'static str, open: impl FnOnce(&Path) -> Result<SaveFiles>) -> Result<()> {
+        // A cold load has its own log line and stays out of the save duration.
+        self.transcript.get();
+        let mut measure = timing::Save::start(trigger);
+        let result = self.write_checkpoint(open, &mut measure);
+        measure.log(result.is_ok());
+        result
+    }
+
+    fn write_checkpoint(
+        &mut self, open: impl FnOnce(&Path) -> Result<SaveFiles>, measure: &mut timing::Save,
+    ) -> Result<()> {
         self.transcript.check().with_context(|| format!("Thread file {}", self.path.display()))?;
         let dir = self.path.parent().context("missing thread directory")?;
         let files = open(dir)?;
@@ -1488,13 +1514,17 @@ impl Thread {
                 }
             }
         }
+        measure.prepared();
         let file = files.replace(
             &self.path,
             |output| {
                 write!(output, "---\n{}---\n", serde_yaml::to_string(&self.front)?)?;
-                self.transcript.write_markdown(output)
+                self.transcript.write_markdown(output)?;
+                measure.written();
+                Ok(())
             },
             || {
+                measure.synced();
                 match File::open(&self.path) {
                     Ok(mut file) => {
                         let version = FileVersion::read(file.metadata()?)?;
@@ -1513,7 +1543,9 @@ impl Thread {
         )?;
         // Even when directory sync fails, the live path now names this file.
         // Keep the transcript dirty and let the next retry recognize our inode.
-        self.file_version.replace(Some(FileVersion::read(file.metadata()?)?));
+        let version = FileVersion::read(file.metadata()?)?;
+        measure.replaced(version.length);
+        self.file_version.replace(Some(version));
         files.sync_replacement(&self.path)?;
         self.transcript.dirty.set(false);
         self.transcript.volatile_payloads = false;
@@ -1584,7 +1616,7 @@ impl Thread {
         self.front.title = title;
         self.front.titled = true;
         self.front.title_auto = Some(automatic);
-        if let Err(error) = self.save() {
+        if let Err(error) = self.save("rename") {
             self.front = old;
             return Err(error);
         }
@@ -1884,7 +1916,7 @@ pub(crate) struct RecoveredMetadata {
 
 impl MetadataRecovery {
     pub(crate) fn read(self) -> Result<RecoveredMetadata> {
-        let transcript = self.source.read()?;
+        let transcript = self.source.read("metadata_recovery")?;
         let blobs = Blobs::new(self.source.path.parent().context("missing thread directory")?);
         let paths = transcript.items.iter().filter_map(|entry| entry.meta.tool.as_ref())
             .flat_map(|tool| tool.artifact_paths(&self.project, &blobs)).collect();
@@ -1964,7 +1996,7 @@ impl Store {
                         if !thread.front.attached.contains(&deck) {
                             thread.front.attached.push(deck);
                         }
-                        if let Err(e) = thread.save() {
+                        if let Err(e) = thread.save("startup_upgrade") {
                             tracing::warn!("could not upgrade {}: {e:#}", thread.path.display());
                         }
                     }
@@ -2077,13 +2109,15 @@ impl Store {
         }
     }
 
-    pub(crate) fn flush_dirty_transcripts(&mut self, busy: impl Fn(&str) -> bool) -> Result<()> {
+    pub(crate) fn flush_dirty_transcripts(
+        &mut self, trigger: &'static str, busy: impl Fn(&str) -> bool,
+    ) -> Result<()> {
         let mut errors = Vec::new();
         for thread in self.threads.values_mut().filter(|thread| {
             thread.transcript.dirty.get()
                 && (!busy(&thread.front.id) || thread.transcript.volatile_payloads)
         }) {
-            if let Err(error) = thread.save_with(SaveFiles::try_open) {
+            if let Err(error) = thread.save_with(trigger, SaveFiles::try_open) {
                 errors.push(format!("{}: {error:#}", thread.path.display()));
             }
         }
@@ -2655,7 +2689,7 @@ impl Store {
         let input = thread.transcript.delegate_input_mut(job).context("Job not found in this thread")?;
         let previous = input.clone();
         input["dismissed_from_panel"] = true.into();
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("delegate_dismiss") {
             *thread.transcript.delegate_input_mut(job).unwrap() = previous;
             return Err(error);
         }
@@ -2673,7 +2707,7 @@ impl Store {
             at_ms: now().timestamp_millis(), source: source.into(), previous_label, label, label_source,
         };
         record_delegate_name(input, &change);
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("delegate_rename") {
             *thread.transcript.delegate_input_mut(job).unwrap() = previous;
             return Err(error);
         }
@@ -2806,7 +2840,7 @@ impl Store {
         let thread = self.threads.get_mut(id).context("Thread not found")?;
         let note = thread.front.handoff.as_mut().context("Handoff not found")?;
         note.issues.insert(task, number);
-        thread.save()
+        thread.save("handoff_issue")
     }
 
     pub fn create_workshop_thread(
@@ -2829,7 +2863,7 @@ impl Store {
         let before = thread.front.github.clone();
         edit(&mut thread.front.github);
         if before != thread.front.github {
-            if let Err(error) = thread.save() {
+            if let Err(error) = thread.save("github_edit") {
                 thread.front.github = before;
                 return Err(error);
             }
@@ -2929,7 +2963,7 @@ impl Store {
         thread.front.github.class_policies = Some(fuzukue_proto::GitHubPolicies::uniform(fuzukue_proto::GitHubPolicy::Notify));
         thread.front.github_pending.clear();
         thread.front.github_responses.clear();
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("github_rollback_hold") {
             thread.front = before;
             return Err(error);
         }
@@ -2956,7 +2990,7 @@ impl Store {
             if !responses.contains(response) { responses.push(response.clone()); }
         }
         thread.front.github_responses = responses;
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("github_rollback_restore") {
             thread.front = before;
             return Err(error);
         }
@@ -2990,7 +3024,7 @@ impl Store {
             let before = thread.front.github_responses.len();
             if !batch.is_empty() { thread.front.github_responses.push(batch); }
             thread.front.github_responses.extend(intake.into_iter().map(|(_, ids)| ids));
-            if let Err(error) = thread.save() {
+            if let Err(error) = thread.save("github_request") {
                 thread.front.github_responses.truncate(before);
                 return Err(error);
             }
@@ -3008,7 +3042,7 @@ impl Store {
         let before = thread.front.github_pending.clone();
         let batch = manual.then(|| thread.front.github_responses.remove(0));
         thread.front.github_pending.retain(|id| !events.iter().any(|event| &event.id == id));
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("github_consume") {
             thread.front.github_pending = before;
             if let Some(batch) = batch {
                 thread.front.github_responses.insert(0, batch);
@@ -3034,7 +3068,7 @@ impl Store {
         ensure!((allow_archived || !thread.front.archived) && thread.path.is_file(), "Thread is archived or missing");
         let event = ServerEvent::TextDelta { session: id.into(), item: item.into(), actor: Actor::System, text };
         thread.transcript.observe(&event);
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("system_note") {
             thread.transcript.items.pop();
             thread.transcript.index.remove(item);
             return Err(error);
@@ -3074,7 +3108,7 @@ impl Store {
             },
             text: String::new(),
         });
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("github_deliver") {
             thread.transcript.items.pop();
             thread.transcript.index.remove(&item);
             thread.front.github.unread -= events.len();
@@ -3175,7 +3209,7 @@ impl Store {
         });
         thread.front.session_id = session_id;
         thread.front.migrated_from = migrated_from.map(str::to_owned);
-        thread.save()?;
+        thread.save("create")?;
         self.threads.insert(thread.front.id.clone(), thread);
         Ok(())
     }
@@ -3217,7 +3251,7 @@ impl Store {
         edit(&mut thread.front);
         if thread.front.attached != old.attached {
             thread.touch();
-            if let Err(e) = thread.save() {
+            if let Err(e) = thread.save("attachments") {
                 thread.front = old;
                 return Err(e);
             }
@@ -3286,7 +3320,7 @@ impl Store {
                 let old = thread.front.clone();
                 thread.front.attached.push(route.deck.clone());
                 thread.front.auto_attached.push(route);
-                if let Err(err) = thread.save() {
+                if let Err(err) = thread.save("routing") {
                     thread.front = old;
                     return Err(err);
                 }
@@ -3348,7 +3382,7 @@ impl Store {
         let thread = self.threads.get_mut(id).context("スレッドが見つからない")?;
         let previous = thread.front.partner_settings.clone();
         thread.front.partner_settings.get_or_insert_with(Default::default).permission_mode = mode;
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("partner_permission") {
             thread.front.partner_settings = previous;
             return Err(error);
         }
@@ -3358,7 +3392,7 @@ impl Store {
     pub fn set_partner_model_inherited(&mut self, id: &str) -> Result<()> {
         let thread = self.threads.get_mut(id).context("スレッドが見つからない")?;
         let previous = thread.front.partner_pinned.replace(false);
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("partner_model_inherited") {
             thread.front.partner_pinned = previous;
             return Err(error);
         }
@@ -3381,7 +3415,7 @@ impl Store {
         } else {
             thread.front.agent_overrides.remove(&name);
         }
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("agent_override") {
             thread.front.agent_overrides = previous;
             return Err(error);
         }
@@ -3399,7 +3433,7 @@ impl Store {
             thread.front.worker_settings = worker;
             thread.front.worker_pinned = true;
         }
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("roles") {
             thread.front = previous;
             return Err(error);
         }
@@ -3526,7 +3560,7 @@ impl Store {
         for entry in replies {
             entry.meta.superseded = true;
         }
-        if let Err(error) = thread.save() {
+        if let Err(error) = thread.save("reply_superseded") {
             for entry in &mut thread.transcript.items {
                 if items.contains(&entry.meta.item) {
                     entry.meta.superseded = false;
@@ -3544,7 +3578,7 @@ impl Store {
         let previous = thread.front.archived;
         if previous != archived {
             thread.front.archived = archived;
-            if let Err(error) = thread.save() {
+            if let Err(error) = thread.save("archive") {
                 thread.front.archived = previous;
                 return Err(error);
             }
@@ -3557,7 +3591,7 @@ impl Store {
         let previous = thread.front.pinned;
         if previous != pinned {
             thread.front.pinned = pinned;
-            if let Err(error) = thread.save() {
+            if let Err(error) = thread.save("pin") {
                 thread.front.pinned = previous;
                 return Err(error);
             }
@@ -3572,7 +3606,7 @@ impl Store {
             if thread.front.session_id.as_deref() != session_id || thread.front.session_start != start {
                 thread.front.session_id = session_id.map(str::to_owned);
                 thread.front.session_start = start;
-                if let Err(e) = thread.save() {
+                if let Err(e) = thread.save("session_id") {
                     tracing::warn!("could not save session ID for {id}: {e:#}");
                 }
                 return true;
@@ -3612,7 +3646,7 @@ impl Store {
                 }
                 if thread.finish_interrupted_applications() {
                     thread.page_revision = thread.page_revision.wrapping_add(1);
-                    thread.save()?;
+                    thread.save("metadata_recovery")?;
                 }
             }
         }
@@ -3626,7 +3660,7 @@ impl Store {
     pub fn record_artifacts(&mut self, id: &str, paths: Vec<String>) -> Result<()> {
         if let Some(thread) = self.threads.get_mut(id) {
             if thread.add_artifacts(paths) {
-                thread.save()?;
+                thread.save("artifacts")?;
             }
         }
         Ok(())
@@ -3749,12 +3783,13 @@ impl Store {
             ServerEvent::TextDelta { item, actor: Actor::System, .. }
                 if item.starts_with(crate::workshop::REPORT_ITEM) =>
             {
-                thread.save()?;
+                thread.save("workshop_report")?;
                 return Ok(false);
             }
             ServerEvent::LocalNotice { .. } | ServerEvent::CommentApplication { .. } => {
                 // A live planner failure also flushes its preceding worker diagnostic.
-                thread.save()?;
+                let notice = matches!(event, ServerEvent::LocalNotice { .. });
+                thread.save(if notice { "local_notice" } else { "comment_application" })?;
                 return Ok(false);
             }
             ServerEvent::ToolResult { item, .. } if item.starts_with(fuzukue_proto::DELEGATE_JOB) => {
@@ -3764,7 +3799,7 @@ impl Store {
                 let large = thread.file_version.borrow().as_ref()
                     .is_some_and(|version| version.length >= LARGE_CHECKPOINT);
                 if !journaled || !large {
-                    thread.save()?;
+                    thread.save("delegate_result")?;
                 }
                 return Ok(false);
             }
@@ -3772,7 +3807,7 @@ impl Store {
                 let paths = artifact_paths.unwrap_or_default().iter()
                     .filter_map(|path| crate::thread_artifacts::relative_path(&self.project, path)).collect();
                 if thread.add_artifacts(paths) {
-                    thread.save()?;
+                    thread.save("artifact_result")?;
                     return Ok(true);
                 }
                 return Ok(false);
@@ -3780,7 +3815,7 @@ impl Store {
             ServerEvent::TextDelta { item, actor: Actor::User, .. }
                 if item.starts_with(fuzukue_proto::slash::ECHO) =>
             {
-                thread.save()?;
+                thread.save("slash_echo")?;
                 return Ok(false);
             }
             ServerEvent::TextDelta {
@@ -3799,7 +3834,7 @@ impl Store {
                 }
             }
             ServerEvent::UserPrompt { to_worker: true, .. } => {
-                thread.save()?;
+                thread.save("worker_prompt")?;
                 return Ok(false);
             }
             ServerEvent::TurnEnded { actor, .. } => {
@@ -3837,7 +3872,8 @@ impl Store {
             _ => return Ok(false),
         }
         thread.touch();
-        thread.save()?;
+        let turn_end = matches!(event, ServerEvent::TurnEnded { .. });
+        thread.save(if turn_end { "turn_end" } else { "user_prompt" })?;
         Ok(true)
     }
 }
@@ -3951,7 +3987,7 @@ impl Store {
         paths.extend(args.cards.iter().map(|card| format!("{deck_path}/cards/{}.md", card.id)));
         thread.add_artifacts(paths);
         thread.touch();
-        if let Err(e) = thread.save() {
+        if let Err(e) = thread.save("research_deck") {
             thread.front = old;
             if let Err(rollback) = std::fs::rename(&destination, stage.path()) {
                 tracing::error!("could not roll back {deck_path}: {rollback}");
@@ -4328,7 +4364,7 @@ mod archive_tests {
             input: serde_json::json!({"title":"Before", "model":"gpt-5.5", "started_at_ms":20}),
         });
         thread.transcript.observe(&tool_call);
-        thread.save()?;
+        thread.save("test")?;
         assert_eq!(store.job_summaries(&session)[0].last_activity.as_deref(), Some("Read notes.md"));
         store.history_tail(&session, &BTreeSet::from([job.into()]), true, bound_history_tool).unwrap();
         drop(store);
@@ -4476,7 +4512,7 @@ mod archive_tests {
                     text: "Synthetic conversation content".repeat(4),
                 });
             }
-            thread.save()?;
+            thread.save("test")?;
             let workers = BTreeSet::new();
             let (expected, _, _) = store.history_tail(&id, &workers, true, bound_history_tool).unwrap();
             let checkpoint_bytes = store.checkpoint_path(&id).metadata()?.len();
@@ -4596,7 +4632,7 @@ mod archive_tests {
                 text: format!("Synthetic message {index}"),
             });
         }
-        thread.save()?;
+        thread.save("test")?;
         store.set_archived(&id, true)?;
         drop(store);
         let store = Store::load(project.path(), state.path(), &BTreeMap::new());
