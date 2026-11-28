@@ -33,3 +33,41 @@ kind = "dots"
 
 点検にモデルは使わない。Git は取得したオブジェクトと `refs/fuzukue/watch/` 配下の専用参照だけを更新する。作業ツリー、`origin/*`、`FETCH_HEAD` はそのまま。
 サーバーを[サービスとして常駐](service.md)させるとクライアントを閉じても点検が続く。サーバー再起動時は保存済みの状態から再開する。
+
+## 作業プロトコル v1
+
+受付と作業側の間で、専用の Git リポジトリを通じて依頼や報告を受け渡す。
+利用するワークスペースごとに、サーバーの状態ディレクトリへ `work-protocol-v1.json` を置く。
+設定が空またはファイルがない場合は点検を開始しない。設定の変更はサーバーを再起動して反映する。
+
+```json
+[
+  {
+    "name": "exchange",
+    "route": {
+      "communication": "team-repository",
+      "destination": "/absolute/path/to/communication.git",
+      "scope": "project",
+      "run": "run-1",
+      "private": true
+    },
+    "writer": "desk",
+    "thread": "thread-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }
+]
+```
+
+両側で `route` をそろえ、作業側には `"writer": "worker"` と作業側の記録先スレッドを指定する。
+既定の Git オブジェクト形式は SHA-1。通信リポジトリが SHA-256 の場合は両側の設定に `"object_format": "sha256"` を加える。
+`name` はワークスペース内の保存名として使う。接続先を変更するときは新しい `name` と `communication` を使う。
+`private` は通信先の公開範囲に合わせる。
+
+サーバーは既存の通知を再処理してから設定済みの経路を点検する。受信したイベントは指定スレッドのシステム記録になる。
+取得したオブジェクトと送受信の記録は、状態ディレクトリの `work-protocol-v1/<name>/` に保存する。
+記録の受け付けに失敗したイベントは保存したまま再試行する。
+
+受付の `watch` ツールで `protocol_routes` を呼ぶと、そのスレッドの経路が分かる。
+送信には `protocol_publish` と `route`（上の `name`）、操作ごとに固定の `operation_id`、`event`（`type` と `payload`）を渡す。
+受付が提示する接続先・参照・新旧のコミット・イベントの内容を確認し、承認すると送信する。
+失敗や拒否で送信待ちのイベントが残った場合、同じ `operation_id` と `event` で再試行できる。
+`operation_id` と `event` を両方省略すると、その時点で送信待ちのイベントと受領確認が承認の対象になる。

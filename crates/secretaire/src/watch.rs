@@ -6,6 +6,7 @@ mod poll;
 #[cfg(test)]
 mod tests;
 mod tool;
+mod protocol;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ use crate::Workspace;
 use model::{Input, Runtime, WakeAcceptance, Watch};
 
 pub(crate) use model::WakeId;
+pub(crate) use protocol::publish as publish_protocol;
 pub(crate) use tool::{call, definition, writes};
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -81,11 +83,17 @@ struct Store {
     next_poll: HashMap<String, Instant>,
 }
 
-pub(crate) struct Watches(Result<Mutex<Store>>);
+pub(crate) struct Watches {
+    store: Result<Mutex<Store>>,
+    protocol_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
 
 impl Watches {
     pub(crate) fn load(project: &Path, state: &Path) -> Self {
-        Self(Store::load(project, state).map(Mutex::new))
+        Self {
+            store: Store::load(project, state).map(Mutex::new),
+            protocol_locks: Mutex::new(HashMap::new()),
+        }
     }
 
     pub(crate) fn waiting_threads(&self) -> HashSet<String> {
@@ -110,7 +118,7 @@ impl Watches {
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
         let store = self
-            .0
+            .store
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error:#}"))?;
         Ok(store.lock().unwrap())
@@ -297,6 +305,9 @@ pub(crate) fn restore_after_rollback(
 }
 
 pub(crate) fn configured(project: &Path, state_dir: &Path) -> bool {
+    if protocol::configured(state_dir) {
+        return true;
+    }
     match Store::load(project, state_dir) {
         Ok(store) => store.watches().next().is_some() || store.state.external.values().any(Option::is_some),
         Err(error) => {
@@ -315,17 +326,24 @@ pub(crate) fn start(app: &Arc<Workspace>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut protocol_started = false;
         loop {
             tick.tick().await;
             let Some(app) = app.upgrade() else { return };
-            if let Err(error) = schedule(&app) {
-                tracing::warn!(%error, "watch scheduler");
+            match schedule(&app) {
+                Ok(true) if !protocol_started => {
+                    // The first admitted pass replays 1a's durable delivery queue.
+                    protocol::start(&app);
+                    protocol_started = true;
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "watch scheduler"),
             }
         }
     });
 }
 
-fn schedule(app: &Arc<Workspace>) -> Result<()> {
+fn schedule(app: &Arc<Workspace>) -> Result<bool> {
     let mut store = app.watches.lock()?;
     let now = Instant::now();
     let due: Vec<_> = store
@@ -347,7 +365,7 @@ fn schedule(app: &Arc<Workspace>) -> Result<()> {
         .collect();
     let _work = match app.admit_work() {
         Ok(work) => work,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(false),
     };
     if store.watches().next().is_some() {
         store.fence_legacy()?;
@@ -384,7 +402,7 @@ fn schedule(app: &Arc<Workspace>) -> Result<()> {
             }
         });
     }
-    Ok(())
+    Ok(true)
 }
 
 fn deliver_external(app: &Workspace, store: &mut Store) {

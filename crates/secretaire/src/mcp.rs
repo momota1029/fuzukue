@@ -1851,6 +1851,18 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         let _admission = app.admit_work()?;
         return Ok(data_result(tool.call(app, session, args)?, false));
     }
+    if matches!(tool, Tool::Watch) && args["action"] == "protocol_publish" {
+        ensure!(trusted, "work protocol publication requires a trusted front desk turn");
+        let (_, cancel) = exec_front_turn(session, claude, codex).await
+            .context("work protocol publication requires an active front desk turn with write access")?;
+        let authorize = || {
+            cancel.check()?;
+            ensure!(exec::trusted_session(app, session), "front desk turn changed");
+            Ok(())
+        };
+        let actor = if claude.is_some() { Actor::Claude } else { Actor::System };
+        return Ok(data_result(Box::pin(crate::watch::publish_protocol(app, session, actor, args, authorize)).await?, false));
+    }
     let project = &app.project_dir;
     if matches!(tool, Tool::GitIntegratePatch) {
         use git_write::integrate;

@@ -16,6 +16,8 @@ use crate::Workspace;
 enum Action {
     Create(Input),
     List,
+    #[serde(rename = "protocol_routes")]
+    ProtocolRoutes,
     Status {
         #[serde(alias = "name")]
         id: Option<String>,
@@ -47,7 +49,7 @@ pub(crate) fn writes(args: &Value) -> bool {
 
 pub(crate) fn definition() -> Value {
     let branch = json!({"type": "string"});
-    json!({
+    let mut definition = json!({
         "name": "watch",
         "description": harness_text!(
             "Manage server-side Git watches in this workspace. When the user says 'watch dots-main' in a thread, use create with name 'dots-main', the local repo path and kind 'dots'. Events stay in the calling thread. Use status to see progress and errors, or test to preview one poll without recording any events.",
@@ -58,7 +60,7 @@ pub(crate) fn definition() -> Value {
             "required": ["action"],
             "additionalProperties": false,
             "properties": {
-                "action": {"type": "string", "enum": ["create", "list", "status", "pause", "resume", "delete", "test"]},
+                "action": {"type": "string", "enum": ["create", "list", "status", "pause", "resume", "delete", "test", "protocol_routes", "protocol_publish"]},
                 "id": {"type": "string", "description": harness_text!("Watch ID or name.", "監視の ID または名前。")},
                 "name": {"type": "string"},
                 "repo": {"type": "string", "description": harness_text!("Git repo under the user's home.", "ホーム配下の Git リポジトリ。")},
@@ -85,7 +87,14 @@ pub(crate) fn definition() -> Value {
                 ]}}
             }
         }
-    })
+    });
+    let properties = definition["inputSchema"]["properties"].as_object_mut().unwrap();
+    properties.extend([
+        ("route".into(), json!({"type": "string", "description": "Work protocol route bound to this thread."})),
+        ("operation_id".into(), json!({"type": "string", "description": "Stable identifier for retrying a work protocol operation."})),
+        ("event".into(), json!({"type": "object", "description": "An object with type and payload. Omit both event and operation_id to publish retained work."})),
+    ]);
+    definition
 }
 
 pub(crate) async fn call(app: &Arc<Workspace>, session: &str, args: &Value) -> Result<Value> {
@@ -109,6 +118,7 @@ pub(crate) async fn call(app: &Arc<Workspace>, session: &str, args: &Value) -> R
             store.edit(|state| state.watches.insert(id, watch.clone()))?;
             Ok(status(&store, &watch, false))
         }
+        Action::ProtocolRoutes => super::protocol::list(app, session),
         Action::List => {
             let store = app.watches.lock()?;
             Ok(

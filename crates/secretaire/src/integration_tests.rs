@@ -1962,6 +1962,20 @@ async fn mcp_large_result_keeps_pagination_and_can_be_read_by_its_session() -> R
 }
 
 #[tokio::test]
+async fn work_protocol_publish_requires_trusted_front_desk() -> Result<()> {
+    let project = TempProject::new()?;
+    let app = mcp_app(&project);
+    let result = mcp_call(&app, "watch", json!({
+        "action": "protocol_publish", "route": "exchange", "operation_id": "test",
+        "event": {"type": "report", "payload": {"summary": "test"}}
+    })).await;
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("requires a trusted front desk turn"));
+    assert!(!app.state_dir.join("work-protocol-v1").exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> {
     let project = TempProject::new()?;
     let app = mcp_app(&project);
@@ -2081,7 +2095,8 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("self_update", &[("action", "string"), ("confirm", "boolean"), ("turn_proof", "string"), ("verbose", "boolean"), ("notify", "boolean")], &["action"]),
         ("watch", &[("action", "string"), ("id", "string"), ("name", "string"), ("repo", "string"),
             ("remote", "string"), ("kind", "string"), ("interval", "integer"), ("wake", "string"),
-            ("attention_patterns", "array"), ("attention_marked_lines", "boolean"), ("sources", "array")],
+            ("attention_patterns", "array"), ("attention_marked_lines", "boolean"), ("sources", "array"),
+            ("route", "string"), ("operation_id", "string"), ("event", "object")],
             &["action"]),
         ("delegate", &[("prompt", "string"), ("title", "string"), ("label", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("folder_grants", "array"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
             ("isolation", "string"), ("backend", "string"), ("model", "string"), ("effort", "string"), ("artifacts", "array")], &["prompt"]),
@@ -2271,6 +2286,9 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
     let schema = |name: &str| {
         &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"]["properties"]
     };
+    assert_eq!(schema("watch")["action"]["enum"], json!([
+        "create", "list", "status", "pause", "resume", "delete", "test", "protocol_routes", "protocol_publish"
+    ]));
     for name in ["delegate", "plan"] {
         for key in ["tier", "min_tier"] {
             assert_eq!(schema(name)[key]["enum"], json!(["light", "standard", "heavy"]));
