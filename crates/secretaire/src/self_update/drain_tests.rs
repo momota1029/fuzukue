@@ -1113,6 +1113,65 @@ async fn legacy_rollback_protects_a_goal_until_a_capable_server_reopens_it() -> 
 }
 
 #[tokio::test]
+async fn switching_to_a_build_that_cannot_read_segments_is_refused() -> Result<()> {
+    use crate::threads::rollback_marker;
+    let dir = tempfile::tempdir()?;
+    let (app, update, workspace) = load(dir.path())?;
+    let old = dir.path().join("old-build");
+    fs::write(&old, ["#!/bin/sh\n", drain::FORMAT_MARKER].concat())?;
+    let capable = dir.path().join("capable-build");
+    fs::write(&capable, [drain::FORMAT_MARKER, rollback_marker::FORMAT_MARKER].concat())?;
+    // This test binary is a build that reads segments.
+    assert!(drain::contains_marker(&std::env::current_exe()?, rollback_marker::FORMAT_MARKER)?);
+    update.ensure_candidate_reads_threads(&app, &old)?;
+
+    // An unopened second workspace uses the real nested state layout.
+    let root = update.root.parent().unwrap().to_owned();
+    let second_project = dir.path().join("second-project");
+    let second_state = workspace.state_dir.join("workspaces").join("second");
+    fs::create_dir_all(&second_project)?;
+    fs::create_dir_all(&second_state)?;
+    let second = crate::Hub::with_timeline(&second_state);
+    second.load_threads_with_root(&second_project, &second_state, &root);
+    let second_id = crate::threads::segment_tests::segmented_workspace_with_root(&second_project, &second, &second_state, &root)?;
+    drop(second);
+    let refusal = update.ensure_candidate_reads_threads(&app, &old).unwrap_err().to_string();
+    assert!(refusal.contains(&second_id) && refusal.contains(&root.join("segmented-threads.json").display().to_string()) && refusal.contains("repair"), "{refusal}");
+    rollback_marker::remove(&root, &second_project, &second_id)?;
+
+    // Listed in the shared file, as for a workspace that is not open.
+    let state = root.join("closed-workspace");
+    rollback_marker::add(&rollback_marker::root(&state), Path::new("/closed"), Some("thread-closed"), "closed.md")?;
+    let error = update.ensure_candidate_reads_threads(&app, &old).unwrap_err().to_string();
+    assert!(error.contains("thread-closed in /closed") && error.contains("/join"), "{error}");
+    update.ensure_candidate_reads_threads(&app, &capable)?;
+    // The swap refuses before it drains or records anything.
+    let lock = fs::File::create(dir.path().join("swap-lock"))?;
+    let refused = update.swap(&app, &old, lock, true, None, None, None).await;
+    assert!(refused.err().is_some_and(|error| error.to_string().contains("thread-closed")));
+    assert!(update.drain_status.borrow().is_none());
+    rollback_marker::remove(&root, Path::new("/closed"), "thread-closed")?;
+    update.ensure_candidate_reads_threads(&app, &old)?;
+
+    // An unreadable list requires a capable build.
+    fs::write(root.join("segmented-threads.json"), "damaged")?;
+    assert!(update.ensure_candidate_reads_threads(&app, &old).is_err());
+    update.ensure_candidate_reads_threads(&app, &capable)?;
+    fs::remove_file(root.join("segmented-threads.json"))?;
+
+    // An open workspace counts even when its mark could not be written.
+    let id = crate::threads::segment_tests::segmented_workspace(
+        &workspace.project_dir, &workspace.hub, &workspace.state_dir)?;
+    let marks = rollback_marker::root(&workspace.state_dir).join("segmented-threads.json");
+    if marks.is_file() {
+        fs::remove_file(marks)?;
+    }
+    let error = update.ensure_candidate_reads_threads(&app, &old).unwrap_err().to_string();
+    assert!(error.contains(&id), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn actual_signals_close_admission_then_exit_on_the_second_signal() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut child = tokio::process::Command::new(std::env::current_exe()?)

@@ -21,10 +21,17 @@ use sha2::{Digest, Sha256};
 
 use crate::{durable, state, workspace};
 
+mod entries;
+mod join;
 pub(crate) mod payloads;
 pub(crate) mod payload_migration;
+pub(crate) mod rollback_marker;
 mod save_files;
+#[cfg(test)]
+pub(crate) mod segment_tests;
+mod segments;
 pub(crate) mod timing;
+use entries::Entries;
 use payloads::{Blobs, Record, Refs, Source};
 use save_files::SaveFiles;
 
@@ -33,6 +40,8 @@ use fuzukue_proto::{AgentBackend, AgentSelection, ChatSettings, DelegateJob, Del
 const ENTRY: &str = "<!-- labo-thread ";
 const TITLE_MESSAGE_LIMIT: usize = 2000;
 const INITIAL_HISTORY_ENTRIES: usize = 256;
+/// Overrides are rewritten on every save, so a large set defeats segmentation.
+const LARGE_OVERRIDES: usize = 1024 * 1024;
 const INITIAL_HISTORY_BYTES: usize = 512 * 1024;
 pub fn prompt() -> &'static str {
     harness_text!(
@@ -202,6 +211,17 @@ impl ToolSummary {
         }
     }
 
+    /// The full input about to replace the inline preview in storage.
+    fn source_input(&self, source: &Source) -> Result<serde_json::Value> {
+        let mut input = source.input()?;
+        if self.name == "delegate" {
+            if let Some(edited) = &self.input {
+                carry_delegate_edits(edited, &mut input);
+            }
+        }
+        Ok(input)
+    }
+
     fn full_input(&self, blobs: &Blobs) -> Result<Option<serde_json::Value>> {
         match (&self.payloads.input, &self.input_source) {
             (Some(digest), _) => Ok(Some(blobs.input(digest)?)),
@@ -269,7 +289,7 @@ impl Entry {
 
 #[derive(Default)]
 struct Transcript {
-    items: Vec<Entry>,
+    items: Entries,
     index: HashMap<String, usize>,
     hidden_replies: HashSet<String>,
     job_facts: HashMap<String, JobFacts>,
@@ -448,7 +468,7 @@ impl Transcript {
                 item, actor, text, ..
             } => {
                 if let Some(&i) = self.index.get(item) {
-                    let entry = &mut self.items[i];
+                    let entry = self.items.entry_mut(i);
                     entry.text.push_str(text);
                     if let Some(job) = fuzukue_proto::delegate_job_id(item, actor).filter(|_| entry.meta.tool.is_none()) {
                         self.job_facts.entry(job.into()).or_default().record(i, entry);
@@ -501,7 +521,7 @@ impl Transcript {
                 });
             }
             ServerEvent::ToolCall { item, input, .. } if item.starts_with(fuzukue_proto::DELEGATE_JOB) => {
-                if let Some(tool) = self.index.get(item).and_then(|&i| self.items[i].meta.tool.as_mut()) {
+                if let Some(tool) = self.index.get(item).and_then(|&i| self.items.entry_mut(i).meta.tool.as_mut()) {
                     if tool.output.as_deref().and_then(|output| serde_json::from_str::<fuzukue_proto::DelegateReport>(output).ok())
                         .is_some_and(|report| report.interrupted) {
                         tool.ok = None;
@@ -520,7 +540,7 @@ impl Transcript {
             ServerEvent::ToolCall { item, actor, input, .. }
                 if fuzukue_proto::delegate_job_id(item, actor).is_some() =>
             {
-                if let Some(tool) = self.index.get(item).and_then(|&i| self.items[i].meta.tool.as_mut()) {
+                if let Some(tool) = self.index.get(item).and_then(|&i| self.items.entry_mut(i).meta.tool.as_mut()) {
                     tool.input = Some(input.clone());
                 }
             }
@@ -535,13 +555,13 @@ impl Transcript {
                 }
             }
             ServerEvent::DelegateProgress { job, summary, .. } => {
-                if let Some(tool) = self.index.get(job).and_then(|&i| self.items[i].meta.tool.as_mut()) {
+                if let Some(tool) = self.index.get(job).and_then(|&i| self.items.entry_mut(i).meta.tool.as_mut()) {
                     tool.progress = Some(summary.clone());
                 }
             }
             ServerEvent::ToolResult { item, ok, output, .. } => {
                 if let Some(&index) = self.index.get(item) {
-                    let meta = &mut self.items[index].meta;
+                    let meta = &mut self.items.entry_mut(index).meta;
                     let Some(tool) = &mut meta.tool else { return };
                     if let Some(job) = fuzukue_proto::delegate_job_id(item, &meta.actor) {
                         if let Some(facts) = self.job_facts.get_mut(job) {
@@ -556,7 +576,7 @@ impl Transcript {
             ServerEvent::CommentApplication { application, .. } => {
                 let item = format!("comments-{}", application.thread);
                 if let Some(&i) = self.index.get(&item) {
-                    self.items[i].meta.application = Some(application.clone());
+                    self.items.entry_mut(i).meta.application = Some(application.clone());
                 } else {
                     self.push(Entry {
                         meta: EntryMeta {
@@ -578,12 +598,12 @@ impl Transcript {
             }
             ServerEvent::MessageDetails { item, details, .. } => {
                 if let Some(&ix) = self.index.get(item) {
-                    self.items[ix].meta.details = Some(details.clone());
+                    self.items.entry_mut(ix).meta.details = Some(details.clone());
                 }
             }
             ServerEvent::TurnEnded { actor, .. } => {
-                if let Some(entry) = self.items.last_mut() {
-                    entry.meta.turn_ends.push(actor.clone());
+                if let Some(last) = self.items.len().checked_sub(1) {
+                    self.items.entry_mut(last).meta.turn_ends.push(actor.clone());
                 }
             }
             _ => {}
@@ -596,7 +616,7 @@ impl Transcript {
             _ => return,
         };
         let Some(&index) = self.index.get(item) else { return };
-        let entry = &mut self.items[index];
+        let entry = self.items.entry_mut(index);
         let delegated_call = entry.meta.is_delegated();
         let Some(tool) = &mut entry.meta.tool else { return };
         let recovered = match &source {
@@ -644,12 +664,22 @@ impl Transcript {
         let Some(tool) = self
             .index
             .get(item)
-            .and_then(|&i| self.items[i].meta.tool.as_mut())
+            .and_then(|&i| self.items.entry_mut(i).meta.tool.as_mut())
         else {
             return;
         };
         match event {
-            ServerEvent::ToolCall { input, .. } if tool.payloads.input.is_none() => tool.input = Some(input.clone()),
+            ServerEvent::ToolCall { input, .. } if tool.payloads.input.is_none() => {
+                // An older journal holds the original call. Later rename and
+                // dismissal edits of a delegate job stay on top of it.
+                let mut input = input.clone();
+                if tool.name == "delegate" {
+                    if let Some(edited) = &tool.input {
+                        carry_delegate_edits(edited, &mut input);
+                    }
+                }
+                tool.input = Some(input);
+            }
             ServerEvent::ToolResult { ok, output, .. } if tool.payloads.output.is_none() => {
                 tool.ok = Some(*ok);
                 tool.output = Some(output.clone());
@@ -707,14 +737,14 @@ impl Transcript {
 
     fn delegate_input_mut(&mut self, job: &str) -> Option<&mut serde_json::Value> {
         let &index = self.index.get(job)?;
-        let tool = self.items[index].meta.tool.as_mut().filter(|tool| tool.name == "delegate")?;
+        let tool = self.items.entry_mut(index).meta.tool.as_mut().filter(|tool| tool.name == "delegate")?;
         tool.input.as_mut().filter(|input| input.is_object())
     }
 
     fn merge(&mut self, recovered: Self) {
-        for entry in recovered.items {
+        for entry in recovered.items.into_vec() {
             if let Some(&i) = self.index.get(&entry.meta.item) {
-                let saved = &mut self.items[i];
+                let saved = self.items.entry_mut(i);
                 if entry.text.starts_with(&saved.text) {
                     saved.text = entry.text;
                 }
@@ -774,57 +804,88 @@ impl Transcript {
     }
 
     fn write_markdown(&self, mut body: impl Write) -> Result<()> {
-        for entry in &self.items {
-            let mut meta = std::borrow::Cow::Borrowed(&entry.meta);
-            if let Some(tool) = entry.meta.tool.as_ref() {
-                if !tool.payloads.is_empty() {
-                    tool.payloads.write_marker(&mut meta.to_mut().attachments);
-                }
-                // Without a sidecar, write through the full source so this
-                // checkpoint can be opened without its local journal.
-                if let Some(source) = tool.input_source.as_ref().filter(|_| tool.payloads.input.is_none()) {
-                    meta.to_mut().tool.as_mut().unwrap().input = Some(source.input()?);
-                }
-                if let Some(source) = tool.output_source.as_ref().filter(|_| tool.payloads.output.is_none()) {
-                    meta.to_mut().tool.as_mut().unwrap().output = Some(source.output()?);
-                }
-            }
-            let meta = serde_json::to_string(&meta)?;
-            // HTML コメントの中で "-->" が始まらないようにする。
-            writeln!(body, "{ENTRY}{} -->", meta.replace('>', "\\u003e"))?;
-            let role = match entry.meta.actor {
-                Actor::User => "User",
-                Actor::Claude => "Claude",
-                Actor::Codex { .. } => "Codex",
-                Actor::System => "System",
-            };
-            if let Some(tool) = &entry.meta.tool {
-                let result = match tool.ok {
-                    Some(true) => "success",
-                    Some(false) => "failed",
-                    None => "result unavailable",
-                };
-                write!(body, "- {role} called `{}` ({result})\n\n", tool.name)?;
-            } else {
-                write!(body, "## {role}\n\n")?;
-                for (i, line) in entry.text.split('\n').enumerate() {
-                    if i > 0 {
-                        body.write_all(b"\n")?;
-                    }
-                    if line.trim_start_matches('\\').starts_with(ENTRY) {
-                        body.write_all(b"\\")?;
-                    }
-                    body.write_all(line.as_bytes())?;
-                }
-                body.write_all(attachment_list(&entry.meta.attachments).as_bytes())?;
-                body.write_all(b"\n\n")?;
-            }
+        for entry in self.items.iter() {
+            Self::write_entry(entry, &mut body)?;
         }
         Ok(())
     }
 
-    fn read_buffered(input: &mut BufReader<&File>, file: &Arc<File>, mut offset: u64) -> Result<Self> {
+    /// The body of a segmented thread's latest file: the changed sealed
+    /// entries in order, followed by every entry outside the segments.
+    fn write_latest(&self, mut body: impl Write) -> Result<()> {
+        let mut overrides = Vec::new();
+        for position in self.items.overrides() {
+            Self::write_entry(&self.items[position], &mut overrides)?;
+        }
+        if overrides.len() > LARGE_OVERRIDES {
+            tracing::warn!(bytes = overrides.len(), "segmented thread overrides are large; join the thread");
+        }
+        body.write_all(&overrides)?;
+        for entry in &self.items[self.items.sealed_len()..] {
+            Self::write_entry(entry, &mut body)?;
+        }
+        Ok(())
+    }
+
+    fn write_entry(entry: &Entry, body: &mut impl Write) -> Result<()> {
+        let mut meta = std::borrow::Cow::Borrowed(&entry.meta);
+        if let Some(tool) = entry.meta.tool.as_ref() {
+            if !tool.payloads.is_empty() {
+                tool.payloads.write_marker(&mut meta.to_mut().attachments);
+            }
+            // Without a sidecar, write through the full source so this
+            // checkpoint can be opened without its local journal.
+            if let Some(source) = tool.input_source.as_ref().filter(|_| tool.payloads.input.is_none()) {
+                meta.to_mut().tool.as_mut().unwrap().input = Some(tool.source_input(source)?);
+            }
+            if let Some(source) = tool.output_source.as_ref().filter(|_| tool.payloads.output.is_none()) {
+                meta.to_mut().tool.as_mut().unwrap().output = Some(source.output()?);
+            }
+        }
+        let meta = serde_json::to_string(&meta)?;
+        // HTML コメントの中で "-->" が始まらないようにする。
+        writeln!(body, "{ENTRY}{} -->", meta.replace('>', "\\u003e"))?;
+        let role = match entry.meta.actor {
+            Actor::User => "User",
+            Actor::Claude => "Claude",
+            Actor::Codex { .. } => "Codex",
+            Actor::System => "System",
+        };
+        if let Some(tool) = &entry.meta.tool {
+            let result = match tool.ok {
+                Some(true) => "success",
+                Some(false) => "failed",
+                None => "result unavailable",
+            };
+            write!(body, "- {role} called `{}` ({result})\n\n", tool.name)?;
+        } else {
+            write!(body, "## {role}\n\n")?;
+            for (i, line) in entry.text.split('\n').enumerate() {
+                if i > 0 {
+                    body.write_all(b"\n")?;
+                }
+                if line.trim_start_matches('\\').starts_with(ENTRY) {
+                    body.write_all(b"\\")?;
+                }
+                body.write_all(line.as_bytes())?;
+            }
+            body.write_all(attachment_list(&entry.meta.attachments).as_bytes())?;
+            body.write_all(b"\n\n")?;
+        }
+        Ok(())
+    }
+
+    fn read_buffered(input: &mut BufReader<&File>, file: &Arc<File>, offset: u64) -> Result<Self> {
         let mut transcript = Self::default();
+        Self::read_entries(input, file, offset, |entry, _| transcript.push(entry))?;
+        Ok(transcript)
+    }
+
+    /// Visit each entry with its stored text, which follows the entry marker.
+    fn read_entries(
+        input: &mut BufReader<&File>, file: &Arc<File>, mut offset: u64,
+        mut visit: impl FnMut(Entry, &str),
+    ) -> Result<()> {
         let mut line = String::new();
         let mut entry = String::new();
         let mut header_record = None;
@@ -837,7 +898,7 @@ impl Transcript {
             if let Some(header) = line.strip_prefix(ENTRY) {
                 if entry.is_empty() || entry.ends_with("\n\n") {
                     if !entry.is_empty() {
-                        transcript.push(Self::decode_buffered_entry(&entry[..entry.len() - 2], header_record.take().unwrap())?);
+                        visit(Self::decode_buffered_entry(&entry[..entry.len() - 2], header_record.take().unwrap())?, &entry);
                     }
                     entry.clear();
                     header_record = Some(Record { offset: line_offset, file: file.clone(), len });
@@ -852,9 +913,9 @@ impl Transcript {
         }
         if !entry.is_empty() {
             let part = entry.strip_suffix("\n\n").context("missing transcript separator")?;
-            transcript.push(Self::decode_buffered_entry(part, header_record.unwrap())?);
+            visit(Self::decode_buffered_entry(part, header_record.unwrap())?, &entry);
         }
-        Ok(transcript)
+        Ok(())
     }
 
     fn decode_buffered_entry(part: &str, record: Record) -> Result<Entry> {
@@ -1195,6 +1256,8 @@ struct TranscriptSource {
     legacy: Option<String>,
     after: u64,
     timeline: state::Timeline,
+    /// Why this thread must stay unreadable, such as a second file with its ID.
+    conflict: Option<String>,
 }
 
 struct LoadedTranscript {
@@ -1308,8 +1371,12 @@ impl DerefMut for TranscriptSlot {
     fn deref_mut(&mut self) -> &mut Transcript {
         self.get();
         self.mark_activity();
-        self.dirty.set(true);
         let loaded = self.loaded.get_mut().unwrap();
+        // A failed load holds nothing worth saving. Leaving it clean lets
+        // shutdown proceed and a later read pick up repaired files.
+        if loaded.error.is_none() {
+            self.dirty.set(true);
+        }
         loaded.weight.set(None);
         &mut loaded.value
     }
@@ -1318,11 +1385,21 @@ impl DerefMut for TranscriptSlot {
 impl TranscriptSource {
     fn read(&self, reason: &'static str) -> Result<Transcript> {
         let mut measure = timing::Load::start(reason);
+        if let Some(conflict) = &self.conflict {
+            anyhow::bail!("{conflict}");
+        }
         let file = Arc::new(File::open(&self.path)?);
         let mut input = BufReader::new(file.as_ref());
-        let (_, offset) = read_front(&mut input)?;
+        let (front, layout, offset) = read_front(&mut input)?;
         let mut transcript = Transcript::read_buffered(&mut input, &file, offset)?;
-        measure.markdown_read(file.metadata().map_or(0, |metadata| metadata.len()));
+        let mut bytes = file.metadata().map_or(0, |metadata| metadata.len());
+        // Every segment is checked here, before any journal record applies.
+        if let Some(layout) = layout {
+            ensure!(front.id == self.session, "thread ID differs from the opened thread");
+            bytes += layout.segments.iter().map(|segment| segment.bytes).sum::<u64>();
+            transcript = segments::compose(&self.path, &self.session, &layout, transcript.items.into_vec())?;
+        }
+        measure.markdown_read(bytes);
         let mut recovered = Transcript::default();
         self.timeline.visit_session(&self.session, |mut env, refs, record| {
             measure.journal.add(record.len);
@@ -1362,9 +1439,19 @@ impl TranscriptSource {
         measure.legacy_replayed();
         transcript.rebuild_job_facts();
         transcript.hide_saved_blank_replies();
+        // An entry that cannot be compared now stays marked for the next save.
+        if let Err(error) = transcript.items.refresh_overrides(entry_digest) {
+            tracing::warn!(%error, "could not compare segmented thread entries");
+        }
         measure.succeeded(transcript.items.len());
         Ok(transcript)
     }
+}
+
+fn entry_digest(entry: &Entry) -> Result<entries::Digest> {
+    let mut digest = Sha256::new();
+    Transcript::write_entry(entry, &mut digest)?;
+    Ok(digest.finalize().into())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1398,9 +1485,13 @@ struct Thread {
     library_updated: i64,
     active: bool,
     suggestions: Vec<fuzukue_proto::DeckRoute>,
+    /// The file on disk uses the segmented format.
+    segmented: bool,
 }
 
-fn read_front(input: &mut impl BufRead) -> Result<(Front, u64)> {
+/// The front matter, the segment layout of a segmented latest file, and the
+/// offset of the body.
+fn read_front(input: &mut impl BufRead) -> Result<(Front, Option<segments::Layout>, u64)> {
     let mut text = String::new();
     input.read_line(&mut text)?;
     ensure!(matches!(text.as_str(), "---\n" | "---\r\n"), "missing thread front matter");
@@ -1413,7 +1504,20 @@ fn read_front(input: &mut impl BufRead) -> Result<(Front, u64)> {
     }
     ensure!(!text.as_bytes().contains(&0), "NUL bytes in thread front matter");
     let (front, _) = fuzukue_cards::split_frontmatter(&text).context("missing thread front matter")?;
-    Ok((serde_yaml::from_str(front)?, text.len() as u64))
+    let (front, layout) = segments::parse_front(front)?;
+    Ok((front, layout, text.len() as u64))
+}
+
+/// Whether a file that failed to open declares the segmented format.
+fn declares_segments(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else { return false };
+    let mut lines = BufReader::new(file.take(1024 * 1024)).split(b'\n');
+    if !lines.next().is_some_and(|line| line.is_ok_and(|line| line.trim_ascii_end() == b"---")) {
+        return false;
+    }
+    lines.map_while(Result::ok)
+        .take_while(|line| line.trim_ascii_end() != b"---")
+        .any(|line| line.strip_prefix(b"format:").is_some_and(|value| value.trim_ascii_start().starts_with(b"segmented-")))
 }
 
 impl Thread {
@@ -1425,7 +1529,9 @@ impl Thread {
         let mut measure = timing::Load::start("full_read");
         let file = Arc::new(File::open(&path)?);
         let mut input = BufReader::new(file.as_ref());
-        let (front, offset) = read_front(&mut input)?;
+        let (front, layout, offset) = read_front(&mut input)?;
+        // Trashed threads are joined first, so a restore never needs segments.
+        ensure!(layout.is_none(), "a segmented thread has to be joined before it can be restored");
         let file_version = FileVersion::read(file.metadata()?)?;
         let transcript = Transcript::read_buffered(&mut input, &file, offset)?;
         measure.markdown_read(file_version.length);
@@ -1440,13 +1546,14 @@ impl Thread {
             library_updated: 0,
             active: false,
             suggestions: Vec::new(),
+            segmented: false,
         })
     }
 
     fn read_lazy(path: PathBuf, timeline: &state::Timeline) -> Result<Self> {
         let mut input = BufReader::new(File::open(&path)?);
         let file_version = FileVersion::read(input.get_ref().metadata()?)?;
-        let (front, offset) = read_front(&mut input)?;
+        let (front, layout, offset) = read_front(&mut input)?;
         if file_version.length > offset {
             let mut last = [0; 2];
             input.seek(SeekFrom::End(-2))?;
@@ -1455,12 +1562,12 @@ impl Thread {
         }
         let transcript = TranscriptSlot::lazy(TranscriptSource {
             path: path.clone(), session: front.id.clone(), legacy: front.migrated_from.clone(),
-            after: 0, timeline: timeline.clone(),
+            after: 0, timeline: timeline.clone(), conflict: None,
         });
         Ok(Self {
             path, file_version: RefCell::new(Some(file_version)), front, transcript,
             page_revision: 0, library_revision: 0, library_updated: 0, active: false,
-            suggestions: Vec::new(),
+            suggestions: Vec::new(), segmented: layout.is_some(),
         })
     }
 
@@ -1483,6 +1590,8 @@ impl Thread {
         &mut self, open: impl FnOnce(&Path) -> Result<SaveFiles>, measure: &mut timing::Save,
     ) -> Result<()> {
         self.transcript.check().with_context(|| format!("Thread file {}", self.path.display()))?;
+        ensure!(self.transcript.items.is_sealed() == self.segmented,
+            "Thread file {} changed format on disk", self.path.display());
         let dir = self.path.parent().context("missing thread directory")?;
         let files = open(dir)?;
         if self.front.preview_payloads {
@@ -1491,9 +1600,15 @@ impl Thread {
             loaded.weight.set(None);
             // A converted checkpoint must keep full journal and memory payloads
             // in sidecars, even when they are newer than the staged Markdown.
-            for tool in loaded.value.items.iter_mut().filter_map(|entry| entry.meta.tool.as_mut()) {
+            for position in 0..loaded.value.items.len() {
+                if !loaded.value.items[position].meta.tool.as_ref()
+                    .is_some_and(|tool| tool.input_source.is_some() || tool.output_source.is_some())
+                {
+                    continue;
+                }
+                let Some(tool) = loaded.value.items.entry_mut(position).meta.tool.as_mut() else { continue };
                 if let Some(source) = &tool.input_source {
-                    match blobs.put_locked(&serde_json::to_vec(&source.input()?)?) {
+                    match blobs.put_locked(&serde_json::to_vec(&tool.source_input(source)?)?) {
                         Ok(digest) => {
                             tool.payloads.input = Some(digest);
                             tool.input_source = None;
@@ -1514,12 +1629,27 @@ impl Thread {
                 }
             }
         }
+        if self.segmented {
+            let loaded = self.transcript.loaded.get_mut().unwrap();
+            loaded.value.items.refresh_overrides(entry_digest)?;
+            // The new latest file refers to these segments.
+            for segment in loaded.value.items.segments() {
+                segment.verify_unchanged()?;
+            }
+        }
         measure.prepared();
         let file = files.replace(
             &self.path,
             |output| {
-                write!(output, "---\n{}---\n", serde_yaml::to_string(&self.front)?)?;
-                self.transcript.write_markdown(output)?;
+                let items = &self.transcript.items;
+                if items.is_sealed() {
+                    let segments: Vec<_> = items.segments().iter().map(|segment| &segment.info).collect();
+                    output.write_all(segments::front_text(&self.front, &segments, &items.overrides())?.as_bytes())?;
+                    self.transcript.write_latest(output)?;
+                } else {
+                    write!(output, "---\n{}---\n", serde_yaml::to_string(&self.front)?)?;
+                    self.transcript.write_markdown(output)?;
+                }
                 measure.written();
                 Ok(())
             },
@@ -1580,14 +1710,16 @@ impl Thread {
     }
 
     fn finish_interrupted_applications(&mut self) -> bool {
-        let mut changed = false;
-        for application in self.transcript.items.iter_mut().filter_map(|entry| entry.meta.application.as_mut()) {
-            if matches!(application.state, CommentApplicationState::Running) {
+        let running: Vec<_> = self.transcript.items.iter().enumerate().filter(|(_, entry)| {
+            entry.meta.application.as_ref()
+                .is_some_and(|application| matches!(application.state, CommentApplicationState::Running))
+        }).map(|(position, _)| position).collect();
+        for &position in &running {
+            if let Some(application) = &mut self.transcript.items.entry_mut(position).meta.application {
                 application.state = CommentApplicationState::Failed { reason: "サーバーが再起動した".into() };
-                changed = true;
             }
         }
-        changed
+        !running.is_empty()
     }
 
     fn add_artifacts(&mut self, paths: Vec<String>) -> bool {
@@ -1711,6 +1843,32 @@ fn record_delegate_name(input: &mut serde_json::Value, change: &fuzukue_proto::D
     input["rename_history"] = history.into();
     input["label"] = serde_json::json!(change.label);
     input["label_source"] = serde_json::json!(change.label_source);
+}
+
+/// A delegate job's inline input holds the latest rename and dismissal edits.
+/// Carry them onto the full input that is about to replace it, which may be the
+/// original call without any of them.
+fn carry_delegate_edits(edited: &serde_json::Value, full: &mut serde_json::Value) {
+    let Some(object) = full.as_object_mut() else { return };
+    if edited["dismissed_from_panel"].as_bool() == Some(true) {
+        object.insert("dismissed_from_panel".into(), true.into());
+    }
+    let Some(changes) = edited["rename_history"].as_array() else { return };
+    let mut history = object.get("rename_history").and_then(serde_json::Value::as_array)
+        .cloned().unwrap_or_default();
+    let last = history.last().and_then(|change| change["at_ms"].as_i64());
+    let newer: Vec<_> = changes.iter()
+        .filter(|change| change["at_ms"].as_i64() >= last && !history.contains(change))
+        .cloned().collect();
+    history.extend(newer);
+    if history.last() == changes.last() {
+        for key in ["label", "label_source"] {
+            if let Some(value) = edited.get(key) {
+                object.insert(key.into(), value.clone());
+            }
+        }
+    }
+    object.insert("rename_history".into(), history.into());
 }
 
 /// Use the ordinary job row events with a small summary payload. Child events
@@ -1929,6 +2087,7 @@ impl MetadataRecovery {
 pub struct Store {
     project: PathBuf,
     state_dir: PathBuf,
+    marker_root: PathBuf,
     timeline: state::Timeline,
     threads: BTreeMap<String, Thread>,
     damaged_files: Vec<String>,
@@ -1948,18 +2107,20 @@ impl Store {
         state_dir: &Path,
         records: &BTreeMap<String, state::SessionRecord>,
     ) -> Self {
-        Self::load_indexed(project, state_dir, records, state::Timeline::open(state_dir))
+        Self::load_indexed(project, state_dir, state_dir.parent().unwrap_or(state_dir), records, state::Timeline::open(state_dir))
     }
 
     pub(crate) fn load_indexed(
         project: &Path,
         state_dir: &Path,
+        marker_root: &Path,
         records: &BTreeMap<String, state::SessionRecord>,
         timeline: state::Timeline,
     ) -> Self {
         let mut store = Self {
             project: project.into(),
             state_dir: state_dir.into(),
+            marker_root: marker_root.into(),
             timeline,
             threads: BTreeMap::new(),
             damaged_files: Vec::new(),
@@ -1979,40 +2140,66 @@ impl Store {
                 tracing::warn!(path=?dir, %error, "could not reconcile thread save files");
             }
         }
-        for entry in dir
+        let mut files: Vec<_> = dir
             .and_then(|dir| std::fs::read_dir(dir).ok())
             .into_iter()
             .flatten()
             .flatten()
-        {
-            if entry.path().extension().is_none_or(|e| e != "md")
-                || !entry.file_type().is_ok_and(|kind| kind.is_file())
-            {
-                continue;
-            }
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "md")
+                && entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .collect();
+        files.sort_by_key(|entry| entry.file_name());
+        let mut segmented = Vec::new();
+        let mut unreadable = Vec::new();
+        for entry in files {
+            let name = entry.file_name().to_string_lossy().into_owned();
             match Thread::read_lazy(entry.path(), &store.timeline) {
-                Ok(mut thread) if is_thread(&thread.front.id) => {
-                    if let Some(deck) = thread.front.promoted_to.take() {
-                        if !thread.front.attached.contains(&deck) {
-                            thread.front.attached.push(deck);
-                        }
-                        if let Err(e) = thread.save("startup_upgrade") {
-                            tracing::warn!("could not upgrade {}: {e:#}", thread.path.display());
-                        }
+                Ok(thread) if is_thread(&thread.front.id) => {
+                    let id = thread.front.id.clone();
+                    if thread.segmented {
+                        segmented.push((Some(id.clone()), name.clone()));
                     }
-                    if let Some(legacy) = &thread.front.migrated_from {
-                        store
-                            .migrations
-                            .insert(legacy.clone(), thread.front.id.clone());
+                    if let Some(first) = store.threads.get_mut(&id) {
+                        // Neither file may be chosen silently. Keep the ID taken
+                        // and unwritable until only one of them remains.
+                        let error = format!("two thread files have the ID {id}: {} and {name}",
+                            first.path.file_name().unwrap_or_default().to_string_lossy());
+                        tracing::warn!(%error, "duplicate thread ID");
+                        if let Some(source) = &mut first.transcript.source {
+                            source.conflict = Some(error.clone());
+                        }
+                        store.damaged_files.push(error);
+                    } else {
+                        store.threads.insert(id, thread);
                     }
-                    store.threads.insert(thread.front.id.clone(), thread);
                 }
                 result => {
                     let error = result.err().map_or_else(|| "invalid thread ID".into(), |e| format!("{e:#}"));
                     let path = entry.path();
                     tracing::warn!(?path, %error, "could not restore thread");
-                    store.damaged_files.push(format!("{}: {error}", entry.file_name().to_string_lossy()));
+                    if declares_segments(&path) {
+                        segmented.push((None, name.clone()));
+                    }
+                    store.damaged_files.push(format!("{name}: {error}"));
+                    unreadable.push(name);
                 }
+            }
+        }
+        store.mark_segmented(&segmented, &unreadable);
+        for thread in store.threads.values_mut() {
+            let conflict = thread.transcript.source.as_ref().is_some_and(|source| source.conflict.is_some());
+            if let Some(deck) = thread.front.promoted_to.take().filter(|_| !conflict) {
+                if !thread.front.attached.contains(&deck) {
+                    thread.front.attached.push(deck);
+                }
+                if let Err(e) = thread.save("startup_upgrade") {
+                    tracing::warn!("could not upgrade {}: {e:#}", thread.path.display());
+                }
+            }
+            if let Some(legacy) = &thread.front.migrated_from {
+                store
+                    .migrations
+                    .insert(legacy.clone(), thread.front.id.clone());
             }
         }
 
@@ -2059,6 +2246,44 @@ impl Store {
             .filter(|id| store.threads.contains_key(id))
             .collect();
         store
+    }
+
+    /// Record the segmented files found at startup, and release the threads
+    /// that are now confirmed to be in the single-file format.
+    fn mark_segmented(&self, segmented: &[(Option<String>, String)], unreadable: &[String]) {
+        for (id, file) in segmented {
+            if let Err(error) = rollback_marker::add(&self.marker_root, &self.project, id.as_deref(), file) {
+                tracing::warn!("could not mark a segmented thread: {error:#}");
+            }
+        }
+        let released = rollback_marker::reconcile(&self.marker_root, &self.project, |listed| {
+            if unreadable.iter().any(|name| name == &listed.file
+                || listed.thread.as_ref().is_some_and(|id| name.contains(id)))
+            {
+                return false;
+            }
+            self.threads.values().any(|thread| {
+                let same = match &listed.thread {
+                    Some(id) => id == &thread.front.id,
+                    None => thread.path.file_name().is_some_and(|name| name == listed.file.as_str()),
+                };
+                same && !thread.segmented
+                    && thread.transcript.source.as_ref().is_some_and(|source| source.conflict.is_none())
+            })
+        });
+        if let Err(error) = released {
+            tracing::warn!("could not update the segmented thread marks: {error:#}");
+        }
+    }
+
+    /// Threads of this workspace that need a build that reads segments.
+    pub(crate) fn segmented_threads(&self) -> impl Iterator<Item = String> + '_ {
+        self.threads.values().filter(|thread| thread.segmented)
+            .map(|thread| format!("{} in {}", thread.front.id, self.project.display()))
+    }
+
+    pub(crate) fn is_segmented(&self, id: &str) -> bool {
+        self.threads.get(id).is_some_and(|thread| thread.segmented)
     }
 
     pub(crate) fn thread_damage(&self, id: &str) -> Option<ServerEvent> {
@@ -2146,7 +2371,9 @@ impl Store {
         &self, idle: std::time::Duration, busy: impl Fn(&str) -> Option<&'static str>,
     ) -> (Option<payload_migration::Candidate>, Option<(&str, &'static str)>) {
         let mut largest = None;
-        let candidate = self.threads.values().filter(|thread| !thread.front.preview_payloads)
+        // Conversion rewrites a whole single-file thread.
+        let candidate = self.threads.values().filter(|thread| !thread.front.preview_payloads && !thread.segmented
+                && thread.transcript.source.as_ref().is_some_and(|source| source.conflict.is_none()))
             .filter_map(|thread| {
                 let version = thread.file_version.borrow();
                 let length = version.as_ref().map_or(0, |version| version.length);
@@ -2183,7 +2410,7 @@ impl Store {
         if let Some(data) = thread.transcript.loaded.get().filter(|_| dirty) {
             // An idle worker may have left a newer, journaled result in memory.
             // Keep pending entries and switch only the old inline locations.
-            for entry in &data.value.items {
+            for entry in data.value.items.iter() {
                 let Some(tool) = &entry.meta.tool else { continue };
                 let refs = refs.get(&entry.meta.item);
                 if matches!(tool.input_source, Some(Source::Inline(_))) && refs.and_then(|refs| refs.input.as_ref()).is_none()
@@ -2198,9 +2425,11 @@ impl Store {
         thread.front.preview_payloads = true;
         if let Some(data) = thread.transcript.loaded.get_mut().filter(|_| dirty) {
             data.weight.set(None);
-            for entry in &mut data.value.items {
-                let Some(tool) = &mut entry.meta.tool else { continue };
-                let Some(refs) = refs.remove(&entry.meta.item) else { continue };
+            for position in 0..data.value.items.len() {
+                let item = &data.value.items[position].meta.item;
+                if data.value.items[position].meta.tool.is_none() { continue }
+                let Some(refs) = refs.remove(item) else { continue };
+                let Some(tool) = &mut data.value.items.entry_mut(position).meta.tool else { continue };
                 if matches!(tool.input_source, Some(Source::Inline(_))) {
                     tool.input_source = None;
                     tool.payloads.input = refs.input;
@@ -2647,7 +2876,7 @@ impl Store {
         let mut ids = Vec::new();
         let mut names = Vec::new();
         for (id, thread) in self.threads.iter().filter(|(id, _)| session.is_none_or(|session| session == *id)) {
-            for entry in &thread.transcript.items {
+            for entry in thread.transcript.items.iter() {
                 let job = &entry.meta.item;
                 let Some(nonce) = job.strip_prefix(DELEGATE_JOB) else { continue };
                 let Some(input) = entry.meta.tool.as_ref().filter(|tool| tool.name == "delegate")
@@ -3066,10 +3295,11 @@ impl Store {
             return Ok(None);
         }
         ensure!((allow_archived || !thread.front.archived) && thread.path.is_file(), "Thread is archived or missing");
+        thread.transcript.check().with_context(|| format!("Thread file {}", thread.path.display()))?;
         let event = ServerEvent::TextDelta { session: id.into(), item: item.into(), actor: Actor::System, text };
         thread.transcript.observe(&event);
         if let Err(error) = thread.save("system_note") {
-            thread.transcript.items.pop();
+            thread.transcript.items.pop_latest();
             thread.transcript.index.remove(item);
             return Err(error);
         }
@@ -3092,6 +3322,7 @@ impl Store {
         if events.is_empty() {
             return Ok(None);
         }
+        thread.transcript.check().with_context(|| format!("Thread file {}", thread.path.display()))?;
         let item = format!("github:{}", events[0].id);
         let pending = thread.front.github_pending.len();
         let policies = thread.front.github.policies();
@@ -3109,7 +3340,7 @@ impl Store {
             text: String::new(),
         });
         if let Err(error) = thread.save("github_deliver") {
-            thread.transcript.items.pop();
+            thread.transcript.items.pop_latest();
             thread.transcript.index.remove(&item);
             thread.front.github.unread -= events.len();
             thread.front.github_pending.truncate(pending);
@@ -3187,6 +3418,7 @@ impl Store {
             library_updated: 0,
             active: false,
             suggestions: Vec::new(),
+            segmented: false,
         })
     }
 
@@ -3206,6 +3438,7 @@ impl Store {
         thread.transcript.source = Some(TranscriptSource {
             path: thread.path.clone(), session: thread.front.id.clone(),
             legacy: migrated_from.map(str::to_owned), after: 0, timeline: self.timeline.clone(),
+            conflict: None,
         });
         thread.front.session_id = session_id;
         thread.front.migrated_from = migrated_from.map(str::to_owned);
@@ -3495,9 +3728,27 @@ impl Store {
         Ok(self.threads.get(id).context("Thread not found")?.path.clone())
     }
 
-    pub(crate) fn trash(&mut self, app: &crate::Workspace, trash: &crate::trash::Store, id: &str) -> Result<()> {
-        let thread = self.threads.get(id).context("Thread not found")?;
+    pub(crate) fn prepare_trash(&mut self, id: &str) -> Result<()> {
+        let thread = self.threads.get_mut(id).context("Thread not found")?;
         ensure!(!thread.active, "Thread is running");
+        // A restore reads the Markdown and only later journal records, so the
+        // file has to hold everything before it moves. Failure leaves it here.
+        thread.save("trash").context("could not save the thread before trashing it; resolve the save error and retry")?;
+        if thread.segmented {
+            // The trash only ever holds the single-file format.
+            self.join_now(id).context("could not join the thread before trashing it; resolve the join error or send /join and retry")?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trash(&mut self, app: &crate::Workspace, trash: &crate::trash::Store, id: &str) -> Result<()> {
+        self.prepare_trash(id)?;
+        self.trash_prepared(app, trash, id)
+    }
+
+    pub(crate) fn trash_prepared(&mut self, app: &crate::Workspace, trash: &crate::trash::Store, id: &str) -> Result<()> {
+        let thread = self.threads.get(id).context("Thread not found")?;
         if let Some(legacy) = &thread.front.migrated_from {
             // Prevent a retired legacy session from being migrated again on restart.
             let path = self.state_dir.join("removed-thread-migrations.json");
@@ -3529,7 +3780,7 @@ impl Store {
         thread.transcript.hide_saved_blank_replies();
         thread.transcript.source = Some(TranscriptSource {
             path: thread.path.clone(), session: id.clone(), legacy: None,
-            after: generation, timeline: self.timeline.clone(),
+            after: generation, timeline: self.timeline.clone(), conflict: None,
         });
         thread.transcript.dirty.set(false);
         let events = thread.transcript.events(&id, &thread.transcript.items).collect();
@@ -3544,27 +3795,26 @@ impl Store {
         ensure!(!thread.active, "Thread is running");
         thread.transcript.check()?;
         let transcript: &mut Transcript = &mut thread.transcript;
-        let entries = &mut transcript.items;
+        let entries = &transcript.items;
         let hidden = &transcript.hidden_replies;
         let index = entries.iter().rposition(|entry| entry.meta.actor == Actor::User && !entry.meta.to_worker)
             .context("No previous user message")?;
         let user = &entries[index];
         let prompt = validate(&user.text, &user.meta.attachments)?;
-        let replies: Vec<_> = entries.iter_mut().skip(index + 1).filter(|entry| {
+        let replies: Vec<_> = entries.iter().enumerate().skip(index + 1).filter(|(_, entry)| {
             !entry.meta.superseded && entry.meta.tool.is_none() && !entry.text.trim().is_empty()
                 && !hidden.contains(&entry.meta.item)
                 && crate::routing::is_partner(&entry.meta.actor) && !entry.meta.is_delegated()
-        }).collect();
-        ensure!(replies.last().is_some_and(|entry| entry.meta.item == item), "Reply is no longer the latest");
-        let items: Vec<_> = replies.iter().map(|entry| entry.meta.item.clone()).collect();
-        for entry in replies {
-            entry.meta.superseded = true;
+        }).map(|(position, _)| position).collect();
+        ensure!(replies.last().is_some_and(|&position| entries[position].meta.item == item),
+            "Reply is no longer the latest");
+        let items: Vec<_> = replies.iter().map(|&position| entries[position].meta.item.clone()).collect();
+        for &position in &replies {
+            transcript.items.entry_mut(position).meta.superseded = true;
         }
         if let Err(error) = thread.save("reply_superseded") {
-            for entry in &mut thread.transcript.items {
-                if items.contains(&entry.meta.item) {
-                    entry.meta.superseded = false;
-                }
+            for &position in &replies {
+                thread.transcript.items.entry_mut(position).meta.superseded = false;
             }
             return Err(error);
         }

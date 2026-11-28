@@ -30,8 +30,8 @@ fn parses_only_a_leading_slash_and_unescapes_once() {
 #[test]
 fn both_backends_have_the_same_localized_inventory() {
     let expected = [
-        "compact", "clear", "new", "model", "effort", "escalate", "archive", "pin", "goal", "pace", "stop",
-        "help",
+        "compact", "clear", "new", "model", "effort", "escalate", "archive", "pin", "goal", "pace", "join",
+        "stop", "help",
     ];
     assert_eq!(
         COMMANDS.iter().map(|spec| spec.name).collect::<Vec<_>>(),
@@ -199,6 +199,37 @@ async fn local_commands_keep_history_and_settings_and_never_start_a_model() -> R
         ServerEvent::TextDelta { text, .. } if text == "A previous conversation")));
     assert!(history.iter().any(|env| matches!(&env.event,
         ServerEvent::LocalNotice { localized: Some(message), .. } if message.key == "command-cleared")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn join_rewrites_only_a_segmented_thread() -> Result<()> {
+    let project = TestDir::new();
+    let shared = TestDir::new();
+    // The segmented thread list sits above each workspace state directory.
+    let state = shared.path().join("workspace");
+    let app = Arc::new(Workspace::new(
+        project.path().into(),
+        "127.0.0.1:7878".into(),
+        state.clone(),
+        Arc::new(crate::hub::Hub::new()),
+    ));
+    let single = thread(&app)?;
+    let (_, mut events) = app.hub.subscribe(u64::MAX);
+    send(&app, &single, "/join").await?;
+    wait_notice(&mut events, "command-not-segmented").await?;
+
+    let id = crate::threads::segment_tests::segmented_workspace(project.path(), &app.hub, &state)?;
+    let path = app.hub.thread_path(&id)?;
+    assert!(std::fs::read_to_string(&path)?.starts_with("---\nformat: segmented-1\n"));
+    let root = crate::threads::rollback_marker::root(&state);
+    assert_eq!(crate::threads::rollback_marker::listed(&root)?.len(), 1);
+    send(&app, &id, "/join").await?;
+    wait_notice(&mut events, "command-joined").await?;
+    let joined = std::fs::read_to_string(&path)?;
+    assert!(joined.contains(&format!("id: {id}\n")) && !joined.contains("segmented-1"));
+    assert!(joined.contains("Synthetic") && joined.contains("/join"));
+    assert!(crate::threads::rollback_marker::listed(&root)?.is_empty());
     Ok(())
 }
 

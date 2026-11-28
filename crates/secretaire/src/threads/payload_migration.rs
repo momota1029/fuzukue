@@ -36,13 +36,13 @@ pub(crate) struct Staged {
 }
 
 #[derive(PartialEq, Eq)]
-struct LiveVersion {
-    file: FileVersion,
+pub(super) struct LiveVersion {
+    pub(super) file: FileVersion,
     changed: (i64, i64),
 }
 
 impl LiveVersion {
-    fn read(metadata: Metadata) -> std::io::Result<Self> {
+    pub(super) fn read(metadata: Metadata) -> std::io::Result<Self> {
         Ok(Self {
             changed: (metadata.ctime(), metadata.ctime_nsec()),
             file: FileVersion::read(metadata)?,
@@ -209,7 +209,7 @@ impl Staged {
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-fn exchange(staged: &Path, live: &Path) -> Result<()> {
+pub(super) fn exchange(staged: &Path, live: &Path) -> Result<()> {
     use rustix::fs::{renameat_with, RenameFlags, CWD};
     #[cfg(target_os = "linux")]
     let flag = RenameFlags::EXCHANGE;
@@ -220,7 +220,7 @@ fn exchange(staged: &Path, live: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-fn exchange(_staged: &Path, _live: &Path) -> Result<()> {
+pub(super) fn exchange(_staged: &Path, _live: &Path) -> Result<()> {
     anyhow::bail!("atomic thread exchange is unavailable on this platform")
 }
 
@@ -242,7 +242,7 @@ fn open_scratch(path: &Path) -> Result<File> {
     Ok(lock)
 }
 
-fn hash(mut file: impl std::io::Read) -> Result<[u8; 32]> {
+pub(super) fn hash(mut file: impl std::io::Read) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     std::io::copy(&mut file, &mut digest)?;
     Ok(digest.finalize().into())

@@ -633,6 +633,13 @@ impl App {
         reason
     }
 
+    /// Segmented threads of the workspaces that are open now.
+    pub(crate) fn segmented_threads(&self) -> Vec<String> {
+        self.loaded_workspaces().iter().flat_map(|workspace| {
+            workspace.hub.read_threads(|store| store.segmented_threads().collect::<Vec<_>>())
+        }).collect()
+    }
+
     pub(crate) fn protect_legacy_rollback(&self) -> Result<()> {
         for workspace in self.loaded_workspaces() {
             crate::watch::protect_legacy_rollback(&workspace)?;
@@ -869,7 +876,8 @@ impl App {
         hub.attach_notification_feed(id, self.notices.clone());
         let hold_planner_during_update = crate::delegate::admission::Overrides::load_workspace(&path)?
             .hold_planner_during_update.unwrap_or(self.hold_planner_during_update);
-        let mut workspace = Workspace::new(path, self.addr.clone(), state_dir, hub);
+        let root = self.state_dir.parent().unwrap_or(&self.state_dir);
+        let mut workspace = Workspace::new_with_root(path, self.addr.clone(), state_dir, hub, root);
         workspace.hold_planner_during_update = hold_planner_during_update;
         workspace.registry = Arc::downgrade(self);
         #[cfg(test)]

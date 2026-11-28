@@ -720,7 +720,29 @@ impl Update {
         Ok(())
     }
 
+    /// A build without the segmented thread format cannot open segmented
+    /// threads, so switching to one waits until every thread is joined. An
+    /// unreadable list counts as a segmented thread.
+    fn ensure_candidate_reads_threads(&self, app: &crate::App, candidate: &Path) -> Result<()> {
+        use crate::threads::rollback_marker;
+        let root = self.root.parent().context("invalid server builds directory")?;
+        let mut needed: std::collections::BTreeSet<String> = app.segmented_threads().into_iter().collect();
+        match rollback_marker::listed(root) {
+            Ok(listed) => needed.extend(listed.into_iter()
+                .map(|entry| format!("{} in {}", entry.thread.unwrap_or(entry.file), entry.workspace))),
+            Err(error) => {
+                needed.insert(format!("unknown ({error:#})"));
+            }
+        }
+        ensure!(needed.is_empty() || drain::contains_marker(candidate, rollback_marker::FORMAT_MARKER)?,
+            "the target server build cannot read segmented threads. Send /join in each of these threads first: {}. Marker: {}. If /join is impossible because a thread or workspace was deleted or moved, or the marker is unreadable, restore the missing data or inspect and repair the marker after verifying all affected threads are safe to open with the target build.",
+            needed.into_iter().collect::<Vec<_>>().join(", "), root.join("segmented-threads.json").display());
+        Ok(())
+    }
+
     async fn swap(&self, app: &crate::App, candidate: &Path, lock: File, rollback: bool, pinned: Option<&str>, registration: Option<tempfile::TempDir>, requester: Option<&RequestingTurn>) -> Result<SwapOutcome> {
+        // Refuse before draining work. The check repeats once the server is idle.
+        self.ensure_candidate_reads_threads(app, candidate)?;
         let id = self.begin_planned_wait(app, DrainReason::Update, requester)?;
         let wait = WaitGuard { control: &self.wait_control, id, reason: DrainReason::Update };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(self.config.wait_stall_seconds.max(1)));
@@ -731,6 +753,10 @@ impl Update {
         let WaitOutcome::Ready(_idle) = idle? else {
             return Ok(SwapOutcome::Cancelled);
         };
+        if let Err(error) = self.ensure_candidate_reads_threads(app, candidate) {
+            self.set_drain_progress(wait.id, DrainProgress::Failed, Some(format!("{error:#}")));
+            return Err(error);
+        }
         let current = self.snapshot_current()?;
         if !drain::supports(candidate)? {
             app.protect_legacy_rollback()?;

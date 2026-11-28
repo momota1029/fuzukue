@@ -215,11 +215,17 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    #[cfg(test)]
     fn new(project_dir: PathBuf, addr: String, state_dir: PathBuf, hub: Arc<Hub>) -> Self {
+        let root = state_dir.parent().unwrap_or(&state_dir).to_owned();
+        Self::new_with_root(project_dir, addr, state_dir, hub, &root)
+    }
+
+    fn new_with_root(project_dir: PathBuf, addr: String, state_dir: PathBuf, hub: Arc<Hub>, root: &Path) -> Self {
         let id = workspaces::id_for(&project_dir);
         hub.init_approval_queue(id.clone(), &state_dir);
         let research_issues = workshop::Queue::new(&project_dir, &state_dir, &id);
-        let saved = hub.load_threads(&project_dir, &state_dir);
+        let saved = hub.load_threads_with_root(&project_dir, &state_dir, root);
         if let Err(error) = hub.restore_full_approval() {
             tracing::warn!(%error, workspace = %id, "Could not restore full approvals");
         }
@@ -601,6 +607,10 @@ async fn run_server() -> anyhow::Result<()> {
     let first = args.next();
     if first.as_deref() == Some("--held-work-format") {
         println!("{}", self_update::drain::FORMAT_MARKER);
+        return Ok(());
+    }
+    if first.as_deref() == Some("--segmented-threads-format") {
+        println!("{}", threads::rollback_marker::FORMAT_MARKER);
         return Ok(());
     }
     if first.as_deref() == Some("worker-scope-hook") {

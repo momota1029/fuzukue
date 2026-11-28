@@ -196,6 +196,15 @@ async fn execute(app: &Arc<Workspace>, session: &str, spec: Spec, args: &str) ->
             message("command-pinned")
         }
         Escalate => usage(spec),
+        Join => {
+            if !app.hub.read_threads(|store| store.is_segmented(session)) {
+                return Ok(message("command-not-segmented"));
+            }
+            let _work = app.admit_work()?;
+            anyhow::ensure!(!app.delegates.is_running(session), "このスレッドには実行中の作業があります");
+            app.hub.join_thread(session).await?;
+            message("command-joined")
+        }
         Model | Effort => {
             let mut settings = app.chat_settings(session);
             if !args.is_empty() {

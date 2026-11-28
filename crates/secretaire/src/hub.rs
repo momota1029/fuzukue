@@ -70,11 +70,19 @@ struct Inner {
 }
 
 impl Inner {
-    fn payload_busy(&self, session: &str) -> Option<&'static str> {
+    fn running_or_compacting(&self, session: &str) -> Option<&'static str> {
         if self.running.contains(session) {
             Some("active partner turn")
         } else if self.compactions.contains_key(session) {
             Some("active compaction")
+        } else {
+            None
+        }
+    }
+
+    fn payload_busy(&self, session: &str) -> Option<&'static str> {
+        if let Some(reason) = self.running_or_compacting(session) {
+            Some(reason)
         } else if self.payload_holds.contains_key(session) {
             Some("live worker or Claude turn")
         } else {
@@ -991,17 +999,25 @@ impl Hub {
         }
     }
 
+    #[cfg(test)]
     pub fn load_threads(
         &self,
         project: &std::path::Path,
         state_dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, crate::state::SessionRecord> {
+        let root = state_dir.parent().unwrap_or(state_dir);
+        self.load_threads_with_root(project, state_dir, root)
+    }
+
+    pub(crate) fn load_threads_with_root(
+        &self, project: &std::path::Path, state_dir: &std::path::Path, root: &std::path::Path,
     ) -> std::collections::BTreeMap<String, crate::state::SessionRecord> {
         let mut records = crate::state::load_sessions(state_dir);
         let mut inner = self.inner.lock().unwrap();
         let timeline = inner.writer.as_ref().map_or_else(
             || crate::state::Timeline::open(state_dir), crate::state::TimelineWriter::timeline,
         );
-        let mut store = crate::threads::Store::load_indexed(project, state_dir, &records, timeline);
+        let mut store = crate::threads::Store::load_indexed(project, state_dir, root, &records, timeline);
         store.restore_sessions(&mut records);
         inner.threads = Some(store);
         inner.folder_grants = Some(crate::folder_grants::Store::load(state_dir));
@@ -1092,6 +1108,37 @@ impl Hub {
             Ok(()) => tracing::info!(target: PAYLOAD_CONVERSION_LOG, thread = %id, elapsed_ms, "idle payload conversion finished"),
             Err(error) => tracing::warn!(target: PAYLOAD_CONVERSION_LOG, thread = %id, elapsed_ms, %error, "idle payload conversion aborted"),
         }
+    }
+
+    /// Rewrite an idle segmented thread as a single file. Staging runs without
+    /// the lock, and publication refuses a thread that changed meanwhile.
+    pub(crate) async fn join_thread(self: &Arc<Self>, session: &str) -> anyhow::Result<()> {
+        self.join_thread_with(session, || {}).await
+    }
+
+    pub(crate) async fn join_thread_with(self: &Arc<Self>, session: &str, after_publish: impl FnOnce() + Send + 'static) -> anyhow::Result<()> {
+        let candidate = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(reason) = inner.running_or_compacting(session) {
+                anyhow::bail!("{reason}");
+            }
+            let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
+            threads.prepare_join(session)?
+        };
+        let hub = self.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut staged = candidate.stage()?;
+            let mut inner = hub.inner.lock().unwrap();
+            if let Some(reason) = inner.running_or_compacting(&staged.candidate.id) {
+                anyhow::bail!("{reason}");
+            }
+            let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
+            threads.publish_join(&mut staged)?;
+            after_publish();
+            staged.finish()?;
+            threads.trim_transcripts();
+            Ok(())
+        }).await?
     }
 
     pub(crate) fn tool_detail(&self, session: &str, item: &str) -> Option<crate::threads::ToolDetail> {
@@ -1308,9 +1355,10 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         let store = inner.threads.as_mut().expect("Workspace initializes the thread store");
         anyhow::ensure!(store.contains(session), "Thread not found");
+        store.prepare_trash(session)?;
         self.end_folder_grants(&mut inner, session, true)?;
         let store = inner.threads.as_mut().unwrap();
-        store.trash(app, trash, session)?;
+        store.trash_prepared(app, trash, session)?;
         let snapshot = store.snapshot();
         let _ = self.tx.send(crate::snapshot(snapshot));
         self.publish_locked(&mut inner, ServerEvent::ThreadHistoryInvalidated {

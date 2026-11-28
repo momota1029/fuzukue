@@ -624,9 +624,14 @@ async fn replay_background(app: &Arc<Workspace>) {
 pub(crate) const FORMAT_MARKER: &str = "secretaire-held-work-v1";
 
 pub(crate) fn supports(path: &Path) -> Result<bool> {
+    contains_marker(path, FORMAT_MARKER)
+}
+
+/// Whether an executable embeds a capability marker shorter than the buffer.
+pub(crate) fn contains_marker(path: &Path, marker: &str) -> Result<bool> {
     use std::io::Read;
     let mut file = fs::File::open(path)?;
-    let marker = FORMAT_MARKER.as_bytes();
+    let marker = marker.as_bytes();
     let mut bytes = [0; 65536];
     let overlap = marker.len() - 1;
     let mut prefix = 0;

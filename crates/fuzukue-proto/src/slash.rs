@@ -14,6 +14,7 @@ pub enum Command {
     Pin,
     Goal,
     Pace,
+    Join,
     Stop,
     Help,
 }
@@ -60,6 +61,7 @@ pub const COMMANDS: &[Spec] = &[
     spec!(Pin, "pin", "", "command-pin"),
     spec!(Goal, "goal", " [text]", "command-goal"),
     spec!(Pace, "pace", " [full|normal|economy]", "command-pace"),
+    spec!(Join, "join", "", "command-join"),
     spec!(Stop, "stop", "", "command-stop"),
     spec!(Help, "help", "", "command-help"),
 ];
