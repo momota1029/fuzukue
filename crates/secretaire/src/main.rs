@@ -3365,6 +3365,13 @@ async fn prompt_codex_with_images(
                 app.finish_comment_application(&session, outcome).await;
             }
             let _start = app.prompt_start.lock().await;
+            if let TurnKind::WatchWake(id) = kind {
+                if let Ok(text) = &result {
+                    watch::complete_wake(&app, &session, id, text, fuzukue_proto::Actor::Codex {
+                        thread_id: thread_id.clone(), parent_tool_use: None,
+                    });
+                }
+            }
             // The spawned turn can fail after the desk queue has handed it off.
             let retrying = delivery.is_some_and(|delivery| match &result {
                 Ok(_) => {

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
@@ -302,7 +303,7 @@ fn wake_policy_and_persisted_rate_limit() -> Result<()> {
 }
 
 #[test]
-fn wakes_remain_durable_until_the_desk_accepts_and_merge_while_waiting() -> Result<()> {
+fn wakes_keep_the_batch_and_all_item_ids_until_a_durable_outcome() -> Result<()> {
     let root = TestDir::new();
     let app = workspace(root.path());
     let thread = app.hub.edit_threads(|store| store.create(None))?;
@@ -311,30 +312,33 @@ fn wakes_remain_durable_until_the_desk_accepts_and_merge_while_waiting() -> Resu
     let mut runtime = Runtime::default();
     runtime.apply(&watch, sample("", &[], None), 1);
     runtime.apply(&watch, sample("new-sha", &[2], None), 2);
-    let first = runtime.outbox.pop_front().unwrap();
-    runtime.record(&watch, first);
-    let mut queued_text = runtime.wake_digest.clone();
-    let second = runtime.outbox.pop_front().unwrap();
-    runtime.record(&watch, second);
+    for event in std::mem::take(&mut runtime.outbox) {
+        runtime.record(&watch, event);
+    }
     app.watches.lock()?.edit(|state| {
         state.watches.insert(watch.id.clone(), watch.clone());
-        state.runtime.insert(watch.id.clone(), runtime.clone());
+        state.runtime.insert(watch.id.clone(), runtime);
     })?;
+
+    let (id, prompt) = super::begin_wake(&app, &watch.id, &thread)?.unwrap();
+    assert!(prompt.contains("new-sha"));
+    assert!(prompt.contains("dots-cycle-2.md"));
+    let pending = app.watches.lock()?.runtime(&watch).pending_wakes;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].items.len(), 2);
+    assert!(pending[0].items.iter().all(|item| item.thread == thread));
     drop(app);
 
     let app = workspace(root.path());
-    let (_, previous) = super::begin_wake(&app, &watch.id, &thread, &mut queued_text)?.unwrap();
-    assert!(queued_text.contains("new-sha"));
-    assert!(queued_text.contains("dots-cycle-2.md"));
-    assert!(app.watches.lock()?.runtime(&watch).wake_digest.is_empty());
-    super::defer_wake(&app, &watch.id, &queued_text, previous)?;
-    assert_eq!(app.watches.lock()?.runtime(&watch).wake_digest, queued_text);
-    assert!(super::begin_wake(&app, &watch.id, &thread, &mut queued_text)?.is_some());
+    assert_eq!(super::begin_wake(&app, &watch.id, &thread)?.unwrap().0, id);
 
-    app.watches.lock()?.edit(|state| {
-        state.runtime.get_mut(&watch.id).unwrap().wake_digest = "new event".into();
-    })?;
-    assert!(super::begin_wake(&app, &watch.id, &thread, &mut queued_text)?.is_none());
+    // Simulate the crash after the reply was saved but before the ack.
+    app.hub.save_note(&thread, &id.reply_item(), "A or B?".into(), fuzukue_proto::Actor::Claude, true)?;
+    drop(app);
+    let app = workspace(root.path());
+    assert!(super::begin_wake(&app, &watch.id, &thread)?.is_none());
+    assert_eq!(transcript(&app, &thread).matches("A or B?").count(), 1);
+    assert!(app.watches.lock()?.runtime(&watch).pending_wakes.is_empty());
     Ok(())
 }
 
@@ -805,7 +809,24 @@ done
 "#]);
     let claude = crate::ClaudeSession::spawn_command(command, thread.clone(), project.clone(), &app, Box::new(|_| {}))?;
     app.sessions.lock().await.insert(thread.clone(), claude);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let mut window = fuzukue_proto::UsageWindow {
+        agent: "claude".into(),
+        name: "test quota".into(),
+        used: 1.0,
+        resets_at: Some(crate::usage::now() + 600),
+        rejected: true,
+        recent_pace: None,
+    };
+    app.usage.restore(vec![window.clone()]);
+    super::schedule(&app)?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!project.join("watch-prompts").exists());
+    assert!(!app.watches.lock()?.runtime(&watch).wake_digest.is_empty());
+    window.used = 0.0;
+    window.rejected = false;
+    window.resets_at = Some(crate::usage::now() + 1200);
+    app.usage.restore(vec![window]);
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             super::schedule(&app)?;
             if project.join("watch-prompts").is_file() { break; }
@@ -817,5 +838,382 @@ done
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(fs::read_to_string(project.join("watch-prompts"))?.lines().count(), 1);
     assert_eq!(transcript(&app, &thread).matches(&item).count(), 1);
+    Ok(())
+}
+
+pub(super) fn delivery_checkpoint(app: &Workspace, checkpoint: &str) {
+    let Some(root) = std::env::var_os("FUZUKUE_TEST_WATCH_CRASH_DIR") else { return };
+    if app.project_dir.parent() != Some(Path::new(&root))
+        || std::env::var("FUZUKUE_TEST_WATCH_CRASH_BOUNDARY").as_deref() != Ok(checkpoint)
+    {
+        return;
+    }
+    fs::write(Path::new(&root).join("ready"), checkpoint).unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+async fn crash_test_backend(app: &Arc<Workspace>, thread: &str, reply: &str) -> Result<()> {
+    let mut command = tokio::process::Command::new("sh");
+    command.args(["-c", r#"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> watch-prompts
+    if [ "$2" = "after-start" ]; then
+        : > ../ready
+    else
+        printf '%s\n' "$1"
+    fi
+done
+"#, "watch-backend"])
+        .arg(json!({"type": "result", "is_error": false, "result": reply}).to_string())
+        .arg(std::env::var("FUZUKUE_TEST_WATCH_CRASH_BOUNDARY").unwrap_or_default());
+    let claude = crate::ClaudeSession::spawn_command(
+        command, thread.into(), app.project_dir.clone(), app, Box::new(|_| {}),
+    )?;
+    app.sessions.lock().await.insert(thread.into(), claude);
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_delivery_survives_process_kill_at_each_boundary() -> Result<()> {
+    const REPLY: &str = "Choose A or B?";
+    for (boundary, silent) in [
+        ("after-note", false),
+        ("after-start", false),
+        ("after-acceptance", false),
+        ("before-ack", false),
+        ("before-ack", true),
+    ] {
+        let root = TestDir::new();
+        let app = workspace(root.path());
+        let thread = app.hub.edit_threads(|store| store.create(None))?;
+        let mut watch = dots(&app.project_dir, &thread);
+        watch.wake = Wake::All;
+        watch.paused = true;
+        let item = enqueue(&app, &watch)?;
+        drop(app);
+        let reply = if silent { "<silent/>" } else { REPLY };
+        kill_at_checkpoint(root.path(), boundary, &thread, Some(reply)).await?;
+
+        let app = workspace(root.path());
+        let runtime = app.watches.lock()?.runtime(&watch);
+        assert_eq!(transcript(&app, &thread).matches(&item).count(), 1, "{boundary}");
+        if boundary == "after-note" {
+            assert_eq!(runtime.outbox.len(), 1);
+            assert!(runtime.pending_wakes.is_empty());
+        } else {
+            assert!(runtime.outbox.is_empty());
+            let batch = &runtime.pending_wakes[0];
+            assert_eq!(batch.items.len(), 1);
+            assert_eq!(batch.items[0].item, item);
+            assert_eq!(batch.items[0].thread, thread);
+            assert_eq!(matches!(batch.acceptance, Some(super::WakeAcceptance::Silent)), silent);
+            assert_eq!(batch.acceptance.is_some(), boundary != "after-start");
+        }
+        let saved_replies = usize::from(boundary == "before-ack" && !silent);
+        assert_eq!(transcript(&app, &thread).matches(REPLY).count(), saved_replies, "{boundary}");
+
+        crash_test_backend(&app, &thread, reply).await?;
+        super::start(&app);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let runtime = app.watches.lock()?.runtime(&watch);
+                if runtime.outbox.is_empty() && runtime.wake_digest.is_empty() && runtime.pending_wakes.is_empty() {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await??;
+        super::schedule(&app)?;
+        let body = transcript(&app, &thread);
+        assert_eq!(body.matches(&item).count(), 1, "{boundary}");
+        assert_eq!(body.matches(REPLY).count(), usize::from(!silent), "{boundary}");
+        assert!(!body.contains("<silent/>"));
+        let prompts = fs::read_to_string(app.project_dir.join("watch-prompts"))?.lines().count();
+        assert_eq!(prompts, if boundary == "after-start" { 2 } else { 1 }, "{boundary}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn watch_delivery_crash_child() -> Result<()> {
+    let Some(root) = std::env::var_os("FUZUKUE_TEST_WATCH_CRASH_DIR") else { return Ok(()) };
+    let app = workspace(Path::new(&root));
+    if let Ok(reply) = std::env::var("FUZUKUE_TEST_WATCH_CRASH_REPLY") {
+        let thread = std::env::var("FUZUKUE_TEST_WATCH_CRASH_THREAD")?;
+        crash_test_backend(&app, &thread, &reply).await?;
+    }
+    super::start(&app);
+    std::future::pending::<Result<()>>().await
+}
+
+async fn kill_at_checkpoint(root: &Path, boundary: &str, thread: &str, reply: Option<&str>) -> Result<()> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.args(["--exact", "watch::tests::watch_delivery_crash_child"])
+        .env("FUZUKUE_TEST_WATCH_CRASH_DIR", root)
+        .env("FUZUKUE_TEST_WATCH_CRASH_BOUNDARY", boundary)
+        .env("FUZUKUE_TEST_WATCH_CRASH_THREAD", thread)
+        .env_remove("FUZUKUE_TEST_WATCH_CRASH_REPLY");
+    if let Some(reply) = reply {
+        command.env("FUZUKUE_TEST_WATCH_CRASH_REPLY", reply);
+    }
+    let mut child = command.spawn()?;
+    let ready = root.join("ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !ready.is_file() && child.try_wait()?.is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let reached = ready.is_file();
+    let _ = child.kill();
+    assert!(!child.wait()?.success());
+    ensure!(reached, "child did not reach {boundary}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_acceptance_is_durable_and_idempotent_before_and_after_delivery() -> Result<()> {
+    use super::{ExternalAcceptance, accept_external_notification};
+
+    let root = TestDir::new();
+    let app = workspace(root.path());
+    let thread = app.hub.edit_threads(|store| store.create(None))?;
+    let other = app.hub.edit_threads(|store| store.create(None))?;
+    let id = "scope/run/desk/1";
+    let mut submissions = Vec::new();
+    for _ in 0..2 {
+        submissions.push(tokio::spawn(accept_external_notification(
+            app.clone(), id.into(), thread.clone(), "External result".into(),
+        )));
+    }
+    let mut accepted = 0;
+    for submission in submissions {
+        accepted += usize::from(submission.await?? == ExternalAcceptance::Accepted);
+    }
+    assert_eq!(accepted, 1);
+    assert!(super::configured(&app.project_dir, &app.state_dir));
+    assert!(!transcript(&app, &thread).contains("External result"));
+    drop(app);
+
+    kill_at_checkpoint(root.path(), "before-external-ack", &thread, None).await?;
+    let app = workspace(root.path());
+    assert_eq!(transcript(&app, &thread).matches("External result").count(), 1);
+    assert_eq!(accept_external_notification(
+        app.clone(), id.into(), other.clone(), "Conflicting retry".into(),
+    ).await?, ExternalAcceptance::AlreadyAccepted);
+    assert!(super::configured(&app.project_dir, &app.state_dir));
+    super::schedule(&app)?;
+    assert!(!super::configured(&app.project_dir, &app.state_dir));
+    drop(app);
+
+    let app = workspace(root.path());
+    assert_eq!(accept_external_notification(
+        app.clone(), id.into(), other.clone(), "Conflicting retry".into(),
+    ).await?, ExternalAcceptance::AlreadyAccepted);
+    super::schedule(&app)?;
+    assert_eq!(transcript(&app, &thread).matches("External result").count(), 1);
+    assert!(!transcript(&app, &other).contains("Conflicting retry"));
+    Ok(())
+}
+
+#[test]
+fn migrates_legacy_wake_digest_and_fences_previous_binary() -> Result<()> {
+    let root = TestDir::new();
+    let app = workspace(root.path());
+    let thread = app.hub.edit_threads(|store| store.create(None))?;
+    let mut watch = dots(root.path(), &thread);
+    watch.wake = Wake::All;
+    let legacy_path = app.state_dir.join("watch.json");
+    let config = format!(r#"
+[[watch]]
+name = "static-dots"
+repo = "."
+kind = "dots"
+wake = "all"
+thread = "{thread}"
+"#);
+    fs::write(app.project_dir.join("fuzukue.toml"), &config)?;
+    let static_id = "static:static-dots";
+    fs::write(&legacy_path, serde_json::to_vec(&json!({
+        "watches": { (watch.id.clone()): watch },
+        "runtime": {
+            (watch.id.clone()): { "wake_digest": "old pending text", "serial": 42 },
+            (static_id): { "wake_digest": "old static pending text", "last_poll": 123, "paused": false }
+        }
+    }))?)?;
+    drop(app);
+    let app = workspace(root.path());
+    let (id, prompt) = super::begin_wake(&app, &watch.id, &thread)?.unwrap();
+    assert!(prompt.contains("old pending text"));
+    let (static_batch, static_prompt) = super::begin_wake(&app, static_id, &thread)?.unwrap();
+    assert!(static_prompt.contains("old static pending text"));
+    super::protect_legacy_rollback(&app)?;
+
+    // Simulate the previous build serializing its own Runtime and dropping new fields.
+    let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&legacy_path)?)?;
+    assert_eq!(legacy["runtime"][&watch.id]["paused"], true);
+    assert_eq!(legacy["runtime"][&watch.id]["wake_digest"], "");
+    assert_eq!(legacy["runtime"][static_id]["paused"], true);
+    assert_eq!(legacy["runtime"][static_id]["wake_digest"], "");
+    for entry in legacy["runtime"].as_object_mut().unwrap().values_mut() {
+        entry.as_object_mut().unwrap().remove("wake_items");
+        entry.as_object_mut().unwrap().remove("pending_wakes");
+    }
+    legacy["runtime"].as_object_mut().unwrap().remove(super::ROLLBACK_FENCE);
+    fs::write(legacy_path, serde_json::to_vec(&legacy)?)?;
+    drop(app);
+    let app = workspace(root.path());
+    assert_eq!(fs::read_to_string(app.project_dir.join("fuzukue.toml"))?, config);
+    {
+        let store = app.watches.lock()?;
+        assert_eq!(store.runtime(&watch).paused, None);
+        let runtime = store.runtime(store.by_id(static_id).unwrap());
+        assert_eq!(runtime.last_poll, Some(123));
+        assert_eq!(runtime.paused, Some(false));
+    }
+    assert_eq!(super::begin_wake(&app, &watch.id, &thread)?.unwrap().0, id);
+    assert_eq!(super::begin_wake(&app, static_id, &thread)?.unwrap().0, static_batch);
+    super::persist_wake_reply(&app, &thread, id, "<silent/>", fuzukue_proto::Actor::Claude)?;
+    super::persist_wake_reply(&app, &thread, static_batch, "Static reply", fuzukue_proto::Actor::Claude)?;
+    assert!(!transcript(&app, &thread).contains(&id.reply_item()));
+    assert_eq!(transcript(&app, &thread).matches("Static reply").count(), 1);
+    assert!(app.watches.lock()?.runtime(&watch).pending_wakes.is_empty());
+    Ok(())
+}
+
+#[test]
+fn prepared_migration_defers_to_legacy_until_the_fence_is_saved() -> Result<()> {
+    let root = TestDir::new();
+    let app = workspace(root.path());
+    let thread = app.hub.edit_threads(|store| store.create(None))?;
+    let watch = dots(root.path(), &thread);
+    let legacy = |digest| json!({
+        "watches": { (watch.id.clone()): watch },
+        "runtime": { (watch.id.clone()): { "wake_digest": digest } }
+    });
+    let mut prepared = legacy("earlier digest");
+    prepared["migration_pending"] = json!(true);
+    super::persist_state(
+        &app.state_dir.join("watch-v1/watch.json"), &serde_json::from_value(prepared)?,
+    )?;
+    fs::write(app.state_dir.join("watch.json"), serde_json::to_vec(&legacy("updated digest"))?)?;
+    drop(app);
+
+    let app = workspace(root.path());
+    assert_eq!(app.watches.lock()?.runtime(&watch).wake_digest, "updated digest");
+    super::protect_legacy_rollback(&app)?;
+    let app = workspace(root.path());
+    assert_eq!(app.watches.lock()?.runtime(&watch).wake_digest, "updated digest");
+    Ok(())
+}
+
+#[test]
+fn a_retried_front_desk_acceptance_keeps_the_first_outcome() -> Result<()> {
+    let root = TestDir::new();
+    let app = workspace(root.path());
+    let thread = app.hub.edit_threads(|store| store.create(None))?;
+    let mut watch = dots(root.path(), &thread);
+    watch.wake = Wake::All;
+    let mut runtime = Runtime::default();
+    runtime.wake_digest = "pending digest".into();
+    app.watches.lock()?.edit(|state| {
+        state.watches.insert(watch.id.clone(), watch.clone());
+        state.runtime.insert(watch.id.clone(), runtime);
+    })?;
+    let (id, _) = super::begin_wake(&app, &watch.id, &thread)?.unwrap();
+    let path = app.hub.thread_path(&thread)?;
+    let unavailable = root.path().join("unavailable.md");
+    fs::rename(&path, &unavailable)?;
+    assert!(super::persist_wake_reply(&app, &thread, id, "First outcome", fuzukue_proto::Actor::Claude).is_err());
+    assert!(app.watches.lock()?.runtime(&watch).pending_wakes[0].acceptance.is_some());
+    fs::rename(&unavailable, &path)?;
+
+    super::persist_wake_reply(&app, &thread, id, "Conflicting outcome", fuzukue_proto::Actor::Claude)?;
+    super::persist_wake_reply(&app, &thread, id, "Conflicting outcome", fuzukue_proto::Actor::Claude)?;
+    let body = transcript(&app, &thread);
+    assert_eq!(body.matches("First outcome").count(), 1);
+    assert!(!body.contains("Conflicting outcome"));
+    assert!(app.watches.lock()?.runtime(&watch).pending_wakes.is_empty());
+    Ok(())
+}
+
+#[test]
+fn wake_batches_keep_unclipped_references_and_complete_in_order() -> Result<()> {
+    let root = TestDir::new();
+    let app = workspace(root.path());
+    let thread = app.hub.edit_threads(|store| store.create(None))?;
+    let mut watch = dots(root.path(), &thread);
+    watch.wake = Wake::All;
+    let mut runtime = Runtime::default();
+    runtime.apply(&watch, sample("base", &[], None), 1);
+    for number in 1..=80 {
+        runtime.apply(&watch, sample(&format!("head-{number}"), &[number], None), 2);
+    }
+    let expected: Vec<_> = runtime.outbox.iter().map(|event| event.item(&watch.id)).collect();
+    for event in std::mem::take(&mut runtime.outbox) {
+        runtime.record(&watch, event);
+    }
+    let now = Utc::now().timestamp();
+    assert!(runtime.seal_wake(now - 600));
+    runtime.apply(&watch, sample("later", &[], None), 3);
+    let event = runtime.outbox.pop_front().unwrap();
+    runtime.record(&watch, event);
+    assert!(runtime.seal_wake(now));
+    let first = &runtime.pending_wakes[0];
+    let second = &runtime.pending_wakes[1];
+    assert_eq!(first.items.iter().map(|item| &item.item).collect::<Vec<_>>(), expected.iter().collect::<Vec<_>>());
+    assert!(first.digest.chars().count() <= 6000);
+    let (first, second) = (first.id, second.id);
+
+    app.watches.lock()?.edit(|state| {
+        state.watches.insert(watch.id.clone(), watch.clone());
+        state.runtime.insert(watch.id.clone(), runtime);
+    })?;
+    drop(app);
+    let app = workspace(root.path());
+    assert_eq!(super::begin_wake(&app, &watch.id, &thread)?.unwrap().0, first);
+    super::persist_wake_reply(&app, &thread, first, "<silent/>", fuzukue_proto::Actor::Claude)?;
+    assert_eq!(super::begin_wake(&app, &watch.id, &thread)?.unwrap().0, second);
+    super::persist_wake_reply(&app, &thread, second, "A decision is pending.", fuzukue_proto::Actor::Claude)?;
+    assert!(app.watches.lock()?.runtime(&watch).pending_wakes.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_wakes_stay_available_for_review() -> Result<()> {
+    use crate::self_update::drain::{self, Work};
+
+    let root = TestDir::new();
+    let app = workspace(root.path());
+    let thread = app.hub.edit_threads(|store| store.create(None))?;
+    let id = "legacy-notification";
+    app.drain.enqueue(&app.state_dir, &thread, id.into(), Work::WatchWake {
+        watch: "test-dots".into(), text: "reviewable legacy excerpt".into(),
+    })?;
+    assert!(app.drain.claim(&app.state_dir, &thread, id)?);
+    app.drain.finish(&app.state_dir, &thread, id, Some("Review the saved transcript".into()));
+    let unclaimed = "unclaimed-legacy-notification";
+    app.drain.enqueue(&app.state_dir, &thread, unclaimed.into(), Work::WatchWake {
+        watch: "test-dots".into(), text: "unclaimed legacy excerpt".into(),
+    })?;
+    drop(app);
+
+    let app = workspace(root.path());
+    drain::start(&app);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if app.drain.records(&app.state_dir)?.iter().any(|record| record.id == unclaimed && record.review.is_some()) {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await??;
+    let records = app.drain.records(&app.state_dir)?;
+    assert!(records.iter().any(|record| record.id == id
+        && record.review.as_deref() == Some("Review the saved transcript")
+        && matches!(&record.work, Work::WatchWake { text, .. } if text == "reviewable legacy excerpt")));
+    assert!(records.iter().any(|record| record.id == unclaimed
+        && record.review.is_some()
+        && matches!(&record.work, Work::WatchWake { text, .. } if text == "unclaimed legacy excerpt")));
     Ok(())
 }

@@ -1372,17 +1372,17 @@ impl Hub {
     }
 
     pub(crate) fn deliver_system_note(&self, session: &str, item: &str, text: String) -> anyhow::Result<()> {
-        self.save_system_note(session, item, text, false).map(|_| ())
+        self.save_note(session, item, text, fuzukue_proto::Actor::System, false).map(|_| ())
     }
 
     pub(crate) fn deliver_update_note(&self, session: &str, item: &str, text: String) -> anyhow::Result<bool> {
-        self.save_system_note(session, item, text, true)
+        self.save_note(session, item, text, fuzukue_proto::Actor::System, true)
     }
 
-    fn save_system_note(&self, session: &str, item: &str, text: String, allow_archived: bool) -> anyhow::Result<bool> {
+    pub(crate) fn save_note(&self, session: &str, item: &str, text: String, actor: fuzukue_proto::Actor, allow_archived: bool) -> anyhow::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
         let threads = inner.threads.as_mut().expect("Workspace initializes the thread store");
-        let Some(event) = threads.system_note(session, item, text, allow_archived)? else { return Ok(false) };
+        let Some(event) = threads.save_note(session, item, text, actor, allow_archived)? else { return Ok(false) };
         let snapshot = threads.snapshot();
         self.broadcast_saved(&mut inner, event, snapshot);
         Ok(true)

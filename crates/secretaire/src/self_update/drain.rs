@@ -562,6 +562,7 @@ pub(crate) fn start(app: &Arc<Workspace>) {
                                 Work::LegacyPlan(_)
                                     | Work::LegacyGitHub(_)
                                     | Work::LegacyWatch { .. }
+                                    | Work::WatchWake { .. }
                             )
                     }) {
                         let Ok(_work) = app.admit_work() else { break };
@@ -668,6 +669,15 @@ fn restore_legacy(app: &Workspace, record: &Record) -> bool {
             digest,
             outbox,
         } => crate::watch::restore_after_rollback(app, watch, *paused, digest, outbox),
+        Work::WatchWake { .. } => {
+            app.drain.finish(
+                &app.state_dir,
+                &record.session,
+                &record.id,
+                Some("Review the legacy watch excerpt and thread before retrying.".into()),
+            );
+            return true;
+        }
         _ => return false,
     };
     match result {

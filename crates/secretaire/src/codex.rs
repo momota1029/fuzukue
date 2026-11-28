@@ -55,6 +55,7 @@ struct ThreadInfo {
     observed: RunMetadata,
     streamed: std::collections::HashSet<String>,
     relay_reply: Option<RelayReply>,
+    durable_reply: bool,
     partner: Option<PartnerOptions>,
     background_commands: crate::background_commands::Codex,
 }
@@ -945,6 +946,7 @@ impl Codex {
                 },
                 streamed: Default::default(),
                 relay_reply: None,
+                durable_reply: false,
                 partner,
                 background_commands: Default::default(),
             },
@@ -1023,7 +1025,8 @@ impl Codex {
             t.last_answer.clear();
             t.acted_or_asked = false;
             t.streamed.clear();
-            t.relay_reply = matches!(kind, TurnKind::WorkerDigest).then(RelayReply::default);
+            t.relay_reply = kind.buffers_reply().then(RelayReply::default);
+            t.durable_reply = matches!(kind, TurnKind::WatchWake(_));
             let overrides = t.partner.as_ref().map(|options| {
                 if let Some(stats) = &mut t.stats {
                     if let Some(model) = &options.settings.model {
@@ -1855,7 +1858,7 @@ impl Codex {
                             });
                         }
                         let result = match p["turn"]["status"].as_str() {
-                            Some("interrupted") if t.partner.is_some() => Err(crate::cancellation::Cancelled.into()),
+                            Some("interrupted") if t.durable_reply || t.partner.is_some() => Err(crate::cancellation::Cancelled.into()),
                             Some(status) if status != "completed" && status != "interrupted" => {
                                 let message = p["turn"]["error"]["message"].as_str().unwrap_or(status);
                                 Err(anyhow!("Codex のターンが完了しなかった（{message}）"))
@@ -1863,14 +1866,20 @@ impl Codex {
                             _ => Ok(t.last_answer.clone()),
                         };
                         let reply = t.relay_reply.take();
-                        t.waiter.take().map(|w| (w, result, reply))
+                        t.waiter.take().map(|w| (w, result, reply, t.durable_reply))
                     })
                 };
                 if !read_only && !self.threads.lock().unwrap().get(thread_id).is_some_and(|t| t.partner.is_some()) {
                     self.hub.publish(ServerEvent::TurnEnded { session: session.clone(), actor: actor.clone() });
                 }
-                if let Some((w, mut answer, reply)) = waiter {
-                    if let Some(reply) = reply {
+                if let Some((w, mut answer, reply, durable_reply)) = waiter {
+                    if durable_reply {
+                        if let (Ok(answer), Some(reply)) = (&mut answer, reply) {
+                            if answer.is_empty() {
+                                *answer = reply.text();
+                            }
+                        }
+                    } else if let Some(reply) = reply {
                         reply.publish(&self.hub, &session, actor);
                         if let Ok(text) = &mut answer {
                             if front_desk::suppress_relay_reply(text) {

@@ -162,7 +162,8 @@ pub(crate) enum DeskTurn {
     WorkerDigest(relay::Digests),
     #[serde(skip)]
     Durable(String),
-    WatchEvent { watch: String, text: String },
+    #[serde(skip)]
+    WatchEvent { watch: String },
     HandoffReport { worker: String, text: String },
     Plan { resumed: bool },
     #[serde(skip)]
@@ -1878,8 +1879,8 @@ fn queue_desk(app: &Arc<App>, session: &str, turn: DeskTurn) {
     }
 }
 
-pub(crate) fn watch_event(app: &Arc<App>, session: &str, id: &str, text: String) {
-    enqueue_desk(app, session, DeskTurn::WatchEvent { watch: id.into(), text });
+pub(crate) fn watch_event(app: &Arc<App>, session: &str, id: &str) {
+    enqueue_desk(app, session, DeskTurn::WatchEvent { watch: id.into() });
 }
 
 async fn wait_for_digest(
@@ -2105,45 +2106,26 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
                 }
                 continue;
             }
-            DeskTurn::WatchEvent { watch, mut text } => {
-                let id = mail::session_key();
-                let saved = app.drain.enqueue(&app.state_dir, &session, id.clone(),
-                    Work::WatchWake { watch: watch.clone(), text: text.clone() });
-                if saved.is_err() || !matches!(app.drain.claim(&app.state_dir, &session, &id), Ok(true)) {
-                    app.drain.finish(&app.state_dir, &session, &id, None);
-                    crate::watch::release_wake(&app, &watch, &session);
-                    continue;
-                }
-                let mut review = None;
-                match crate::watch::begin_wake(&app, &watch, &session, &mut text) {
-                    Ok(Some((name, previous))) => {
-                        let prompt = format!("{}\n\n{name}\n\n{text}", crate::front_desk::watch_event_instruction());
-                        match crate::delegate_worker_digest(&app, &session, prompt, crate::preferences::Inheritance::Captured(None)).await {
+            DeskTurn::WatchEvent { watch } => {
+                match crate::watch::begin_wake(&app, &watch, &session) {
+                    Ok(Some((id, prompt))) => {
+                        let kind = crate::front_desk::TurnKind::WatchWake(id);
+                        match crate::delegate_background_turn(&app, &session, prompt, kind, crate::preferences::Inheritance::Captured(None)).await {
                             Ok(true) => {}
                             Ok(false) => {
-                                match crate::watch::defer_wake(&app, &watch, &text, previous) {
-                                    Ok(()) => {
-                                        app.drain.finish(&app.state_dir, &session, &id, None);
-                                        app.delegates.desk.lock().unwrap().get_mut(&session).unwrap()
-                                            .enqueue(DeskTurn::WatchEvent { watch, text });
-                                        drop(start);
-                                        drop(_work);
-                                        wait_for_digest(&app, &mut events, &changed).await;
-                                        continue;
-                                    }
-                                    Err(error) => review = Some(format!("could not defer watch wake: {error:#}")),
-                                }
+                                app.delegates.desk.lock().unwrap().get_mut(&session).unwrap()
+                                    .enqueue(DeskTurn::WatchEvent { watch });
+                                drop(start);
+                                drop(_work);
+                                wait_for_digest(&app, &mut events, &changed).await;
+                                continue;
                             }
-                            Err(error) => {
-                                review = Some(format!("watch turn delivery requires review: {error:#}"));
-                                desk_delivery_notice(&app, &session, &error);
-                            }
+                            Err(error) => desk_delivery_notice(&app, &session, &error),
                         }
                     }
                     Ok(None) => {}
                     Err(error) => tracing::warn!(%error, "could not start watch wake"),
                 }
-                app.drain.finish(&app.state_dir, &session, &id, review);
                 crate::watch::release_wake(&app, &watch, &session);
                 continue;
             }

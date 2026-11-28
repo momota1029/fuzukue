@@ -517,6 +517,8 @@ pub(super) struct Runtime {
     pub outbox: VecDeque<Event>,
     pub last_wake: Option<i64>,
     pub wake_digest: String,
+    pub wake_items: Vec<WakeItem>,
+    pub pending_wakes: VecDeque<WakeBatch>,
     serial: u64,
 }
 
@@ -526,6 +528,38 @@ pub(super) enum Seen {
     BranchHeads(BTreeMap<String, String>),
     Report(Option<u64>),
     Heartbeat { stale: bool, heartbeat: Heartbeat },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct WakeItem {
+    pub thread: String,
+    pub item: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct WakeBatch {
+    pub id: WakeId,
+    pub digest: String,
+    pub items: Vec<WakeItem>,
+    pub reply_thread: Option<String>,
+    #[serde(default)]
+    pub acceptance: Option<WakeAcceptance>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct WakeId(u64);
+
+impl WakeId {
+    pub(super) fn reply_item(self) -> String {
+        format!("watch:reply:{:016x}", self.0)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) enum WakeAcceptance {
+    Reply { text: String, actor: fuzukue_proto::Actor },
+    Silent,
 }
 
 impl Runtime {
@@ -714,6 +748,10 @@ impl Runtime {
                 None => format!("{}\n{}", event.summary, event.context()),
             };
             merge_digest(&mut self.wake_digest, &text);
+            self.wake_items.push(WakeItem {
+                thread: self.thread(watch).to_owned(),
+                item: event.item(&watch.id),
+            });
         }
         self.last_event = Some(event);
     }
@@ -726,7 +764,19 @@ impl Runtime {
         .then_some(&self.wake_digest)
     }
 
-    pub fn take_wake(&mut self, now: i64) -> Option<String> {
+    pub fn seal_wake(&mut self, now: i64) -> bool {
+        let Some(digest) = self.take_wake(now) else { return false };
+        self.pending_wakes.push_back(WakeBatch {
+            id: WakeId(rand::random()),
+            digest,
+            items: std::mem::take(&mut self.wake_items),
+            reply_thread: None,
+            acceptance: None,
+        });
+        true
+    }
+
+    pub(super) fn take_wake(&mut self, now: i64) -> Option<String> {
         self.ready_wake(now)?;
         self.last_wake = Some(now);
         Some(std::mem::take(&mut self.wake_digest))

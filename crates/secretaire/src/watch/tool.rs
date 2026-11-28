@@ -187,6 +187,8 @@ fn status(store: &Store, watch: &Watch, detailed: bool) -> Value {
         result["last_event_id"] = json!(last_event.map(|event| event.item(&watch.id)));
         result["consecutive_failures"] = json!(runtime.failures);
         result["pending_events"] = json!(runtime.outbox.len());
+        result["pending_wake_items"] = json!(runtime.wake_items);
+        result["pending_wake_batches"] = json!(runtime.pending_wakes);
         result["sources"] = json!(
             watch
                 .sources

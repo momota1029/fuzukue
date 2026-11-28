@@ -52,10 +52,15 @@ pub(crate) enum TurnKind {
     Escalated,
     Nudge,
     WorkerDigest,
+    WatchWake(crate::watch::WakeId),
     GoalDecision(u64),
 }
 
 impl TurnKind {
+    pub(crate) fn buffers_reply(self) -> bool {
+        matches!(self, Self::WorkerDigest | Self::WatchWake(_))
+    }
+
     pub(crate) fn user_conversation(self) -> bool {
         matches!(self, Self::UserConversation | Self::Escalated)
     }
@@ -276,8 +281,12 @@ impl RelayReply {
         }
     }
 
+    pub(crate) fn text(&self) -> String {
+        self.items.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
     pub(crate) fn publish(self, hub: &Hub, session: &str, actor: Actor) {
-        let reply = self.items.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("\n");
+        let reply = self.text();
         if suppress_relay_reply(&reply) {
             return;
         }

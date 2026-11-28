@@ -580,7 +580,11 @@ impl ClaudeSession {
                     app.save_drain_checkpoint(&me.id, "claude", wait, me.project.clone(), text, false);
                 }
             }
-            me.publish_relay_reply();
+            if active.as_ref().is_some_and(|turn| matches!(turn.kind, TurnKind::WatchWake(_))) {
+                me.stream.lock().unwrap().relay_reply.take();
+            } else {
+                me.publish_relay_reply();
+            }
             if let Some(history) = active.as_mut().and_then(|turn| turn.history.take()) {
                 history.finish(&me.hub, &me.id, None).await;
             }
@@ -789,7 +793,7 @@ impl ClaudeSession {
             todo_notices,
             preference_candidate: preferences.filter(|text| !text.is_empty()),
         });
-        self.stream.lock().unwrap().relay_reply = matches!(kind, TurnKind::WorkerDigest).then(RelayReply::default);
+        self.stream.lock().unwrap().relay_reply = kind.buffers_reply().then(RelayReply::default);
         self.hub.set_github_auth_request(&self.id, prompt.github_auth);
         let written = Self::write_to_process(&mut process, msg).await;
         drop(process);
@@ -1287,11 +1291,23 @@ impl ClaudeSession {
             let _ = compaction.complete.send(response);
             return Ok(());
         }
-        self.publish_relay_reply();
         let kind = active.as_ref().map_or(TurnKind::Conversation, |turn| turn.kind);
+        if let TurnKind::WatchWake(id) = kind {
+            let buffered = self.stream.lock().unwrap().relay_reply.take().map(|reply| reply.text());
+            let succeeded = result["is_error"] != true
+                && result["subtype"].as_str().is_none_or(|subtype| subtype == "success")
+                && turns.interrupted.is_none() && active.as_ref().is_some_and(|turn| !turn.interrupted);
+            if let Some(app) = self.app.upgrade().filter(|_| succeeded) {
+                let text = result["result"].as_str().filter(|text| !text.is_empty())
+                    .or(buffered.as_deref()).unwrap_or_default();
+                crate::watch::complete_wake(&app, &self.id, id, text, Actor::Claude);
+            }
+        } else {
+            self.publish_relay_reply();
+        }
         if let Some(history) = active.as_mut().and_then(|turn| turn.history.take()) {
             let fallback = result["result"].as_str()
-                .filter(|text| !matches!(kind, TurnKind::WorkerDigest) || !front_desk::suppress_relay_reply(text));
+                .filter(|text| !kind.buffers_reply() || !front_desk::suppress_relay_reply(text));
             history.finish(&self.hub, &self.id, fallback.map(str::to_owned)).await;
         }
         let interrupted = active.as_ref().is_some_and(|turn| turn.interrupted);
@@ -1338,7 +1354,7 @@ impl ClaudeSession {
             let until = self.usage.provider_limit("claude").map(|(until, _)| until)
                 .unwrap_or_else(|| now() + FALLBACK_PAUSE_SECS);
             let retry = active.as_ref()
-                .filter(|turn| !matches!(turn.kind, TurnKind::GoalDecision(_) | TurnKind::Escalated))
+                .filter(|turn| !matches!(turn.kind, TurnKind::GoalDecision(_) | TurnKind::Escalated | TurnKind::WatchWake(_)))
                 .map(ActiveTurn::usage_continuation);
             self.pause(&mut turns, until, "Claude が使用量の上限で止まった".into(), retry);
         }
