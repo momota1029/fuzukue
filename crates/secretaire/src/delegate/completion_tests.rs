@@ -84,6 +84,8 @@ async fn one_result_for_a_prompt_sent_mid_turn_completes_the_job() -> Result<()>
     message_worker(&fixture.app, &fixture.session, &job, "Include the verification", true)?;
     assert!(finish(run).await??.starts_with("Fixture report"));
     assert_eq!(fixture.app.delegates.job_status(&fixture.app, &job, jobs::View::Full)?["state"], "finished");
+    let page = fixture.app.delegates.report_page(&fixture.app, &job, 0)?;
+    assert!(page["report"].as_str().unwrap().contains("Fixture report"));
     Ok(())
 }
 
@@ -263,14 +265,100 @@ async fn target_changes_with_an_unconfirmed_writer_stay_listed() -> Result<()> {
     let (_, run) = fixture.launch(&[]).await?;
     let report = finish(run).await??;
     let changed = changed_line(&report)?;
-    for path in ["notes.txt", "target/old", "target/tracked"] {
-        assert!(changed.contains(path), "{report}");
-        assert!(report.contains(&format!("- \"{path}\" — ")), "{report}");
-    }
-    for n in 1..=13 {
-        let path = format!("target/other/{n:02}");
+    for path in ["notes.txt", "target/old", "target/other/01"] {
         assert!(changed.contains(&format!("{path} (writer unconfirmed)")), "{report}");
         assert!(report.contains(&format!("- \"{path}\" — ")), "{report}");
     }
+    assert!(changed.contains("(and 6 more)"), "{report}");
+    assert!(report.contains("6 additional entries omitted"), "{report}");
+    Ok(())
+}
+
+#[test]
+fn new_nested_clone_is_summarized_and_confirmed_edits_remain_visible() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let git = |args: &[&str]| -> Result<()> {
+        assert!(std::process::Command::new("git").args(args).current_dir(root).status()?.success());
+        Ok(())
+    };
+    git(&["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "target/\n")?;
+    fs::write(root.join("one"), "one")?;
+    fs::write(root.join("two"), "two")?;
+    git(&["add", "."])?;
+    git(&["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"])?;
+    let before = Files::read(root);
+    fs::create_dir_all(root.join("target/job"))?;
+    git(&["clone", "-q", "--local", ".", "target/job/src"])?;
+    fs::write(root.join("target/job/src/one"), "edited")?;
+    let after = Files::read(root);
+    let changed = before.changes(root, &after, |path| {
+        if path == Path::new("target/job/src/one") { quarantine::Writer::Own }
+        else { quarantine::Writer::Unconfirmed }
+    }).render(false);
+    assert!(changed.contains("target/job/src/one (confirmed own)"), "{changed}");
+    assert!(changed.contains("target/job/src/: 2 untracked ignored files (writer unconfirmed)"), "{changed}");
+    assert!(!changed.contains("target/job/src/two (writer unconfirmed)"), "{changed}");
+    Ok(())
+}
+
+#[test]
+fn changed_file_list_is_bounded() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let before = Files::read(root);
+    for i in 0..25 {
+        fs::write(root.join(format!("file-{i:02}")), "data")?;
+    }
+    let changed = before.changes(root, &Files::read(root), |_| quarantine::Writer::Unconfirmed).render(false);
+    assert!(changed.contains("(and 15 more)"), "{changed}");
+    assert!(!changed.contains("file-24"), "{changed}");
+    Ok(())
+}
+
+#[test]
+fn completion_delivery_is_bounded_at_utf8_boundary() {
+    let original = "あ".repeat(100_000);
+    let result = bounded_completion(&original, 16 * 1024);
+    assert!(result.len() <= 16 * 1024);
+    assert!(result.contains("bytes omitted; use job_status with report_offset"));
+    assert!(original.starts_with(result.split("\n\n[").next().unwrap()));
+}
+
+#[test]
+fn thousands_of_other_ignored_paths_are_counted_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(root).status()?.success());
+    fs::write(root.join(".gitignore"), "target/\n")?;
+    let before = Files::read(root);
+    fs::create_dir_all(root.join("target/other/src"))?;
+    for i in 0..2000 {
+        fs::write(root.join(format!("target/other/src/file-{i:04}")), "x")?;
+    }
+    let changed = before.changes(root, &Files::read(root), |_| quarantine::Writer::Other).render(false);
+    assert!(changed.contains("target/other/: 2000 untracked ignored files"), "{changed}");
+    assert!(!changed.contains("file-0000"), "{changed}");
+    assert!(changed.len() < 1000);
+    Ok(())
+}
+
+#[test]
+fn oversized_report_is_readable_in_bounded_pages() -> Result<()> {
+    let original = format!("{}end", "あ\\\"".repeat(20_000));
+    let mut offset = 0;
+    let mut recovered = String::new();
+    loop {
+        let page = report_page("job", &original, offset)?;
+        assert!(page.to_string().len() < 16 * 1024);
+        recovered.push_str(page["report"].as_str().unwrap());
+        match page["next_offset"].as_u64() {
+            Some(next) => offset = next as usize,
+            None => break,
+        }
+    }
+    assert_eq!(recovered, original);
+    assert!(report_page("job", &original, 1).is_err());
     Ok(())
 }

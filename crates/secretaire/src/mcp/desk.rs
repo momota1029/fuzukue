@@ -169,9 +169,9 @@ impl Tool {
                 "limit": JOB_LIMIT.property(DEFAULT_JOB_LIMIT)
             }), &[]),
             Self::JobStatus => (harness_text!(
-                "Read one job's state and timings. Use report for the final report, summary for the change summary, or full for activity and files.",
-                "委譲ジョブの状態と時刻を読む。完了報告は report、変更の要約は summary、動きやファイルも見るには full を使う。"
-            ), json!({"job": job(), "view": {"type": "string", "enum": ["report", "summary", "full"], "default": "full"}}), &["job"]),
+                "Read one job's state and timings. Set report_offset to 0 to read the full report in bounded pages; follow next_offset.",
+                "委譲ジョブの状態と時刻を読む。報告全文は report_offset に 0 を指定し、next_offset で続きを読む。"
+            ), json!({"job": job(), "view": {"type": "string", "enum": ["report", "summary", "full"], "default": "full"}, "report_offset": {"type": "integer", "minimum": 0, "description": "Byte offset for a page of the final report."}}), &["job"]),
             Self::JobWriteAudit => (harness_text!(
                 "Read a delegated job's persisted file-write audit, newest first. Use next_before to page back. The limit defaults to 30 and is clamped to 1–100.",
                 "委譲ジョブのファイル書き込み監査を新しい順に読む。次のページは next_before を指定。limit は既定で 30、範囲は 1〜100。"
@@ -253,8 +253,9 @@ impl Tool {
             }
             Self::ListJobs => unreachable!("list_jobs renders JSON lines and a text table"),
             Self::JobStatus => {
-                let Job { job, view } = parse_args(args)?;
-                app.delegates.job_status(app, &job, view)?
+                let Job { job, view, report_offset } = parse_args(args)?;
+                if let Some(offset) = report_offset { app.delegates.report_page(app, &job, offset)? }
+                else { app.delegates.job_status(app, &job, view)? }
             }
             Self::JobWriteAudit => {
                 #[derive(Deserialize)]
@@ -416,6 +417,7 @@ struct Job {
     job: String,
     #[serde(default)]
     view: JobView,
+    report_offset: Option<usize>,
 }
 
 #[derive(Deserialize)]

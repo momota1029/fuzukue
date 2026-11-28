@@ -452,8 +452,9 @@ fn build_output(path: &str) -> bool {
 
 fn status_text(value: &mut Value, key: &str, text: Option<&str>, chars: usize) {
     value[key] = json!(text.map(|text| truncate(text, chars)));
-    if text.is_some_and(|text| value[key].as_str() != Some(text)) {
+    if let Some(text) = text.filter(|text| value[key].as_str() != Some(*text)) {
         value["truncated"] = true.into();
+        value[format!("{key}_omitted_chars")] = json!(text.chars().count().saturating_sub(chars));
     }
 }
 
@@ -485,6 +486,11 @@ pub(crate) fn limit_status(mut status: Value) -> Value {
         }
         !value.is_array() && !value.is_object()
     });
+    if status.to_string().len() > STATUS_MAX_BYTES {
+        let omitted_bytes = status.to_string().len();
+        return json!({"truncated": true, "omitted_bytes": omitted_bytes,
+            "note": "Status exceeded the size limit; use job_status with report_offset for the report."});
+    }
     status
 }
 

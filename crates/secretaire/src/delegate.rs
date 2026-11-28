@@ -350,6 +350,20 @@ impl Workers {
         Ok(jobs::limit_status(status))
     }
 
+    pub(crate) fn report_page(&self, app: &App, job: &str, offset: usize) -> Result<serde_json::Value> {
+        let status = self.job_status(app, job, JobView::Summary)?;
+        let id = status["id"].as_str().context("Job ID unavailable")?;
+        let session = status["session"].as_str().context("Job session unavailable")?;
+        // The inventory retains only prefixes; the thread tool result holds the full report.
+        let report = app.hub.read_threads(|store| {
+            store.tool_detail(session, id).and_then(|detail| {
+                serde_json::from_str::<DelegateReport>(&detail.output().ok()??).ok()
+            })
+        }).context("Final report unavailable")?;
+        let text = format!("{}\n\n{}", report.text, report.changes);
+        report_page(id, &text, offset)
+    }
+
     pub(crate) fn rename_job(
         &self, app: &App, query: &str, session: Option<&str>, name: &str, source: &str,
     ) -> Result<serde_json::Value> {
@@ -1503,8 +1517,12 @@ async fn launch_assignment(
                     text
                 }
             };
+            let report_text = match input.job.summary.lock().unwrap().as_deref() {
+                Some(summary) if !summary.is_empty() => format!("{text}\n\n## Progress summary\n{summary}"),
+                _ => text.clone(),
+            };
             let report = DelegateReport {
-                elapsed_ms, text: text.clone(), interrupted: false, changes: changes_ja, attempts: attempts.clone(), files,
+                elapsed_ms, text: report_text, interrupted: false, changes: changes_ja, attempts: attempts.clone(), files,
                 tool_activity: Some(job_record.activity.tool_activity()),
             };
             if !claimed {
@@ -1546,11 +1564,12 @@ async fn launch_assignment(
         app.hub.publish(ServerEvent::ToolResult {
             session: session.clone(), item: job.clone(), ok: result.is_ok(), output: serde_json::to_string(&report)?,
         });
+        let context = bounded_completion(&context, 16 * 1024);
         if worktree.is_none() || caller.is_some() {
             // Queue the report before scheduling the planner. Both stay ordered with desk turns.
             let _start = app.prompt_start.lock().await;
             enqueue_desk(&app, &session, DeskTurn::Report { job: job.clone(), text: context.clone(), plan_failed: false });
-            let summary = input.job.summary.lock().unwrap().clone();
+            let summary = input.job.summary.lock().unwrap().as_deref().map(|text| bounded_completion(text, 4 * 1024));
             planner::after_job(&app, &session, planner::JobReport {
                 job: &job, role: &role, approach: &input.job.approach, ok: result.is_ok(), text: &context, summary: summary.as_deref(),
             });
@@ -1571,6 +1590,23 @@ async fn launch_assignment(
         result.map(|_| context)
     });
     Ok((job, run))
+}
+
+fn report_page(id: &str, text: &str, offset: usize) -> Result<serde_json::Value> {
+    ensure!(offset <= text.len() && text.is_char_boundary(offset), "Invalid report byte offset");
+    let mut end = offset.saturating_add(2000).min(text.len());
+    while !text.is_char_boundary(end) { end -= 1; }
+    Ok(json!({"id": id, "report": &text[offset..end], "offset": offset,
+        "total_bytes": text.len(), "next_offset": (end < text.len()).then_some(end),
+        "omitted_bytes": text.len() - end}))
+}
+
+// Bound untrusted completion text in every desk and planner delivery.
+fn bounded_completion(text: &str, limit: usize) -> String {
+    if text.len() <= limit { return text.to_owned(); }
+    let mut end = limit.saturating_sub(160).min(text.len());
+    while !text.is_char_boundary(end) { end -= 1; }
+    format!("{}\n\n[{} bytes omitted; use job_status with report_offset to read the full report]", &text[..end], text.len() - end)
 }
 
 // What a job must still satisfy when an attempt starts after waiting.
@@ -2009,6 +2045,7 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
                 harness_format!("English question for the front desk from worker job {job}. If you know the answer from context, call answer_worker with question_id `{id}` and the answer. If you need the user’s input, ask in your own words in the user's language and use the same ID after they reply.\n\n{text}\n\n{plan}", "作業役（ジョブ {job}）から受付への英語の質問。文脈から答えが分かれば answer_worker に question_id `{id}` と答えを渡す。利用者に確認が必要なら、自分の言葉で日本語に言い換えて訊き、返答を受けてから同じ ID を使う。\n\n{text}\n\n{plan}")
             }
             DeskTurn::Report { job, text, plan_failed } => {
+                let text = bounded_completion(&text, 16 * 1024);
                 let plan = if plan_failed {
                     harness_text!("The plan could not be updated. Tell the user the outcome and use replan before continuing.", "方針を更新できなかった。今回の結果を伝え、続ける前に replan で見直す。").into()
                 } else {
@@ -2567,6 +2604,7 @@ async fn summarize_progress(
 struct Files {
     entries: BTreeMap<PathBuf, quarantine::Fingerprint>,
     cards: BTreeMap<PathBuf, BTreeSet<String>>,
+    repositories: BTreeSet<PathBuf>,
     incomplete: bool,
 }
 
@@ -2575,6 +2613,7 @@ impl Files {
         let threads = project.join("threads");
         let mut incomplete = false;
         let mut entries = BTreeMap::new();
+        let mut repositories = BTreeSet::new();
         for entry in walkdir::WalkDir::new(project).into_iter()
             .filter_entry(|entry| !matches!(entry.file_name().to_str(),
                 Some(".git" | ".fuzukue" | ".labo"))
@@ -2585,6 +2624,11 @@ impl Files {
                 continue;
             };
             if entry.file_type().is_dir() {
+                if entry.path() != project && entry.path().join(".git").exists() {
+                    if let Ok(path) = entry.path().strip_prefix(project) {
+                        repositories.insert(path.to_owned());
+                    }
+                }
                 continue;
             }
             let (Ok(path), Ok(metadata)) = (entry.path().strip_prefix(project), entry.metadata()) else {
@@ -2604,7 +2648,7 @@ impl Files {
                 }
             }
         }
-        Self { entries, cards, incomplete }
+        Self { entries, cards, repositories, incomplete }
     }
 
     fn changes(&self, root: &Path, after: &Self, writer: impl Fn(&Path) -> quarantine::Writer) -> ChangedFiles {
@@ -2613,7 +2657,8 @@ impl Files {
         let cards = paths.iter()
             .flat_map(|path| self.cards.get(*path).into_iter().chain(after.cards.get(*path)))
             .flatten().map(String::as_str).collect::<BTreeSet<_>>();
-        let attribution = quarantine::Attribution::new(root, paths.iter().copied(), &after.entries, writer);
+        let new_repositories = after.repositories.difference(&self.repositories).cloned().collect();
+        let attribution = quarantine::Attribution::new(root, paths.iter().copied(), &after.entries, &self.entries, &new_repositories, writer);
         ChangedFiles {
             paths: paths.into_iter().cloned().collect(),
             cards: cards.into_iter().map(str::to_owned).collect(),
@@ -2692,18 +2737,25 @@ impl ChangedFiles {
             }
             list
         }
-        let mut files: Vec<_> = self.paths.iter()
-            .filter(|path| !self.attribution.summarized(path))
+        let mut paths: Vec<_> = self.paths.iter().filter(|path| !self.attribution.summarized(path)).collect();
+        paths.sort_by_key(|path| self.attribution.writer(path) != quarantine::Writer::Own);
+        let mut files: Vec<_> = paths.into_iter()
             .map(|path| {
                 let writer = self.attribution.writer(path).label(japanese);
-                if japanese { format!("{}（{writer}）", path.display()) } else { format!("{} ({writer})", path.display()) }
+                let label = if japanese { format!("{}（{writer}）", path.display()) } else { format!("{} ({writer})", path.display()) };
+                (label, 1usize)
             }).collect();
         files.extend(self.attribution.summaries(self.paths.iter().map(PathBuf::as_path), japanese));
-        let files = if files.is_empty() {
-            (if japanese { "なし" } else { "none" }).into()
+        let omitted: usize = files.iter().skip(10).map(|(_, count)| count).sum();
+        let mut files = if files.is_empty() {
+            (if japanese { "なし" } else { "none" }).to_owned()
         } else {
-            files.join(if japanese { "、" } else { ", " })
+            files.iter().take(10).map(|(label, _)| label.as_str()).collect::<Vec<_>>()
+                .join(if japanese { "、" } else { ", " })
         };
+        if omitted > 0 {
+            files.push_str(&if japanese { format!("（ほか {omitted} 件）") } else { format!(" (and {omitted} more)") });
+        }
         let cards = compact(&self.cards, japanese, String::clone);
         if japanese {
             format!("変更ファイル（作業中）: {files}\n変更カード: {cards}")

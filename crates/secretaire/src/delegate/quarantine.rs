@@ -88,29 +88,34 @@ impl Writer {
 pub(super) struct Attribution {
     writers: BTreeMap<PathBuf, Writer>,
     summarized: BTreeSet<PathBuf>,
+    new_repositories: BTreeSet<PathBuf>,
 }
 
 impl Attribution {
-    /// Label every path. Only files in `present` under `target/` that git
-    /// ignores, and that another job declared or wrote, are summarized.
-    /// Deletions, tracked files and protected paths stay listed.
+    /// Summarize ignored files attributed to another job and unconfirmed new
+    /// files in newly created nested repositories. Keep confirmed writes visible.
     pub(super) fn new<'a>(
         root: &Path,
         paths: impl Iterator<Item = &'a PathBuf>,
         present: &BTreeMap<PathBuf, Fingerprint>,
+        before: &BTreeMap<PathBuf, Fingerprint>,
+        new_repositories: &BTreeSet<PathBuf>,
         writer: impl Fn(&Path) -> Writer,
     ) -> Self {
         let writers: BTreeMap<_, _> = paths.map(|path| (path.clone(), writer(path))).collect();
         let protected = protection();
         let candidates: Vec<_> = writers.iter()
             .filter(|(path, writer)| {
-                path.starts_with("target") && **writer == Writer::Other && present.contains_key(*path)
+                path.starts_with("target") && present.contains_key(*path)
+                    && (**writer == Writer::Other || (**writer == Writer::Unconfirmed
+                        && !before.contains_key(*path)
+                        && new_repositories.iter().any(|repo| path.starts_with(repo))))
                     && !protected(&root.join(path))
             })
             .map(|(path, _)| path.as_path())
             .collect();
         let summarized = crate::git::ignored(root, &candidates);
-        Self { writers, summarized }
+        Self { writers, summarized, new_repositories: new_repositories.clone() }
     }
 
     pub(super) fn writer(&self, path: &Path) -> Writer {
@@ -122,22 +127,25 @@ impl Attribution {
     }
 
     /// One line for each directory and writer among the summarized `paths`.
-    pub(super) fn summaries<'a>(&self, paths: impl Iterator<Item = &'a Path>, japanese: bool) -> Vec<String> {
+    pub(super) fn summaries<'a>(&self, paths: impl Iterator<Item = &'a Path>, japanese: bool) -> Vec<(String, usize)> {
         let mut counts = BTreeMap::<(PathBuf, Writer), usize>::new();
         for path in paths.filter(|path| self.summarized(path)) {
             // `target/<name>`, or `target` for the files directly in it.
             let depth = if path.components().count() > 2 { 2 } else { 1 };
-            let directory = path.components().take(depth).collect();
+            let directory = self.new_repositories.iter().filter(|repo| path.starts_with(repo))
+                .max_by_key(|repo| repo.components().count()).cloned()
+                .unwrap_or_else(|| path.components().take(depth).collect());
             *counts.entry((directory, self.writer(path))).or_default() += 1;
         }
         counts.into_iter().map(|((directory, writer), count)| {
             let directory = directory.display();
             let writer = writer.label(japanese);
-            if japanese {
+            let summary = if japanese {
                 format!("{directory}/ の git が無視する未追跡ファイル {count} 件（{writer}）")
             } else {
                 format!("{directory}/: {count} untracked ignored files ({writer})")
-            }
+            };
+            (summary, count)
         }).collect()
     }
 }
@@ -307,7 +315,10 @@ impl Review {
             }
             .into(),
         );
-        for entry in self.entries.iter().filter(|entry| !attribution.summarized(Path::new(&entry.path))) {
+        let mut entries: Vec<_> = self.entries.iter().filter(|entry| !attribution.summarized(Path::new(&entry.path))).collect();
+        entries.sort_by_key(|entry| attribution.writer(Path::new(&entry.path)) != Writer::Own);
+        const LIMIT: usize = 10;
+        for entry in entries.iter().take(LIMIT) {
             let action = match (&entry.action, japanese) {
                 (Action::Copied { backup }, false) => format!("copied to quarantine ({backup})"),
                 (Action::Copied { backup }, true) => format!("隔離先にコピーした（{backup}）"),
@@ -334,7 +345,13 @@ impl Review {
             });
         }
         let summaries = attribution.summaries(self.entries.iter().map(|entry| Path::new(&entry.path)), japanese);
-        lines.extend(summaries.iter().map(|summary| format!("- {summary}")));
+        let remaining = LIMIT.saturating_sub(entries.len());
+        lines.extend(summaries.iter().take(remaining).map(|(summary, _)| format!("- {summary}")));
+        let omitted = entries.len().saturating_sub(LIMIT) + summaries.iter().skip(remaining).map(|(_, count)| count).sum::<usize>();
+        if omitted > 0 {
+            lines.push(if japanese { format!("- ほか {omitted} 件を省略") }
+                else { format!("- {omitted} additional entries omitted") });
+        }
         if let Some(manifest) = &self.manifest {
             lines.push(if japanese {
                 format!("隔離の記録とコピーの保存先は {manifest:?}。")
@@ -358,6 +375,20 @@ mod attribution_tests {
     use super::*;
 
     #[test]
+    fn review_caps_paths_and_reports_omissions() {
+        let entries = (0..25).map(|i| Entry {
+            path: format!("file-{i:02}"),
+            action: Action::Missing,
+        }).collect();
+        let review = Review { entries, ..Review::default() };
+        for japanese in [false, true] {
+            let report = review.render(&Attribution::default(), japanese);
+            assert_eq!(report.lines().filter(|line| line.starts_with("- \"file-")).count(), 10);
+            assert!(report.contains(if japanese { "ほか 15 件を省略" } else { "15 additional entries omitted" }), "{report}");
+        }
+    }
+
+    #[test]
     fn nested_clone_summarizes_only_confirmed_other_present_ignored_paths() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
@@ -376,7 +407,7 @@ mod attribution_tests {
             .current_dir(root).status()?.success());
         let present = paths.iter().filter_map(|path| fs::metadata(root.join(path)).ok()
             .map(|metadata| (path.clone(), Fingerprint::from(&metadata)))).collect();
-        let attribution = Attribution::new(root, paths.iter(), &present, |path| {
+        let attribution = Attribution::new(root, paths.iter(), &present, &BTreeMap::new(), &BTreeSet::new(), |path| {
             if path.ends_with("own") { Writer::Own }
             else if path.ends_with("unknown") { Writer::Unconfirmed }
             else { Writer::Other }
@@ -384,8 +415,8 @@ mod attribution_tests {
         assert!(attribution.summarized(&paths[0]));
         for path in &paths[1..] { assert!(!attribution.summarized(path), "{path:?}"); }
         assert_eq!(attribution.summaries(paths.iter().map(PathBuf::as_path), false),
-            ["target/job/: 1 untracked ignored files (declared or written by another job)"]);
-        let unavailable = Attribution::new(&root.join("missing"), paths.iter(), &present, |_| Writer::Other);
+            [("target/job/: 1 untracked ignored files (declared or written by another job)".into(), 1)]);
+        let unavailable = Attribution::new(&root.join("missing"), paths.iter(), &present, &BTreeMap::new(), &BTreeSet::new(), |_| Writer::Other);
         assert!(paths.iter().all(|path| !unavailable.summarized(path)));
         Ok(())
     }

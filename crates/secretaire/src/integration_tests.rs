@@ -2106,7 +2106,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
         ("set_server_settings", &[("review", "object"), ("model", "object")], &[]),
         ("block_step", &[("step", "string"), ("reason", "string"), ("needs", "string")], &["step", "reason"]),
         ("list_jobs", &[("state", "string"), ("thread", "string"), ("limit", "integer")], &[]),
-        ("job_status", &[("job", "string"), ("view", "string")], &["job"]),
+        ("job_status", &[("job", "string"), ("view", "string"), ("report_offset", "integer")], &["job"]),
         ("job_write_audit", &[("job", "string"), ("before", "string"), ("limit", "integer")], &["job"]),
         ("cancel_job", &[("job", "string"), ("reason", "string")], &["job", "reason"]),
         ("rename_job", &[("job", "string"), ("label", "string")], &["job", "label"]),
