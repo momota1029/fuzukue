@@ -1,9 +1,11 @@
 # App icon
 
-A dark tile with a white desk and a lemon (`#EFFF3A`) nib and cap.
+A dark (`#0C0C0E`) tile with a desk: white legs under a lemon (`#EFFF3A`) top
+that is also a pen, with a nib and a cap. The pen's upper edge and the desk top
+are flush, and the nib and cap are no thicker than the legs.
 
-`icon-small.svg` is used below 256 px. `icon-large.svg` adds the nib's slit and
-breather hole and is used at 256 px and up.
+`icon-small.svg` is used up to 32 px: it has a thicker desk top and wider gaps.
+`icon-large.svg` is used for larger sizes and for the Android vector.
 
 After editing either SVG, regenerate the checked-in assets from the repository
 root. The script needs the Python standard library and the librsvg and cairo
