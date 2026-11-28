@@ -435,6 +435,7 @@ pub(super) enum Kind {
     Stale,
     AliveAgain,
     Error,
+    HistoryGap,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -489,7 +490,7 @@ impl Event {
         match policy {
             Wake::All => true,
             Wake::Attention => {
-                matches!(self.kind, Kind::Stale | Kind::AliveAgain | Kind::Error)
+                matches!(self.kind, Kind::Stale | Kind::AliveAgain | Kind::Error | Kind::HistoryGap)
                     || self.kind == Kind::Report && self.attention.is_some()
             }
             Wake::Silent => false,
@@ -659,11 +660,23 @@ impl Runtime {
                 }
                 Some(Seen::BranchHeads(heads))
             }
-            (Source::NewFile { .. }, Sample::Reports { reports, checkpoint }) => {
+            (Source::NewFile { .. }, Sample::Reports { reports, checkpoint, gap_from }) => {
                 let last = match previous {
                     Some(Seen::Report(last)) => last,
                     _ => None,
                 };
+                if let (Some(from), Some(tip)) = (gap_from, &checkpoint) {
+                    self.emit(Event::new(
+                        Kind::HistoryGap,
+                        source.label(),
+                        format!(
+                            "{}: {}",
+                            watch.name,
+                            harness_text!("report history gap", "報告履歴の欠落"),
+                        ),
+                        format!("{from} → {tip}"),
+                    ));
+                }
                 let mut latest = last;
                 for report in reports {
                     if last.is_some_and(|known| report.number <= known) {

@@ -41,6 +41,7 @@ fn sample(head: &str, reports: &[u64], heartbeat: Option<Heartbeat>) -> Observat
                 })
                 .collect(),
             checkpoint: None,
+            gap_from: None,
         }),
         Ok(Sample::Heartbeat(heartbeat)),
     ])
@@ -213,6 +214,7 @@ fn attention_requires_explicit_marked_lines_and_supports_custom_substrings() -> 
                     text: report.into(),
                 }],
                 checkpoint: None,
+                gap_from: None,
             }),
             Ok(Sample::Heartbeat(None)),
         ]);
@@ -546,7 +548,7 @@ async fn push_cycle(root: &TestDir, author: &Path, number: u64, update: i64) -> 
 }
 
 async fn observe_fixture(watch: &Watch, runtime: &Runtime, root: &Path) -> Result<Observation> {
-    let samples = poll::observe_in(watch, runtime, Ok(root.to_owned()))
+    let samples = poll::observe_in(watch, runtime, Ok(root.to_owned()), false)
         .await?
         .unwrap();
     Ok(Observation::Sources(samples))
@@ -682,7 +684,7 @@ async fn real_git_catches_up_after_restart_and_only_changes_private_refs() -> Re
 
     fs::rename(&clone, root.path().join("relocated-clone"))?;
     assert!(
-        poll::observe_in(&watch, &before, Ok(root.path().into()))
+        poll::observe_in(&watch, &before, Ok(root.path().into()), false)
             .await?
             .is_none()
     );
@@ -1305,5 +1307,160 @@ async fn replay_includes_report_removed_before_tip_after_restart() -> Result<()>
     assert_eq!(reports.len(), 2);
     assert!(reports[0].contains("# C2: synthetic"));
     assert!(reports[1].contains("# C10: synthetic"));
+    Ok(())
+}
+
+struct RecoveryFixture {
+    root: TestDir,
+    watch: Watch,
+    checkpoint: String,
+    tip: String,
+}
+
+impl RecoveryFixture {
+    async fn new() -> Result<Self> {
+        let root = TestDir::new();
+        let author = root.path().join("author");
+        fs::create_dir(&author)?;
+        command(root.path(), &["init", "--bare", "remote.git"]).await?;
+        command(&author, &["init", "-b", "work/dots-main"]).await?;
+        command(&author, &["remote", "add", "origin", "../remote.git"]).await?;
+        push_cycle(&root, &author, 1, Utc::now().timestamp()).await?;
+        command(
+            root.path(),
+            &["clone", "--no-local", "-b", "work/dots-main", "remote.git", "clone"],
+        )
+        .await?;
+
+        let app = workspace(root.path());
+        let thread = app.hub.edit_threads(|store| store.create(None))?;
+        let mut watch = dots(&root.path().join("clone"), &thread);
+        watch.sources.retain(|source| matches!(source, super::model::Source::NewFile { .. }));
+        app.watches.lock()?.edit(|state| state.watches.insert(watch.id.clone(), watch.clone()))?;
+        let baseline = observe_fixture(&watch, &Runtime::default(), root.path()).await?;
+        finish_poll(&app, &watch, baseline)?;
+        let checkpoint = app.watches.lock()?.runtime(&watch).report_checkpoints[&watch.sources[0].key(&watch)].clone();
+        drop(app);
+
+        command(&author, &["checkout", "--orphan", "replacement"]).await?;
+        for (number, text) in [(10, "recovered report two"), (2, "recovered report one")] {
+            root.write(&format!("author/notes/handoff/dots-cycle-{number}.md"), text);
+            command(&author, &["add", "notes"]).await?;
+            Self::commit(&author, text).await?;
+        }
+        command(&author, &["rm", "notes/handoff/dots-cycle-2.md"]).await?;
+        Self::commit(&author, "Remove intermediate replacement report").await?;
+        let tip = command(&author, &["rev-parse", "HEAD"]).await?.trim().to_owned();
+        command(&author, &["push", "--force", "origin", "HEAD:refs/heads/work/dots-main"]).await?;
+        Ok(Self { root, watch, checkpoint, tip })
+    }
+
+    async fn commit(author: &Path, message: &str) -> Result<()> {
+        command(
+            author,
+            &["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "-c", "core.hooksPath=/dev/null", "commit", "-m", message],
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn assert_recovered(&self, runtime: &Runtime) {
+        assert_eq!(runtime.report_checkpoints[&self.watch.sources[0].key(&self.watch)], self.tip);
+        assert!(runtime.last_error.is_none());
+        assert_eq!(kinds(runtime), [Kind::HistoryGap, Kind::Report, Kind::Report]);
+        assert_eq!(runtime.outbox[0].detail, format!("{} → {}", self.checkpoint, self.tip));
+        assert_eq!(runtime.outbox[1].detail, "recovered report one");
+        assert_eq!(runtime.outbox[2].detail, "recovered report two");
+    }
+}
+
+#[tokio::test]
+async fn disconnected_history_replays_once_after_interrupted_handoff() -> Result<()> {
+    for checkpoint_present in [true, false] {
+        let fixture = RecoveryFixture::new().await?;
+        let root = fixture.root.path();
+        let watch = &fixture.watch;
+        if !checkpoint_present {
+            fs::rename(&watch.repo, root.join("old-clone"))?;
+            command(
+                root,
+                &["clone", "--no-local", "-b", "work/dots-main", "remote.git", "clone"],
+            )
+            .await?;
+        }
+        let object = git::run(&watch.repo, &["cat-file", "-e", &fixture.checkpoint], 4096).await?;
+        assert_eq!(object.status.success(), checkpoint_present);
+
+        kill_at_checkpoint(root, "after-poll", &watch.thread, None).await?;
+        fs::remove_file(root.join("ready"))?;
+        let app = workspace(root);
+        let pending = app.watches.lock()?.runtime(watch);
+        fixture.assert_recovered(&pending);
+        drop(app);
+
+        kill_at_checkpoint(root, "after-note", &watch.thread, None).await?;
+        let app = workspace(root);
+        assert_eq!(app.watches.lock()?.runtime(watch).outbox.len(), 3);
+        assert_eq!(transcript(&app, &watch.thread).matches(&pending.outbox[0].item(&watch.id)).count(), 1);
+        finish_poll(&app, watch, observe_fixture(watch, &pending, root).await?)?;
+        {
+            let mut store = app.watches.lock()?;
+            deliver(&app, &mut store, watch)?;
+            assert!(store.runtime(watch).outbox.is_empty());
+        }
+        drop(app);
+
+        let app = workspace(root);
+        let history = transcript(&app, &watch.thread);
+        for event in &pending.outbox {
+            assert_eq!(history.matches(&event.item(&watch.id)).count(), 1);
+            assert_eq!(history.matches(&event.detail).count(), 1);
+        }
+        assert!(!history.contains("# C1: synthetic"));
+        assert!(app.watches.lock()?.runtime(watch).outbox.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_retries_fetch_and_preserves_checkpoint_if_remote_stays_offline() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = RecoveryFixture::new().await?;
+    let root = fixture.root.path();
+    let watch = &fixture.watch;
+    let key = watch.sources[0].key(watch);
+    fs::rename(root.join("remote.git"), root.join("remote.offline"))?;
+    kill_at_checkpoint(root, "after-poll", &watch.thread, None).await?;
+    fs::remove_file(root.join("ready"))?;
+    let app = workspace(root);
+    let offline = app.watches.lock()?.runtime(watch);
+    assert!(offline.last_error.is_some());
+    assert_eq!(offline.report_checkpoints[&key], fixture.checkpoint);
+    assert!(offline.outbox.is_empty());
+    drop(app);
+    fs::rename(root.join("remote.offline"), root.join("remote.git"))?;
+
+    // Let branch discovery succeed, fail the first fetch, then serve its retry.
+    fixture.root.write("upload-pack", r#"#!/bin/sh
+attempts="$1.attempts"
+printf 'request\n' >> "$attempts"
+if [ "$(wc -l < "$attempts")" -eq 2 ]; then
+    exit 1
+fi
+exec git-upload-pack "$@"
+"#);
+    let upload_pack = root.join("upload-pack");
+    fs::set_permissions(&upload_pack, fs::Permissions::from_mode(0o700))?;
+    command(
+        &watch.repo,
+        &["config", "remote.origin.uploadpack", upload_pack.to_str().unwrap()],
+    )
+    .await?;
+    kill_at_checkpoint(root, "after-poll", &watch.thread, None).await?;
+    let app = workspace(root);
+    fixture.assert_recovered(&app.watches.lock()?.runtime(watch));
+    assert_eq!(fs::read_to_string(root.join("remote.git.attempts"))?.lines().count(), 3);
     Ok(())
 }

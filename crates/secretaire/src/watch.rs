@@ -383,10 +383,12 @@ fn schedule(app: &Arc<Workspace>) -> Result<bool> {
         tokio::spawn(async move {
             let result = match app.admit_work() {
                 Ok(_work) => {
-                    let runtime = app.watches.lock().map(|store| store.runtime(&watch));
-                    match runtime {
-                        Ok(runtime) => {
-                            let observed = history::observe(watch.clone(), runtime).await;
+                    let poll = app.watches.lock().map(|store| {
+                        (store.runtime(&watch), !store.next_poll.contains_key(&watch.id))
+                    });
+                    match poll {
+                        Ok((runtime, startup)) => {
+                            let observed = history::observe(watch.clone(), runtime, startup).await;
                             finish_poll(&app, &watch, observed)
                         }
                         Err(error) => Err(error),

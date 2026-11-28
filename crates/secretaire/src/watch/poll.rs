@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
@@ -27,6 +29,7 @@ pub(super) enum Sample {
     Reports {
         reports: Vec<Report>,
         checkpoint: Option<String>,
+        gap_from: Option<String>,
     },
     Heartbeat(Option<Heartbeat>),
 }
@@ -78,8 +81,8 @@ async fn check_git(repo: &Path, remote: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn observe(watch: &Watch, runtime: &Runtime) -> Observation {
-    match observe_in(watch, runtime, user_home()).await {
+pub(super) async fn observe(watch: &Watch, runtime: &Runtime, startup: bool) -> Observation {
+    match observe_in(watch, runtime, user_home(), startup).await {
         Ok(Some(samples)) => Observation::Sources(samples),
         Ok(None) => Observation::MissingRepo,
         Err(error) => Observation::RepoError(format!("{error:#}")),
@@ -90,6 +93,7 @@ pub(super) async fn observe_in(
     watch: &Watch,
     runtime: &Runtime,
     home: Result<PathBuf>,
+    startup: bool,
 ) -> Result<Option<Vec<Result<Sample>>>> {
     let repo = match watch.repo.canonicalize() {
         Ok(path) => path,
@@ -116,7 +120,7 @@ pub(super) async fn observe_in(
     let heads = if branches.is_empty() {
         Ok(BTreeMap::new())
     } else {
-        remote_heads(&repo, &args).await
+        retry_startup(startup, || remote_heads(&repo, &args)).await
     };
     let mut snapshots = HashMap::new();
     let mut samples = Vec::new();
@@ -141,18 +145,18 @@ pub(super) async fn observe_in(
                     })
                     .map_err(|error| anyhow::anyhow!("{error:#}"))
             }
-            Source::BranchHeads { pattern } => remote_heads(
-                &repo,
-                &["ls-remote", "--heads", "--", &watch.remote, pattern],
-            )
-            .await
-            .map(Sample::BranchHeads),
+            Source::BranchHeads { pattern } => {
+                let args = ["ls-remote", "--heads", "--", &watch.remote, pattern];
+                retry_startup(startup, || remote_heads(&repo, &args))
+                    .await
+                    .map(Sample::BranchHeads)
+            }
             _ => {
                 let branch = source.branch().unwrap();
                 if !snapshots.contains_key(branch) {
                     let snapshot = match &heads {
                         Ok(heads) if heads.contains_key(branch) => {
-                            fetch_snapshot(&repo, &watch.remote, branch).await.map(Some)
+                            fetch_snapshot(&repo, &watch.remote, branch, startup).await.map(Some)
                         }
                         Ok(_) => Ok(None),
                         Err(error) => Err(anyhow::anyhow!("{error:#}")),
@@ -166,6 +170,7 @@ pub(super) async fn observe_in(
                     Ok(None) if matches!(source, Source::NewFile { .. }) => Ok(Sample::Reports {
                         reports: Vec::new(),
                         checkpoint: None,
+                        gap_from: None,
                     }),
                     Ok(None) => Ok(Sample::Heartbeat(None)),
                     Err(error) => Err(anyhow::anyhow!("{error:#}")),
@@ -188,36 +193,48 @@ async fn remote_heads(repo: &Path, args: &[&str]) -> Result<BTreeMap<String, Str
         .collect())
 }
 
+async fn retry_startup<T, F: Future<Output = Result<T>>>(
+    startup: bool,
+    mut operation: impl FnMut() -> F,
+) -> Result<T> {
+    if startup {
+        for delay in [1, 2] {
+            if let Ok(value) = operation().await {
+                return Ok(value);
+            }
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+    }
+    operation().await
+}
+
 async fn fetch_snapshot(
     repo: &Path,
     remote: &str,
     branch: &str,
+    startup: bool,
 ) -> Result<(String, BTreeSet<String>)> {
     let reference = format!("{REF_PREFIX}{branch}");
     let refspec = format!("+refs/heads/{branch}:{reference}");
-    git_output(
-        repo,
-        &[
-            "-c",
-            "fetch.writeCommitGraph=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "fetch",
-            "-q",
-            "--no-tags",
-            "--no-prune",
-            "--no-prune-tags",
-            "--no-write-fetch-head",
-            "--no-recurse-submodules",
-            "--no-auto-maintenance",
-            "--refmap=",
-            "--",
-            remote,
-            &refspec,
-        ],
-        8192,
-    )
-    .await?;
+    let args = [
+        "-c",
+        "fetch.writeCommitGraph=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "fetch",
+        "-q",
+        "--no-tags",
+        "--no-prune",
+        "--no-prune-tags",
+        "--no-write-fetch-head",
+        "--no-recurse-submodules",
+        "--no-auto-maintenance",
+        "--refmap=",
+        "--",
+        remote,
+        &refspec,
+    ];
+    retry_startup(startup, || git_output(repo, &args, 8192)).await?;
     let tip = git_output(repo, &["rev-parse", "--verify", &reference], 128).await?;
     let tip = tip.trim().to_owned();
     let output = complete_bytes(repo, &["ls-tree", "-rz", "--name-only", &tip], TREE_LIMIT).await?;
@@ -246,6 +263,7 @@ async fn sample_files(
             let last = runtime.last_report(watch, source);
             let checkpoint = runtime.report_checkpoints.get(&source.key(watch));
             let mut paths = BTreeMap::new();
+            let mut gap_from = None;
             if checkpoint.is_none_or(|checkpoint| checkpoint != tip) {
                 for path in tree {
                     if let Some(number) = report_number(&matcher, path)
@@ -255,7 +273,11 @@ async fn sample_files(
                     }
                 }
                 if let Some(checkpoint) = checkpoint {
-                    for commit in history::commits(repo, checkpoint, tip).await?.lines() {
+                    let (commits, disconnected) = history::commits(repo, checkpoint, tip).await?;
+                    if disconnected {
+                        gap_from = Some(checkpoint.clone());
+                    }
+                    for commit in commits.lines() {
                         if commit != tip {
                             collect_added_reports(repo, commit, &matcher, last.flatten(), &mut paths)
                                 .await?;
@@ -272,7 +294,7 @@ async fn sample_files(
             } else if let Some((number, (_, path))) = paths.into_iter().next_back() {
                 reports.push(Report { number, path, text: String::new() });
             }
-            Ok(Sample::Reports { reports, checkpoint: Some(tip.to_owned()) })
+            Ok(Sample::Reports { reports, checkpoint: Some(tip.to_owned()), gap_from })
         }
         Source::Heartbeat { file, .. } => {
             let heartbeat = if tree.contains(file) {

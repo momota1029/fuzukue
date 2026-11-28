@@ -166,7 +166,7 @@ pub(crate) async fn call(app: &Arc<Workspace>, session: &str, args: &Value) -> R
                 (watch.clone(), store.runtime(watch))
             };
             runtime.outbox.clear();
-            let result = poll::observe(&watch, &runtime).await;
+            let result = poll::observe(&watch, &runtime, false).await;
             let would_pause = matches!(&result, poll::Observation::MissingRepo);
             runtime.apply(&watch, result, chrono::Utc::now().timestamp());
             Ok(json!({
