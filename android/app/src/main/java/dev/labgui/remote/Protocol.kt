@@ -12,7 +12,9 @@ import kotlinx.serialization.json.decodeFromJsonElement
 
 internal const val JOB_SUMMARY_PROTOCOL = 74
 internal const val TOOL_DETAILS_PROTOCOL = 75
-const val PROTOCOL_VERSION = TOOL_DETAILS_PROTOCOL
+// TODO events are safely ignored until Android exposes them.
+internal const val TODO_PROTOCOL = 76
+const val PROTOCOL_VERSION = TODO_PROTOCOL
 internal const val MIN_PROTOCOL_VERSION = 18
 internal const val THREAD_HISTORY_PROTOCOL = 62
 internal const val FOLDER_ACCESS_REQUEST = "folder-access-"

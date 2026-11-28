@@ -94,6 +94,23 @@ class RemoteRepositoryTest {
         assertNull(state.error)
     }
 
+    @Test fun protocol75ServerConnectsToProtocol76App() {
+        finishConnect(protocol = 75)
+        assertEquals(ConnectionPhase.Connected, state.phase)
+        assertFalse(state.updateRequired)
+        assertNull(state.error)
+    }
+
+    @Test fun protocol76TodoEventsAreIgnoredWithoutInterruptingUpdates() {
+        val socket = finishConnect()
+        socket.event("""{"type":"todo_changed","session":"s","revision":1,"items":[],"unreadable":false}""")
+        socket.event("""{"type":"threads","threads":[{"id":"s","title":"Updated","updated":0}]}""")
+
+        assertEquals(ConnectionPhase.Connected, state.phase)
+        assertNull(state.error)
+        assertEquals("Updated", state.threads.single().title)
+    }
+
     @Test fun welcomeAtCurrentProtocolConnects() {
         finishConnect()
         assertEquals(ConnectionPhase.Connected, state.phase)
