@@ -281,6 +281,7 @@ fn comments_round_trip_compose_and_clear_drafts() -> Result<()> {
             source: Some(fuzukue_proto::CommentSource {
                 range: 10..29,
                 text: r"Let \(x\) be fixed.".into(),
+                context: Some("Surrounding context".into()),
             }),
             text: "Expand the proof.".into(),
             created: 200,
@@ -306,6 +307,7 @@ fn comments_round_trip_compose_and_clear_drafts() -> Result<()> {
     let source = loaded[1].source.as_ref().unwrap();
     assert_eq!(source.range, 10..29);
     assert_eq!(source.text, r"Let \(x\) be fixed.");
+    assert_eq!(source.context.as_deref(), Some("Surrounding context"));
     assert!(message.contains(harness_text!("2. [[thm-sphere-concentration]]\n   Quote: Let $x$ be fixed.\n   TeX source: Let \\(x\\) be fixed.\n   Comment: Expand the proof.", "2. [[thm-sphere-concentration]]\n   引用: Let $x$ be fixed.\n   TeX 原文: Let \\(x\\) be fixed.\n   コメント: Expand the proof.")));
 
     comments::save(deck, &[])?;
@@ -5430,6 +5432,7 @@ done
         source: Some(fuzukue_proto::CommentSource {
             range: 0..13,
             text: "Raw quotation".into(),
+            context: None,
         }),
         created: 0,
     };

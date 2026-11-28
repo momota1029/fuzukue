@@ -119,7 +119,7 @@ mod tests {
             text: note.into(),
             quote: quote.map(str::to_owned),
             proof: quote.map(|_| false),
-            source: Some(fuzukue_proto::CommentSource { range: 0..text.len(), text: text.into() }),
+            source: Some(fuzukue_proto::CommentSource { range: 0..text.len(), text: text.into(), context: None }),
             created: 1,
         };
         let items = [

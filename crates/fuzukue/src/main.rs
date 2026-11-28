@@ -42,6 +42,7 @@ mod exploration;
 mod math;
 mod paper;
 mod paper_prose;
+mod packaged_server;
 mod paper_edit;
 mod paper_pdf;
 mod pane_resize;
@@ -952,7 +953,7 @@ impl Workbench {
                         .and_then(|range| {
                             let card = this.cards.iter().find(|card| card.id == part.card)?;
                             let text = card.body.get(range.clone())?.to_owned();
-                            Some(CommentSource { range, text })
+                            Some(CommentSource { range, text, context: None })
                         });
                     CommentTarget { card: part.card.clone(), proof: part.proof, quote: Some(quote), source }
                 } else {
@@ -1503,6 +1504,7 @@ impl Workbench {
             activity.record(&env.event);
         }
         match ev {
+            ConnEvent::PackagedPeer(peer) => self.safe_close.packaged_peer = peer,
             ConnEvent::Connected => {
                 self.receiving_backlog = true;
                 self.safe_close_reconnected();
@@ -1514,6 +1516,7 @@ impl Workbench {
             ConnEvent::AdvertisedTranscriptCache(cached) => self.advertised_transcript_cache(cached),
             ConnEvent::OwnedServerStopped => self.owned_server_stopped(window, cx),
             ConnEvent::Disconnected(e) => {
+                self.safe_close.packaged_peer = None;
                 self.approvals.disconnect();
                 self.workspace_requests = Default::default();
                 self.agent_models.disconnect();
@@ -3469,16 +3472,30 @@ fn main() {
         appearance::register_window_typography(cx);
         math::init(cx);
         let options = appearance::main_window_options(cx);
-        gpui_kit::open_window(options, cx, |window, cx| {
+        let (window, view) = gpui_kit::open_window(options, cx, |window, cx| {
             window.set_window_title("fuzukue");
             cx.new(|cx| Workbench::new(window, cx))
         })
         .expect("failed to open window");
+        if packaged_server::PackagedServer::installed().is_some() {
+            cx.set_quit_mode(gpui_kit::QuitMode::LastWindowClosed);
+            let view = view.downgrade();
+            cx.on_action(move |_: &QuitPackaged, cx| {
+                let _ = window.update(cx, |_, window, cx| {
+                    let _ = view.update(cx, |this, cx| this.close_workbench(window, cx));
+                });
+            });
+            cx.bind_keys([gpui_kit::KeyBinding::new("cmd-q", QuitPackaged, None)]);
+            cx.set_menus([gpui_kit::Menu::new("fuzukue")
+                .items([gpui_kit::MenuItem::action(tr!("menu-quit-app"), QuitPackaged)])]);
+        }
         cx.activate(true);
         #[cfg(target_os = "macos")]
         show_packaged_setup_guide(cx);
     });
 }
+
+gpui_kit::actions!(fuzukue, [QuitPackaged]);
 
 #[cfg(target_os = "macos")]
 fn show_packaged_setup_guide(cx: &mut gpui_kit::App) {

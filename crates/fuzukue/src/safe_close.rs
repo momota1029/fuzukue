@@ -46,6 +46,7 @@ fn close_plan(intent: Intent, last_window: bool, managed: bool, save: bool, jobs
 
 #[derive(Default)]
 pub(super) struct SafeClose {
+    pub(super) packaged_peer: Option<u64>,
     work: Option<ShutdownWork>,
     latest_drain: Option<DrainStatus>,
     flow: Option<Flow>,
@@ -69,6 +70,7 @@ struct RunningWork {
 
 struct Flow {
     intent: Intent,
+    packaged_peer: Option<u64>,
     work: RunningWork,
     visible: bool,
     phase: Phase,
@@ -111,6 +113,7 @@ impl Flow {
     fn new(intent: Intent, work: RunningWork, visible: bool) -> Self {
         Self {
             intent,
+            packaged_peer: None,
             work,
             visible,
             phase: Phase::Review,
@@ -295,16 +298,13 @@ impl Workbench {
             return false;
         }
         let last = cx.windows().len() <= 1;
-        let managed = last && self.connection.manages_server(&self.http, cx);
+        let save = self.save_server_on_close(cx);
+        let managed = last
+            && (self.connection.manages_server(&self.http, cx)
+                || (save && self.safe_close.packaged_peer.is_some()));
         if managed {
             let work = self.running_work();
-            match close_plan(
-                Intent::Window,
-                last,
-                managed,
-                self.save_server_on_close(cx),
-                work.jobs,
-            ) {
+            match close_plan(Intent::Window, last, managed, save, work.jobs) {
                 Plan::Review => {
                     self.begin_close(Intent::Window, work, true, window, cx);
                     return false;
@@ -410,7 +410,9 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.safe_close.flow = Some(Flow::new(intent, work, visible));
+        let mut flow = Flow::new(intent, work, visible);
+        flow.packaged_peer = self.safe_close.packaged_peer;
+        self.safe_close.flow = Some(flow);
         if visible {
             self.show_close_dialog(window, cx);
         } else {
@@ -507,7 +509,9 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(flow) = &mut self.safe_close.flow {
+        if let Some(flow) = self.safe_close.flow.as_mut().filter(|flow| {
+            flow.packaged_peer.is_none() || flow.packaged_peer == self.safe_close.packaged_peer
+        }) {
             let effect = flow.on_status(&status, Instant::now());
             if !flow.visible
                 && (flow.error.is_some()
@@ -583,7 +587,12 @@ impl Workbench {
         match effect {
             Effect::None => {}
             Effect::Send(message) => {
-                if self.out.send(message).is_err() {
+                let sent = match self.safe_close.flow.as_ref().and_then(|flow| flow.packaged_peer) {
+                    Some(peer) => self.safe_close.packaged_peer == Some(peer)
+                        && self.connection.send_packaged_shutdown(peer, message),
+                    None => self.out.send(message).is_ok(),
+                };
+                if !sent {
                     self.safe_close_error(tr!("safe-close-no-response").into(), window, cx);
                 }
             }
@@ -651,7 +660,8 @@ impl Workbench {
 
     fn render_safe_close(&self, cx: &mut Context<Self>) -> Option<(String, gpui_kit::Div)> {
         let flow = self.safe_close.flow.as_ref()?;
-        let can_save = self.can_request_shutdown();
+        let can_save = self.can_request_shutdown()
+            && flow.packaged_peer.is_none_or(|peer| self.safe_close.packaged_peer == Some(peer));
         let can_force = (can_save && self.protocol >= SAFE_CLOSE_PROTOCOL)
             || self.connection.can_stop_launched_server(&self.http, cx);
         let colors = cx.theme();
@@ -857,6 +867,56 @@ mod tests {
             close_plan(Intent::StopServer, false, false, false, 0),
             Plan::Drain
         );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "headless-shot"))]
+    #[test]
+    fn safe_close_packaged_server_reviews_work_and_binds_shutdown_to_the_verified_socket() {
+        use gpui_kit::AppContext as _;
+
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(|cx| {
+            gpui_kit::init(cx);
+            crate::math::init(cx);
+            let (window, view) = gpui_kit::open_window(
+                gpui_kit::component::TitleBar::window_options(),
+                cx,
+                |window, cx| cx.new(|cx| Workbench::new_with_target(window, cx, Some(Err("Fixture")))),
+            ).unwrap();
+            window.update(cx, |_, window, cx| view.update(cx, |view, cx| {
+                let requests = view.connection.packaged_shutdown_fixture();
+                view.status = ConnectionStatus::Connected;
+                view.protocol = SAFE_CLOSE_PROTOCOL;
+                view.shutdown_work(ShutdownWork { jobs_running: 1, threads: vec![], deadline_secs: 60 });
+
+                // The loopback address alone confers no authority to stop a server.
+                cx.global_mut::<crate::appearance::SaveServerOnClose>().0 = true;
+                assert!(view.window_can_close(window, cx));
+
+                view.safe_close.packaged_peer = Some(42);
+                cx.global_mut::<crate::appearance::SaveServerOnClose>().0 = false;
+                assert!(view.window_can_close(window, cx));
+
+                cx.global_mut::<crate::appearance::SaveServerOnClose>().0 = true;
+                assert!(!view.window_can_close(window, cx));
+                assert!(matches!(view.safe_close.flow.as_ref().unwrap().phase, Phase::Review));
+                assert!(requests.try_recv().is_err());
+                view.cancel_close(window, cx);
+
+                view.shutdown_work(ShutdownWork { jobs_running: 0, threads: vec![], deadline_secs: 60 });
+                assert!(!view.window_can_close(window, cx));
+                assert!(matches!(
+                    requests.try_recv().unwrap(),
+                    (42, ClientMsg::RequestDrain { reason: DrainReason::Shutdown })
+                ));
+                view.safe_close.packaged_peer = Some(43);
+                view.apply_close_effect(Effect::Send(ClientMsg::ForceShutdown { started_at: None }), window, cx);
+                assert!(requests.try_recv().is_err());
+                assert!(view.safe_close.flow.as_ref().unwrap().error.is_some());
+            })).unwrap();
+            cx.spawn(async move |cx| {
+                let _ = cx.update(|cx| cx.quit());
+            }).detach();
+        });
     }
 
     #[test]

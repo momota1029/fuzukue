@@ -2,8 +2,8 @@
 //!
 //! A passage has no card id, and its byte offsets move when the TeX changes.
 //! The anchor therefore keeps the file, the offset at the time of writing and
-//! the TeX text itself. The text decides where the comment belongs; the offset
-//! decides among passages that are not loaded or no longer contain the text.
+//! the TeX text itself. Selected text also keeps surrounding context to help
+//! distinguish repetitions; the offset remains a fallback for older comments.
 
 use std::ops::Range;
 
@@ -35,6 +35,17 @@ pub fn passage_comment_anchor(
         Some(range) => tex[range.clone()].to_owned(),
         None => head(tex).to_owned(),
     };
+    let context = selection.as_ref().filter(|range| range.len() <= EXCERPT_BYTES).map(|range| {
+        let mut start = range.start.saturating_sub(EXCERPT_BYTES / 2);
+        while !tex.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = range.end.saturating_add(EXCERPT_BYTES / 2).min(tex.len());
+        while !tex.is_char_boundary(end) {
+            end -= 1;
+        }
+        tex[start..end].to_owned()
+    });
     let (path, range) = match text {
         DocProseText::Tex(_) => (String::new(), selection.unwrap_or(0..tex.len())),
         DocProseText::Source(spans) => {
@@ -62,7 +73,7 @@ pub fn passage_comment_anchor(
     };
     (
         format!("{MANUSCRIPT_COMMENT_PREFIX}{path}"),
-        CommentSource { range, text: excerpt },
+        CommentSource { range, text: excerpt, context },
     )
 }
 
@@ -86,7 +97,13 @@ pub fn resolve_passage_comment(comment: &CommentView, passages: &[Passage<'_>]) 
     let contains = |passage: &Passage<'_>| {
         excerpt.is_some_and(|excerpt| passage.tex.is_some_and(|tex| tex.contains(excerpt)))
     };
-    // Passages of the anchored file, nearest first among those with the text.
+    let context = source
+        .and_then(|source| source.context.as_deref())
+        .filter(|context| !context.is_empty());
+    let has_context = |passage: &Passage<'_>| {
+        context.is_some_and(|context| passage.tex.is_some_and(|tex| tex.contains(context)))
+    };
+    // Prefer surrounding text before the old offset when selections are repeated.
     let nearest = passages
         .iter()
         .enumerate()
@@ -103,18 +120,22 @@ pub fn resolve_passage_comment(comment: &CommentView, passages: &[Passage<'_>]) 
                     })
                     .min(),
             }?;
-            Some(((!contains(passage), passage.tex.is_some(), distance), index))
+            let rank = (!contains(passage), !has_context(passage), distance);
+            Some((rank, index, passage.tex.is_some()))
         });
     // An unloaded passage of the file may still hold the text.
-    let unloaded = nearest.clone().any(|((_, loaded, _), _)| !loaded);
-    let nearest = nearest
-        .map(|((missing, _, distance), index)| ((missing, distance), index))
-        .min();
-    if let Some(((false, _), index)) = nearest {
+    let unloaded = nearest.clone().any(|(_, _, loaded)| !loaded);
+    let nearest = nearest.map(|(rank, index, _)| (rank, index)).min();
+    if let Some(((false, _, _), index)) = nearest {
         return Some(index);
     }
     // The text moved to another file, or the file is gone: follow the text.
-    let moved = passages.iter().position(contains).filter(|_| !unloaded);
+    let moved = if unloaded {
+        None
+    } else {
+        passages.iter().position(|passage| contains(passage) && has_context(passage))
+            .or_else(|| passages.iter().position(contains))
+    };
     moved
         .or_else(|| nearest.map(|(_, index)| index))
         .or_else(|| (!passages.is_empty()).then_some(0))
@@ -197,6 +218,43 @@ mod tests {
         assert_eq!(card, "manuscript:b.tex");
         assert_eq!(source.range, 27..31);
         assert_eq!(source.text, "file");
+    }
+
+    #[test]
+    fn selection_uses_context_after_insertion_before_repeated_word() {
+        let target = "A distinct paragraph with the short word here.";
+        let old = DocProseText::Source(vec![span("a.tex", 100, target, false)]);
+        let start = target.find("word").unwrap();
+        let draft = comment(passage_comment_anchor(&old, target, Some(start..start + 4)));
+        let earlier_text = "An earlier word appears here.";
+        let earlier = DocProseText::Source(vec![span("a.tex", 60, earlier_text, false)]);
+        let original = [
+            Passage { text: &earlier, tex: Some(earlier_text) },
+            Passage { text: &old, tex: Some(target) },
+        ];
+        assert_eq!(resolve_passage_comment(&draft, &original), Some(1));
+
+        let insertion = "A new paragraph inserted before both existing paragraphs.\n\n";
+        let shift = insertion.len() as u64;
+        let shifted_earlier = DocProseText::Source(vec![span("a.tex", 60 + shift, earlier_text, false)]);
+        let shifted_target = DocProseText::Source(vec![span("a.tex", 100 + shift, target, false)]);
+        let passages = [
+            Passage { text: &shifted_earlier, tex: Some(earlier_text) },
+            Passage { text: &shifted_target, tex: Some(target) },
+        ];
+        assert_eq!(resolve_passage_comment(&draft, &passages), Some(1));
+        let json = serde_json::to_string(&draft).unwrap();
+        let restored: CommentView = serde_json::from_str(&json).unwrap();
+        assert_eq!(resolve_passage_comment(&restored, &passages), Some(1));
+        let legacy_source: CommentSource = serde_json::from_str(&format!(
+            r#"{{"range":{{"start":{},"end":{}}},"text":"word"}}"#,
+            100 + start,
+            104 + start,
+        )).unwrap();
+        assert!(legacy_source.context.is_none());
+        let mut legacy = restored;
+        legacy.source = Some(legacy_source);
+        assert_eq!(resolve_passage_comment(&legacy, &passages), Some(0));
     }
 
     #[test]

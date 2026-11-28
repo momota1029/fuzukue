@@ -49,6 +49,9 @@ pub const DRAIN_PROTOCOL: u32 = 48;
 pub const CLIENT_COMMAND_PROTOCOL: u32 = 49;
 pub const GOAL_PAUSE_PROTOCOL: u32 = 50;
 pub const SAFE_CLOSE_PROTOCOL: u32 = 51;
+
+/// WebSocket upgrade header identifying a local macOS package server process.
+pub const MACOS_PACKAGE_PID_HEADER: &str = "x-fuzukue-macos-package-pid";
 pub const SLASH_COMMAND_PROTOCOL: u32 = 52;
 pub const GITHUB_REPORT_PROTOCOL: u32 = 53;
 pub const BACKGROUND_COMMANDS_PROTOCOL: u32 = 54;
@@ -1778,6 +1781,9 @@ pub fn manuscript_comment_path(card: &str) -> Option<&str> {
 pub struct CommentSource {
     pub range: std::ops::Range<usize>,
     pub text: String,
+    /// Surrounding manuscript text used to distinguish repeated selections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

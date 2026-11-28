@@ -8,6 +8,7 @@ menu-help = ヘルプ
 menu-new-thread = 新規スレッド
 menu-open-workspace = ワークスペースを開く…
 menu-close-workspace = ワークスペースを閉じる
+menu-quit-app = fuzukue を終了
 menu-finish-edits-before-closing = 編集内容を保存してから閉じる
 menu-no-thread = スレッドを選ぶと操作できる
 menu-shortcut-threads = 前 / 次のスレッド（{ $shortcut }）

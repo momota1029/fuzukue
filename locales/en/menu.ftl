@@ -8,6 +8,7 @@ menu-help = Help
 menu-new-thread = New thread
 menu-open-workspace = Open workspace…
 menu-close-workspace = Close workspace
+menu-quit-app = Quit fuzukue
 menu-finish-edits-before-closing = Save your edits before closing the workspace
 menu-no-thread = Select a thread to see its actions
 menu-shortcut-threads = Previous / next thread ({ $shortcut })

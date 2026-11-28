@@ -33,6 +33,14 @@ fn write(path: &Path, settings: &Table) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) fn load_appearance(path: &Path, save_server_default: bool) -> anyhow::Result<AppearanceSettings> {
+    let mut table = read(path)?;
+    table.entry(SAVE_SERVER_ON_CLOSE).or_insert(Value::Boolean(save_server_default));
+    let mut settings: AppearanceSettings = table.try_into()?;
+    settings.normalize();
+    Ok(settings)
+}
+
 pub(super) fn save_appearance(path: &Path, settings: &AppearanceSettings) -> anyhow::Result<()> {
     let _write = SETTINGS_WRITE.lock().unwrap();
     let mut existing = read(path)?;
@@ -188,6 +196,23 @@ mod tests {
         save_server_on_close(&path, false).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(!AppearanceSettings::from_toml(&saved).unwrap().save_server_on_close);
+    }
+
+    #[test]
+    fn packaged_shutdown_default_preserves_explicit_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        assert!(!load_appearance(&path, false).unwrap().save_server_on_close);
+        let settings = load_appearance(&path, true).unwrap();
+        assert!(settings.save_server_on_close);
+        save_appearance(&path, &settings).unwrap();
+        assert!(!read(&path).unwrap().contains_key(SAVE_SERVER_ON_CLOSE));
+        assert!(load_appearance(&path, true).unwrap().save_server_on_close);
+
+        save_server_on_close(&path, false).unwrap();
+        assert!(!load_appearance(&path, true).unwrap().save_server_on_close);
+        save_server_on_close(&path, true).unwrap();
+        assert!(load_appearance(&path, false).unwrap().save_server_on_close);
     }
 
     #[test]

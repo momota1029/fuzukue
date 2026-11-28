@@ -708,9 +708,7 @@ async fn run_server() -> anyhow::Result<()> {
     let _ = app.self_update.set(shutdown_control.clone());
     if let Some(update) = &update {
         job_process::start_cache_reclaim();
-        let macos_package = cfg!(target_os = "macos")
-            && std::env::var_os("FUZUKUE_MACOS_PACKAGE").as_deref() == Some(std::ffi::OsStr::new("1"));
-        service::start_project(app.clone(), update.clone(), macos_package);
+        service::start_project(app.clone(), update.clone(), macos_package());
         watch::restore(app.clone(), update.clone());
         workspace_requests::start(&app);
     }
@@ -935,6 +933,11 @@ async fn handle_shutdown_signals(
     }
 }
 
+fn macos_package() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::var_os("FUZUKUE_MACOS_PACKAGE").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(app): State<Arc<App>>,
@@ -950,7 +953,7 @@ async fn ws_handler(
         .unwrap_or_else(|| if ip.is_loopback() { "local_user" } else { "shared_token_user" }.into());
     // The largest ordinary client request is a 4 MiB screenshot encoded as Base64.
     // Allow headroom for text requests while bounding incoming fragmented messages.
-    ws.max_message_size(16 * 1024 * 1024).on_upgrade(move |socket| async move {
+    let mut response = ws.max_message_size(16 * 1024 * 1024).on_upgrade(move |socket| async move {
         let settings = settings.filter(|_| github_report_client).map(|extension| extension.0);
         let serve = client_loop(socket, app, ip, github_report_client, grant_principal, settings);
         if let Some(axum::Extension(device)) = device {
@@ -958,7 +961,14 @@ async fn ws_handler(
         } else {
             serve.await;
         }
-    })
+    });
+    if ip.is_loopback() && macos_package() {
+        response.headers_mut().insert(
+            fuzukue_proto::MACOS_PACKAGE_PID_HEADER,
+            axum::http::HeaderValue::from(std::process::id()),
+        );
+    }
+    response
 }
 
 #[derive(serde::Deserialize)]

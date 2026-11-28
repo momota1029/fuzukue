@@ -17,12 +17,13 @@ use fuzukue_view::{
 };
 use tungstenite::{client::IntoClientRequest, stream::MaybeTlsStream, Message, WebSocket};
 
-use crate::server::ServerOwner;
+use crate::{packaged_server::PackagedServer, server::ServerOwner};
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 pub enum ConnEvent {
     Connected,
+    PackagedPeer(Option<u64>),
     AdvertisedTranscriptCache(Vec<CachedSession>),
     ApprovalQueueAvailable(bool),
     Disconnected(String),
@@ -35,6 +36,7 @@ pub enum ConnEvent {
 pub struct Target {
     url: String,
     launch: Option<Launch>,
+    packaged: Option<PackagedServer>,
     host_tailnet: bool,
     keep_running: bool,
     http: HttpTarget,
@@ -97,9 +99,15 @@ impl Target {
             None => None,
         };
         let launch_addr = launch.as_ref().map(Launch::addr);
+        let packaged = if settings.mode == ServerMode::External && url == DEFAULT_URL {
+            PackagedServer::installed()
+        } else {
+            None
+        };
         Ok(Self {
             url,
             launch,
+            packaged,
             host_tailnet: settings.host_tailnet,
             keep_running: settings.host_tailnet && settings.keep_running,
             http: HttpTarget {
@@ -127,6 +135,7 @@ impl Target {
         Ok(Self {
             url: url.into(),
             launch: None,
+            packaged: None,
             host_tailnet: false,
             keep_running: false,
             http: HttpTarget {
@@ -140,29 +149,40 @@ impl Target {
         })
     }
 
-    fn connect(&self) -> anyhow::Result<Socket> {
+    fn connect(&self) -> anyhow::Result<(Socket, bool)> {
         // Older servers send a complete deck in a single frame.
         let config = Some(tungstenite::protocol::WebSocketConfig::default()
             .max_frame_size(Some(64 * 1024 * 1024))
             .max_message_size(Some(64 * 1024 * 1024)));
-        let Some(launch) = &self.launch else {
+        let addr = self.launch.as_ref().map(Launch::addr).or_else(|| {
+            self.packaged.as_ref().map(|_| fuzukue_view::server::DEFAULT_ADDR.parse().unwrap())
+        });
+        let Some(addr) = addr else {
             if let Some(authorization) = &self.http.authorization {
                 use tungstenite::http::{header::AUTHORIZATION, HeaderValue};
                 let mut request = self.url.as_str().into_client_request()?;
                 let mut value = HeaderValue::from_str(authorization)?;
                 value.set_sensitive(true);
                 request.headers_mut().insert(AUTHORIZATION, value);
-                return Ok(tungstenite::client::connect_with_config(request, config, 0)?.0);
+                let (ws, _) = tungstenite::client::connect_with_config(request, config, 0)?;
+                return Ok((ws, false));
             }
-            return Ok(tungstenite::client::connect_with_config(self.url.as_str(), config, 3)?.0);
+            let (ws, _) = tungstenite::client::connect_with_config(self.url.as_str(), config, 3)?;
+            return Ok((ws, false));
         };
         let request = self.url.as_str().into_client_request()?;
-        let stream = TcpStream::connect_timeout(&launch.addr(), Duration::from_secs(1))?;
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-        let (ws, _) = tungstenite::client::client_with_config(request, MaybeTlsStream::Plain(stream), config)
+        let (ws, response) = tungstenite::client::client_with_config(request, MaybeTlsStream::Plain(stream), config)
             .map_err(|err| anyhow::anyhow!("{err}"))?;
-        Ok(ws)
+        let packaged = self.packaged.as_ref().is_some_and(|agent| {
+            response.headers().get(fuzukue_proto::MACOS_PACKAGE_PID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+                .is_some_and(|pid| agent.owns_peer(pid))
+        });
+        Ok((ws, packaged))
     }
 }
 
@@ -429,6 +449,7 @@ enum Control {
 
 pub struct Connection {
     control: mpsc::Sender<Control>,
+    packaged_shutdown: mpsc::Sender<(u64, ClientMsg)>,
     owner: Arc<Mutex<ServerOwner>>,
     parked: bool,
     #[cfg(all(target_os = "linux", feature = "headless-shot"))]
@@ -454,6 +475,17 @@ impl Connection {
         }, false, false)?;
         http.launch_addr = Some(addr);
         Ok(())
+    }
+
+    #[cfg(all(test, target_os = "linux", feature = "headless-shot"))]
+    pub(super) fn packaged_shutdown_fixture(&mut self) -> mpsc::Receiver<(u64, ClientMsg)> {
+        let (out, requests) = mpsc::channel();
+        self.packaged_shutdown = out;
+        requests
+    }
+
+    pub(super) fn send_packaged_shutdown(&self, peer: u64, request: ClientMsg) -> bool {
+        self.packaged_shutdown.send((peer, request)).is_ok()
     }
 
     pub fn restart(&self, target: Target) {
@@ -658,6 +690,7 @@ pub fn spawn(
 ) -> (Sender, Connection) {
     let (out_tx, out_rx) = mpsc::channel();
     let (control, commands) = mpsc::channel();
+    let (packaged_shutdown, packaged_requests) = mpsc::channel();
     let owner = Arc::new(Mutex::new(ServerOwner::default()));
     let mut sender = Sender::from(out_tx);
     sender.send_latency = SendLatency::from_env().map(Arc::new);
@@ -665,6 +698,7 @@ pub fn spawn(
         events,
         commands,
         out_rx,
+        packaged_requests,
         transcript_resume: sender.transcript_resume.clone(),
         send_latency: sender.send_latency.clone(),
         owner: owner.clone(),
@@ -675,6 +709,7 @@ pub fn spawn(
         sender,
         Connection {
             control,
+            packaged_shutdown,
             owner,
             parked: false,
             #[cfg(all(target_os = "linux", feature = "headless-shot"))]
@@ -715,6 +750,7 @@ struct Worker {
     events: UnboundedSender<ConnEvent>,
     commands: mpsc::Receiver<Control>,
     out_rx: mpsc::Receiver<ClientMsg>,
+    packaged_requests: mpsc::Receiver<(u64, ClientMsg)>,
     transcript_resume: Arc<Mutex<Option<TranscriptCursor>>>,
     send_latency: Option<Arc<SendLatency>>,
     owner: Arc<Mutex<ServerOwner>>,
@@ -799,7 +835,7 @@ impl Worker {
     }
 
     fn run_connection(&self, target: &Target, cursor: &mut Cursor) -> Result<Option<Control>, String> {
-        let mut may_start = target.launch.is_some();
+        let mut may_start = target.launch.is_some() || target.packaged.is_some();
         let mut deadline: Option<Instant> = None;
         let mut delay = Duration::from_millis(200);
         let mut last_error = String::new();
@@ -840,11 +876,16 @@ impl Worker {
                 return Err(message);
             }
             match target.connect() {
-                Ok(mut ws) => {
+                Ok((mut ws, packaged)) => {
                     may_start = false;
+                    let peer = packaged.then(|| {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static NEXT: AtomicU64 = AtomicU64::new(1);
+                        NEXT.fetch_add(1, Ordering::Relaxed)
+                    });
                     deadline = None;
                     let started = Instant::now();
-                    match self.transfer(&mut ws, cursor, target) {
+                    match self.transfer(&mut ws, cursor, target, peer) {
                         Ok(Transfer::Control(Control::Workspace(id))) => {
                             *cursor = Cursor { workspace: Some(id), pending_workspace_save: true, ..Default::default() };
                             rapid_failures = 0;
@@ -912,6 +953,16 @@ impl Worker {
                         }
                         deadline = Some(Instant::now() + Duration::from_secs(60));
                         last_error = err.to_string();
+                    } else if may_start
+                        && err.downcast_ref::<io::Error>().is_some_and(|err| err.kind() == io::ErrorKind::ConnectionRefused)
+                        && target.packaged.as_ref().is_some_and(PackagedServer::start_if_stopped)
+                    {
+                        may_start = false;
+                        deadline = Some(Instant::now() + Duration::from_secs(60));
+                        last_error = err.to_string();
+                        if !self.emit(ConnEvent::Status(tr!("connection-starting-local-server").into())) {
+                            return Ok(None);
+                        }
                     } else {
                         if !self.emit(ConnEvent::Disconnected(err.to_string())) {
                             return Ok(None);
@@ -968,7 +1019,13 @@ impl Worker {
         message
     }
 
-    fn transfer(&self, ws: &mut Socket, cursor: &mut Cursor, _target: &Target) -> anyhow::Result<Transfer> {
+    fn transfer(
+        &self,
+        ws: &mut Socket,
+        cursor: &mut Cursor,
+        target: &Target,
+        peer: Option<u64>,
+    ) -> anyhow::Result<Transfer> {
         if let MaybeTlsStream::Plain(s) = ws.get_mut() {
             s.set_read_timeout(Some(Duration::from_millis(30)))?;
             s.set_write_timeout(Some(Duration::from_secs(1)))?;
@@ -1000,7 +1057,9 @@ impl Worker {
                 build_id: Some(crate::updater::BUILD_ID.into()),
             },
         )?;
-        if !self.emit(ConnEvent::Connected) {
+        if (target.packaged.is_some() && !self.emit(ConnEvent::PackagedPeer(peer)))
+            || !self.emit(ConnEvent::Connected)
+        {
             return Ok(Transfer::Control(Control::Stop));
         }
 
@@ -1015,6 +1074,15 @@ impl Worker {
         loop {
             if let Some(control) = self.wait(Duration::ZERO) {
                 return Ok(Transfer::Control(control));
+            }
+            if welcomed {
+                // A queued automatic shutdown belongs only to the socket
+                // whose identity was verified when the user closed the window.
+                while let Ok((requested_peer, request)) = self.packaged_requests.try_recv() {
+                    if peer == Some(requested_peer) {
+                        send(ws, &request)?;
+                    }
+                }
             }
             loop {
                 if !welcomed {
@@ -1043,7 +1111,7 @@ impl Worker {
                             _ => {}
                         }
                         #[cfg(all(target_os = "linux", feature = "headless-shot"))]
-                        if _target.shot_read_only == Some(true)
+                        if target.shot_read_only == Some(true)
                             && matches!(request, ClientMsg::WorkspaceRequestSurface { .. })
                         {
                             continue;
@@ -1057,7 +1125,7 @@ impl Worker {
                             continue;
                         }
                         #[cfg(all(target_os = "linux", feature = "headless-shot"))]
-                        if _target.shot_read_only == Some(true) && !matches!(
+                        if target.shot_read_only == Some(true) && !matches!(
                             request,
                             ClientMsg::ListPendingApprovals { .. } | ClientMsg::SetLocale { .. } | ClientMsg::SelfUpdateStatus | ClientMsg::ListExtensions | ClientMsg::ListTests | ClientMsg::LookupSymbol { .. } | ClientMsg::SearchDecks { .. } | ClientMsg::SearchLibrary { .. } | ClientMsg::GetThreadArtifacts { .. } | ClientMsg::ListWorkspaces | ClientMsg::BrowseWorkspace { .. } | ClientMsg::ListFiles { .. } | ClientMsg::FindFiles { .. } | ClientMsg::ResolveFile { .. } | ClientMsg::ListAgents | ClientMsg::GetAgentStats | ClientMsg::GetAgentHistory { .. } | ClientMsg::GetPaperPdfMap { .. }
                                 | ClientMsg::ReviewReports { action: fuzukue_proto::ReviewReportsAction::List, .. }

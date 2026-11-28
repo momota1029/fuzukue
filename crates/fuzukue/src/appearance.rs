@@ -2,7 +2,6 @@
 
 use std::{
     cell::Cell,
-    fs,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -740,12 +739,14 @@ fn settings_path() -> Option<PathBuf> {
 }
 
 fn load_settings(path: &Path) -> anyhow::Result<AppearanceSettings> {
-    match fs::read_to_string(path) {
-        Ok(text) => AppearanceSettings::from_toml(&text)
-            .map_err(|_| anyhow::anyhow!(tr!("settings-invalid-toml-or-settings-value"))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AppearanceSettings::default()),
-        Err(err) => Err(err.into()),
-    }
+    let save_server_default = crate::packaged_server::PackagedServer::installed().is_some();
+    crate::settings_file::load_appearance(path, save_server_default).map_err(|err| {
+        if err.is::<toml::de::Error>() {
+            anyhow::anyhow!(tr!("settings-invalid-toml-or-settings-value"))
+        } else {
+            err
+        }
+    })
 }
 
 pub(super) fn main_window_options(cx: &App) -> WindowOptions {
