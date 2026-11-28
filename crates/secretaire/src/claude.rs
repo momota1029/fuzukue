@@ -227,6 +227,9 @@ impl ClaudeLaunch {
             "--mcp-config", &self.mcp_config,
             "--permission-mode", mode.cli_value(),
             "--permission-prompt-tool", "stdio",
+            // Native subagent permission prompts can get stuck inside Claude.
+            // Task is the former name of Agent. SendMessage can resume an old subagent.
+            "--disallowedTools", "Agent", "Task", "SendMessage",
         ]);
         if self.mail_enabled || canary {
             cmd.arg("--strict-mcp-config");
@@ -349,6 +352,10 @@ pub(crate) fn partner_system(
         );
     }
     system.push_str(crate::delegate::prompt());
+    system.push_str(harness_text!(
+        "\nClaude's built-in Agent tool is disabled here because its subagent permission prompts can stall. Use fuzukue's delegate tool.",
+        "\nClaude 組み込みの Agent は、サブエージェントの許可待ちが止まることがあるため無効。fuzukue の delegate を使う。",
+    ));
     system.push_str(crate::mcp::front_desk_instructions());
     system.push_str(crate::worker_scope::SHELL_READ_GUIDANCE);
     if !crate::canary() {
@@ -2932,13 +2939,19 @@ mod tests {
             let stale = resume_id == Some("missing-session");
             std::fs::write(&program, r#"#!/bin/sh
 resume=
+native_agents_disabled=
 while [ "$#" -gt 0 ]; do
-    if [ "$1" = "--resume" ]; then
-        shift
-        resume="$1"
-    fi
+    case "$1" in
+        --resume) resume="$2"; shift ;;
+        --disallowedTools)
+            [ "$2" = Agent ] && [ "$3" = Task ] && [ "$4" = SendMessage ] || exit 2
+            native_agents_disabled=yes
+            shift 3
+            ;;
+    esac
     shift
 done
+[ "$native_agents_disabled" = yes ] || exit 2
 if [ "$resume" != missing-session ]; then
     printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "${resume:-new-session}"
 fi

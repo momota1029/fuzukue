@@ -4678,6 +4678,8 @@ async fn front_desk_accept_edits_preserves_the_checked_shell_policy() -> Result<
 import json, sys
 from pathlib import Path
 assert sys.argv[sys.argv.index("--permission-mode") + 1] == "acceptEdits"
+denied_at = sys.argv.index("--disallowedTools") + 1
+assert sys.argv[denied_at:denied_at + 3] == ["Agent", "Task", "SendMessage"]
 assert "Bash" in json.loads(sys.argv[sys.argv.index("--settings") + 1])["permissions"]["ask"]
 json.loads(sys.stdin.readline())
 def ask(id, tool, input, **flags):
