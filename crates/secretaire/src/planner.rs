@@ -2035,6 +2035,10 @@ pub(crate) fn worker_report_context(app: &Workspace, session: &str) -> Option<St
     let thread = app.plans.get(app, session).ok()?;
     {
         let mut state = thread.state.lock().unwrap();
+        // A finished plan says nothing about this job.
+        if state.plan.as_ref().is_some_and(|plan| plan.status == PlanStatus::Done) {
+            return None;
+        }
         if state.report_updates.running {
             state.report_updates.desk_waiting = true;
             return Some(harness_text!(
@@ -2340,6 +2344,20 @@ mod tests {
         state.plan.as_mut().unwrap().pace = Some(GoalPace::Economy);
         state.jobs.get_mut("third").unwrap().running = None;
         assert!(matches!(gate(&state), Some((WaitReason::PlannerPace { running: 2, limit: 2, .. }, None))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_finished_plan_stays_out_of_worker_reports() -> Result<()> {
+        let directory = crate::test_support::TestDir::new();
+        let app = Arc::new(Workspace::new(directory.path().into(), "127.0.0.1:7878".into(),
+            directory.path().join(".fuzukue"), Arc::new(crate::hub::Hub::new())));
+        app.hub.load_threads(directory.path(), &app.state_dir);
+        let session = app.hub.edit_threads(|store| store.create(None))?;
+        write_test_plan(&app, &session)?;
+        assert!(worker_report_context(&app, &session).unwrap().contains("Resume test goal"));
+        app.plans.get(&app, &session)?.state.lock().unwrap().plan.as_mut().unwrap().status = PlanStatus::Done;
+        assert_eq!(worker_report_context(&app, &session), None);
         Ok(())
     }
 

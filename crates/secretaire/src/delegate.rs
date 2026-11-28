@@ -10,6 +10,8 @@ mod relay;
 pub(crate) mod touches;
 mod quarantine;
 #[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
 mod tool_guard_tests;
 #[cfg(test)]
 mod workspace_write_tests;
@@ -188,6 +190,9 @@ pub(crate) struct JobInput {
     rx: mpsc::UnboundedReceiver<String>,
     pub paced: bool,
     attempt_cancel: Arc<Cancellation>,
+    /// Paths the backend reports as edited. They add to those named by tool
+    /// events, which can leave some out, such as a move destination.
+    pub(crate) edits: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl JobInput {
@@ -923,7 +928,8 @@ async fn launch_assignment(
         prompt: prompt.chars().take(400).collect(), worktree: root.into(),
         declared: touches, effective, selection: initial_model.selection.clone(), tier: initial.tier,
         queued_at, started_at: None, finished_at: None, wait: None, routing_note: None, cancel_reason: None,
-        final_report: None, start_error: None, finish_error: None, activity: Default::default(),
+        final_report: None, start_error: None, finish_error: None,
+        activity: jobs::Timeline::declaring(writes.clone()),
     });
     let globs = writes.globs();
     let publish = move |app: &App, session: &str, job: &str, selection: &AgentSelection,
@@ -958,7 +964,8 @@ async fn launch_assignment(
         let mut attempts = Vec::new();
         let cancel = control.cancel.clone();
         let timer = Instant::now();
-        let mut input = JobInput { job: control, rx, paced: false, attempt_cancel: Arc::default() };
+        let edits = record.lock().unwrap().activity.edits.clone();
+        let mut input = JobInput { job: control, rx, paced: false, attempt_cancel: Arc::default(), edits };
         let mut work = None;
         let mut claimed = false;
         // The drain that kept a retry from starting.
@@ -1377,14 +1384,28 @@ async fn launch_assignment(
             }
             input.job.input.lock().unwrap().take();
             let writes_to_check = writes.clone();
+            let written = record.lock().unwrap().activity.written(&checkout);
+            let others = app.delegates.jobs.claims(&job, started_at);
             let changes = tokio::task::spawn_blocking(move || {
                 if let Some(scope) = write_scope {
                     scope.close();
                 }
+                // The checkout can be shared, and shell writes have no known
+                // writer. Every change is reported, labelled with what is known.
+                let root = checkout.canonicalize().unwrap_or_else(|_| checkout.clone());
+                let writer = |path: &Path| {
+                    if path.to_str().is_some_and(|name| written.contains(name)) {
+                        quarantine::Writer::Own
+                    } else if others.cover(&root.join(path)) {
+                        quarantine::Writer::Other
+                    } else {
+                        quarantine::Writer::Unconfirmed
+                    }
+                };
                 if hands_off {
-                    (before.changes(&Files::read(&checkout)), quarantine::Review::default())
+                    (before.changes(&checkout, &Files::read(&checkout), writer), quarantine::Review::default())
                 } else {
-                    before.review(&checkout, &recovery, &writes_to_check)
+                    before.review(&checkout, &recovery, &writes_to_check, writer)
                 }
             }).await;
             if interrupted_retry.is_some() || input.job.drain_notice.lock().unwrap().is_some() || app.admit_work().is_err() {
@@ -1405,7 +1426,7 @@ async fn launch_assignment(
             let mut details = match &changes {
                 Some(Ok((changes, quarantine))) => {
                     let mut details = changes.render(japanese);
-                    details.push_str(&quarantine.render(japanese));
+                    details.push_str(&quarantine.render(&changes.attribution, japanese));
                     details
                 }
                 Some(Err(error)) if japanese => format!("変更一覧を取得できなかった。\n\n## 範囲外の書き込み\n検査を完了できなかった（{error}）。"),
@@ -1434,7 +1455,15 @@ async fn launch_assignment(
                 Ok(answer) => answer.clone(),
                 Err(error) => {
                     tracing::warn!(%job, "worker ended: {error:#}");
-                    format!("{error:#}")
+                    let mut text = format!("{error:#}");
+                    // No end of turn arrived, so keep what the worker last said.
+                    if matches!(error.downcast_ref(), Some(crate::tiers::Retry::Stalled(_))) {
+                        if let Some(last) = job_record.activity.last_message() {
+                            let heading = harness_text!("Last message from the worker (possibly unfinished)", "作業役の最後の発言（未完了の可能性がある）");
+                            text.push_str(&format!("\n\n## {heading}\n\n{last}"));
+                        }
+                    }
+                    text
                 }
             };
             let report = DelegateReport {
@@ -2524,21 +2553,25 @@ impl Files {
         Self { entries, cards, incomplete }
     }
 
-    fn changes(&self, after: &Self) -> ChangedFiles {
+    fn changes(&self, root: &Path, after: &Self, writer: impl Fn(&Path) -> quarantine::Writer) -> ChangedFiles {
         let paths: BTreeSet<_> = self.entries.keys().chain(after.entries.keys())
             .filter(|path| self.entries.get(*path) != after.entries.get(*path)).collect();
         let cards = paths.iter()
             .flat_map(|path| self.cards.get(*path).into_iter().chain(after.cards.get(*path)))
             .flatten().map(String::as_str).collect::<BTreeSet<_>>();
+        let attribution = quarantine::Attribution::new(root, paths.iter().copied(), &after.entries, writer);
         ChangedFiles {
             paths: paths.into_iter().cloned().collect(),
             cards: cards.into_iter().map(str::to_owned).collect(),
+            attribution,
         }
     }
 
-    fn review(&self, root: &Path, recovery: &Path, writes: &touches::WriteSet) -> (ChangedFiles, quarantine::Review) {
+    fn review(
+        &self, root: &Path, recovery: &Path, writes: &touches::WriteSet, writer: impl Fn(&Path) -> quarantine::Writer,
+    ) -> (ChangedFiles, quarantine::Review) {
         let after = Self::read(root);
-        let changes = self.changes(&after);
+        let changes = self.changes(root, &after, writer);
         let quarantine = quarantine::review(
             root, recovery, writes, &changes.paths, &after.entries, self.incomplete || after.incomplete,
         );
@@ -2587,6 +2620,7 @@ impl PartialWorktree {
 struct ChangedFiles {
     paths: Vec<PathBuf>,
     cards: Vec<String>,
+    attribution: quarantine::Attribution,
 }
 
 impl ChangedFiles {
@@ -2604,7 +2638,22 @@ impl ChangedFiles {
             }
             list
         }
-        let files = compact(&self.paths, japanese, |path| path.display().to_string());
+        let listed: Vec<_> = self.paths.iter().filter(|path| !self.attribution.summarized(path)).collect();
+        let summaries = self.attribution.summaries(self.paths.iter().map(PathBuf::as_path), japanese);
+        let mut files = compact(&listed, japanese, |path| {
+            let writer = self.attribution.writer(path).label(japanese);
+            if japanese { format!("{}（{writer}）", path.display()) } else { format!("{} ({writer})", path.display()) }
+        });
+        if !summaries.is_empty() {
+            let summaries = compact(&summaries, japanese, String::clone);
+            files = if listed.is_empty() {
+                summaries
+            } else if japanese {
+                format!("{files}、{summaries}")
+            } else {
+                format!("{files}, {summaries}")
+            };
+        }
         let cards = compact(&self.cards, japanese, String::clone);
         if japanese {
             format!("変更ファイル（作業中）: {files}\n変更カード: {cards}")
@@ -2671,7 +2720,11 @@ pub async fn run_legacy_codex(
             Ok(Ok(String::new()))
         } else {
             tokio::task::spawn_blocking(move || {
-                before.map(|before| before.review(&project, &recovery, &writes).1.render(false))
+                before.map(|before| {
+                    let unknown = |_: &Path| quarantine::Writer::Unconfirmed;
+                    let (changes, quarantine) = before.review(&project, &recovery, &writes, unknown);
+                    quarantine.render(&changes.attribution, false)
+                })
             }).await
         };
         let details = match report {

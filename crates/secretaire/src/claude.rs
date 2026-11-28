@@ -35,6 +35,9 @@ const RESUME_SLACK_SECS: i64 = 30;
 /// レート制限のエラーで止まったのに、リセット時刻が分からないときに待つ秒数。
 const FALLBACK_PAUSE_SECS: i64 = 15 * 60;
 pub(crate) const PARTNER_SWITCH_WAIT: &str = "相手を替えるには Claude のターンの完了を待つ";
+/// How long a worker stays silent after a result that left a prompt unanswered
+/// before that result is final. It has to stay shorter than the idle watchdog.
+const TURN_SETTLE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 60 });
 
 #[derive(Default)]
 struct TurnState {
@@ -1966,10 +1969,16 @@ pub(crate) async fn run_worker(
             let mut approvals = FuturesUnordered::new();
             let mut pending_approvals: HashMap<String, AbortHandle> = HashMap::new();
             let mut refusals = crate::full_approval::guard::Refusals::default();
+            // A result's report while another prompt still awaits its own
+            // result. New activity on the main thread drops it.
+            let mut ended: Option<(String, tokio::time::Instant)> = None;
             loop {
+                let settle_at = ended.as_ref().map_or_else(tokio::time::Instant::now, |(_, at)| *at);
                 let line = tokio::select! {
                     biased;
                     Some(message) = steering.recv() => {
+                        // The new prompt can start another turn.
+                        ended = None;
                         send_prompt(stdin, &message).await?;
                         pending += 1;
                         continue;
@@ -1983,12 +1992,39 @@ pub(crate) async fn run_worker(
                         }
                         continue;
                     }
+                    // Below the output branch, so buffered frames are read first.
+                    _ = tokio::time::sleep_until(settle_at), if ended.is_some() && pending_approvals.is_empty() => {
+                        let (report, _) = ended.take().context("Claude turn report is missing")?;
+                        if let Some(message) = steering.next_or_finish() {
+                            send_prompt(stdin, &message).await?;
+                            pending = 1;
+                            last_answer.clear();
+                            continue;
+                        }
+                        tracing::info!(%job, %session, pending, "Claude worker finished a turn without a further result");
+                        return Ok(report);
+                    }
                 };
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue };
                 stream.stats.observe_invocation(metadata, &frame);
                 on_model(metadata);
                 stream.map_event_for(session, &frame, &app.hub, Some(job));
-                match frame["type"].as_str() {
+                let kind = frame["type"].as_str();
+                let new_message = kind == Some("stream_event") && frame["event"]["type"] == "message_start";
+                // Other system frames, such as task notifications, can arrive
+                // after a turn without another turn following them.
+                let system_activity = kind == Some("system") && match frame["subtype"].as_str() {
+                    Some("init" | "api_retry" | "compact_boundary") => true,
+                    Some("status") => frame["status"].is_string(),
+                    Some("session_state_changed") => frame["state"] == "running",
+                    _ => false,
+                };
+                // Late frames from a subagent leave the held report in place.
+                let main_thread = frame["parent_tool_use_id"].is_null() && frame["request"]["agent_id"].is_null();
+                if main_thread && (new_message || system_activity || matches!(kind, Some("assistant" | "user" | "control_request"))) {
+                    ended = None;
+                }
+                match kind {
                     Some("rate_limit_event") => app.usage.update_claude(&frame["rate_limit_info"]),
                     Some("assistant") => {
                         for item in frame["message"]["content"].as_array().into_iter().flatten() {
@@ -2139,6 +2175,10 @@ pub(crate) async fn run_worker(
                             } else {
                                 return Ok(text.to_owned());
                             }
+                        } else {
+                            // The CLI can answer a prompt sent mid-turn within
+                            // that turn, leaving one result for both prompts.
+                            ended = Some((text.to_owned(), tokio::time::Instant::now() + TURN_SETTLE));
                         }
                         last_answer.clear();
                     }

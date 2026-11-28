@@ -1,7 +1,7 @@
 //! Workspace-scoped inspection of delegated work.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, ensure, Result};
@@ -9,11 +9,18 @@ use fuzukue_proto::{DelegateFileObservation, DelegateReport, ServerEvent, DELEGA
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{activity, admission::WaitReason, Activity, Workers};
+use super::{activity, admission::WaitReason, touches::WriteSet, Activity, Workers};
 
 const QUIET_MS: i64 = 10 * 60 * 1000;
 const RETAINED_COMPLETIONS: usize = 256;
 const STATUS_MAX_BYTES: usize = 16 * 1024;
+const LAST_MESSAGE_BYTES: usize = 16 * 1024;
+
+/// The file a scoped write tool changed. Thread artifacts do not list these.
+fn scoped_write<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
+    let name = name.strip_prefix("mcp__fuzukue__").or_else(|| name.strip_prefix("fuzukue."))?;
+    matches!(name, "fs_write" | "fs_edit" | "fs_apply_patch").then(|| input["path"].as_str()).flatten()
+}
 
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,8 +124,15 @@ pub(super) struct Timeline {
     tool_count: usize,
     last_tool: Option<String>,
     tool_guard: Option<Arc<crate::tool_guard::Guard>>,
-    had_error: bool,
+    /// A tool call reported an error. The job itself can still succeed.
+    had_tool_error: bool,
     changed_files: BTreeSet<String>,
+    /// Paths the backend reports as edited, shared with the job's input.
+    pub(super) edits: Arc<Mutex<BTreeSet<String>>>,
+    /// The job's write set, which attributes changes in a shared checkout.
+    writes: Option<Arc<WriteSet>>,
+    /// The latest prose item of the current attempt.
+    last_message: (String, String),
     latest_digest: u64,
     relayed_digest: u64,
 }
@@ -138,7 +152,45 @@ impl Timeline {
         let previous = self.tool_activity();
         self.tool_count = previous.count;
         self.last_tool = previous.last_tool;
+        // A new guard starts a new attempt.
+        if guard.is_some() {
+            self.last_message = Default::default();
+        }
         self.tool_guard = guard;
+    }
+
+    pub(super) fn declaring(writes: Arc<WriteSet>) -> Self {
+        Self { writes: Some(writes), ..Self::default() }
+    }
+
+    /// Paths under `root` that this job is known to have written, from its
+    /// successful tool calls and the backend's edits.
+    pub(super) fn written(&self, root: &Path) -> BTreeSet<String> {
+        let mut written = self.changed_files.clone();
+        written.extend(self.edits.lock().unwrap().iter()
+            .filter_map(|path| crate::thread_artifacts::relative_path(root, path)));
+        written
+    }
+
+    /// The worker's latest message, keeping the end of an oversized one.
+    pub(super) fn last_message(&self) -> Option<&str> {
+        Some(self.last_message.1.trim()).filter(|text| !text.is_empty())
+    }
+
+    fn record_prose(&mut self, item: &str, text: &str) {
+        // Plans and reasoning summaries are not messages from the worker.
+        if item.contains("plan:") || item.contains(":summary:") {
+            return;
+        }
+        let (last_item, message) = &mut self.last_message;
+        if last_item != item {
+            *last_item = item.into();
+            message.clear();
+        }
+        message.push_str(text);
+        if message.len() > LAST_MESSAGE_BYTES {
+            message.drain(..message.ceil_char_boundary(message.len() - LAST_MESSAGE_BYTES));
+        }
     }
 
     fn push(&mut self, line: Line) {
@@ -153,8 +205,14 @@ impl Job {
     pub(super) fn record_report(&mut self, report: &DelegateReport) {
         // Status views already display only these prefixes. The full report
         // is attached to the thread's tool result.
+        // A failed job's report can end with the worker's last message.
+        let text = if self.state() == State::Failed {
+            ends(&report.text, 4001)
+        } else {
+            prefix(&report.text, 4001).into()
+        };
         let report = DelegateReport {
-            text: prefix(&report.text, 4001).into(),
+            text,
             changes: prefix(&report.changes, 4001).into(),
             elapsed_ms: report.elapsed_ms,
             interrupted: report.interrupted,
@@ -184,6 +242,9 @@ impl Job {
     }
 
     pub(super) fn observe(&mut self, event: &ServerEvent, now: i64, artifact_paths: Option<&[String]>) {
+        if let Some(Activity::Prose { item, text }) = activity(event, &self.session, &self.id) {
+            self.activity.record_prose(item, text);
+        }
         let line = match activity(event, &self.session, &self.id) {
             Some(Activity::Prose { item, text }) if !text.trim().is_empty() => {
                 if let Some(last) = self
@@ -254,7 +315,7 @@ impl Job {
                 } else {
                     self.activity.push(line);
                 }
-                self.activity.had_error |= !ok;
+                self.activity.had_tool_error |= !ok;
                 if *ok {
                     let fallback;
                     let paths = match artifact_paths {
@@ -264,7 +325,8 @@ impl Job {
                             &fallback
                         }
                     };
-                    self.activity.changed_files.extend(paths.iter().filter_map(|path| {
+                    let scoped = scoped_write(&name, &input);
+                    self.activity.changed_files.extend(paths.iter().map(String::as_str).chain(scoped).filter_map(|path| {
                         crate::thread_artifacts::relative_path(&self.worktree, path)
                     }));
                 }
@@ -304,7 +366,7 @@ impl Job {
             "label_source": self.display.label_source, "agent": self.agent, "tier": self.tier,
             "thread": self.session, "session": self.session, "state": state,
             "queued_at": self.queued_at, "started_at": self.started_at, "finished_at": self.finished_at,
-            "elapsed_ms": elapsed, "error": state == State::Failed || self.activity.had_error,
+            "elapsed_ms": elapsed, "error": state == State::Failed, "tool_error": self.activity.had_tool_error,
             "wait_reason": self.wait.as_ref().map(WaitReason::message), "cancel_reason": self.cancel_reason,
         });
         let tools = self.activity.tool_activity();
@@ -350,11 +412,19 @@ impl Job {
             View::Report | View::Summary => self.status_header(now),
         };
         value["start_error"] = json!(self.start_error);
-        value["finish_error"] = json!(self.finish_error);
+        value["finish_error"] = json!(self.finish_error.as_deref().map(|error| ends(error, 4000)));
         let report = self.final_report.as_ref();
         status_text(&mut value, "change_summary", report.map(|report| report.changes.as_str()), 4000);
         if matches!(view, View::Full | View::Report) {
-            status_text(&mut value, "final_report", report.map(|report| report.text.as_str()), 4000);
+            let text = report.map(|report| report.text.as_str());
+            if self.state() == State::Failed {
+                value["final_report"] = json!(text.map(|text| ends(text, 4000)));
+                if text.is_some_and(|text| value["final_report"].as_str() != Some(text)) {
+                    value["truncated"] = true.into();
+                }
+            } else {
+                status_text(&mut value, "final_report", text, 4000);
+            }
         }
         if !matches!(view, View::Full) {
             return value;
@@ -403,10 +473,15 @@ pub(crate) fn limit_status(mut status: Value) -> Value {
         }
     }
     // Bound unusually long reports, error strings and durable diagnostics as well.
+    let failed = status["state"] == "failed";
     let fields = status.as_object_mut().unwrap();
     fields.retain(|key, value| {
         if let Some(text) = value.as_str() {
-            *value = truncate(text, if key == "final_report" { 1000 } else { 80 }).into();
+            *value = match key.as_str() {
+                "final_report" if failed => ends(text, 1000),
+                "final_report" => truncate(text, 1000),
+                _ => truncate(text, 80),
+            }.into();
         }
         !value.is_array() && !value.is_object()
     });
@@ -421,11 +496,35 @@ fn truncate(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
 }
 
+/// At most `chars` characters, taken mostly from the end of an oversized text.
+fn ends(text: &str, chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= chars {
+        return text.into();
+    }
+    let head = chars / 4;
+    let tail = text.chars().skip(count - (chars - head - 1));
+    text.chars().take(head).chain(['…']).chain(tail).collect()
+}
+
 pub(super) fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
 pub(super) type Record = Arc<Mutex<Job>>;
+
+/// Absolute paths other jobs wrote, and the write sets they declared.
+#[derive(Default)]
+pub(super) struct Claims {
+    written: HashSet<PathBuf>,
+    declared: Vec<Arc<WriteSet>>,
+}
+
+impl Claims {
+    pub(super) fn cover(&self, path: &Path) -> bool {
+        self.written.contains(path) || self.declared.iter().any(|writes| writes.declares(path))
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Inventory {
@@ -463,6 +562,27 @@ impl Inventory {
                 records.remove(&id);
             }
         }
+    }
+
+    /// What jobs other than `own` that ran at any time since `since` are
+    /// known to have written, or declared.
+    pub(super) fn claims(&self, own: &str, since: i64) -> Claims {
+        let others: Vec<_> = self.records.lock().unwrap().iter()
+            .filter(|(id, _)| id.as_str() != own)
+            .map(|(_, record)| record.clone())
+            .collect();
+        let mut claims = Claims::default();
+        for record in others {
+            let job = record.lock().unwrap();
+            if job.started_at.is_none() || job.finished_at.is_some_and(|at| at < since) {
+                continue;
+            }
+            if let Ok(root) = job.worktree.canonicalize() {
+                claims.written.extend(job.activity.written(&root).into_iter().map(|path| root.join(path)));
+            }
+            claims.declared.extend(job.activity.writes.clone());
+        }
+        claims
     }
 
     pub(super) fn digest_ready(&self, id: &str) -> Option<u64> {
@@ -670,6 +790,29 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_job_keeps_the_end_of_a_long_report_in_its_status() -> Result<()> {
+        let inventory = Inventory::default();
+        let text = format!("Stalled\n{}last words", "作".repeat(20_000));
+        let mut failed = job("00000000f", "Stalled", "main", 0);
+        failed.finished_at = Some(1);
+        failed.finish_error = Some(text.clone());
+        failed.record_report(&DelegateReport {
+            elapsed_ms: 1, text, interrupted: false, changes: "c".repeat(5000), attempts: Vec::new(), files: None,
+            tool_activity: None,
+        });
+        inventory.insert(failed);
+        for view in [View::Report, View::Full] {
+            let status = inventory.status("00000000f", 2, view)?;
+            assert_eq!(status["truncated"], true);
+            for status in [status.clone(), limit_status(status)] {
+                let report = status["final_report"].as_str().unwrap();
+                assert!(report.starts_with("Stalled") && report.ends_with("last words"), "{report}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn inventory_reports_states_filters_and_observed_activity() -> Result<()> {
         let inventory = Inventory::default();
         let now = 1_500_000;
@@ -762,7 +905,9 @@ mod tests {
             120
         );
         assert_eq!(running["tool_count"], 1);
-        assert_eq!(running["error"], true);
+        // A failed tool call leaves the job itself without an error.
+        assert_eq!(running["error"], false);
+        assert_eq!(running["tool_error"], true);
         assert_eq!(running["activity"].as_array().unwrap().len(), 2);
         let finished = &inventory.status("11111111", now, View::Full)?;
         assert_eq!(finished["state"], "finished");

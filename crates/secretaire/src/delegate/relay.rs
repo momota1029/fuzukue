@@ -56,7 +56,8 @@ impl Digest {
     fn render(&self) -> String {
         let mut parts = Vec::new();
         if let Some(failure) = self.failures.front() {
-            parts.push(format!("Failure\n{failure}"));
+            // One call failed. The job is still running.
+            parts.push(format!("Tool call error\n{failure}"));
         }
         if !self.paths.is_empty() {
             let paths = self.paths.iter().cloned().collect::<Vec<_>>().join(", ");
@@ -343,11 +344,11 @@ mod tests {
             ("unrelated failure", vec![result("other-job", false, "unrelated")], ""),
             ("failure with null output", vec![
                 call("test", "fuzukue.run_recipe", empty.clone()), result("test", false, "null"),
-            ], "Failure\nfuzukue.run_recipe"),
+            ], "Tool call error\nfuzukue.run_recipe"),
             ("failure with duplicate", vec![
                 call("test", "exec", empty.clone()), result("test", false, "  error: expected x  \nsecond line"),
                 call("retry", "exec", empty), result("retry", false, "  error: expected x  \nretry"),
-            ], "Failure\n  error: expected x  "),
+            ], "Tool call error\n  error: expected x  "),
             ("plan prose", vec![prose("plan", "次はテストが失敗した原因を追って、修正できる場所を見つけるねぇ。")], ""),
             ("quoted code", vec![prose("quote", "> Fixed the retry queue and confirmed all three test cases passed.")], ""),
             ("result prose across deltas", vec![prose("answer", "3 件"), prose("answer", "通過した")], "3 件通過した"),
@@ -424,7 +425,7 @@ mod tests {
         desk.enqueue(failed(JOB, "first"));
         desk.enqueue(failed(JOB, "second"));
         let DeskTurn::WorkerDigest(batch) = desk.next(failure_at).unwrap().unwrap() else { panic!("missing failure") };
-        assert_eq!(batch[JOB].render(), "Failure\nfirst");
+        assert_eq!(batch[JOB].render(), "Tool call error\nfirst");
         desk.relay.sent(&batch, failure_at);
 
         let ready = failure_at + FAILURE_INTERVAL;
@@ -435,11 +436,11 @@ mod tests {
             panic!("missing failure from other job")
         };
         assert_eq!(other[JOB].render(), "4 tests passed");
-        assert_eq!(other["other-job"].render(), "Failure\nother failure");
+        assert_eq!(other["other-job"].render(), "Tool call error\nother failure");
         desk.relay.sent(&other, ready - Duration::from_secs(1));
 
         let DeskTurn::WorkerDigest(later) = desk.next(ready).unwrap().unwrap() else { panic!("missing delayed failure") };
-        assert_eq!(later[JOB].render(), "Failure\nsecond");
+        assert_eq!(later[JOB].render(), "Tool call error\nsecond");
     }
 
     #[test]

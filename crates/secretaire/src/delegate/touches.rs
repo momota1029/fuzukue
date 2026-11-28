@@ -149,6 +149,13 @@ impl WriteSet {
         })
     }
 
+    /// Whether the caller declared this path as the job's own. Inferred sets
+    /// only reflect paths a prompt mentions, which includes read-only work.
+    /// The path is absolute or relative to the set's root.
+    pub(super) fn declares(&self, relative: &Path) -> bool {
+        self.source == DelegateWriteSetSource::Declared && self.contains(relative)
+    }
+
     pub(crate) fn globs(&self) -> Option<Vec<String>> {
         self.patterns.as_ref().map(|patterns| {
             patterns

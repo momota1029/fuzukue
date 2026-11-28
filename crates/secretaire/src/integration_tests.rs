@@ -6303,10 +6303,14 @@ async fn mcp_delegate_returns_immediately_and_jobs_run_concurrently() -> Result<
                     use fuzukue_proto::DelegateWriteSetSource::{Declared, PreviousJob};
                     assert_eq!(files.source, if item == first_id { Declared } else { PreviousJob });
                     assert_eq!(files.touches, Some(vec!["planned.md".into()]));
+                    // The test wrote the gate file. Neither job owns it, and no
+                    // job is known to be its writer, so it stays visible.
                     assert!(files.changed_files.context("missing changed files")?.iter().any(|path| path == "finish-workers"));
-                    assert!(report.changes.contains("## 範囲外の書き込み") && report.changes.contains("finish-workers"), "{output}");
+                    assert!(report.changes.contains("## 範囲外の書き込み"), "{output}");
+                    assert!(report.changes.lines().any(|line| line.starts_with("- ")
+                        && line.contains("finish-workers") && line.ends_with("（書き手は未確認）")), "{output}");
                     let recovery = mcp::workspace_write::recovery_dir(&app.state_dir, &item)?;
-                    assert!(recovery.join("quarantine/manifest.json").is_file(), "{output}");
+                    assert!(fs::read_to_string(recovery.join("quarantine/manifest.json"))?.contains("finish-workers"));
                     finished += 1;
                 }
             }
@@ -6741,7 +6745,8 @@ async fn role_pairs_persist_steer_and_follow_up_once() -> Result<()> {
             tokio::spawn(async move {
                 mcp_request_for(&app, &session, "tools/call", json!({
                     "name": "delegate",
-                    "arguments": {"prompt": "原稿を確認する。追加の指示を待つ。"}
+                    "arguments": {"prompt": "原稿を確認する。追加の指示を待つ。",
+                        "touches": [format!("{PAPER}/cards/**")]}
                 })).await
             })
         };

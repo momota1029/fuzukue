@@ -1,5 +1,9 @@
 //! Git operations scoped to the root of the open workspace.
 
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::io::{Seek, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -46,6 +50,53 @@ async fn read_capped(mut stream: impl AsyncRead + Unpin, limit: usize) -> std::i
     }
 }
 
+/// The server's inherited Git environment must not redirect operations to another repo.
+const INHERITED_ENV: [&str; 12] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
+
+/// The paths under `root` that Git ignores and does not track. Empty when Git
+/// cannot establish this. Blocks the thread.
+pub(crate) fn ignored(root: &Path, paths: &[&Path]) -> BTreeSet<PathBuf> {
+    let check = || -> Result<BTreeSet<PathBuf>> {
+        let mut input = tempfile::tempfile()?;
+        for path in paths {
+            input.write_all(path.as_os_str().as_bytes())?;
+            input.write_all(b"\0")?;
+        }
+        input.rewind()?;
+        let mut command = std::process::Command::new("git");
+        command
+            .args(["-c", "core.fsmonitor=false", "check-ignore", "-z", "--stdin"])
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(input);
+        for name in INHERITED_ENV {
+            command.env_remove(name);
+        }
+        let output = command.output()?;
+        // Status 1 reports no ignored path, and other failures report nothing.
+        ensure!(output.status.success(), "Git did not report ignored paths");
+        Ok(output.stdout.split(|byte| *byte == 0).filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(OsStr::from_bytes(path))).collect())
+    };
+    if paths.is_empty() {
+        return BTreeSet::new();
+    }
+    check().unwrap_or_default()
+}
+
 pub(crate) async fn run(root: &Path, args: &[&str], limit: usize) -> Result<Output> {
     let mut command = Command::new("git");
     command
@@ -60,21 +111,7 @@ pub(crate) async fn run(root: &Path, args: &[&str], limit: usize) -> Result<Outp
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    // The server's inherited Git environment must not redirect operations to another repo.
-    for name in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-        "GIT_PREFIX",
-        "GIT_LITERAL_PATHSPECS",
-        "GIT_GLOB_PATHSPECS",
-        "GIT_NOGLOB_PATHSPECS",
-        "GIT_ICASE_PATHSPECS",
-    ] {
+    for name in INHERITED_ENV {
         command.env_remove(name);
     }
     let mut child = command.spawn().context("Git を起動できない")?;

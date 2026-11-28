@@ -382,7 +382,7 @@ fn post_job_quarantine_copies_changes_and_preserves_ambiguous_user_data() -> Res
     std::os::unix::fs::symlink(fixture.path(), root.join("escape"))?;
     let after = Files::read(&root);
     let writes = touches::WriteSet::new(&root, Some(vec!["in.txt".into()]), "", || None)?;
-    let changes = before.changes(&after);
+    let changes = before.changes(&root, &after, |_| quarantine::Writer::Unconfirmed);
     let recovery = crate::mcp::workspace_write::recovery_dir(&state, "delegate:quarantine-test")?;
     let review = quarantine::review(
         &root,
@@ -392,7 +392,7 @@ fn post_job_quarantine_copies_changes_and_preserves_ambiguous_user_data() -> Res
         &after.entries,
         before.incomplete || after.incomplete,
     );
-    let text = review.render(false);
+    let text = review.render(&changes.attribution, false);
     assert!(text.contains("## Out-of-scope writes"));
     assert!(text.contains("removed.txt") && text.contains("missing"));
     assert!(text.contains("escape") && text.contains("not a regular file"));

@@ -1,6 +1,6 @@
 //! Preserve suspect files found by the post-job worktree comparison.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
@@ -61,6 +61,98 @@ struct Entry {
     action: Action,
 }
 
+/// What is known about the writer of a change observed in a checkout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Writer {
+    /// The job's own tool calls or backend edits wrote the path.
+    Own,
+    /// Another job wrote the path or declared it.
+    Other,
+    Unconfirmed,
+}
+
+impl Writer {
+    pub(super) fn label(self, japanese: bool) -> &'static str {
+        match (self, japanese) {
+            (Self::Own, false) => "confirmed own",
+            (Self::Own, true) => "この仕事の書き込みと確認",
+            (Self::Other, false) => "declared or written by another job",
+            (Self::Other, true) => "ほかの仕事が予定したか書き込んだ",
+            (Self::Unconfirmed, false) => "writer unconfirmed",
+            (Self::Unconfirmed, true) => "書き手は未確認",
+        }
+    }
+}
+
+/// The writer of each observed change, and the changes that reports only count.
+#[derive(Default)]
+pub(super) struct Attribution {
+    writers: BTreeMap<PathBuf, Writer>,
+    summarized: BTreeSet<PathBuf>,
+}
+
+impl Attribution {
+    /// Label every path. Only files in `present` under `target/` that git
+    /// ignores, and that this job is not known to have written, are summarized.
+    /// Deletions, tracked files and protected paths stay listed.
+    pub(super) fn new<'a>(
+        root: &Path,
+        paths: impl Iterator<Item = &'a PathBuf>,
+        present: &BTreeMap<PathBuf, Fingerprint>,
+        writer: impl Fn(&Path) -> Writer,
+    ) -> Self {
+        let writers: BTreeMap<_, _> = paths.map(|path| (path.clone(), writer(path))).collect();
+        let protected = protection();
+        // The outer repository calls a nested repository's tracked files ignored.
+        let nested = |path: &Path| {
+            path.ancestors().skip(1).filter(|dir| !dir.as_os_str().is_empty())
+                .any(|dir| root.join(dir).join(".git").symlink_metadata().is_ok())
+        };
+        let candidates: Vec<_> = writers.iter()
+            .filter(|(path, writer)| {
+                path.starts_with("target") && **writer != Writer::Own && present.contains_key(*path)
+                    && !protected(&root.join(path)) && !nested(path)
+            })
+            .map(|(path, _)| path.as_path())
+            .collect();
+        let summarized = crate::git::ignored(root, &candidates);
+        Self { writers, summarized }
+    }
+
+    pub(super) fn writer(&self, path: &Path) -> Writer {
+        self.writers.get(path).copied().unwrap_or(Writer::Unconfirmed)
+    }
+
+    pub(super) fn summarized(&self, path: &Path) -> bool {
+        self.summarized.contains(path)
+    }
+
+    /// One line for each directory and writer among the summarized `paths`.
+    pub(super) fn summaries<'a>(&self, paths: impl Iterator<Item = &'a Path>, japanese: bool) -> Vec<String> {
+        let mut counts = BTreeMap::<(PathBuf, Writer), usize>::new();
+        for path in paths.filter(|path| self.summarized(path)) {
+            // `target/<name>`, or `target` for the files directly in it.
+            let depth = if path.components().count() > 2 { 2 } else { 1 };
+            let directory = path.components().take(depth).collect();
+            *counts.entry((directory, self.writer(path))).or_default() += 1;
+        }
+        counts.into_iter().map(|((directory, writer), count)| {
+            let directory = directory.display();
+            let writer = writer.label(japanese);
+            if japanese {
+                format!("{directory}/ の git が無視する未追跡ファイル {count} 件（{writer}）")
+            } else {
+                format!("{directory}/: {count} untracked ignored files ({writer})")
+            }
+        }).collect()
+    }
+}
+
+fn protection() -> impl Fn(&Path) -> bool {
+    let aliases = crate::folder_grants::protected_aliases();
+    move |path| workspace_write::denied(path) || aliases.iter().any(|alias| path.starts_with(alias))
+}
+
 #[derive(Default)]
 pub(super) struct Review {
     entries: Vec<Entry>,
@@ -85,10 +177,7 @@ pub(super) fn review(
         incomplete,
         unknown: !writes.known() || root != writes.root(),
     };
-    let aliases = crate::folder_grants::protected_aliases();
-    let protected = |path: &Path| {
-        workspace_write::denied(path) || aliases.iter().any(|alias| path.starts_with(alias))
-    };
+    let protected = protection();
     let unknown = review.unknown;
     let candidates = changed
         .iter()
@@ -188,7 +277,7 @@ fn copy(
 }
 
 impl Review {
-    pub(super) fn render(&self, japanese: bool) -> String {
+    pub(super) fn render(&self, attribution: &Attribution, japanese: bool) -> String {
         if self.entries.is_empty() && !self.incomplete {
             return String::new();
         }
@@ -224,7 +313,10 @@ impl Review {
             }
             .into(),
         );
-        for entry in self.entries.iter().take(REPORT_LIMIT) {
+        let listed: Vec<_> = self.entries.iter()
+            .filter(|entry| !attribution.summarized(Path::new(&entry.path)))
+            .collect();
+        for entry in listed.iter().take(REPORT_LIMIT) {
             let action = match (&entry.action, japanese) {
                 (Action::Copied { backup }, false) => format!("copied to quarantine ({backup})"),
                 (Action::Copied { backup }, true) => format!("隔離先にコピーした（{backup}）"),
@@ -243,14 +335,31 @@ impl Review {
                     format!("コピーに失敗した（{error}）。確認が必要")
                 }
             };
-            lines.push(format!("- {:?} — {action}", entry.path));
-        }
-        if self.entries.len() > REPORT_LIMIT {
-            let remaining = self.entries.len() - REPORT_LIMIT;
+            let writer = attribution.writer(Path::new(&entry.path)).label(japanese);
             lines.push(if japanese {
+                format!("- {:?} — {action}（{writer}）", entry.path)
+            } else {
+                format!("- {:?} — {action} ({writer})", entry.path)
+            });
+        }
+        let more = |remaining| {
+            if japanese {
                 format!("ほか {remaining} 件。")
             } else {
                 format!("{remaining} more paths.")
+            }
+        };
+        if listed.len() > REPORT_LIMIT {
+            lines.push(more(listed.len() - REPORT_LIMIT));
+        }
+        let summaries = attribution.summaries(self.entries.iter().map(|entry| Path::new(&entry.path)), japanese);
+        lines.extend(summaries.iter().take(REPORT_LIMIT).map(|summary| format!("- {summary}")));
+        if summaries.len() > REPORT_LIMIT {
+            let remaining = summaries.len() - REPORT_LIMIT;
+            lines.push(if japanese {
+                format!("ほか {remaining} ディレクトリー。")
+            } else {
+                format!("{remaining} more directories.")
             });
         }
         if let Some(manifest) = &self.manifest {

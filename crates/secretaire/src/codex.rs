@@ -35,6 +35,9 @@ struct ThreadInfo {
     worker_execution: Option<crate::worker_execution::Policy>,
     worker_external_approval: bool,
     worker_external_message: Arc<std::sync::atomic::AtomicBool>,
+    /// Paths of a worker's applied patches, including move destinations, which
+    /// the patch's `edit` tool event leaves out.
+    worker_edits: Arc<Mutex<std::collections::BTreeSet<String>>>,
     cwd: Option<String>,
     /// The paths of patches in progress, by item. Approval requests omit them.
     file_changes: HashMap<String, Value>,
@@ -555,6 +558,7 @@ impl Codex {
         if let Some(thread) = self.threads.lock().unwrap().get_mut(&thread) {
             thread.worker_external_approval = steering.external_approval();
             thread.worker_external_message = steering.external_message();
+            thread.worker_edits = steering.edits.clone();
         }
         let observed = self.threads.lock().unwrap().get(&thread).map(|thread| RunMetadata {
             model: thread.observed.model.clone(),
@@ -901,6 +905,7 @@ impl Codex {
                 worker_execution: None,
                 worker_external_approval: false,
                 worker_external_message: Default::default(),
+                worker_edits: Default::default(),
                 cwd: r["cwd"].as_str().map(str::to_owned),
                 file_changes: Default::default(),
                 current_turn: None,
@@ -1503,6 +1508,11 @@ impl Codex {
         let item_id = item["id"].as_str().unwrap_or("").to_string();
         if item["type"] == "fileChange" && !item_id.is_empty() {
             if let Some(thread) = self.threads.lock().unwrap().get_mut(thread_id) {
+                if method == "item/completed" && item["status"] == "completed" {
+                    thread.worker_edits.lock().unwrap().extend(item["changes"].as_array().into_iter().flatten()
+                        .flat_map(|change| [&change["path"], &change["kind"]["move_path"], &change["kind"]["movePath"], &change["move_path"]])
+                        .filter_map(|path| path.as_str().map(str::to_owned)));
+                }
                 match method {
                     "item/completed" => thread.file_changes.remove(&item_id),
                     _ => thread.file_changes.insert(item_id.clone(), item["changes"].clone()),
