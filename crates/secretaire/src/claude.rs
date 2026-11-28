@@ -362,6 +362,7 @@ pub(crate) fn partner_system(
     ));
     system.push_str(crate::mcp::front_desk_instructions());
     system.push_str(crate::preferences::desk_guidance());
+    system.push_str(crate::memory::guidance());
     system.push_str(crate::worker_scope::SHELL_READ_GUIDANCE);
     if !crate::canary() {
         system.push_str(crate::mcp::workspace_read::GUIDANCE);
@@ -743,6 +744,11 @@ impl ClaudeSession {
         let app = self.app.upgrade();
         let external = matches!(kind, TurnKind::ExternalInput) || app.as_ref()
             .is_some_and(|app| !crate::mcp::exec::trusted_session(app, &self.id));
+        let memory = if let Some(app) = app.as_ref().filter(|_| self.launch.is_some()) {
+            crate::memory::for_turn(app, &self.id, kind).await?
+        } else {
+            None
+        };
         let preferences = if let Some(app) = app.as_ref().filter(|_| self.launch.is_some()) {
             let selection = crate::preferences::for_turn(
                 app, &self.id, kind, prompt.automatic_resume, text, &prompt.preference_inheritance,
@@ -770,6 +776,9 @@ impl ClaudeSession {
         if let Some(preferences) = preferences.as_deref() {
             let reuse = !preferences.is_empty() && process.preference_sent.as_deref() == Some(preferences);
             content.push(json!({ "type": "text", "text": format!("App-attached guidance (not user text):{}", crate::preferences::codex_turn_guidance(preferences, reuse)) }));
+        }
+        if let Some(memory) = memory {
+            content.push(json!({ "type": "text", "text": memory }));
         }
         content.extend_from_slice(&prompt.images);
         let msg = json!({ "type": "user", "message": { "role": "user", "content": content } });
@@ -1456,6 +1465,12 @@ impl ClaudeSession {
         anyhow::ensure!(!writes || mode != PermissionMode::Plan,
             "計画モードではプロジェクトを変更するツールを利用できません");
         Ok(writes && mode == PermissionMode::Default)
+    }
+
+    pub(crate) async fn memory_turn(&self) -> Option<bool> {
+        self.state.lock().await.active.as_ref().map(|turn| {
+            turn.kind.user_conversation() && !turn.interrupted && turn.exec.cancel.check().is_ok()
+        })
     }
 
     pub(crate) async fn trusted_turn(&self) -> bool {

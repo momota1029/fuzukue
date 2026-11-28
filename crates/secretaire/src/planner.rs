@@ -1546,7 +1546,7 @@ async fn dispatch_idle_step(app: &Arc<Workspace>, session: &str, generation: u64
         let preferences = preference_selection(app, session)?;
         delegate::start_with_grants(
             app, session, step.task, None, None, step.agent.as_deref(), AgentCaller::Planner,
-            step.routing, None, Vec::new(), None, false, preferences,
+            step.routing, None, Vec::new(), None, false, preferences, Vec::new(),
         ).await?;
     }
     Ok(())

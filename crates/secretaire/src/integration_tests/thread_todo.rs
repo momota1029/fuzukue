@@ -314,6 +314,8 @@ async fn codex_turns_with_external_input_get_no_todos_even_when_steered() -> Res
     handle(&app, ClientMsg::Prompt { session: thread.clone(), text: "synthetic steering".into() }).await?;
     let steering = received(&log, "synthetic steering").await?;
     assert!(steering.contains("turn/steer"), "{steering}");
+    let codex_thread = app.session_records.lock().unwrap()[&thread].codex_thread_id.clone().unwrap();
+    assert!(!app.running_codex().await.unwrap().memory_user_turn(&codex_thread));
     let sent = fs::read_to_string(&log)?;
     assert!(!sent.contains("synthetic second"), "{sent}");
     assert!(pending(&app, &thread));

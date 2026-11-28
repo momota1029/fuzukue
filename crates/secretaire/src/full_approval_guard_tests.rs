@@ -48,6 +48,7 @@ fn external_destructive_administrator_and_credential_commands_need_a_person() {
         ("cat ~/.ssh/id_ed25519", Credentials),
         ("cat \"$HOME/.ssh/id_ed25519\"", Credentials),
         ("cat /srv/state/server-token", Credentials),
+        ("cat .fuzukue/memory/index.jsonl", Credentials),
         ("cat < /srv/state/server-token", Credentials),
         ("cat /srv/state/worker-abc/.claude/.credentials.json", Credentials),
         ("gh auth token", Credentials),

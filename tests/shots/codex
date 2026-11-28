@@ -238,6 +238,11 @@ for line in sys.stdin:
             mcp = config["config"]["mcp_servers"]["fuzukue"]
             steering = "追加の指示を待って" in prompt
             threading.Thread(target=delegate, args=(thread_id, turn_id, mcp, steering), daemon=True).start()
+        elif "private-memory turn fixture" in prompt:
+            deadline = time.monotonic() + 10
+            while not Path("release-private-memory-turn").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            finish(thread_id, turn_id, "Memory fixture completed.")
         elif "tool-guard-front-desk fixture" in prompt:
             for i in range(12):
                 item = {"type": "commandExecution", "id": f"{turn_id}-command-{i}",

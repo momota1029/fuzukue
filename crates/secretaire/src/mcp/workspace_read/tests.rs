@@ -61,6 +61,35 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn memory_is_not_accessible_to_generic_read_tools() -> Result<()> {
+    let f = Fixture::new()?;
+    let memory = f.project.join(".fuzukue/memory");
+    fs::create_dir_all(memory.join("items"))?;
+    fs::write(memory.join("index.jsonl"), "{\"secret\":\"memory-marker\"}\n")?;
+    fs::write(memory.join("items/item.md"), "memory-marker")?;
+    for scope in [f.front_desk()?, f.worker()?] {
+        assert!(scope.resolve(&memory.join("index.jsonl")).is_err());
+        assert!(scope.resolve(&memory.join("items/item.md")).is_err());
+        assert!(Tool::Read.call(scope.clone(), &json!({"path": memory.join("items/item.md")})).await.is_err());
+        assert!(Tool::Jq.call(scope, &json!({"path": memory.join("index.jsonl"), "filter": "."})).await.is_err());
+    }
+    let global = f.scratch.join(".fuzukue/memory");
+    fs::create_dir_all(&global)?;
+    fs::write(global.join("index.jsonl"), "{\"secret\":\"memory-marker\"}\n")?;
+    assert!(Tool::Jq.call(f.worker()?, &json!({
+        "path": global.join("index.jsonl"), "filter": ".",
+    })).await.is_err());
+
+    for (scope, root) in [(f.front_desk()?, &f.project), (f.worker()?, &f.scratch)] {
+        let found = Tool::Search.call(scope, &json!({
+            "path": root, "pattern": "memory-marker", "include_hidden": true,
+        })).await?;
+        assert!(!found.to_string().contains("memory-marker"));
+    }
+    Ok(())
+}
+
 #[test]
 fn worker_can_search_its_session_spill_outside_its_checkout() -> Result<()> {
     let f = Fixture::new()?;

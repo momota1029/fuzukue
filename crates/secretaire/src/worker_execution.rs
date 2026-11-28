@@ -147,7 +147,7 @@ async fn probe_mount(bwrap: &Path, isolate_net: bool) -> Result<()> {
     let blocked = root_path.join("blocked");
     std::fs::create_dir(&allowed)?;
     std::fs::create_dir(&blocked)?;
-    let mut command = sandbox_command(bwrap, &root_path, &[&allowed], isolate_net);
+    let mut command = sandbox_command(bwrap, &root_path, &[&allowed], &[], isolate_net);
     command.args(["/bin/sh", "-ec",
         "printf ok > \"$1/marker\"; if (printf bad > \"$2/marker\") 2>/dev/null; then exit 3; fi",
         "bwrap-probe",
@@ -168,7 +168,7 @@ fn sandbox_base(bwrap: &Path) -> Command {
     command
 }
 
-fn sandbox_command(bwrap: &Path, cwd: &Path, writable: &[&Path], isolate_net: bool) -> Command {
+fn sandbox_command(bwrap: &Path, cwd: &Path, writable: &[&Path], protected: &[PathBuf], isolate_net: bool) -> Command {
     let mut command = sandbox_base(bwrap);
     command.args(["--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"]);
     if isolate_net {
@@ -176,6 +176,20 @@ fn sandbox_command(bwrap: &Path, cwd: &Path, writable: &[&Path], isolate_net: bo
     }
     for root in writable {
         command.arg("--bind").arg(root).arg(root);
+    }
+    for root in protected {
+        let parent = root.parent().expect("memory root has a parent");
+        // Pin a writable parent so it cannot be replaced while this mask is mounted.
+        if writable.iter().any(|writable| parent.starts_with(writable)) {
+            command.arg("--bind").arg(parent).arg(parent);
+            for child in writable.iter().filter(|child| **child != parent && child.starts_with(parent)) {
+                command.arg("--bind").arg(child).arg(child);
+            }
+        }
+    }
+    for root in protected {
+        command.args(["--perms", "000", "--tmpfs"]).arg(root);
+        command.arg("--remount-ro").arg(root);
     }
     command.arg("--chdir").arg(cwd).arg("--");
     command
@@ -190,12 +204,13 @@ impl Policy {
         if !host.workspace_write {
             bail!("requested worker sandbox is unavailable: {}", host.error.as_deref().unwrap_or("probe failed"));
         }
+        scope.prepare_memory_mounts()?;
         let mut writable = vec![scope.scratch.as_path()];
         if self.sandbox == Sandbox::WorkspaceWrite {
             writable.push(&scope.cwd);
         }
         // The backend needs its API connection and loopback MCP in this namespace.
-        let mut command = sandbox_command(host.bwrap.as_deref().context("missing bubblewrap path")?, &scope.cwd, &writable, false);
+        let mut command = sandbox_command(host.bwrap.as_deref().context("missing bubblewrap path")?, &scope.cwd, &writable, &scope.memory_roots, false);
         command.arg(program);
         Ok(command)
     }
@@ -263,6 +278,65 @@ pub(crate) fn set(workspace: &crate::Workspace, change: Settings) -> Result<()> 
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn sandbox_hides_memory_saved_after_launch() -> Result<()> {
+        let host = capability().await;
+        if !host.workspace_write {
+            eprintln!("skipping bubblewrap memory check: {}", host.error.as_deref().unwrap_or("probe failed"));
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().join("workspace");
+        let home = fixture.path().join("home");
+        let scratch = workspace.join(".fuzukue/scratch");
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::create_dir(&home)?;
+        let mut scope = crate::worker_scope::Scope::open(&workspace, &workspace, &scratch)?;
+        scope.memory_roots = vec![
+            home.canonicalize()?.join(".fuzukue/memory"),
+            scope.cwd.join(".fuzukue/memory"),
+        ];
+        assert!(scope.memory_roots.iter().all(|path| !path.exists()));
+
+        let policy = Policy { sandbox: Sandbox::WorkspaceWrite, approval: Approval::Never, full: false };
+        let mut child = policy.command(Path::new("/bin/sh"), &scope).await?
+            .args(["-ec", r#"
+                printf ready > "$1/ready"
+                while [ ! -f "$1/go" ]; do sleep 0.01; done
+                if mv .fuzukue moved 2>/dev/null; then exit 2; fi
+                shift
+                for path do
+                    test ! -r "$path/index.jsonl"
+                    if (printf bad > "$path/worker-write") 2>/dev/null; then exit 3; fi
+                done
+                printf ok > permitted
+            "#, "memory-sandbox"])
+            .arg(&scope.scratch)
+            .args(&scope.memory_roots)
+            .kill_on_drop(true)
+            .spawn()?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !scope.scratch.join("ready").is_file() {
+                ensure!(child.try_wait()?.is_none(), "sandbox exited before becoming ready");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            for path in &scope.memory_roots {
+                std::fs::write(path.join("index.jsonl"), "private")?;
+            }
+            std::fs::write(scope.scratch.join("go"), "")?;
+            let status = child.wait().await?;
+            ensure!(status.success(), "memory sandbox exited with {status}");
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+
+        assert_eq!(std::fs::read_to_string(workspace.join("permitted"))?, "ok");
+        for path in &scope.memory_roots {
+            assert_eq!(std::fs::read_to_string(path.join("index.jsonl"))?, "private");
+            assert!(!path.join("worker-write").exists());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn probe_checks_mount_write_boundary_and_optional_network_namespace() -> Result<()> {

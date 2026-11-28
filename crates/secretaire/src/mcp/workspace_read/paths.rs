@@ -21,6 +21,7 @@ pub(crate) struct ReadScope {
     scratch: Option<PathBuf>,
     roots: Vec<PathBuf>,
     protected: Vec<PathBuf>,
+    memory: Vec<PathBuf>,
     sensitive_aliases: Vec<PathBuf>,
     access: Option<Access>,
     results: Option<result_spill::Owner>,
@@ -35,12 +36,18 @@ impl ReadScope {
         let mut roots = worker_scope::workspace_read::configured_roots(&workspace, worker)?;
         roots.push(cwd.clone());
         roots.extend(scratch.iter().cloned());
+        let protected = worker_scope::protected_roots(state);
+        let mut memory = worker_scope::memory_roots(&workspace);
+        if let Some(worker) = worker {
+            memory.extend(worker.memory_roots.iter().cloned());
+        }
         Ok(Self {
             workspace,
             cwd,
             scratch,
             roots,
-            protected: worker_scope::protected_roots(state),
+            protected,
+            memory,
             sensitive_aliases: folder_grants::protected_aliases(),
             access: None,
             results: None,
@@ -88,6 +95,8 @@ impl ReadScope {
 
     fn check_protected(&self, path: &Path) -> Result<()> {
         ensure!(!fuzukue_proto::is_thread_save_artifact(path), "Access denied to private thread saves");
+        ensure!(!self.memory.iter().any(|root| path.starts_with(root)),
+            "Access denied to app-owned memory; use the memory tools");
         if result_spill::is_spill_path(path) {
             ensure!(self.allows_result(path), "Use the exact MCP result path from this session's tool reply. The result may have expired.");
             return Ok(());

@@ -75,13 +75,17 @@ pub(crate) enum Inheritance {
     Captured(Option<Selection>),
 }
 
+pub(crate) fn trusted_turn(app: &crate::Workspace, session: &str, kind: crate::front_desk::TurnKind) -> bool {
+    !matches!(kind, crate::front_desk::TurnKind::ExternalInput) && trusted_session(app, session)
+}
+
 pub(crate) fn for_turn(
     app: &crate::Workspace, session: &str, kind: crate::front_desk::TurnKind,
     automatic_resume: bool, task: &str, inheritance: &Inheritance,
 ) -> Result<Option<Selection>> {
     use crate::front_desk::TurnKind;
 
-    let trusted = !matches!(kind, TurnKind::ExternalInput) && trusted_session(app, session);
+    let trusted = trusted_turn(app, session, kind);
     let new_user = trusted && kind.user_conversation() && !automatic_resume;
     let check_attachment = automatic_resume || !matches!(kind, TurnKind::WorkerDigest);
     let paper = (trusted && check_attachment)

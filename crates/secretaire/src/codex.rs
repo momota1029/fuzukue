@@ -463,6 +463,7 @@ impl Codex {
             policy.push_str(&crate::rules::conversation_voice());
             policy.push_str(crate::mcp::front_desk_instructions());
             policy.push_str(crate::preferences::desk_guidance());
+            policy.push_str(crate::memory::guidance());
             policy.push_str(crate::worker_scope::SHELL_READ_GUIDANCE);
             if !crate::canary() {
                 policy.push_str(crate::mcp::workspace_read::GUIDANCE);
@@ -525,6 +526,34 @@ impl Codex {
         Some(exec.clone())
     }
 
+    pub(crate) fn memory_turn(&self, session: &str, key: &str) -> Option<bool> {
+        let threads = self.threads.lock().unwrap();
+        let thread = threads.values().find(|thread| thread.session == session
+            && thread.partner.as_ref().is_some_and(|partner| partner.mcp_key == key))?;
+        thread.waiter.as_ref()?;
+        Some(Self::thread_allows_memory(thread))
+    }
+
+    pub(crate) fn memory_user_turn(&self, id: &str) -> bool {
+        self.threads.lock().unwrap().get(id).is_some_and(Self::thread_allows_memory)
+    }
+
+    fn thread_allows_memory(thread: &ThreadInfo) -> bool {
+        thread.trusted_approval_turn
+            && thread.exec.as_ref().is_some_and(|(_, cancel)| cancel.check().is_ok())
+    }
+
+    pub(crate) fn memory_writable(&self, session: &str, key: &str) -> bool {
+        self.threads.lock().unwrap().values().any(|thread| {
+            thread.session == session && thread.waiter.is_some()
+                && thread.partner.as_ref().is_some_and(|options| {
+                    options.mcp_key == key && options.sandbox() != "read-only"
+                        && !self.hub.external_approval_input(session)
+                        && !(options.mail_enabled && self.hub.desk_automatic(session, options.mode()).unwrap_or(true))
+                })
+        })
+    }
+
     pub(crate) fn check_mcp(
         &self, session: &str, key: &str, writes: bool, always_confirm: bool,
     ) -> Result<Option<Actor>> {
@@ -547,11 +576,12 @@ impl Codex {
         })
     }
 
-    /// 新しいスレッドを作る。作業ディレクトリへの書き込みは許し、それ以外は承認を求めさせる。
-    pub async fn start_thread(&self, session: &str, parent_tool_use: Option<String>, launch: Option<&crate::delegate::WorkerLaunch>, preferences: &str) -> Result<String> {
+    /// 新しい作業スレッドを指定されたファイルシステム範囲で開始する。
+    pub async fn start_thread(&self, session: &str, parent_tool_use: Option<String>, launch: &crate::delegate::WorkerLaunch, preferences: &str) -> Result<String> {
+        anyhow::ensure!(launch.scope.is_some(), "worker filesystem scope is missing");
         // A legacy worker can start before its parent tool event arrives.
         let parent_tool_use = Some(parent_tool_use.unwrap_or_else(|| format!("codex-run:{}", crate::mail::session_key())));
-        self.start_thread_with_policy(&self.project_dir, session, parent_tool_use, false, None, None, launch, preferences).await
+        self.start_thread_with_policy(&self.project_dir, session, parent_tool_use, false, None, None, Some(launch), preferences).await
     }
 
     pub async fn run_worker(
@@ -586,7 +616,7 @@ impl Codex {
             loop {
                 let mut deferred = None;
                 let answer = self.run_turn_with_schema(
-                    &thread, &prompt, &[], None, Some(&cancel), Some((steering, &mut deferred)), TurnKind::Conversation, None, || Ok(()), || {},
+                    &thread, &prompt, &[], None, Some(&cancel), Some((steering, &mut deferred)), TurnKind::Conversation, None, None, || Ok(()), || {},
                 ).await?;
                 let Some(next) = deferred.or_else(|| steering.next_or_finish()) else {
                     anyhow::ensure!(!answer.trim().is_empty(), "The Codex worker returned no final report");
@@ -644,7 +674,7 @@ impl Codex {
         cancel.check()?;
         let thread = self.start_thread_with_policy(project, session, None, true, Some(settings), None, launch, "").await?;
         let result = self.run_turn_with_schema(
-            &thread, prompt, &[], Some(schema), Some(cancel), None, TurnKind::Conversation, None, || Ok(()), || {},
+            &thread, prompt, &[], Some(schema), Some(cancel), None, TurnKind::Conversation, None, None, || Ok(()), || {},
         ).await;
         self.collect_metadata(&thread, metadata);
         self.close_worker(&thread).await;
@@ -662,7 +692,7 @@ impl Codex {
         )).await??;
         let mut cleanup = SummaryThread { codex: self.clone(), thread: Some(thread.clone()) };
         let result = tokio::time::timeout(timeout,
-            self.run_turn_with_schema(&thread, evidence, &[], None, None, None, TurnKind::Conversation, None, || Ok(()), || {}),
+            self.run_turn_with_schema(&thread, evidence, &[], None, None, None, TurnKind::Conversation, None, None, || Ok(()), || {}),
         ).await;
         if result.is_err() {
             let _ = tokio::time::timeout(Duration::from_secs(5), self.interrupt(&thread)).await;
@@ -794,6 +824,7 @@ impl Codex {
                 "skill_mcp_dependency_install": false,
             });
         } else if let Some(scope) = scope {
+            scope.prepare_memory_mounts()?;
             let mut fs = serde_json::Map::new();
             fs.insert(":minimal".into(), json!("read"));
             for root in &scope.read_roots {
@@ -813,6 +844,20 @@ impl Codex {
                 for path in crate::preferences::protected_workspace_dirs(&scope.cwd) {
                     fs.insert(path.to_string_lossy().into_owned(), json!("read"));
                 }
+            }
+            fs.retain(|path, _| !scope.memory_roots.iter().any(|root| Path::new(path).starts_with(root)));
+            for root in &scope.memory_roots {
+                let path = root.to_str().context("Codex memory protection requires a UTF-8 path")?;
+                let parent = root.parent().context("Codex memory root has no parent")?;
+                if (workspace == "write" && parent.starts_with(&scope.cwd) && parent != scope.cwd)
+                    || (parent.starts_with(&scope.scratch) && parent != scope.scratch)
+                {
+                    // Preserve the mask if a command tries to replace the parent directory.
+                    let parent = parent.to_str().context("Codex memory protection requires a UTF-8 path")?;
+                    fs.insert(parent.into(), json!({".": "read"}));
+                }
+                // A scoped "." entry treats the key as a literal path, even if it contains glob characters.
+                fs.insert(path.into(), json!({".": "deny"}));
             }
             params.as_object_mut().unwrap().remove("sandbox");
             params["permissions"] = json!(WORKER_PERMISSIONS);
@@ -956,16 +1001,16 @@ impl Codex {
 
     /// ターンを始め、終わるまで待って最後の答えを返す。途中経過はタイムラインに流れる。
     pub async fn run_turn(&self, thread_id: &str, text: &str) -> Result<String> {
-        self.run_turn_with_images(thread_id, text, &[], TurnKind::Conversation, None, || Ok(()), || {}).await
+        self.run_turn_with_images(thread_id, text, &[], TurnKind::Conversation, None, None, || Ok(()), || {}).await
     }
 
     pub(crate) async fn run_turn_with_images(
         &self, thread_id: &str, text: &str, images: &[PathBuf], kind: TurnKind,
-        preferences: Option<&str>, before_submit: impl FnOnce() -> Result<()>,
+        preferences: Option<&str>, memory: Option<&str>, before_submit: impl FnOnce() -> Result<()>,
         after_submit: impl FnOnce(),
     ) -> Result<String> {
         self.run_turn_with_schema(
-            thread_id, text, images, None, None, None, kind, preferences, before_submit, after_submit,
+            thread_id, text, images, None, None, None, kind, preferences, memory, before_submit, after_submit,
         ).await
     }
 
@@ -991,6 +1036,7 @@ impl Codex {
         steering: Option<(&mut crate::delegate::JobInput, &mut Option<String>)>,
         kind: TurnKind,
         preferences: Option<&str>,
+        memory: Option<&str>,
         before_submit: impl FnOnce() -> Result<()>,
         after_submit: impl FnOnce(),
     ) -> Result<String> {
@@ -1048,6 +1094,9 @@ impl Codex {
                     let mut input = vec![json!({ "type": "text", "text": self.usage.context_line() })];
                     let guided = guidance.map(|guidance| format!("{text}{guidance}"));
                     input.extend(turn_input(guided.as_deref().unwrap_or(text), images));
+                    if let Some(memory) = memory {
+                        input.push(json!({ "type": "text", "text": memory }));
+                    }
                     let mut params = json!({ "threadId": thread_id, "input": input });
                     if let Some(overrides) = overrides {
                         params.as_object_mut().unwrap().extend(overrides.as_object().unwrap().clone());
@@ -1084,7 +1133,7 @@ impl Codex {
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => break,
-                            result = self.steer_turn(thread_id, turn_id, &message, &[]) => {
+                            result = self.steer_turn(thread_id, turn_id, &message, &[], None) => {
                                 if result.is_err() {
                                     // A turn may have just ended on the app-server. Continue in the same thread.
                                     *deferred = Some(message);
@@ -1116,11 +1165,15 @@ impl Codex {
         rx.await.context("codex turn was dropped")?
     }
 
-    async fn steer_turn(&self, thread_id: &str, turn_id: &str, text: &str, images: &[PathBuf]) -> Result<()> {
+    async fn steer_turn(&self, thread_id: &str, turn_id: &str, text: &str, images: &[PathBuf], memory: Option<&str>) -> Result<()> {
+        let mut input = turn_input(text, images);
+        if let Some(memory) = memory {
+            input.push(json!({ "type": "text", "text": memory }));
+        }
         self.request("turn/steer", json!({
             "threadId": thread_id,
             "expectedTurnId": turn_id,
-            "input": turn_input(text, images),
+            "input": input,
         })).await?;
         Ok(())
     }
@@ -1128,17 +1181,19 @@ impl Codex {
     pub(crate) async fn steer_with_images(&self, thread_id: &str, text: &str, images: &[PathBuf]) -> Result<()> {
         let turn = self.threads.lock().unwrap().get(thread_id).and_then(|t| t.current_turn.clone())
             .context("Codex のターンは終了した")?;
-        self.steer_turn(thread_id, &turn, text, images).await
+        self.steer_turn(thread_id, &turn, text, images, None).await
     }
 
     pub(crate) async fn steer_desk(
-        &self, thread_id: &str, text: &str, images: &[PathBuf], preferences: &str,
+        &self, thread_id: &str, text: &str, images: &[PathBuf], preferences: &str, memory: Option<&str>,
     ) -> Result<()> {
         // Steering can race with completion of the original turn. Its input uses a full
         // block and invalidates the original turn's candidate before submitting.
         self.clear_desk_preference_hash(thread_id);
         let input = format!("{text}{}", crate::preferences::codex_turn_guidance(preferences, false));
-        self.steer_with_images(thread_id, &input, images).await
+        let turn = self.threads.lock().unwrap().get(thread_id).and_then(|t| t.current_turn.clone())
+            .context("Codex のターンは終了した")?;
+        self.steer_turn(thread_id, &turn, &input, images, memory).await
     }
 
     pub(crate) async fn compact(
@@ -1931,6 +1986,16 @@ fn truncate(s: &str) -> String {
 mod tests {
     use super::*;
 
+    async fn start_worker_fixture(codex: &Codex, parent: &str) -> Result<String> {
+        let root = &codex.project_dir;
+        let scope = crate::worker_scope::Scope::open(root, root, root)?;
+        let launch = crate::delegate::WorkerLaunch {
+            execution: None, scope: Some(scope), instructions: String::new(),
+            mcp_url: None, key: String::new(), tools: Vec::new(),
+        };
+        codex.start_thread("owner", Some(parent.into()), &launch, "").await
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn consultation_uses_explicit_mcp_approval_in_read_only_thread() -> Result<()> {
@@ -1961,7 +2026,7 @@ mod tests {
         assert!(server.get("default_tools_approval_mode").is_none());
         codex.close_worker(&thread).await;
 
-        let thread = codex.start_thread("owner", Some("delegate:fixture".into()), None, "").await?;
+        let thread = start_worker_fixture(&codex, "delegate:fixture").await?;
         let mut events = hub.subscribe(u64::MAX).1;
         let message = "MCP tool call requires approval, but approval policy is never";
         for (error, result, expected) in [
@@ -2134,7 +2199,7 @@ mod tests {
         fixture.env("FUZUKUE_CODEX_FIXTURE_LOG", &log);
         let codex = Codex::spawn_command(fixture, project.path(), hub.clone(),
             Arc::new(Usage::new(hub.clone())), Default::default()).await?;
-        let thread = codex.start_thread("owner", Some("delegate:fixture".into()), None, "").await?;
+        let thread = start_worker_fixture(&codex, "delegate:fixture").await?;
         let mut requests = hub.subscribe(u64::MAX).1;
         let action = json!({"threadId": thread, "command": "cat README.md", "cwd": project.path()});
         let method = "item/commandExecution/requestApproval";
@@ -2171,7 +2236,7 @@ mod tests {
         assert!(codex.resolve(&grant, "decline", false).await?);
         codex.close_worker(&thread).await;
 
-        let legacy = codex.start_thread("owner", Some("legacy-tool-use".into()), None, "").await?;
+        let legacy = start_worker_fixture(&codex, "legacy-tool-use").await?;
         let mut requests = hub.subscribe(u64::MAX).1;
         codex.on_server_request(method, json!(93), &json!({
             "threadId": legacy, "command": "git push", "cwd": project.path(),
@@ -2189,7 +2254,7 @@ mod tests {
         hub.init_approval_queue("fixture".into(), &project.path().join("state"));
         let change = fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour };
         let principal = crate::remote::SettingsPrincipal::fixture();
-        let full = codex.start_thread("owner", Some("delegate:full".into()), None, "").await?;
+        let full = start_worker_fixture(&codex, "delegate:full").await?;
         let push = json!({"threadId": full, "command": "cargo build", "cwd": project.path()});
         codex.on_server_request(method, json!(94), &push).await;
         let ServerEvent::ApprovalRequested { request_id: swept, .. } = requests.recv().await?.event else {

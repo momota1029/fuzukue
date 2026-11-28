@@ -2098,7 +2098,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
             ("attention_patterns", "array"), ("attention_marked_lines", "boolean"), ("sources", "array"),
             ("route", "string"), ("operation_id", "string"), ("event", "object")],
             &["action"]),
-        ("delegate", &[("prompt", "string"), ("title", "string"), ("label", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("folder_grants", "array"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
+        ("delegate", &[("prompt", "string"), ("title", "string"), ("label", "string"), ("agent", "string"), ("issue", "integer"), ("plan_step", "boolean"), ("folder_grants", "array"), ("memory_items", "array"), ("tier", "string"), ("min_tier", "string"), ("touches", "array"),
             ("isolation", "string"), ("backend", "string"), ("model", "string"), ("effort", "string"), ("artifacts", "array")], &["prompt"]),
         ("plan", &[("goal", "string"), ("context", "string"), ("long_running", "boolean"), ("pace", "string"), ("tier", "string"), ("min_tier", "string"), ("include_history", "boolean")],
             &["goal", "context"]),
@@ -2349,6 +2349,7 @@ async fn mcp_lists_tool_schemas_and_respects_write_confirmation() -> Result<()> 
                 Some("file_inbox" | "create_research" | "create_workspace")
             ))
             .map(|tool| format!("mcp__fuzukue__{}", tool["name"].as_str().unwrap()))
+            .chain(crate::memory::Tool::ALL.into_iter().map(|tool| format!("mcp__fuzukue__{}", tool.name())))
             .collect::<Vec<_>>(),
     );
     let confirming_writes: Vec<_> = mcp::claude_tool_names(false, true).collect();
@@ -5071,8 +5072,13 @@ printf '%s\n' '{"type":"result","is_error":false}'
     let listed = request(authorized.clone(), "tools/list", json!({})).await;
     let listed: Value = serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await?)?;
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len() + 1, mcp::available_tool_names(true).len());
-    assert_eq!(mcp::claude_tool_names(true, false).count(), tools.len() - 2);
+    assert_eq!(tools.len() + 1, mcp::available_tool_names(true).len() + crate::memory::Tool::ALL.len());
+    let allowed: Vec<_> = mcp::claude_tool_names(true, false).collect();
+    assert_eq!(allowed.len(), tools.len() - 2);
+    for tool in crate::memory::Tool::ALL {
+        assert!(allowed.iter().any(|name| name.ends_with(&format!("__{}", tool.name()))));
+        assert!(tools.iter().any(|listed| listed["name"] == tool.name()));
+    }
     assert!(tools.iter().all(|tool| tool["name"] != "send_mail"));
 
     let (_, mut events) = app.hub.subscribe(u64::MAX);
@@ -7285,7 +7291,16 @@ done
         assert!(config["tools"].get("git_push").is_none());
         assert!(config["tools"].get("add_memo").is_none());
         assert_eq!(params["approvalPolicy"], "never");
-        assert_eq!(params["config"]["permissions"]["labo-worker"]["network"]["enabled"], false);
+        let permissions = &params["config"]["permissions"]["labo-worker"];
+        assert_eq!(permissions["network"]["enabled"], false);
+        let filesystem = permissions["filesystem"].as_object().unwrap();
+        let workspace_memory = root.join(".fuzukue/memory");
+        assert_eq!(filesystem[workspace_memory.to_str().unwrap()]["."], "deny");
+        let scratch_memory = filesystem.iter().find_map(|(path, access)| {
+            (access == "write" && Path::new(path).parent() == Some(&app.state_dir))
+                .then(|| Path::new(path).join(".fuzukue/memory"))
+        }).unwrap();
+        assert_eq!(filesystem[scratch_memory.to_str().unwrap()]["."], "deny");
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("authorization", config["http_headers"]["Authorization"].as_str().unwrap().parse()?);
         let query = || Query(mcp::McpQuery { session: session.clone(), backend: None, workspace: None, job: Some(job.into()) });
@@ -7732,7 +7747,7 @@ async fn queued_planner_worker_checks_paper_when_admitted() -> Result<()> {
     let job = crate::delegate::start_with_grants(&app, &session, step.task.clone(), None, None,
         step.agent.as_deref(), AgentCaller::Planner, step.routing, None, Vec::new(),
         Some(AgentSelection { backend: AgentBackend::Codex, model: None, effort: None }),
-        false, selection).await?;
+        false, selection, Vec::new()).await?;
     app.hub.edit_threads(|store| {
         store.detach(&session, "papers/first")?;
         store.attach(&session, &["papers/second".into()])
@@ -10391,7 +10406,7 @@ async fn queued_worker_uses_captured_paper_in_developer_instructions() -> Result
         &app, &session, task.into(), None, None, None, fuzukue_proto::AgentCaller::FrontDesk,
         Default::default(), None, Vec::new(), Some(fuzukue_proto::AgentSelection {
             backend: fuzukue_proto::AgentBackend::Codex, model: None, effort: None,
-        }), false, preferences,
+        }), false, preferences, Vec::new(),
     ).await?;
     app.hub.edit_threads(|store| {
         store.detach(&session, "papers/first")?;
@@ -10440,6 +10455,9 @@ async fn legacy_codex_preferences_use_ephemeral_developer_instructions() -> Resu
         .collect::<serde_json::Result<Vec<Value>>>()?;
     let start = &rpc.iter().find(|row| row["method"] == "thread/start").unwrap()["params"];
     assert_eq!(start["ephemeral"], true);
+    assert_eq!(start["permissions"], "labo-worker");
+    let memory = root.canonicalize()?.join(".fuzukue/memory");
+    assert_eq!(start["config"]["permissions"]["labo-worker"]["filesystem"][memory.to_str().unwrap()]["."], "deny");
     assert!(start["developerInstructions"].as_str().unwrap().contains(preferences));
     let turn = &rpc.iter().find(|row| row["method"] == "turn/start").unwrap()["params"];
     assert!(turn["input"].to_string().contains(task));

@@ -438,7 +438,7 @@ for line in sys.stdin:
         continue
     if method == "turn/start":
         thread = params["threadId"]
-        text = params["input"][-1]["text"]
+        text = "\n".join(item["text"] for item in params["input"] if item["type"] == "text")
         if "outputSchema" in params:
             assert req["params"]["outputSchema"]["required"] == ["summary"]
             assert "Previous conversation text" in text

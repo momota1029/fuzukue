@@ -660,13 +660,14 @@ pub async fn start(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, agent: Option<&str>, caller: AgentCaller, routing: TierRequest,
     touches: Option<Vec<String>>,
 ) -> Result<String> {
-    start_with_grants(app, session, prompt, title, None, agent, caller, routing, touches, Vec::new(), None, false, None).await
+    start_with_grants(app, session, prompt, title, None, agent, caller, routing, touches, Vec::new(), None, false, None, Vec::new()).await
 }
 
 pub(crate) async fn start_with_grants(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, label: Option<String>, agent: Option<&str>, caller: AgentCaller,
     routing: TierRequest, touches: Option<Vec<String>>, folder_grants: Vec<String>, selection: Option<AgentSelection>, exec_trusted: bool,
     personal_preferences: Option<crate::preferences::Selection>,
+    memory_items: Vec<crate::memory::WorkerItem>,
 ) -> Result<String> {
     let personal_preferences = personal_preferences.map(|selection| {
         selection.for_task(app, &prompt, title.iter().chain(label.iter()).chain(touches.iter().flatten()))
@@ -674,7 +675,7 @@ pub(crate) async fn start_with_grants(
     let request = Assignment {
         prompt, title, label, worktree: None, agent: agent.map(str::to_owned),
         selection, caller: Some(caller), adopted: None, routing, touches, issue: None, isolation: None, blind_input: None, folder_grants, exec_trusted,
-        personal_preferences,
+        personal_preferences, memory_items,
     };
     start_assignment(app, session, request).await
 }
@@ -697,6 +698,7 @@ async fn start_assignment(app: &Arc<App>, session: &str, request: Assignment) ->
 pub async fn start_for_issue(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, label: Option<String>, agent: Option<&str>, caller: AgentCaller, number: u64, routing: TierRequest,
     touches: Option<Vec<String>>, folder_grants: Vec<String>, selection: Option<AgentSelection>,
+    memory_items: Vec<crate::memory::WorkerItem>,
 ) -> Result<String> {
     let link = crate::issue_threads::link(app, number)?;
     ensure!(app.hub.read_threads(|store| store.github_state(session)).is_some_and(|state| state.links.contains(&link)),
@@ -704,7 +706,7 @@ pub async fn start_for_issue(
     let request = Assignment {
         prompt, title, label, worktree: Some(crate::github::worktree_path(&app.project_dir, number)?), agent: agent.map(str::to_owned),
         selection, caller: Some(caller), adopted: None, routing, touches, issue: Some(number), isolation: None, blind_input: None, folder_grants, exec_trusted: false,
-        personal_preferences: None,
+        personal_preferences: None, memory_items,
     };
     start_assignment(app, session, request).await
 }
@@ -727,6 +729,7 @@ pub(crate) async fn queue_issue_assignment(
         prompt, title: None, label: None, worktree: Some(directory), agent: None, selection: Some(selection),
         caller: None, adopted: None, routing: Default::default(), touches: None, issue: None, isolation: None, blind_input: None, folder_grants: Vec::new(), exec_trusted: false,
         personal_preferences: None,
+        memory_items: Vec::new(),
     };
     let (_, run) = launch_assignment(app, session, job, assignment, false).await?;
     Ok(run)
@@ -758,7 +761,7 @@ async fn launch(
     let _accept = app.admit_work()?;
     let job = format!("{DELEGATE_JOB}{}", mail::session_key());
     let request = Assignment { prompt, title, label: None, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None, blind_input: None, folder_grants: Vec::new(), exec_trusted: false,
-        personal_preferences: None };
+        personal_preferences: None, memory_items: Vec::new() };
     launch_assignment(app, session, job, request, false).await
 }
 
@@ -788,6 +791,8 @@ pub(crate) struct Assignment {
     exec_trusted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     personal_preferences: Option<crate::preferences::Selection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memory_items: Vec<crate::memory::WorkerItem>,
 }
 
 impl Assignment {
@@ -816,7 +821,7 @@ pub(crate) async fn restore_assignment(app: &Arc<App>, session: String, id: Stri
 async fn launch_assignment(
     app: &Arc<App>, session: &str, job: String, request: Assignment, restore: bool,
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
-    let Assignment { prompt, title, label, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, blind_input, folder_grants, exec_trusted, personal_preferences } = request.clone();
+    let Assignment { prompt, title, label, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, blind_input, folder_grants, exec_trusted, personal_preferences, memory_items } = request.clone();
     let blind = isolation.is_some();
     app.hub.validate_worker_grants(session, &folder_grants)?;
     let is_planner = request.is_planner();
@@ -1308,6 +1313,8 @@ async fn launch_assignment(
                 };
                 let run = async {
                     let backend = async {
+                        let memory = crate::memory::worker_attachment(&app, &memory_items).await?;
+                        let task = format!("{task}{memory}");
                         match model.selection.backend {
                             AgentBackend::Codex => app.worker_codex(&launch, Some(&processes)).await?.run_worker(cwd, &session, &job, settings, &task, &mut input, &launch, &mut metadata, on_model, adopted.as_ref().map(|worker| worker.thread_id.as_str())).await,
                             AgentBackend::Claude => claude::run_worker(&app, cwd, &session, &job, settings, &task, &mut input, &launch, &processes, &mut metadata, on_model).await,
@@ -2770,24 +2777,22 @@ pub async fn run_legacy_codex(
             let hands_off = lease.is_some() || app.automatic_thread(&session) && crate::mcp::exec::trusted_session(&app, &session);
             crate::worker_execution::settings(&app)?.lock().unwrap().effective(hands_off)
         };
-        let launch = execution.map(|execution| -> Result<_> {
-            let scratch = tempfile::Builder::new().prefix("worker-").tempdir_in(&app.state_dir)?;
-            let scope = crate::worker_scope::Scope::open(&app.project_dir, &app.project_dir, scratch.path())?;
-            Ok((WorkerLaunch {
-                execution: Some(execution), scope: Some(scope), instructions: String::new(),
-                mcp_url: None, key: String::new(), tools: Vec::new(),
-            }, scratch))
-        }).transpose()?;
-        let policy = launch.as_ref().map(|(launch, _scratch)| launch);
-        let codex = match policy {
-            Some(launch) => app.worker_codex(launch, None).await?,
-            None => app.codex().await?,
+        let scratch = tempfile::Builder::new().prefix("worker-").tempdir_in(&app.state_dir)?;
+        let scope = crate::worker_scope::Scope::open(&app.project_dir, &app.project_dir, scratch.path())?;
+        let launch = WorkerLaunch {
+            execution, scope: Some(scope), instructions: String::new(),
+            mcp_url: None, key: String::new(), tools: Vec::new(),
+        };
+        let codex = if execution.is_some() {
+            app.worker_codex(&launch, None).await?
+        } else {
+            app.codex().await?
         };
         let preferences = match personal_preferences {
             Some(selection) => selection.load(&app, &session).await?,
             None => String::new(),
         };
-        let thread = codex.start_thread(&session, parent.clone(), policy, &preferences).await?;
+        let thread = codex.start_thread(&session, parent.clone(), &launch, &preferences).await?;
         let history = app.history.turn(&app.project_dir, "agent:codex".into(), &session, parent).await;
         let before_project = app.project_dir.clone();
         let before = tokio::task::spawn_blocking(move || Files::read(&before_project)).await;

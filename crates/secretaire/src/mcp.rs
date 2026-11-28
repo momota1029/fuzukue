@@ -474,6 +474,9 @@ impl Tool {
                     "issue": {"type": "integer", "minimum": 1, "description": harness_text!("Linked GitHub issue number. Run in its worktree.", "紐づく Issue 番号。その作業ツリーで実行する。")},
                     "folder_grants": {"type": "array", "maxItems": 100, "uniqueItems": true,
                         "items": {"type": "string"}, "description": harness_text!("Active folder grant IDs to share with this worker's MCP read tools.", "この作業役の MCP 読み取りツールに引き継ぐ、有効なフォルダー許可の ID。")},
+                    "memory_items": {"type": "array", "description": "Private memory items marked for workers and relevant to this regular assignment.",
+                        "items": {"type": "object", "additionalProperties": false, "required": ["scope", "id"],
+                            "properties": {"scope": {"enum": ["global", "workspace"]}, "id": {"type": "string"}}}},
                     "plan_step": { "type": "boolean", "description": harness_text!("Set to true to execute a step from next. Pass its agent and task unchanged as agent and prompt.", "方針の next を実行する場合に true。agent と prompt にはその手順の agent と task をそのまま渡す。") } }),
                 &["prompt"],
             ),
@@ -1017,6 +1020,8 @@ pub(crate) fn claude_tool_names(mail: bool, confirm_writes: bool) -> impl Iterat
             !(matches!(tool, Tool::FileInbox | Tool::CreateResearch | Tool::CreateWorkspace) || confirm_writes && tool.writes() && !matches!(tool, Tool::GitCommit | Tool::GitIntegratePatch | Tool::GitPush | Tool::GitPull | Tool::Desk(desk::Tool::CancelJob) | Tool::Exec))
         })
         .map(Tool::claude_name)
+        .chain(crate::memory::Tool::ALL.into_iter()
+            .map(|tool| format!("mcp__{SERVER_NAME}__{}", tool.name())))
 }
 
 // Default worker tools provide internal communication, scoped reads, and paper builds.
@@ -1093,11 +1098,14 @@ pub(crate) fn codex_desk_tool_policy() -> Value {
     for tool in Tool::available(true).filter(|tool| desk_tool_auto_eligible(tool.name())) {
         approved.insert(tool.name().into(), json!({"approval_mode": "approve"}));
     }
+    for tool in crate::memory::Tool::ALL {
+        approved.insert(tool.name().into(), json!({"approval_mode": "approve"}));
+    }
     policy
 }
 
 pub(crate) fn desk_tool_auto_eligible(name: &str) -> bool {
-    Tool::available(true).any(|tool| tool.name() == name && !matches!(tool,
+    crate::memory::Tool::named(name).is_some() || Tool::available(true).any(|tool| tool.name() == name && !matches!(tool,
         Tool::GitPush | Tool::SelfUpdate | Tool::ClientScreenshot
         | Tool::GitHub(_) | Tool::GitHubAuth(_) | Tool::Handoff(_)
         | Tool::Research(crate::workshop::mcp::Tool::Accept) | Tool::WorkspaceRequest(_)
@@ -1182,6 +1190,9 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let authenticated_desk = codex.is_some() || authorized.is_some()
+        && authorized == claude.as_ref().and_then(|s| s.mcp_key());
+    let desk_codex = codex.as_ref().map(|(codex, key)| (codex.as_ref(), *key));
     let spill_owner = result_spill::Owner::thread(&q.session);
     let method = req["method"].as_str().unwrap_or("");
     let params = &req["params"];
@@ -1250,6 +1261,28 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
         return crate::capture::respond(id, &headers, &params["_meta"]["progressToken"], prepare()).await;
     }
     let result = match method {
+        "tools/call" if params["name"].as_str().and_then(crate::memory::Tool::named).is_some() => {
+            let result = Box::pin(async {
+                let tool = params["name"].as_str().and_then(crate::memory::Tool::named).unwrap();
+                ensure!(authenticated_desk, "private memory requires an authenticated front desk");
+                ensure!(memory_turn(&app, &q.session, claude.as_deref(), desk_codex).await == Some(true),
+                    "private memory requires a trusted user turn");
+                let write = if tool.requires_write_turn() {
+                    if let Some((codex, key)) = desk_codex {
+                        ensure!(codex.memory_writable(&q.session, key), "memory changes require a writable turn");
+                    }
+                    let (_, cancel) = exec_front_turn(&q.session, claude.as_deref(), desk_codex).await
+                        .context("memory changes require a trusted writable user turn")?;
+                    Some(cancel)
+                } else {
+                    None
+                };
+                let data = tool.call(&app, &q.session, params["arguments"].clone(), write).await?;
+                Ok::<_, anyhow::Error>(data_result(data, false))
+            }).await.unwrap_or_else(|error| text_result(format!("{error:#}"), true));
+            // A memory result must never spill into a workspace file.
+            return Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response();
+        }
         "tools/call" if params["name"] == exec::NAME => {
             let result = Box::pin(async {
                 let lease = exec::lease(&app, &q.session, worker.is_none())?;
@@ -1298,6 +1331,13 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
             if worker.is_none() && automatic_github_turn(&app, &q.session) {
                 list.retain(|tool| !desk::Tool::ALL.into_iter()
                     .any(|desk| desk.todo() && tool["name"] == desk.name()));
+            }
+            // The CLIs can register tool schemas before submitting their first turn.
+            // Every call still needs a live trusted user turn, even with a cached schema.
+            if authenticated_desk
+                && memory_turn(&app, &q.session, claude.as_deref(), desk_codex).await != Some(false)
+            {
+                list.extend(crate::memory::Tool::ALL.into_iter().map(crate::memory::Tool::definition));
             }
             list.extend(crate::extensions::tools(app.clone()).await.into_iter().filter(|tool| {
                 worker.as_ref().is_none_or(|(_, allow)| allow.iter().any(|name| tool["name"] == *name))
@@ -1373,7 +1413,10 @@ async fn dispatch(app: Arc<Workspace>, q: McpQuery, headers: HeaderMap, req: Val
             };
             Ok(result.unwrap_or_else(|error| text_result(format!("{error:#}"), true)))
         }
-        "tools/call" => Ok(call_tool(&app, &q.session, claude.as_deref(), codex.as_ref().map(|(codex, key)| (codex.as_ref(), *key)), requester, &req["params"])
+        "tools/call" if params["name"] == Tool::Delegate.name() && !authenticated_desk
+            && params["arguments"]["memory_items"].as_array().is_some_and(|items| !items.is_empty()) =>
+            Ok(text_result("Selecting worker memory requires an authenticated front desk".into(), true)),
+        "tools/call" => Ok(call_tool(&app, &q.session, claude.as_deref(), desk_codex, requester, &req["params"])
             .await
             .unwrap_or_else(|e| text_result(format!("{e:#}"), true))),
         _ => Err(json!({ "code": -32601, "message": format!("method not found: {method}") })),
@@ -1514,6 +1557,8 @@ struct DelegateArgs {
     artifacts: Option<Vec<crate::delegate::blind::Artifact>>,
     #[serde(default)]
     folder_grants: Vec<String>,
+    #[serde(default)]
+    memory_items: Vec<crate::memory::WorkerItem>,
     #[serde(default)]
     plan_step: bool,
 }
@@ -1812,6 +1857,19 @@ fn automatic_github_turn(app: &Workspace, session: &str) -> bool {
     app.issue_threads.intake_turn(session) || app.issue_threads.automatic_policy(session).is_some()
 }
 
+async fn memory_turn(
+    app: &Workspace, session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>,
+) -> Option<bool> {
+    if !exec::trusted_session(app, session) {
+        return Some(false);
+    }
+    if let Some(claude) = claude {
+        return claude.memory_turn().await;
+    }
+    let (codex, key) = codex?;
+    codex.memory_turn(session, key)
+}
+
 async fn exec_front_turn(
     session: &str, claude: Option<&crate::ClaudeSession>, codex: Option<(&crate::codex::Codex, &str)>,
 ) -> Option<(String, Arc<crate::cancellation::Cancellation>)> {
@@ -2080,6 +2138,12 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         }
         Tool::Delegate => {
             let mut args: DelegateArgs = parse_args(args)?;
+            if !args.memory_items.is_empty() {
+                ensure!(args.isolation.is_none(), "Selected memory is unavailable for blind review");
+                ensure!(memory_turn(app, session, claude, codex).await == Some(true),
+                    "Selecting worker memory requires a trusted user turn");
+                crate::memory::worker_attachment(app, &args.memory_items).await?;
+            }
             ensure!(args.label.as_ref().is_none_or(|label| !label.trim().is_empty()), "Job label must contain text");
             args.label = args.label.map(|label| label.trim().to_owned());
             let display = fuzukue_proto::DelegateDisplay::from_title(args.title.as_deref(), args.label.as_deref());
@@ -2118,7 +2182,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 )).await?
             } else if let Some(number) = args.issue {
                 Box::pin(crate::delegate::start_for_issue(
-                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, number, routing, args.touches, args.folder_grants, selection,
+                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, number, routing, args.touches, args.folder_grants, selection, args.memory_items,
                 )).await?
             } else {
                 let exec_trusted = exec::trusted_session(app, session) && exec_front_turn(session, claude, codex).await.is_some();
@@ -2130,7 +2194,7 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                     crate::preferences::current(app, session)
                 };
                 Box::pin(crate::delegate::start_with_grants(
-                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection, exec_trusted, personal_preferences,
+                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection, exec_trusted, personal_preferences, args.memory_items,
                 )).await?
             };
             if claude.is_some() || codex.is_some() {

@@ -31,6 +31,7 @@ The installer selects Apple Silicon or Intel, adds fuzukue to Applications in yo
 - Track findings from human and agent reviews of proofs and drafts in a deck’s review findings ledger. [Review findings ledger](docs/review-findings.md)
 - Grant agents read access to a specific server-side folder for a thread, choose how long it lasts, and review or revoke access. [Folder grants](docs/folder-grants.md)
 - Keep requests and promises that outlast a turn on the thread’s TODO list, and check the count or mark items done on the desktop. [Thread TODOs (Japanese)](docs/thread-todo.md)
+- Keep private preferences and work notes across conversations, with per-item sharing for worker assignments. [Front-desk memory (Japanese)](docs/memory.md)
 - Render callouts, tables, and review findings from XML components embedded in Markdown replies on the desktop. [XML components](docs/xml-components.md)
 - Browse a research deck’s exploration tree to see questions and conjectures by branch or by status. [Sample exploration tree](examples/lab/research/curvature/exploration/tree.json)
 - Receive desktop update notices from the connected server and resume interrupted downloads. [Client distribution and updates](docs/update.md)

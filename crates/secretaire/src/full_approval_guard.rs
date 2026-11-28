@@ -172,7 +172,8 @@ pub(crate) fn credential(path: &str, protected: &[PathBuf]) -> bool {
         matches!(*part, ".ssh" | ".gnupg" | ".netrc" | ".git-credentials")
             || matches!((*part, next), (".config", "gh") | (".config", "fuzukue") | (".aws", "credentials")
                 | (".codex", "auth.json") | (".claude", ".credentials.json") | (".docker", "config.json")
-                | (".cargo", "credentials") | (".cargo", "credentials.toml") | (".config", "git"))
+                | (".cargo", "credentials") | (".cargo", "credentials.toml") | (".config", "git")
+                | (".fuzukue", "memory"))
             || (*part == "state" && next == "fuzukue")
                 && index > 0 && parts[index - 1] == ".local" && !job_file(&parts[index + 2..])
     });

@@ -87,10 +87,11 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
     {
         return None;
     }
+    let protected = ProtectedPaths { state: protected, memory: &scope.memory_roots };
     let command = input["command"].as_str()?;
     let stages = parse(command)?;
     let mut cwd = scope.cwd.as_path().to_path_buf();
-    if protected.iter().any(|root| cwd.starts_with(root)) {
+    if protected.state.iter().chain(protected.memory).any(|root| cwd.starts_with(root)) {
         return None;
     }
     // A directory-changing command and all its operands are worktree-local.
@@ -201,7 +202,7 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
                 // use individual regular files so each can be checked, including
                 // its link count. Pipeline input has already passed an earlier stage.
                 let kind = if files {
-                    PathKind::Entry
+                    PathKind::Search
                 } else {
                     PathKind::FileOrStdin
                 };
@@ -210,7 +211,7 @@ pub(crate) fn check(scope: &Scope, input: &Value, protected: &[PathBuf]) -> Opti
                         && name == "rg"
                         && *join != Join::Pipe
                         && (!files
-                            || checked_path(&roots, &cwd, ".", protected, scratch, PathKind::Directory)
+                            || checked_path(&roots, &cwd, ".", protected, scratch, PathKind::Search)
                                 .is_none()))
                     || (files && !options.iter().any(|option| option == "--no-ignore"))
                 {
@@ -323,17 +324,24 @@ fn parse(command: &str) -> Option<Vec<(Join, Vec<String>)>> {
 }
 
 #[derive(Clone, Copy)]
+struct ProtectedPaths<'a> {
+    state: &'a [PathBuf],
+    memory: &'a [PathBuf],
+}
+
+#[derive(Clone, Copy)]
 enum PathKind {
     Entry,
     Directory,
     FileOrStdin,
+    Search,
 }
 
 fn checked_path(
     roots: &[&Path],
     cwd: &Path,
     name: &str,
-    protected: &[PathBuf],
+    protected: ProtectedPaths<'_>,
     scratch: &Path,
     kind: PathKind,
 ) -> Option<PathBuf> {
@@ -354,7 +362,11 @@ fn checked_path(
     let canonical = absolute.canonicalize().ok()?;
     if !absolute.components().eq(canonical.components())
         || !roots.iter().any(|root| canonical.starts_with(root))
-        || protected.iter().any(|root| {
+        || protected.memory.iter().any(|root| {
+            canonical.starts_with(root)
+                || matches!(kind, PathKind::Search) && root.starts_with(&canonical)
+        })
+        || protected.state.iter().any(|root| {
             // The job directory lives under the server state directory. Only its
             // own files are exempt, never a protected root nested inside it.
             let own = scratch != root.as_path()
@@ -384,7 +396,7 @@ fn checked_path(
 
 /// Whether `name` is a directory below one of `roots` that can be created, or
 /// already exists, without passing a link, Git metadata or a protected root.
-fn new_directory(roots: &[&Path], cwd: &Path, name: &str, protected: &[PathBuf], scratch: &Path) -> bool {
+fn new_directory(roots: &[&Path], cwd: &Path, name: &str, protected: ProtectedPaths<'_>, scratch: &Path) -> bool {
     if name.is_empty() || name.starts_with(['~', '-']) {
         return false;
     }
@@ -398,11 +410,12 @@ fn new_directory(roots: &[&Path], cwd: &Path, name: &str, protected: &[PathBuf],
         !relative.iter().any(|part| part.eq_ignore_ascii_case(".git"))
     })) && existing.is_some_and(|path| {
         path.is_dir() && path.canonicalize().is_ok_and(|canonical| canonical.components().eq(path.components()))
-    }) && !protected.iter().any(|root| {
-        let own = scratch != root.as_path() && scratch.starts_with(root) && absolute.starts_with(scratch)
-            && super::own_file(scratch, &absolute);
-        absolute.starts_with(root) && !own
-    })
+    }) && !protected.memory.iter().any(|root| absolute.starts_with(root))
+        && !protected.state.iter().any(|root| {
+            let own = scratch != root.as_path() && scratch.starts_with(root) && absolute.starts_with(scratch)
+                && super::own_file(scratch, &absolute);
+            absolute.starts_with(root) && !own
+        })
 }
 
 // Options must precede operands. A second dash-prefixed operand can otherwise
@@ -514,13 +527,13 @@ fn jq_filter(filter: &str) -> bool {
         })
 }
 
-fn find_args(roots: &[&Path], cwd: &Path, args: &[String], protected: &[PathBuf], scratch: &Path) -> bool {
+fn find_args(roots: &[&Path], cwd: &Path, args: &[String], protected: ProtectedPaths<'_>, scratch: &Path) -> bool {
     let Some((path, expressions)) = args.split_first() else {
         return false;
     };
     // GNU find treats an operand that starts with ! or ( as an expression.
     if path.starts_with(['!', '('])
-        || checked_path(roots, cwd, path, protected, scratch, PathKind::Directory).is_none()
+        || !checked_path(roots, cwd, path, protected, scratch, PathKind::Search).is_some_and(|path| path.is_dir())
     {
         return false;
     }
@@ -577,6 +590,7 @@ mod tests {
             cwd: worktree.clone(),
             scratch: scratch.clone(),
             read_roots: vec![references.clone(), PathBuf::from("/etc")],
+            memory_roots: vec![],
         };
         let checked = |command: &str| check(&scope, &json!({"command": command}), &[]);
         let absolute = |path: &Path| {
@@ -676,6 +690,7 @@ mod tests {
             cwd,
             scratch,
             read_roots: vec![read_root.clone(), protected.clone()],
+            memory_roots: vec![],
         };
         for dir in [&scope.cwd, &scope.scratch, &read_root, &protected] {
             std::fs::write(dir.join("notes.md"), "first line\nnext line\n")?;

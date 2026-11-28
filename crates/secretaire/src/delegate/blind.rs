@@ -65,6 +65,7 @@ pub(crate) async fn start(
             folder_grants: Vec::new(),
             exec_trusted: false,
             personal_preferences: None,
+            memory_items: Vec::new(),
         },
     )
     .await
@@ -154,6 +155,7 @@ mod tests {
             folder_grants: Vec::new(),
             exec_trusted: false,
             personal_preferences: None,
+            memory_items: Vec::new(),
         };
         let mut invalid = assignment.clone();
         invalid.personal_preferences = Some(serde_json::from_value(json!({"paper": "papers/private"}))?);

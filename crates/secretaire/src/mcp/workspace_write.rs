@@ -209,6 +209,7 @@ pub(crate) struct Scope {
     root: PathBuf,
     writes: Arc<WriteSet>,
     protected: Vec<PathBuf>,
+    memory: Vec<PathBuf>,
     recovery: PathBuf,
     closed: Cancellation,
     scratch: Option<PathBuf>,
@@ -228,10 +229,12 @@ impl Scope {
         );
         let mut protected = worker_scope::protected_roots(state);
         protected.extend(folder_grants::protected_aliases());
+        let memory = worker_scope::memory_roots(&root);
         Ok(Self {
             root,
             writes,
             protected,
+            memory,
             recovery: recovery_dir(state, job)?,
             closed: Cancellation::default(),
             scratch: None,
@@ -240,6 +243,7 @@ impl Scope {
     }
 
     pub(crate) fn with_job_paths(mut self, workspace: &Path, scratch: &Path, assignment: &str) -> Self {
+        self.memory.extend(worker_scope::memory_roots(workspace));
         self.scratch = Some(scratch.to_owned());
         if self.root.starts_with(workspace.join("target")) {
             self.checkouts.push(self.root.clone());
@@ -326,6 +330,7 @@ impl Scope {
         let absolute = scratch.map_or_else(|| self.root.join(relative), |_| relative.to_owned());
         ensure!(
             !denied(&absolute) && !crate::preferences::protected_write(&absolute)
+                && !self.memory.iter().any(|path| absolute.starts_with(path))
                 && (scratch.is_some() || !self.protected.iter().any(|path| absolute.starts_with(path))),
             "Access denied to a protected write path"
         );
@@ -923,6 +928,19 @@ mod tests {
         let home_rules = root.join("home/.fuzukue/rules/style.md");
         assert!(crate::preferences::protected_write(&home_rules));
         assert!(scope.locate(&home_rules).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn memory_cannot_be_written_even_when_in_touches() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?.join("worktree");
+        let state = fixture.path().join("state");
+        fs::create_dir_all(root.join(".fuzukue/memory"))?;
+        fs::create_dir(&state)?;
+        let writes = Arc::new(WriteSet::new(&root, Some(vec!["**".into()]), "", || None)?);
+        let scope = Scope::new(root, writes, &state, "delegate:memory-test")?;
+        assert!(scope.prepare(".fuzukue/memory/index.jsonl".into(), Operation::Write("bad".into())).is_err());
         Ok(())
     }
 

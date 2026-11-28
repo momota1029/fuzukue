@@ -46,6 +46,8 @@ pub(crate) struct Scope {
     pub(crate) cwd: PathBuf,
     pub(crate) scratch: PathBuf,
     pub(crate) read_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) memory_roots: Vec<PathBuf>,
 }
 
 impl Scope {
@@ -88,11 +90,32 @@ impl Scope {
         }
         read_roots.sort();
         read_roots.dedup();
+        let project = project.canonicalize()?;
+        #[cfg(not(test))]
+        let global = global_memory_root();
+        #[cfg(test)]
+        let global = Some(scratch.canonicalize()?.join(".fuzukue/memory"));
+        let mut memory_roots = vec![project.join(".fuzukue/memory")];
+        memory_roots.extend(global);
+        memory_roots.sort();
+        memory_roots.dedup();
         Ok(Self {
             cwd: cwd.canonicalize()?,
             scratch: scratch.canonicalize()?,
             read_roots,
+            memory_roots,
         })
+    }
+
+    pub(crate) fn prepare_memory_mounts(&self) -> Result<()> {
+        for root in &self.memory_roots {
+            ensure!(
+                !self.writable().iter().any(|path| path.starts_with(root)),
+                "worker directory is inside app-owned memory"
+            );
+            crate::memory::prepare_sandbox_mount(root)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn writable(&self) -> [&Path; 2] {
@@ -105,7 +128,8 @@ impl Scope {
 
     fn allows(&self, base: &Path, path: &Path, write: bool) -> bool {
         resolve(&base.join(path)).is_ok_and(|path| {
-            if write && crate::preferences::protected_write(&path) {
+            if self.memory_roots.iter().any(|root| path.starts_with(root))
+                || (write && crate::preferences::protected_write(&path)) {
                 return false;
             }
             self.writable().iter().any(|root| path.starts_with(root))
@@ -149,6 +173,9 @@ impl Scope {
                         .filter(|_| event["tool_name"] == "Glob")
                 });
                 self.allows(cwd, Path::new(path), false)
+                    && resolve(&cwd.join(path)).is_ok_and(|search| {
+                        !self.memory_roots.iter().any(|root| root.starts_with(&search))
+                    })
                     && pattern.is_none_or(|pattern| {
                         let pattern = Path::new(pattern);
                         !pattern.is_absolute()
@@ -191,8 +218,26 @@ impl Scope {
 
 }
 
+fn global_memory_root() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    home.is_absolute().then(|| {
+        home.canonicalize().unwrap_or(home).join(".fuzukue/memory")
+    })
+}
+
+pub(crate) fn memory_roots(workspace: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![workspace.join(".fuzukue/memory")];
+    roots.extend(global_memory_root());
+    let aliases: Vec<_> = roots.iter().filter_map(|path| resolve(path).ok()).collect();
+    roots.extend(aliases);
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 pub(crate) fn protected_roots(state_dir: &Path) -> Vec<PathBuf> {
     let mut roots = vec![state_dir.to_path_buf()];
+    roots.extend(global_memory_root());
     #[cfg(not(test))]
     {
         let bases = fuzukue_proto::compat::config_home().into_iter().chain([
@@ -304,6 +349,39 @@ fn tool_install_dir(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_roots_are_excluded_from_worker_access() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let project = fixture.path().join("project");
+        let scratch = fixture.path().join("scratch");
+        std::fs::create_dir(&project)?;
+        std::fs::create_dir(&scratch)?;
+        let scope = Scope::open(&project, &project, &scratch)?;
+        let event = json!({"cwd": project, "tool_name": "Grep", "tool_input": {"path": "."}});
+        assert_eq!(scope.claude_decision(&event)["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(shell::check(&scope, &json!({"command": "find . -type f"}), &[]).is_none());
+        if Path::new("/usr/bin/ls").is_file() {
+            assert!(shell::check(&scope, &json!({"command": "ls ."}), &[]).is_some());
+        }
+        assert!(shell::check(&scope, &json!({"command": format!(
+            "mkdir -p {}/.fuzukue/memory/items", scratch.display()
+        )}), &[]).is_none());
+        std::fs::create_dir_all(project.join(".fuzukue/memory/items"))?;
+        std::fs::write(project.join(".fuzukue/memory/index.jsonl"), "private")?;
+        let global_memory = scratch.join(".fuzukue/memory");
+        std::fs::create_dir_all(&global_memory)?;
+        std::fs::write(global_memory.join("index.jsonl"), "private")?;
+        for path in [project.join(".fuzukue/memory"), global_memory] {
+            for tool in ["Read", "Write", "Edit"] {
+                let event = json!({"cwd": project, "tool_name": tool,
+                    "tool_input": {"file_path": path.join("index.jsonl")}});
+                assert_eq!(scope.claude_decision(&event)["hookSpecificOutput"]["permissionDecision"], "deny");
+            }
+        }
+        assert!(shell::check(&scope, &json!({"command": "cat .fuzukue/memory/index.jsonl"}), &[]).is_none());
+        Ok(())
+    }
 
     #[test]
     fn claude_guard_checks_file_tools_and_routes_shell_to_server_review() -> Result<()>

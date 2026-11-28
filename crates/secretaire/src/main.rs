@@ -21,6 +21,7 @@ mod commands;
 mod lean;
 mod library;
 mod memos;
+mod memory;
 mod preferences;
 mod mutations;
 mod claude;
@@ -180,6 +181,7 @@ pub struct Workspace {
     research_issues: workshop::Queue,
     issue_threads: issue_threads::Watch,
     github_auth: github_auth::Auth,
+    memory_confirmations: memory::Confirmations,
     watches: watch::Watches,
     handoff: handoff::State,
     builds: build_jobs::Builds,
@@ -241,6 +243,7 @@ impl Workspace {
             research_issues,
             issue_threads: Default::default(),
             github_auth: github_auth::Auth::new(&state_dir),
+            memory_confirmations: Default::default(),
             watches: watch::Watches::load(&project_dir, &state_dir),
             handoff: Default::default(),
             registry: Default::default(),
@@ -3339,13 +3342,14 @@ async fn prompt_codex_with_images(
                 };
                 let (mut input, notices) = app.partner_input(&session, prompt, external).await?;
                 let preferences = preferences::load_selection(selection, &app, &session).await?;
+                let memory = if isolated { None } else { memory::for_turn(&app, &session, kind).await? };
                 input.push_str("\n\n");
                 input.push_str(&self_update::RequestingTurn::proof_instruction(&update_proof));
                 let images = if is_nudge { &[][..] } else { &images };
                 if !is_nudge {
                     app.hub.set_github_auth_request(&session, github_auth);
                 }
-                let result = codex.run_turn_with_images(&thread_id, &input, images, kind, Some(&preferences), || {
+                let result = codex.run_turn_with_images(&thread_id, &input, images, kind, Some(&preferences), memory.as_deref(), || {
                     if let Some(delivery) = delivery.filter(|delivery| delivery.report) {
                         app.drain.begin_submission(&app.state_dir, &session, std::slice::from_ref(&delivery.id))?;
                     }
@@ -3913,6 +3917,7 @@ async fn handle_from_client(
                 ClientMsg::WorkerPrompt { session, job, text, paths } => (session, text, paths, Some(job)),
                 _ => unreachable!(),
             };
+            let direct_text = matches!(commands::parse(&text), commands::Input::Prompt(_));
             let text = match commands::parse(&text) {
                 commands::Input::Prompt(text) => text,
                 commands::Input::Command { args, .. } => args,
@@ -3942,6 +3947,9 @@ async fn handle_from_client(
                 send_latency::expect_echo(&event, "worker_steer");
                 app.delegates.steer(app, &session, &job, &prompt, event)?;
                 planner::goal_event(app, &session, false);
+                return Ok(());
+            }
+            if direct_text && paths.is_empty() && memory::user_confirmation(app, &session, &text).await? {
                 return Ok(());
             }
             planner::wake_goal(app, &session)?;
@@ -3983,7 +3991,12 @@ async fn handle_from_client(
                 let (steering, notices) = app.partner_input(&session, input, false).await?;
                 let selection = preferences::for_turn(app, &session, TurnKind::UserConversation, false, &prompt, &preferences::Inheritance::Desk)?;
                 let preferences = preferences::load_selection(selection, app, &session).await?;
-                codex.steer_desk(&thread, &steering, &images, &preferences).await?;
+                let memory = if codex.memory_user_turn(&thread) {
+                    memory::for_turn(app, &session, TurnKind::UserConversation).await?
+                } else {
+                    None
+                };
+                codex.steer_desk(&thread, &steering, &images, &preferences, memory.as_deref()).await?;
                 todo::delivered(app, &session, notices);
                 app.hub.set_github_auth_request(&session,
                     github_auth_request(TurnKind::UserConversation, "", user_event.as_ref()));
