@@ -259,6 +259,163 @@ fn manuscript_prose_renders_in_order_before_and_between_lazy_cards() {
 }
 
 #[test]
+fn every_card_and_manuscript_passage_takes_a_comment_that_stays_anchored() {
+    use fuzukue_proto::{CommentView, DocProse, DocProseText};
+
+    run_card_reader_test(async |runner, cx| {
+        let card = "sample-lemma".to_owned();
+        let abstract_tex = r"\begin{abstract}We study $x^2$ on fictional spheres.\end{abstract}";
+        let intro = DocProseText::Tex("Introduction prose about widgets.".into());
+        let opening = DocProseText::Tex(abstract_tex.into());
+        let blank = DocProseText::Tex("% nothing to show".into());
+        let references = DocProseText::Tex(
+            r"\begin{thebibliography}{1}\bibitem{a} A. Author, A book.\end{thebibliography}".into(),
+        );
+        let document = |passages: &[&DocProseText]| {
+            let mut document = paper_document(std::slice::from_ref(&card));
+            let ServerEvent::Document { sections, .. } = &mut document else { unreachable!() };
+            sections[0].prose = passages
+                .iter()
+                .enumerate()
+                .map(|(index, text)| DocProse {
+                    before_item: usize::from(index >= 2),
+                    text: (*text).clone(),
+                })
+                .collect();
+            document
+        };
+        let (out, messages) = std::sync::mpsc::channel();
+        runner.update(cx, |view, _, cx| {
+            view.out = out.into();
+            let mut summary = synthetic_card(&card, "lemma");
+            summary.body = "## Statement\n\nA short statement.".into();
+            view.apply_deck_cards(DECK, vec![summary], vec![], cx);
+            view.on_event(document(&[&opening, &intro, &references, &blank]), cx);
+            view.open_paper_deck(DECK.into(), cx);
+        })?;
+        // Title, section, abstract, introduction, card, references, blank.
+        runner.wait_for(cx, "comment buttons", TIMEOUT_MS, |view, window| {
+            view.read_prose.len() == 4
+                && ["comment-passage-2", "comment-passage-3", "comment-card-sample-lemma", "comment-passage-5"]
+                    .iter()
+                    .all(|id| window.shot_element_bounds(id).is_some())
+                && window.shot_element_bounds("formula:x^2").is_some()
+        }).await?;
+        runner.update(cx, |view, window, _| {
+            let rule: Vec<_> = (0..view.read_rows.len())
+                .map(|row| view.row_comment_target(row).is_some())
+                .collect();
+            assert_eq!(rule, [false, false, true, true, true, true, false]);
+            assert!(window.shot_element_bounds("comment-passage-6").is_none());
+            // The button has the same horizontal place on cards and passages.
+            let right = window.shot_element_bounds("comment-card-sample-lemma").unwrap().right();
+            for id in ["comment-passage-2", "comment-passage-3", "comment-passage-5"] {
+                assert_eq!(window.shot_element_bounds(id).unwrap().right(), right, "{id}");
+            }
+        })?;
+
+        let mut saved = Vec::new();
+        for (button, note) in [
+            ("comment-passage-2", "Shorten the abstract."),
+            ("comment-passage-3", "Define widgets."),
+            ("comment-card-sample-lemma", "State the hypothesis."),
+            ("comment-passage-5", "Add a source."),
+        ] {
+            runner.click(cx, ClickTarget::Element { id: button.into() })?;
+            runner.frame(cx)?;
+            runner.step(Step::Type { text: note.into() }, cx).await?;
+            runner.click(cx, ClickTarget::Element { id: "add-comment".into() })?;
+            let ClientMsg::AddComment { card, text, quote, proof, source, .. } = messages.try_recv()?
+            else {
+                bail!("{button} did not add a comment")
+            };
+            assert_eq!(text, note);
+            assert_eq!(quote, None);
+            saved.push(CommentView { card, text, quote, proof, source, created: 0 });
+        }
+        assert_eq!(
+            saved.iter().map(|comment| comment.card.as_str()).collect::<Vec<_>>(),
+            ["manuscript:", "manuscript:", "sample-lemma", "manuscript:"],
+        );
+
+        // Selecting text in a passage offers the same quoted comment as a card.
+        runner.step(Step::DragFromElement { id: "formula:x^2".into(), dx: 120., dy: 0. }, cx).await?;
+        runner.frame(cx)?;
+        runner.click(cx, ClickTarget::Element { id: "quote-passage".into() })?;
+        runner.frame(cx)?;
+        runner.step(Step::Type { text: "Explain the square.".into() }, cx).await?;
+        runner.click(cx, ClickTarget::Element { id: "add-comment".into() })?;
+        let ClientMsg::AddComment { card: place, text, quote, proof, source, .. } = messages.try_recv()?
+        else {
+            bail!("the passage selection did not add a comment")
+        };
+        assert_eq!(place, "manuscript:");
+        assert!(quote.as_deref().is_some_and(|quote| quote.contains("$x^2$")), "{quote:?}");
+        assert!(abstract_tex.contains(&source.as_ref().unwrap().text));
+        saved.push(CommentView { card: place, text, quote, proof, source, created: 0 });
+
+        // Reload with a new passage inserted before the others, as after a TeX edit.
+        let added = DocProseText::Tex("A new opening remark.".into());
+        runner.update(cx, |view, _, cx| {
+            view.on_event(document(&[&added, &opening, &intro, &references]), cx);
+            view.on_event(ServerEvent::Comments { deck: DECK.into(), items: saved.clone() }, cx);
+        })?;
+        // Title, section, remark, abstract, card, introduction, references.
+        runner.wait_for(cx, "anchored comments", TIMEOUT_MS, |view, _| {
+            view.read_prose.len() == 4 && {
+                let mut placed: Vec<_> = view.passage_comments().into_iter().collect();
+                placed.sort();
+                placed == [(3, vec![0, 4]), (5, vec![1]), (6, vec![3])]
+            }
+        }).await?;
+        // Drafts added here stay open under their own passage, and fold again.
+        for open in [true, false, true] {
+            runner.frame(cx)?;
+            runner.update(cx, |_, window, _| {
+                for id in ["rm-comment-0", "rm-comment-4"] {
+                    assert_eq!(window.shot_element_bounds(id).is_some(), open, "{id}");
+                }
+            })?;
+            // Other passages of the same file keep their own state.
+            runner.update(cx, |view, _, _| {
+                assert!(view.open_comments.contains(&crate::paper::open_comment_key(
+                    &saved[3].card,
+                    saved[3].source.as_ref(),
+                )));
+            })?;
+            runner.click(cx, ClickTarget::Element { id: "comments-passage-3".into() })?;
+        }
+
+        // The button is reachable and usable with the keyboard alone.
+        runner.update(cx, |view, window, cx| {
+            view.comment_target = None;
+            view.paper_focus.focus(window, cx);
+        })?;
+        let mut reached = false;
+        for _ in 0..40 {
+            runner.step(Step::Key { key: "Tab".into() }, cx).await?;
+            runner.frame(cx)?;
+            // A button activates on the release of the key.
+            cx.update_window(runner.handle, |_, window, cx| {
+                let keystroke = Keystroke::parse_with_os("enter", gpui_kit::OperatingSystem::Linux).unwrap();
+                window.dispatch_keystroke(keystroke.clone(), cx);
+                window.dispatch_event(
+                    gpui_kit::PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke }),
+                    cx,
+                );
+            })?;
+            runner.frame(cx)?;
+            reached = runner.update(cx, |view, _, _| view.comment_target.is_some())?;
+            if reached {
+                break;
+            }
+        }
+        assert!(reached, "Tab did not reach a comment button");
+        Ok(())
+    });
+}
+
+#[test]
 fn harness_card_typesets_argument_macros_and_names_unknown_macros() {
     let id = "sample-definition".to_string();
     run_card_reader_test(async move |runner, cx| {

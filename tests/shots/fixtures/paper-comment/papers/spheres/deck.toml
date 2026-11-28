@@ -1,0 +1,5 @@
+kind = "paper"
+title = "Fictional spheres"
+
+[build]
+tex_root = "main.tex"

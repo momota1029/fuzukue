@@ -160,6 +160,8 @@ impl Workbench {
         self.remeasure_card(&part.card);
         self.comment_popup = None;
         self.comment_selection = None;
+        self.prose_selection = None;
+        self.prose_popup = None;
         if tex {
             self.notice = None;
         }

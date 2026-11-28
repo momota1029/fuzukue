@@ -1761,7 +1761,19 @@ pub struct CommentView {
     pub created: i64,
 }
 
-/// Original UTF-8 byte range and text in the body of the card.
+/// Prefix of `CommentView::card` for a comment on manuscript text outside the
+/// cards (abstract, introduction, body prose, references). The rest is the
+/// deck-relative TeX path, empty for text without a file. `source` then holds
+/// the byte range in that file and the TeX text that anchors the comment.
+pub const MANUSCRIPT_COMMENT_PREFIX: &str = "manuscript:";
+
+/// The TeX path of a manuscript comment, or `None` for a card comment.
+pub fn manuscript_comment_path(card: &str) -> Option<&str> {
+    card.strip_prefix(MANUSCRIPT_COMMENT_PREFIX)
+}
+
+/// Original UTF-8 byte range and text in the body of the card, or in the
+/// manuscript file for a manuscript comment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentSource {
     pub range: std::ops::Range<usize>,

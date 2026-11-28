@@ -115,6 +115,11 @@ fn fixture_map_matches_repository_scenarios() -> Result<()> {
             "fixture",
             "tests/shots/fixtures/card-markdown",
         ),
+        (
+            "paper-comment",
+            "fixture",
+            "tests/shots/fixtures/paper-comment",
+        ),
         ("github-report", "fixture", "examples/lab"),
         ("right-pane-resize", "fixture", "examples/lab"),
         ("thread-switch", "fixture", "examples/lab"),

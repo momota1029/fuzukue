@@ -2,6 +2,7 @@
 
 pub mod appearance;
 pub mod chat;
+pub mod comment_anchor;
 pub mod lean;
 pub mod markdown_code;
 mod paper;

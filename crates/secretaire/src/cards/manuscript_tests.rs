@@ -325,6 +325,31 @@ fn large_prose_has_a_small_outline_and_bounded_utf8_excerpts() -> Result<()> {
 }
 
 #[test]
+fn paper_comment_fixture_shows_the_abstract_prose_card_and_references() -> Result<()> {
+    let deck = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/shots/fixtures/paper-comment/papers/spheres");
+    let ServerEvent::Document { sections, .. } = document_for_deck(&deck, None) else {
+        unreachable!()
+    };
+    // The shot scenario comments on the first passage, directly under the title.
+    assert!(sections[0].title.is_empty() && sections[0].items.is_empty());
+    assert!(prose(&deck, &sections[0].prose[0].text)?.contains("\\begin{abstract}"));
+    let mut text = String::new();
+    for passage in sections.iter().flat_map(|section| &section.prose) {
+        text.push_str(&prose(&deck, &passage.text)?);
+    }
+    for expected in ["introduction explains", "closing prose", "thebibliography"] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+    assert!(sections
+        .iter()
+        .flat_map(|section| &section.items)
+        .any(|item| matches!(item, DocItem::Card { id } if id == "lem-round")));
+    assert!(sections.iter().all(|section| !section.unmatched));
+    Ok(())
+}
+
+#[test]
 fn writing_harness_projects_title_and_end_hooks_around_the_editable_outline() -> Result<()> {
     let dir = TestDir::new();
     dir.write("fictional/deck.toml", "kind = 'paper'\n");

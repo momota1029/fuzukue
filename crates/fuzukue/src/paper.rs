@@ -1,6 +1,7 @@
 use super::{
-    icon_pill, icons::Symbol, math, pill, scroll_list_by_key, App, ClientMsg, Context, Entity, MouseButton, PaperJump,
-    Pixels, ReadPart, ReadRow, ReadText, RightPane, SharedString, Window, Workbench,
+    icon_pill, icons::Symbol, math, paper_prose::ProseBody, pill, scroll_list_by_key, App, ClientMsg, CommentTarget,
+    Context, Entity, MouseButton, PaperJump, Pixels, Point, ReadPart, ReadRow, ReadText, RightPane, SharedString,
+    Window, Workbench,
 };
 use gpui_kit::base::text::{
     InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode, MarkdownParseContext,
@@ -287,7 +288,28 @@ pub(super) fn lean_card_progress(
     Some((label, checked == total))
 }
 
-fn unique_quote(text: &str, quote: &str) -> Option<std::ops::Range<usize>> {
+/// Space at the right of every card and passage for its comment button.
+const COMMENT_GUTTER: Pixels = px(32.);
+
+/// What a draft comment points at, for headings and lists.
+fn comment_place(card: &str) -> String {
+    match fuzukue_proto::manuscript_comment_path(card) {
+        Some("") => tr!("paper-manuscript-text").into(),
+        Some(path) => format!("{} · {path}", tr!("paper-manuscript-text")),
+        None => format!("[[{card}]]"),
+    }
+}
+
+/// The key of a draft in `open_comments`. Passages of one file share a
+/// comment id, so their anchor text tells them apart.
+pub(super) fn open_comment_key(card: &str, source: Option<&fuzukue_proto::CommentSource>) -> String {
+    match source.filter(|_| fuzukue_proto::manuscript_comment_path(card).is_some()) {
+        Some(source) => format!("{card}\n{}", source.text),
+        None => card.to_owned(),
+    }
+}
+
+pub(super) fn unique_quote(text: &str, quote: &str) -> Option<std::ops::Range<usize>> {
     if quote.is_empty() {
         return None;
     }
@@ -593,6 +615,131 @@ impl Workbench {
         });
     }
 
+    /// The one rule for the comment button: every card, and every manuscript
+    /// passage that shows text, takes a comment. Headings do not.
+    pub(super) fn row_comment_target(&self, index: usize) -> Option<CommentTarget> {
+        match self.read_rows.get(index)? {
+            ReadRow::Card(id) => Some(CommentTarget {
+                card: id.clone(),
+                quote: None,
+                source: None,
+                proof: false,
+            }),
+            ReadRow::Prose(text) if self.passage_shown(text) => {
+                let Some(ProseBody::Ready { tex, .. }) = self.read_prose.get(text) else {
+                    return None;
+                };
+                let (card, source) =
+                    fuzukue_view::comment_anchor::passage_comment_anchor(text, tex, None);
+                Some(CommentTarget { card, quote: None, source: Some(source), proof: false })
+            }
+            _ => None,
+        }
+    }
+
+    /// The button stays in the layout and the tab order; hover or keyboard
+    /// focus makes it visible.
+    fn row_comment_button(&self, index: usize, top: Pixels, entity: &Entity<Self>) -> Option<gpui_kit::Div> {
+        let target = self.row_comment_target(index)?;
+        let id = match &self.read_rows[index] {
+            ReadRow::Card(card) => format!("comment-card-{card}"),
+            _ => format!("comment-passage-{index}"),
+        };
+        let entity = entity.clone();
+        let label = tr!("paper-comment");
+        Some(div().absolute().top(top).right(px(4.)).child(
+            Button::new(SharedString::from(id))
+                .ghost()
+                .xsmall()
+                .icon(Symbol::MessageSquare.icon())
+                .accessibility_label(label)
+                .tooltip(label)
+                .opacity(0.)
+                .group_hover("paper-row", |style| style.opacity(1.))
+                .focus_visible(|style| style.opacity(1.))
+                .on_click(move |_, window, cx| {
+                    entity.update(cx, |this, cx| this.start_comment(target.clone(), window, cx));
+                }),
+        ))
+    }
+
+    /// The disclosure and drafts under a card or passage.
+    fn render_row_comments(
+        &self,
+        index: usize,
+        comments: &[usize],
+        entity: &Entity<Self>,
+        cx: &App,
+    ) -> Option<gpui_kit::Div> {
+        if comments.is_empty() {
+            return None;
+        }
+        let ids: Vec<_> = comments
+            .iter()
+            .map(|&i| open_comment_key(&self.comments[i].card, self.comments[i].source.as_ref()))
+            .collect();
+        let open = ids.iter().any(|id| self.open_comments.contains(id));
+        let disclosure_id = match &self.read_rows[index] {
+            ReadRow::Card(card) => format!("comments-{card}"),
+            _ => format!("comments-passage-{index}"),
+        };
+        let link = entity.clone();
+        let actions = h_flex().child(
+            icon_pill(
+                disclosure_id,
+                if open { Symbol::ChevronDown } else { Symbol::ChevronRight },
+                tr!("paper-comment-count", count = comments.len().to_string()),
+                cx,
+            )
+            .on_click(move |_, _, cx| {
+                link.update(cx, |this, cx| {
+                    for id in &ids {
+                        if open {
+                            this.open_comments.remove(id);
+                        } else {
+                            this.open_comments.insert(id.clone());
+                        }
+                    }
+                    this.read_list.remeasure_items(index..index + 1);
+                    cx.notify();
+                });
+            }),
+        );
+        let mut block = v_flex().w_full().min_w_0().gap_2().child(actions);
+        if open {
+            for &i in comments {
+                block = block.child(self.render_saved_comment(i, &self.comments[i], entity, cx));
+            }
+        }
+        Some(block)
+    }
+
+    pub(super) fn comment_popup_pill(
+        id: String,
+        target: CommentTarget,
+        offset: Point<Pixels>,
+        entity: &Entity<Self>,
+        cx: &App,
+    ) -> impl IntoElement {
+        let link = entity.clone();
+        let dismiss = entity.clone();
+        pill(id, tr!("paper-comment"), true, cx)
+            .absolute()
+            .left(offset.x)
+            .top(offset.y)
+            .shadow_md()
+            .on_mouse_down_out(move |_, _, cx| {
+                dismiss.update(cx, |this, cx| {
+                    this.comment_popup = None;
+                    cx.notify();
+                });
+            })
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                link.update(cx, |this, cx| this.start_comment(target.clone(), window, cx));
+                cx.stop_propagation();
+            })
+    }
+
     pub(super) fn render_read_text(
         &self,
         id: &str,
@@ -618,7 +765,10 @@ impl Workbench {
                 if event.button == MouseButton::Left
                     && TextSelection::is_selectable_at(event.position, window, cx)
                 {
-                    link.update(cx, |this, _| this.comment_selection = Some(part.clone()));
+                    link.update(cx, |this, _| {
+                        this.prose_selection = None;
+                        this.comment_selection = Some(part.clone());
+                    });
                 }
             })
             .child(self.card_body_text(TextView::new(view), read.uses_tex, cx));
@@ -627,28 +777,13 @@ impl Workbench {
             .as_ref()
             .filter(|(target, _)| target.card == id && target.proof == proof)
         {
-            let target = target.clone();
-            let link = entity.clone();
-            let dismiss = entity.clone();
-            text = text.child(
-                pill(format!("quote-{id}"), tr!("paper-comment"), true, cx)
-                    .absolute()
-                    .left(offset.x)
-                    .top(offset.y)
-                    .shadow_md()
-                    .on_mouse_down_out(move |_, _, cx| {
-                        dismiss.update(cx, |this, cx| {
-                            this.comment_popup = None;
-                            cx.notify();
-                        });
-                    })
-                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        link.update(cx, |this, cx| {
-                            this.start_comment(target.clone(), window, cx)
-                        });
-                        cx.stop_propagation();
-                    }),
-            );
+            text = text.child(Self::comment_popup_pill(
+                format!("quote-{id}"),
+                target.clone(),
+                *offset,
+                entity,
+                cx,
+            ));
         }
         let row_id = SharedString::from(format!("symbol-text-{id}-{proof}"));
         Some(self.symbol_menu(div().id(row_id).w_full().min_w_0().child(text), entity,
@@ -693,6 +828,7 @@ impl Workbench {
                 jump.tail
             }
         });
+        let passage_comments = self.passage_comments();
         let reader = gpui_kit::list(self.read_list.clone(), move |ix, _window, cx| {
             let theme = cx.theme().clone();
             let this = entity.read(cx);
@@ -722,7 +858,20 @@ impl Workbench {
                     .text_base()
                     .child(t.clone())
                     .into_any_element(),
-                ReadRow::Prose(text) => this.render_prose(text, &entity, cx).into_any_element(),
+                ReadRow::Prose(text) => {
+                    let comments = passage_comments.get(&ix).map_or(&[][..], Vec::as_slice);
+                    v_flex()
+                        .relative()
+                        .group("paper-row")
+                        .w_full()
+                        .min_w_0()
+                        .child(this.render_prose(text, &entity, cx).pr(COMMENT_GUTTER))
+                        .children(this.render_row_comments(ix, comments, &entity, cx).map(|block| {
+                            block.px(PANE_INSET).pb_2()
+                        }))
+                        .children(this.row_comment_button(ix, px(8.), &entity))
+                        .into_any_element()
+                }
                 ReadRow::Unmatched => div()
                     .px(PANE_INSET)
                     .pt_4()
@@ -846,7 +995,8 @@ impl Workbench {
                         statement.children(this.render_read_text(id, false, &entity, cx))
                     };
                     let highlighted = this.paper_highlight.as_ref().is_some_and(|(card, _)| card == id);
-                    let mut col = v_flex().w_full().min_w_0().px(PANE_INSET).py_4().gap_2()
+                    let mut col = v_flex().relative().group("paper-row")
+                        .w_full().min_w_0().pl(PANE_INSET).pr(COMMENT_GUTTER).py_4().gap_2()
                         .when(highlighted, |row| row.rounded_lg().bg(theme.link.alpha(0.15)))
                         .child(statement)
                         .children(card.and_then(|_| this.card_body_status(id, &entity, cx)))
@@ -896,41 +1046,12 @@ impl Workbench {
                         }
                     }
 
-                    let comments: Vec<_> = this
-                        .comments
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| &c.card == id)
+                    let comments: Vec<_> = (0..this.comments.len())
+                        .filter(|&i| &this.comments[i].card == id)
                         .collect();
-                    let open = this.open_comments.contains(id);
-                    if !comments.is_empty() {
-                        let target = id.clone();
-                        let link = entity.clone();
-                        let actions = h_flex().child(
-                            icon_pill(
-                                format!("comments-{id}"),
-                                if open { Symbol::ChevronDown } else { Symbol::ChevronRight },
-                                tr!("paper-comment-count", count = comments.len().to_string()),
-                                cx,
-                            )
-                            .on_click(move |_, _, cx| {
-                                link.update(cx, |this, cx| {
-                                    if !this.open_comments.remove(&target) {
-                                        this.open_comments.insert(target.clone());
-                                    }
-                                    this.read_list.remeasure_items(ix..ix + 1);
-                                    cx.notify();
-                                });
-                            }),
-                        );
-                        col = col.child(actions);
-                    }
-                    if open {
-                        for (index, comment) in comments {
-                            col = col.child(this.render_saved_comment(index, comment, &entity, cx));
-                        }
-                    }
-                    col.into_any_element()
+                    col.children(this.render_row_comments(ix, &comments, &entity, cx))
+                        .children(this.row_comment_button(ix, px(16.), &entity))
+                        .into_any_element()
                 }
             }
         });
@@ -951,7 +1072,10 @@ impl Workbench {
                                 div()
                                     .text_sm()
                                     .text_color(theme.muted_foreground)
-                                    .child(tr!("paper-comment-on-card", card = target.card.to_string())),
+                                    .child(match fuzukue_proto::manuscript_comment_path(&target.card) {
+                                        Some(_) => tr!("paper-comment-on-passage", place = comment_place(&target.card)),
+                                        None => tr!("paper-comment-on-card", card = target.card.to_string()),
+                                    }),
                             )
                             .child(pill("cancel-comment", tr!("paper-close"), false, cx).on_click(
                                 cx.listener(|this, _, window, cx| {
@@ -1195,7 +1319,11 @@ impl Workbench {
             ).px(crate::pane_resize::PANE_INSET).py_2().border_b_1().border_color(theme.sidebar_border))
             .child(div().id("deck-comments").flex_1().min_h_0().overflow_y_scrollbar()
                 .child(v_flex().gap_3().p_4().children(self.comments.iter().enumerate().map(|(index, comment)| {
-                    v_flex().gap_1().child(div().text_xs().child(comment.card.clone()))
+                    let place = match fuzukue_proto::manuscript_comment_path(&comment.card) {
+                        Some(_) => comment_place(&comment.card),
+                        None => comment.card.clone(),
+                    };
+                    v_flex().gap_1().child(div().text_xs().child(place))
                         .child(self.render_saved_comment(index, comment, &entity, cx))
                 }))))
     }

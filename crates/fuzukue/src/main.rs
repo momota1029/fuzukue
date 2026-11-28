@@ -269,6 +269,10 @@ struct Workbench {
     comment_input: Entity<TextareaState>,
     comment_popup: Option<(CommentTarget, Point<Pixels>)>,
     comment_selection: Option<ReadPart>,
+    /// The manuscript passage where a text selection started
+    prose_selection: Option<fuzukue_proto::DocProseText>,
+    /// The manuscript passage that shows `comment_popup`
+    prose_popup: Option<fuzukue_proto::DocProseText>,
     open_comments: HashSet<String>,
     /// 会話ごと・エージェントごとの統計（モデル、料金、コンテキスト）
     stats: std::collections::BTreeMap<(String, String), fuzukue_proto::ServerEvent>,
@@ -747,6 +751,8 @@ impl Workbench {
             comment_input,
             comment_popup: None,
             comment_selection: None,
+            prose_selection: None,
+            prose_popup: None,
             open_comments: HashSet::new(),
             palette: None,
             palette_previous_focus: None,
@@ -858,6 +864,7 @@ impl Workbench {
         if text.trim().is_empty() {
             return;
         }
+        let open = paper::open_comment_key(&target.card, target.source.as_ref());
         if self
             .out
             .send(ClientMsg::AddComment {
@@ -870,7 +877,7 @@ impl Workbench {
             })
             .is_ok()
         {
-            self.open_comments.insert(target.card);
+            self.open_comments.insert(open);
             self.comment_target = None;
             self.comment_input
                 .update(cx, |input, cx| input.clean(window, cx));
@@ -904,9 +911,11 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(part) = self.comment_selection.take() else {
+        let part = self.comment_selection.take();
+        let passage = self.prose_selection.take();
+        if part.is_none() && passage.is_none() {
             return;
-        };
+        }
         let entity = cx.entity().downgrade();
         // 選択を確定するマウスイベントの処理が終わってから読む。
         window.defer(cx, move |window, cx| {
@@ -915,26 +924,48 @@ impl Workbench {
                 return;
             }
             let _ = entity.update(cx, |this, cx| {
-                let Some(text) = this.read_md.get(&part) else {
+                let view = match (&part, &passage) {
+                    (Some(part), _) => this.read_md.get(part).map(|text| &text.view),
+                    (None, Some(passage)) => match this.read_prose.get(passage) {
+                        Some(paper_prose::ProseBody::Ready { view, .. }) => Some(view),
+                        _ => None,
+                    },
+                    (None, None) => None,
+                };
+                let Some(view) = view else {
                     return;
                 };
-                let state = text.view.read(cx);
+                let state = view.read(cx);
                 let quote = state.selected_text().trim().to_owned();
                 if quote.is_empty() {
                     return;
                 }
-                let source = state.selected_source_range()
-                    .and_then(|range| text.display.tex_range(range))
-                    .and_then(|range| {
-                        let card = this.cards.iter().find(|card| card.id == part.card)?;
-                        let text = card.body.get(range.clone())?.to_owned();
-                        Some(CommentSource { range, text })
-                    });
+                let selected = state.selected_source_range();
                 let bounds = state.bounds();
+                let target = if let Some(part) = &part {
+                    let source = selected
+                        .and_then(|range| this.read_md[part].display.tex_range(range))
+                        .and_then(|range| {
+                            let card = this.cards.iter().find(|card| card.id == part.card)?;
+                            let text = card.body.get(range.clone())?.to_owned();
+                            Some(CommentSource { range, text })
+                        });
+                    CommentTarget { card: part.card.clone(), proof: part.proof, quote: Some(quote), source }
+                } else {
+                    let Some(passage) = &passage else { return };
+                    let Some(paper_prose::ProseBody::Ready { tex, display, .. }) = this.read_prose.get(passage) else {
+                        return;
+                    };
+                    let range = selected.and_then(|range| display.tex_range(range));
+                    let (card, source) =
+                        fuzukue_view::comment_anchor::passage_comment_anchor(passage, tex, range);
+                    CommentTarget { card, proof: false, quote: Some(quote), source: Some(source) }
+                };
                 let mut offset = position - bounds.origin;
                 offset.x = offset.x.clamp(px(0.), (bounds.size.width - px(84.)).max(px(0.)));
                 offset.y = (offset.y - px(34.)).clamp(px(0.), (bounds.size.height - px(28.)).max(px(0.)));
-                this.comment_popup = Some((CommentTarget { card: part.card, proof: part.proof, quote: Some(quote), source }, offset));
+                this.prose_popup = passage.clone().filter(|_| part.is_none());
+                this.comment_popup = Some((target, offset));
                 cx.notify();
             });
         });
@@ -1722,6 +1753,8 @@ impl Workbench {
         self.comment_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.comment_popup = None;
         self.comment_selection = None;
+        self.prose_selection = None;
+        self.prose_popup = None;
         self.close_palette(window, cx);
         self.palette_graph = None;
         self.chat_activity_clock = None;
@@ -2049,6 +2082,7 @@ impl Workbench {
                     for (part, text) in &self.read_md {
                         self.highlight_quotes(part, &text.view, cx);
                     }
+                    self.highlight_passage_quotes(cx);
                     self.read_list.remeasure_items(0..self.read_rows.len());
                 }
             }
@@ -2219,9 +2253,12 @@ impl Workbench {
                     self.comment_target = None;
                     self.comment_popup = None;
                     self.comment_selection = None;
+                    self.prose_selection = None;
+                    self.prose_popup = None;
                     for (part, text) in &self.read_md {
                         self.highlight_quotes(part, &text.view, cx);
                     }
+                    self.highlight_passage_quotes(cx);
                     self.paper_jump = None;
                     self.paper_highlight = None;
                     self.doc_references = None;

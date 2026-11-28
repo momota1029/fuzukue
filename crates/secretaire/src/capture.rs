@@ -177,6 +177,7 @@ impl Scenario {
         };
         let project = match name {
             "card-markdown" | "translation-drift" => "tests/shots/fixtures/card-markdown",
+            "paper-comment" => "tests/shots/fixtures/paper-comment",
             "editor" | "open-file" => "tests/shots/fixtures/editor",
             "lsp" => "tests/shots/fixtures/lsp",
             "issue-intake" => "tests/shots/fixtures/issue-intake",

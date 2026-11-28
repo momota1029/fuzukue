@@ -1,0 +1,23 @@
+{
+  "steps": [
+    {"action": "size", "width": 1120, "height": 900},
+    {"action": "theme", "theme": "light"},
+    {"action": "connect"},
+    {"action": "open_paper", "deck": "papers/spheres"},
+    {"action": "wait_paper_card", "deck": "papers/spheres", "card": "lem-round"},
+    {"action": "wait_element", "id": "comment-passage-1"},
+    {"action": "hover", "id": "comment-passage-1"},
+    {"action": "screenshot", "name": "paper-comment-passage-button"},
+    {"action": "hover", "id": "comment-card-lem-round"},
+    {"action": "screenshot", "name": "paper-comment-card-button"},
+    {"action": "click", "id": "comment-passage-1"},
+    {"action": "type", "text": "Say in the abstract what round means."},
+    {"action": "screenshot", "name": "paper-comment-draft"},
+    {"action": "click", "id": "add-comment"},
+    {"action": "wait_element", "id": "comments-passage-1"},
+    {"action": "wait_idle"},
+    {"action": "screenshot", "name": "paper-comment-saved"},
+    {"action": "theme", "theme": "dark"},
+    {"action": "screenshot", "name": "paper-comment-saved-dark"}
+  ]
+}
