@@ -2116,6 +2116,7 @@ dependencies = [
  "chrono",
  "codebook-tree-sitter-latex",
  "dirs 6.0.0",
+ "embed-resource",
  "futures",
  "fuzukue-cards",
  "fuzukue-i18n",

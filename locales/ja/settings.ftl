@@ -3,6 +3,7 @@ settings-agents = エージェント
 settings-appearance = 外観
 settings-show-worker-messages = 作業役の発話を表示する
 settings-accent = アクセント色
+settings-accent-lemon = レモン
 settings-accent-teal = 青緑
 settings-accent-blue = 青
 settings-accent-green = 緑

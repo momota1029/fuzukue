@@ -378,6 +378,8 @@ if (!$dir.PSIsContainer -or $exe.PSIsContainer -or
     if ($Shortcut) {
         $link.TargetPath = $powerShell
         $link.Arguments = $linkArgs
+        # The shortcut starts PowerShell, so point its icon at the client.
+        $link.IconLocation = (Join-Path $dest 'fuzukue.exe') + ',0'
         $link.Save()
     }
     Write-Host "Installed $tag. Launch with $cmd"

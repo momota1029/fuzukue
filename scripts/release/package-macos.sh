@@ -53,7 +53,7 @@ done
 app="$stage/fuzukue.app"
 contents="$app/Contents"
 resources="$contents/Resources"
-mkdir -p "$contents/MacOS" "$resources/bin" "$resources/licenses" "$stage/fuzukue.iconset"
+mkdir -p "$contents/MacOS" "$resources/bin" "$resources/licenses"
 cp "$stage/target/release/fuzukue" "$contents/MacOS/"
 cp "$root/install.sh" "$resources/install.sh"
 install -m 755 "$root/scripts/release/macos/git" "$resources/bin/git"
@@ -80,17 +80,7 @@ plutil -insert FuzukueReleaseTag -string "$tag" "$info"
 plutil -insert FuzukueReleaseCommit -string "$commit" "$info"
 plutil -lint "$info"
 
-xcrun swift "$root/scripts/release/macos/make-icon.swift" "$stage/icon.png"
-for side in 16 32 128 256 512; do
-    for scale in 1 2; do
-        pixels=$((side * scale))
-        suffix=
-        if [[ $scale == 2 ]]; then suffix=@2x; fi
-        sips -z "$pixels" "$pixels" "$stage/icon.png" \
-            --out "$stage/fuzukue.iconset/icon_${side}x${side}$suffix.png" >/dev/null
-    done
-done
-iconutil -c icns -o "$resources/fuzukue.icns" "$stage/fuzukue.iconset"
+iconutil -c icns -o "$resources/fuzukue.icns" "$root/crates/fuzukue/assets/app-icon/macos/fuzukue.iconset"
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"
 archive="fuzukue-app-$tag-$platform.tar.gz"

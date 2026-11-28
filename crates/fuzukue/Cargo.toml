@@ -88,6 +88,10 @@ tempfile = "3"
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 unicode-script = "0.5"
 
+[build-dependencies]
+# Already part of the build through gpui-pre. Compiles the Windows icon resource.
+embed-resource = "3"
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 

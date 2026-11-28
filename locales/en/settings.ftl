@@ -3,6 +3,7 @@ settings-agents = Agents
 settings-appearance = Appearance
 settings-show-worker-messages = Show worker messages
 settings-accent = Accent color
+settings-accent-lemon = Lemon
 settings-accent-teal = Teal
 settings-accent-blue = Blue
 settings-accent-green = Green

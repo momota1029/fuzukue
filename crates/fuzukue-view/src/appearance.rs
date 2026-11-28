@@ -63,7 +63,8 @@ impl ThemePreset {
 
     pub const fn accent(self) -> AccentPreset {
         match self {
-            Self::Classic | Self::Lagoon => AccentPreset::Teal,
+            Self::Classic => AccentPreset::Lemon,
+            Self::Lagoon => AccentPreset::Teal,
             Self::Parchment | Self::Terracotta => AccentPreset::Orange,
             Self::Iris => AccentPreset::Purple,
             Self::Monochrome | Self::Ink => AccentPreset::Gray,
@@ -299,6 +300,7 @@ pub enum FontWeightChoice {
 pub enum AccentPreset {
     #[default]
     Theme,
+    Lemon,
     Teal,
     Blue,
     Green,
@@ -575,6 +577,24 @@ mod tests {
         assert_eq!(settings.theme.preset, ThemePreset::Classic);
         assert_eq!(settings.theme.base, ThemePreference::Dark);
         assert_eq!(settings.theme.accent, AccentChoice::Custom("#2468ac".into()));
+    }
+
+    #[test]
+    fn default_accent_is_lemon_and_saved_accents_are_kept() {
+        assert_eq!(ThemePreset::default().accent(), AccentPreset::Lemon);
+        for (id, accent) in [
+            ("theme", AccentPreset::Theme),
+            ("lemon", AccentPreset::Lemon),
+            ("teal", AccentPreset::Teal),
+        ] {
+            let settings = AppearanceSettings::from_toml(&format!("[theme]\naccent = '{id}'")).unwrap();
+            assert_eq!(settings.theme.accent, AccentChoice::Preset(accent));
+            assert!(settings.to_toml().unwrap().contains(&format!("accent = \"{id}\"")));
+        }
+        // A client without a preset name keeps it as written, so a newer choice survives its save.
+        let settings = AppearanceSettings::from_toml("[theme]\naccent = 'future-accent'").unwrap();
+        assert_eq!(settings.theme.accent, AccentChoice::Custom("future-accent".into()));
+        assert!(settings.to_toml().unwrap().contains("accent = \"future-accent\""));
     }
 
     #[test]

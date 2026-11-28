@@ -52,14 +52,14 @@ import kotlin.time.Duration.Companion.nanoseconds
 @Composable
 internal fun RemoteTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
     val colors = if (dark) darkColorScheme(
-        primary = Color(0xFFC4C2FF), onPrimary = Color(0xFF292458),
-        primaryContainer = Color(0xFF383464), onPrimaryContainer = Color(0xFFE9E6FF),
+        primary = Color(0xFFEFFF3A), onPrimary = Color(0xFF2F3300),
+        primaryContainer = Color(0xFF454A12), onPrimaryContainer = Color(0xFFF6FFB0),
         background = Color(0xFF171823), surface = Color(0xFF1D1F2C),
         surfaceContainer = Color(0xFF252737), surfaceContainerHigh = Color(0xFF303247),
         outlineVariant = Color(0xFF42455A),
     ) else lightColorScheme(
-        primary = Color(0xFF504894), onPrimary = Color.White,
-        primaryContainer = Color(0xFFEAE6FF), onPrimaryContainer = Color(0xFF30286B),
+        primary = Color(0xFF646C00), onPrimary = Color.White,
+        primaryContainer = Color(0xFFEEF5B8), onPrimaryContainer = Color(0xFF343900),
         background = Color(0xFFF8F8FD), surface = Color(0xFFFFFBFF),
         surfaceContainer = Color(0xFFF0EFF9), surfaceContainerHigh = Color(0xFFE7E6F4),
         outlineVariant = Color(0xFFD6D5E4),

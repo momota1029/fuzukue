@@ -177,7 +177,14 @@ impl AccentSwatch {
     }
 }
 
-const ACCENT_SWATCHES: [AccentSwatch; 7] = [
+const ACCENT_SWATCHES: [AccentSwatch; 8] = [
+    // Light themes darken this to olive in `accessible_accent`.
+    AccentSwatch {
+        preset: AccentPreset::Lemon,
+        label: "settings-accent-lemon",
+        light: 0xefff3a,
+        dark: 0xefff3a,
+    },
     AccentSwatch {
         preset: AccentPreset::Teal,
         label: "settings-accent-teal",
@@ -394,10 +401,9 @@ fn desktop_palette(
 ) -> ThemeColor {
     let surfaces = ThemeSurfaces::for_preset(preset, dark);
     let accent_surface = surfaces.least_contrast(dark);
-    let is_classic_teal = preset == ThemePreset::Classic && match choice {
-        AccentChoice::Preset(accent) => matches!(accent, AccentPreset::Theme | AccentPreset::Teal),
-        AccentChoice::Custom(value) => parse_hex_color(value).is_none(),
-    };
+    // Teal on Classic keeps its hand-picked hover, link, and selection colors.
+    let is_classic_teal =
+        preset == ThemePreset::Classic && *choice == AccentChoice::Preset(AccentPreset::Teal);
     let primary = accessible_accent(accent_color(choice, preset, dark), accent_surface, dark, 4.5);
     let [mut foreground, mut muted, selection, text_selection, success, warning, danger, info] =
         if dark {
@@ -757,8 +763,18 @@ pub(super) fn main_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(window_bounds),
         display_id,
+        icon: window_icon(),
         ..gpui_kit::component::TitleBar::window_options()
     }
+}
+
+/// X11 takes the window icon from the client. Windows reads the executable's icon
+/// resource and macOS the app bundle.
+fn window_icon() -> Option<Arc<image::RgbaImage>> {
+    let png = include_bytes!("../assets/app-icon/linux/window-icon.png");
+    image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .ok()
+        .map(|icon| Arc::new(icon.into_rgba8()))
 }
 
 fn restore_window_placement(
@@ -1921,12 +1937,35 @@ mod accent_tests {
     }
 
     #[test]
-    fn default_accent_separates_buttons_links_and_text_selection() {
+    fn default_accent_is_lemon_in_dark_and_darkened_to_olive_in_light() {
+        let default = desktop_palette(ThemeColor::default(), ThemePreset::Classic, &AccentChoice::default(), true);
+        assert_eq!(default.primary, rgb(0xefff3a).into());
+        let light = desktop_palette(ThemeColor::default(), ThemePreset::Classic, &AccentChoice::default(), false);
+        let primary = Rgba::from(light.primary);
+        for (channel, expected) in [(primary.r, 0x64), (primary.g, 0x6c), (primary.b, 0x00)] {
+            assert!((channel * 255. - expected as f32).abs() <= 3., "{primary:?}");
+        }
+        for dark in [false, true] {
+            for choice in [AccentChoice::Preset(AccentPreset::Lemon), AccentChoice::Custom("invalid".into())] {
+                let colors = desktop_palette(ThemeColor::default(), ThemePreset::Classic, &choice, dark);
+                let default = desktop_palette(
+                    ThemeColor::default(), ThemePreset::Classic, &AccentChoice::default(), dark,
+                );
+                assert_eq!(colors.primary, default.primary);
+                assert_eq!(colors.link, default.link);
+                assert_eq!(colors.selection, default.selection);
+            }
+        }
+    }
+
+    #[test]
+    fn classic_teal_separates_buttons_links_and_text_selection() {
         for (dark, primary, link, selection) in [
             (false, 0x00735e, 0x00735e, 0xbdf0e4),
             (true, 0x02fac8, 0x7affe1, 0x235349),
         ] {
-            let colors = desktop_palette(ThemeColor::default(), ThemePreset::Classic, &AccentChoice::default(), dark);
+            let teal = AccentChoice::Preset(AccentPreset::Teal);
+            let colors = desktop_palette(ThemeColor::default(), ThemePreset::Classic, &teal, dark);
             assert_eq!(colors.primary, rgb(primary).into());
             let original_link = Hsla::from(rgb(link));
             assert_eq!(colors.link.h, original_link.h);
@@ -2140,6 +2179,11 @@ mod accent_tests {
 #[cfg(test)]
 mod window_tests {
     use super::*;
+
+    #[test]
+    fn bundled_window_icon_decodes() {
+        assert_eq!(window_icon().unwrap().dimensions(), (128, 128));
+    }
 
     #[test]
     fn ui_line_height_scales_with_the_label_font_size() {
