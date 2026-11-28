@@ -479,7 +479,7 @@ async fn first_turn(
         Ok(permit) => permit,
         Err(_) => {
             let save = || app.drain.enqueue(&app.state_dir, session, crate::user_item(),
-                crate::self_update::drain::Work::Prompt { text: text.clone(), paths: Vec::new(), reply_blocks: false });
+                crate::self_update::drain::Work::Prompt { text: text.clone(), paths: Vec::new(), reply_blocks: false, reply_interactions: false });
             if let Some(update) = app.registry.upgrade().and_then(|registry| registry.self_update.get().cloned()) {
                 update.hold_input(save)?;
             } else {

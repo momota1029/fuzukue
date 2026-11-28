@@ -1636,8 +1636,8 @@ impl Hub {
         (initial, live)
     }
 
-    pub(crate) fn reply_fallback_at(&self, after: u64) -> crate::reply_components::Fallback {
-        let mut fallback = crate::reply_components::Fallback::default();
+    pub(crate) fn reply_fallback_at(&self, after: u64, keep_blocks: bool) -> crate::reply_components::Fallback {
+        let mut fallback = crate::reply_components::Fallback::new(keep_blocks);
         if after == 0 {
             return fallback;
         }

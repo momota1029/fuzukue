@@ -43,6 +43,8 @@ pub(crate) enum Work {
         paths: Vec<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         reply_blocks: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reply_interactions: bool,
     },
     Compact { instructions: String },
     WatchWake {

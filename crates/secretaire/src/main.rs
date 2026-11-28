@@ -1411,7 +1411,7 @@ async fn serve_workspace(
     app: Arc<Workspace>,
     (protocol, resume_from, first, thread_history): (u32, u64, bool, bool),
     transcripts: Option<&hub::TranscriptResume>,
-    reply_blocks: bool,
+    reply_blocks: reply_components::Support,
     locale: &std::sync::RwLock<fuzukue_i18n::Locale>,
     client_manifest: Option<fuzukue_proto::ClientManifest>,
     distribution: &mut Option<(std::net::IpAddr, tokio::sync::broadcast::Receiver<Option<std::net::IpAddr>>)>,
@@ -1530,7 +1530,9 @@ async fn serve_workspace(
         }
     }
     let send = |env: &Envelope| wire_event(env, protocol, Some(&app.id), locale_for_wire());
-    let mut fallback = (!reply_blocks).then(|| app.hub.reply_fallback_at(resume_from));
+    use reply_components::Support;
+    let mut fallback = (reply_blocks != Support::Interactions)
+        .then(|| app.hub.reply_fallback_at(resume_from, reply_blocks == Support::Blocks));
     let transcript_frames = |env: &Envelope, fallback: &mut Option<reply_components::Fallback>| {
         let Some(fallback) = fallback else { return vec![send(env)] };
         if !reply_components::Fallback::relevant(&env.event) {
@@ -3724,11 +3726,11 @@ async fn replay_prompts(app: &Arc<Workspace>) {
                     commands::start_compaction(app, session, instructions, record.id, work);
                 }
             }
-            Work::Prompt { text, paths, reply_blocks } => {
+            Work::Prompt { text, paths, reply_blocks, reply_interactions } => {
                 if !matches!(app.drain.claim(&app.state_dir, session, &record.id), Ok(true)) { continue; }
                 let result = match with_attachments(&app.project_dir, &app.state_dir, &text, &paths) {
                     Ok((prompt, images)) => {
-                        let prompt = reply_components::guide(prompt, reply_blocks);
+                        let prompt = reply_components::guide(prompt, reply_blocks, reply_interactions);
                         start_user_prompt(app, session.clone(), settings, prompt, None, images).await
                     }
                     Err(error) => Err(error),
@@ -3807,9 +3809,12 @@ impl Workspace {
 }
 
 async fn handle_from_client(
-    app: &Arc<Workspace>, msg: ClientMsg, client: Option<(&screenshots::Connection<'_>, bool)>,
+    app: &Arc<Workspace>, msg: ClientMsg, client: Option<(&screenshots::Connection<'_>, reply_components::Support)>,
 ) -> anyhow::Result<()> {
-    let reply_blocks = client.is_some_and(|(_, supported)| supported);
+    use reply_components::Support;
+    let support = client.map_or(Support::Markdown, |(_, support)| support);
+    let reply_blocks = support != Support::Markdown;
+    let reply_interactions = support == Support::Interactions;
     let client = client.map(|(connection, _)| connection);
     match msg {
         ClientMsg::ListPendingApprovals { .. } | ClientMsg::DecideApproval { .. } | ClientMsg::WorkspaceRequest { .. } | ClientMsg::WorkspaceRequestSurface { .. } => {}
@@ -3972,7 +3977,7 @@ async fn handle_from_client(
                         "Wait for the current turn and queued messages to finish");
                     let _work = work?;
                     let selection = app.escalation_model(&session).await?;
-                    prompt_escalated_partner(app, &session, selection, reply_components::guide(prompt, reply_blocks), user_event, images).await
+                    prompt_escalated_partner(app, &session, selection, reply_components::guide(prompt, reply_blocks, reply_interactions), user_event, images).await
                 }.await;
                 if let Err(error) = result {
                     commands::escalation_unavailable(&app.hub, &session, format!("{error:#}"));
@@ -3987,7 +3992,7 @@ async fn handle_from_client(
                     .and_then(|record| record.codex_thread_id.clone()).context("Codex のスレッドが見つからない")?;
                 let codex = app.running_codex().await.context("Codex が停止した")?;
                 // The hub knows whether the running turn has received external input.
-                let input = reply_components::guide(prompt.clone(), reply_blocks);
+                let input = reply_components::guide(prompt.clone(), reply_blocks, reply_interactions);
                 let (steering, notices) = app.partner_input(&session, input, false).await?;
                 let selection = preferences::for_turn(app, &session, TurnKind::UserConversation, false, &prompt, &preferences::Inheritance::Desk)?;
                 let preferences = preferences::load_selection(selection, app, &session).await?;
@@ -4015,7 +4020,7 @@ async fn handle_from_client(
                     _ => unreachable!("user prompt event"),
                 };
                 let store = || app.drain.enqueue(&app.state_dir, &session, item.clone(),
-                    self_update::drain::Work::Prompt { text: text.clone(), paths, reply_blocks });
+                    self_update::drain::Work::Prompt { text: text.clone(), paths, reply_blocks, reply_interactions });
                 match app.registry.upgrade().and_then(|registry| registry.self_update.get().cloned()) {
                     Some(update) => { update.hold_input(store)?; }
                     None => { store()?; }
@@ -4032,7 +4037,7 @@ async fn handle_from_client(
                 AgentBackend::Codex => "codex",
             };
             send_latency::expect_echo(user_event.as_ref().unwrap(), route);
-            let prompt = reply_components::guide(prompt, reply_blocks);
+            let prompt = reply_components::guide(prompt, reply_blocks, reply_interactions);
             start_user_prompt(app, session, settings, prompt, user_event, images).await?;
         }
         ClientMsg::Interrupt { session } => {

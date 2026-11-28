@@ -1,5 +1,6 @@
 use super::*;
 use fuzukue_proto::{Actor, ReviewFindingsOutcome};
+use gpui_kit::EntityInputHandler as _;
 
 const MESSAGE: &str = include_str!("../../../../tests/shots/fixtures/xml-components.md");
 const UI_KIT: &str = include_str!("../../../../tests/shots/fixtures/ui-kit.md");
@@ -343,6 +344,128 @@ fn flowchart_streams_and_lays_out_branches_at_narrow_width() {
                 runner.step(Step::SeedChatReply { text: String::new(), streaming: false }, cx).await?;
                 runner.step(Step::WaitElement { id: "xml-component-literal".into() }, cx).await?;
                 Ok(())
+            }.await;
+            result.send(outcome).unwrap();
+            cx.update(|cx| cx.quit());
+        }).detach();
+    });
+    completed.recv().unwrap().unwrap();
+}
+
+#[test]
+fn reply_interactions_update_one_editable_draft_and_send_once() {
+    let _locale = crate::i18n::pin_test_locale(fuzukue_i18n::Locale::supported("en").unwrap());
+    const PREFIX: char = '\u{524d}';
+    let scenario: Scenario =
+        serde_json::from_str(include_str!("../../../../tests/shots/reply-interactions.json")).unwrap();
+    let (result, completed) = std::sync::mpsc::channel();
+    gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+        gpui_kit::init(cx);
+        math::init(cx);
+        let (handle, view) = open_workbench_at_size(cx, 680., 930.).unwrap();
+        let (out, messages) = std::sync::mpsc::channel();
+        cx.spawn(async move |cx| {
+            let mut runner = Runner {
+                handle, view, target: None, output: PathBuf::new(), read_only: false,
+                seen: HashMap::new(),
+            };
+            let outcome: Result<()> = async {
+                let click = |id: &str| Step::Click { id: Some(id.into()), x: None, y: None };
+                let number = "Selection — Examples: 5";
+                let methods = "Methods, assumptions, and notes for a reader new to the project";
+                let selection = format!("Selection — Report sections: Summary, {methods}");
+                for step in scenario.steps {
+                    let ready = matches!(&step, Step::WaitElement { id } if id == "xml-interaction-0-option-0");
+                    if !matches!(step, Step::Screenshot { .. }) {
+                        runner.step(step, cx).await?;
+                    }
+                    if ready {
+                        runner.update(cx, |view, _, _| view.out = out.clone().into())?;
+                    }
+                }
+                runner.step(Step::AssertComposerText {
+                    text: format!("Please prepare a draft.\n{selection}\n{number}"),
+                }, cx).await?;
+                runner.step(click("xml-interaction-1-increase"), cx).await?;
+                let unexpected = messages.try_iter().collect::<Vec<_>>();
+                assert!(unexpected.is_empty(), "unexpected client messages: {unexpected:?}");
+                runner.update(cx, |view, window, cx| {
+                    view.input.update(cx, |input, cx| {
+                        input.replace_text_in_range(Some(0..0), &format!("{PREFIX} "), window, cx);
+                    });
+                })?;
+                runner.step(click("xml-interaction-1-decrease"), cx).await?;
+                // Clicking the selected option focuses it. Space operates it again.
+                runner.step(click("xml-interaction-0-option-0"), cx).await?;
+                runner.step(Step::AssertComposerText {
+                    text: format!("{PREFIX} Please prepare a draft.\nSelection — Report sections: {methods}\nSelection — Examples: 3"),
+                }, cx).await?;
+                runner.frame(cx)?;
+                cx.update_window(runner.handle, |_, window, cx| {
+                    let mut keystroke = gpui_kit::Keystroke::parse("space").unwrap();
+                    keystroke.key_char = Some(" ".into());
+                    window.dispatch_event(PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+                        keystroke: keystroke.clone(), is_held: false, prefer_character_input: false,
+                    }), cx);
+                    window.dispatch_event(PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke }), cx);
+                })?;
+                let draft = format!("{PREFIX} Please prepare a draft.\n{selection}\nSelection — Examples: 3");
+                runner.step(Step::AssertComposerText { text: draft.clone() }, cx).await?;
+                runner.step(click("xml-interaction-0-remove"), cx).await?;
+                let draft = format!("{PREFIX} Please prepare a draft.\nSelection — Examples: 3");
+                runner.step(Step::AssertComposerText { text: draft.clone() }, cx).await?;
+                assert!(messages.try_iter().next().is_none());
+                runner.step(click("send-prompt"), cx).await?;
+                assert!(matches!(messages.try_recv()?, ClientMsg::Prompt { session, text }
+                    if session == "chat-reply-fixture" && text == draft));
+                assert!(messages.try_iter().next().is_none());
+                runner.step(Step::AssertComposerText { text: String::new() }, cx).await?;
+                Ok(())
+            }.await;
+            result.send(outcome).unwrap();
+            cx.update(|cx| cx.quit());
+        }).detach();
+    });
+    completed.recv().unwrap().unwrap();
+}
+
+#[test]
+fn reply_interactions_change_panel_display_only_until_explicit_insert() {
+    let _locale = crate::i18n::pin_test_locale(fuzukue_i18n::Locale::supported("en").unwrap());
+    let (result, completed) = std::sync::mpsc::channel();
+    gpui_kit::platform::headless().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+        gpui_kit::init(cx);
+        math::init(cx);
+        let (handle, view) = open_workbench_at_size(cx, 680., 790.).unwrap();
+        let (out, messages) = std::sync::mpsc::channel();
+        cx.spawn(async move |cx| {
+            let mut runner = Runner {
+                handle, view, target: None, output: PathBuf::new(), read_only: false,
+                seen: HashMap::new(),
+            };
+            let steps: Scenario = serde_json::from_str(r#"{"steps":[
+                {"action":"locale","locale":"en"},
+                {"action":"seed_chat_reply","text":"<fuzukue:tabs label=\"Report\"><fuzukue:panel label=\"First\">Overview.</fuzukue:panel><fuzukue:panel label=\"/help\">Details.</fuzukue:panel></fuzukue:tabs>\n\n<fuzukue:disclosure label=\"Notes\"><fuzukue:panel label=\"Sources\">Sources used.</fuzukue:panel></fuzukue:disclosure>"},
+                {"action":"wait_element","id":"xml-interaction-0-show-1"},
+                {"action":"click","id":"xml-interaction-0-show-1"},
+                {"action":"click","id":"xml-interaction-1-show-0"},
+                {"action":"assert_composer_text","text":""},
+                {"action":"click","id":"xml-interaction-0-insert"},
+                {"action":"assert_composer_text","text":"Selection — Report: /help"},
+                {"action":"click","id":"xml-interaction-1-show-0"},
+                {"action":"assert_composer_text","text":"Selection — Report: /help"}
+            ]}"#).unwrap();
+            let outcome = async {
+                for step in steps.steps {
+                    let ready = matches!(&step, Step::WaitElement { .. });
+                    runner.step(step, cx).await?;
+                    if ready {
+                        runner.update(cx, |view, _, _| view.out = out.clone().into())?;
+                    }
+                }
+                let unexpected = messages.try_iter().collect::<Vec<_>>();
+                assert!(unexpected.is_empty(), "unexpected client messages: {unexpected:?}");
+                Ok::<_, anyhow::Error>(())
             }.await;
             result.send(outcome).unwrap();
             cx.update(|cx| cx.quit());

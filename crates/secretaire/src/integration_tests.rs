@@ -9630,6 +9630,122 @@ async fn distribution_auth_welcome_notice_and_rejected_websocket() -> Result<()>
 
 
 #[tokio::test]
+async fn reply_interaction_prompt_is_one_user_message_for_both_clients_and_after_reconnect() -> Result<()> {
+    use axum::{Extension, extract::ConnectInfo};
+    use futures_util::{SinkExt, StreamExt};
+    use fuzukue_proto::PROTOCOL_VERSION;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::{io::{duplex, DuplexStream}, sync::mpsc, time::timeout};
+    use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
+
+    const TEXT: &str = "Selection — Format: /help";
+    const CONTROL: &str = r#"<fuzukue:choices label="Format"><fuzukue:option label="/help"/></fuzukue:choices>"#;
+    type Socket = WebSocketStream<DuplexStream>;
+
+    async fn send(socket: &mut Socket, message: ClientMsg) -> Result<()> {
+        socket.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
+        Ok(())
+    }
+
+    async fn tail(socket: &mut Socket, app: &Workspace, session: &str) -> Result<Vec<ServerEvent>> {
+        send(socket, ClientMsg::InWorkspace {
+            id: app.id.clone(),
+            request: Box::new(ClientMsg::GetThreadTail { session: session.into(), request: 1 }),
+        }).await?;
+        while let Some(frame) = socket.next().await {
+            match serde_json::from_str::<Envelope>(frame?.to_text()?)?.event {
+                ServerEvent::ThreadTail { session: owner, request: 1, events, .. } if owner == session => {
+                    return Ok(events);
+                }
+                ServerEvent::Error { message } => anyhow::bail!("{message}"),
+                _ => {}
+            }
+        }
+        anyhow::bail!("WebSocket closed before thread tail")
+    }
+
+    fn user_items(events: &[ServerEvent]) -> Vec<(&str, &str)> {
+        events.iter().filter_map(|event| match event {
+            ServerEvent::TextDelta { item, actor: Actor::User, text, .. } => {
+                Some((item.as_str(), text.as_str()))
+            }
+            _ => None,
+        }).collect()
+    }
+
+    let project = TempProject::new()?;
+    let program = project.path().join("reply-claude");
+    fs::write(&program, r#"#!/bin/sh
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"reply-session"}'
+while IFS= read -r line; do
+    printf '%s\n' '{"type":"assistant","message":{"id":"received","content":[{"type":"text","text":"Received."}]}}'
+    printf '%s\n' '{"type":"result","is_error":false}'
+done
+"#)?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+    let mut app = mcp_app(&project);
+    Arc::get_mut(&mut app).unwrap().claude_program = Some(program);
+    let session = app.hub.edit_threads(|store| store.create(None))?;
+    app.hub.publish(ServerEvent::TextDelta {
+        session: session.clone(), item: "original-reply".into(), actor: Actor::Claude, text: CONTROL.into(),
+    });
+    app.hub.publish(ServerEvent::TurnEnded { session: session.clone(), actor: Actor::Claude });
+
+    let access = crate::remote::Access::new(&project.path().join("access"), Default::default())?;
+    let peer = "127.0.0.1:1234".parse::<std::net::SocketAddr>()?;
+    let router = crate::router(crate::App::fixture(app.clone()), Arc::new(access)).layer(Extension(ConnectInfo(peer)));
+    let (incoming, sockets) = mpsc::channel(2);
+    let server = tokio::spawn(async move { axum::serve(MemoryListener(sockets), router).await });
+
+    let result = timeout(std::time::Duration::from_secs(15), async {
+        let connect = |android: bool| {
+            let incoming = incoming.clone();
+            async move {
+                let (local, remote) = duplex(128 * 1024);
+                incoming.send(remote).await?;
+                let (mut socket, _) = client_async("ws://localhost/ws", local).await?;
+                send(&mut socket, ClientMsg::Hello {
+                    protocol: PROTOCOL_VERSION, locale: Some("en".into()), resume_from: None, workspace: None,
+                    platform: android.then(|| "android".into()), build_id: None, thread_history: true,
+                    selection_scoped_transcripts: true, epoch: None, cached_sessions: Vec::new(),
+                    markdown_components: if android { vec![] } else { fuzukue_view::xml_components::capabilities() },
+                }).await?;
+                Ok::<_, anyhow::Error>(socket)
+            }
+        };
+        let mut desktop = connect(false).await?;
+        let mut android = connect(true).await?;
+        for (socket, expected_native) in [(&mut desktop, true), (&mut android, false)] {
+            let events = tail(socket, &app, &session).await?;
+            assert!(user_items(&events).is_empty());
+            let original = events.iter().find_map(|event| match event {
+                ServerEvent::TextDelta { item, text, .. } if item == "original-reply" => Some(text.as_str()),
+                _ => None,
+            }).context("missing original reply")?;
+            assert_eq!(original.contains("<fuzukue:"), expected_native);
+            assert!(original.contains("Format") && original.contains("/help"));
+        }
+
+        let (_, mut live) = app.hub.subscribe(u64::MAX);
+        send(&mut desktop, ClientMsg::Prompt { session: session.clone(), text: TEXT.into() }).await?;
+        let events = wait_for_desk_turn(&session, &mut live).await?;
+        let user = user_items(&events);
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].1, TEXT);
+        let expected = user[0];
+        for socket in [&mut desktop, &mut android] {
+            assert_eq!(user_items(&tail(socket, &app, &session).await?), [expected]);
+        }
+        drop(desktop);
+        let mut reconnected = connect(false).await?;
+        assert_eq!(user_items(&tail(&mut reconnected, &app, &session).await?), [expected]);
+        Ok::<_, anyhow::Error>(())
+    }).await;
+    server.abort();
+    result?
+}
+
+#[tokio::test]
 async fn change_history_round_trips_over_websocket() -> Result<()> {
     use axum::{extract::ConnectInfo, Extension};
     use futures_util::{SinkExt, StreamExt};

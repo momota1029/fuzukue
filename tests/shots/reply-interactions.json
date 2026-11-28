@@ -1,0 +1,53 @@
+{
+  "steps": [
+    {
+      "action": "size",
+      "width": 680,
+      "height": 930
+    },
+    {
+      "action": "locale",
+      "locale": "en"
+    },
+    {
+      "action": "theme",
+      "theme": "light"
+    },
+    {
+      "action": "seed_chat_reply",
+      "text": "Which sections should the report include?\n\n<fuzukue:checklist label=\"Report sections\">\n  <fuzukue:option label=\"Summary\"/>\n  <fuzukue:option label=\"Methods, assumptions, and notes for a reader new to the project\"/>\n  <fuzukue:option label=\"Appendix\"/>\n</fuzukue:checklist>\n\n<fuzukue:number label=\"Examples\" min=\"1\" max=\"5\" step=\"2\" value=\"3\"/>"
+    },
+    {
+      "action": "wait_element",
+      "id": "xml-interaction-0-option-0"
+    },
+    {
+      "action": "click",
+      "id": "chat-input"
+    },
+    {
+      "action": "type",
+      "text": "Please prepare a draft."
+    },
+    {
+      "action": "click",
+      "id": "xml-interaction-0-option-0"
+    },
+    {
+      "action": "click",
+      "id": "xml-interaction-0-option-1"
+    },
+    {
+      "action": "click",
+      "id": "xml-interaction-1-increase"
+    },
+    {
+      "action": "wait_element",
+      "id": "xml-interaction-1-preview"
+    },
+    {
+      "action": "screenshot",
+      "name": "reply-interactions"
+    }
+  ]
+}

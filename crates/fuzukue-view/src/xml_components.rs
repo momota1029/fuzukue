@@ -1,9 +1,9 @@
 //! XML reply components and their canonical UI tree.
 
 use crate::ui_kit::{
-    self, Component, FlowBranch, FlowNode, ListItem, ListKind, Segment, Severity, Span, Step,
-    StepStatus, TextKind, Tone,
-    MAX_CELLS, MAX_CHILDREN, MAX_DEPTH, MAX_LABEL, MAX_ROWS, MAX_TEXT,
+    self, Component, FlowBranch, FlowNode, Interaction, InteractionPanel, ListItem, ListKind,
+    Segment, Severity, Span, Step, StepStatus, TextKind, Tone,
+    MAX_CELLS, MAX_CHILDREN, MAX_DEPTH, MAX_INTERACTION_ITEMS, MAX_LABEL, MAX_ROWS, MAX_TEXT,
 };
 use fuzukue_proto::MarkdownComponentCapability;
 use markdown::mdast::Node;
@@ -11,11 +11,13 @@ use markdown::mdast::Node;
 mod source;
 pub use source::{
     BlockContent, ReplyBlock, has_pending_block, link_card_refs, markdown_fallback, reply_blocks,
-    text_fallback,
+    stage1_markdown_fallback, text_fallback, text_with_interactions,
 };
 
 /// Capability token for fence-less blocks and the current native component set.
 pub const REPLY_BLOCKS_CAPABILITY: &str = "reply-blocks";
+/// Independent opt-in for controls that stage 1 clients cannot display.
+pub const REPLY_INTERACTIONS_CAPABILITY: &str = "reply-interactions";
 
 const FENCE_LANGUAGE: &str = "fuzukue-v1";
 const NAMESPACE: &str = "urn:fuzukue:ui:v1";
@@ -37,6 +39,7 @@ const TAGS: &[&str] = &[
     "details",
     "accordion",
     "divider",
+    REPLY_INTERACTIONS_CAPABILITY,
     "kbd",
     "code",
 ];
@@ -177,6 +180,9 @@ impl<'a> Xml<'a> {
                 }
             }
             "progress" => self.progress(&tag)?,
+            "choices" | "checklist" | "number" | "tabs" | "disclosure" if depth == 1 => {
+                self.interaction(&tag)?
+            }
             "text" => {
                 tag.allowed(&["style"])?;
                 let kind = match tag.get("style").unwrap_or("body") {
@@ -315,6 +321,47 @@ impl<'a> Xml<'a> {
             }
             _ => return None,
         })
+    }
+
+    fn interaction(&mut self, tag: &Tag<'_>) -> Option<Component> {
+        let label = tag.get("label")?.trim().to_owned();
+        let control = match tag.local() {
+            "choices" | "checklist" => {
+                tag.allowed(&["label"])?;
+                let options = self.members(tag, MAX_INTERACTION_ITEMS, |_, option| {
+                    if option.name != "fuzukue:option" || !option.empty {
+                        return None;
+                    }
+                    option.allowed(&["label"])?;
+                    Some(option.get("label")?.trim().to_owned())
+                })?;
+                Interaction::Select { multiple: tag.local() == "checklist", options }
+            }
+            "number" if tag.empty => {
+                tag.allowed(&["label", "min", "max", "step", "value"])?;
+                Interaction::Number {
+                    min: tag.get("min")?.parse().ok()?,
+                    max: tag.get("max")?.parse().ok()?,
+                    step: tag.get("step")?.parse().ok()?,
+                    value: tag.get("value")?.parse().ok()?,
+                }
+            }
+            "tabs" | "disclosure" => {
+                tag.allowed(&["label"])?;
+                let items = self.members(tag, MAX_INTERACTION_ITEMS, |xml, panel| {
+                    if panel.name != "fuzukue:panel" || panel.empty {
+                        return None;
+                    }
+                    panel.allowed(&["label"])?;
+                    let text = xml.text(MAX_TEXT)?.trim().to_owned();
+                    xml.close(panel.name)?;
+                    Some(InteractionPanel { label: panel.get("label")?.trim().to_owned(), text })
+                })?;
+                Interaction::Panels { tabs: tag.local() == "tabs", items }
+            }
+            _ => return None,
+        };
+        Some(Component::Interaction { label, control })
     }
 
     fn progress(&mut self, tag: &Tag<'_>) -> Option<Component> {

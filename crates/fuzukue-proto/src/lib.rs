@@ -3026,10 +3026,16 @@ mod tests {
         assert_eq!(serde_json::to_value(hello).unwrap(), legacy);
 
         let mut offered = legacy.clone();
-        offered["markdown_components"] = serde_json::json!([{"tag": "callout", "version": 1}]);
+        offered["markdown_components"] = serde_json::json!([
+            {"tag": "reply-blocks", "version": 1},
+            {"tag": "reply-interactions", "version": 1},
+        ]);
         let hello: ClientMsg = serde_json::from_value(offered.clone()).unwrap();
         assert!(matches!(&hello, ClientMsg::Hello { markdown_components, .. }
-            if markdown_components == &[MarkdownComponentCapability { tag: "callout".into(), version: 1 }]));
+            if markdown_components == &[
+                MarkdownComponentCapability { tag: "reply-blocks".into(), version: 1 },
+                MarkdownComponentCapability { tag: "reply-interactions".into(), version: 1 },
+            ]));
         assert_eq!(serde_json::to_value(hello).unwrap(), offered);
 
         #[derive(Deserialize)]

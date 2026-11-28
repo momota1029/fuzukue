@@ -135,9 +135,28 @@ pub struct Segment {
     pub tone: Tone,
 }
 
+/// A local reply control. Its values are text or bounded integers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Interaction {
+    Select { multiple: bool, options: Vec<String> },
+    Number { min: i32, max: i32, step: i32, value: i32 },
+    Panels { tabs: bool, items: Vec<InteractionPanel> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionPanel {
+    pub label: String,
+    pub text: String,
+}
+
+pub(crate) const MAX_INTERACTION_ITEMS: usize = 12;
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Component {
+    Interaction { label: String, control: Interaction },
     Card {
         title: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -330,6 +349,21 @@ impl Component {
                     }
                 }
             }
+            Self::Interaction { label, control } => {
+                lines.push(label.clone());
+                match control {
+                    Interaction::Select { options, .. } => lines.extend(options.iter().cloned()),
+                    Interaction::Number { min, max, step, value } => {
+                        lines.push(format!("{value} ({min}–{max}, Δ {step})"));
+                    }
+                    Interaction::Panels { items, .. } => {
+                        for item in items {
+                            lines.push(item.label.clone());
+                            lines.push(item.text.clone());
+                        }
+                    }
+                }
+            }
             Self::Table { rows } => lines.extend(rows.iter().map(|row| row.join(" · "))),
             Self::Finding { deck, id } => lines.push(format!("{deck} · {id}")),
             Self::Divider => {}
@@ -359,6 +393,23 @@ impl Validator {
             return Err("UI labels must be nonempty single lines");
         }
         self.text(text, MAX_LABEL)
+    }
+
+    fn interaction_labels<'a>(
+        &mut self,
+        labels: impl ExactSizeIterator<Item = &'a str>,
+    ) -> Result<(), &'static str> {
+        if !(1..=MAX_INTERACTION_ITEMS).contains(&labels.len()) {
+            return Err("Invalid number of reply control items");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for label in labels {
+            self.label(label)?;
+            if !seen.insert(label.trim()) {
+                return Err("Reply control labels must be distinct");
+            }
+        }
+        Ok(())
     }
 
     fn optional_label(&mut self, text: &Option<String>) -> Result<(), &'static str> {
@@ -482,6 +533,35 @@ impl Validator {
                                 self.label(&branch.label)?;
                                 self.label(&branch.result)?;
                             }
+                        }
+                    }
+                }
+            }
+            Component::Interaction { label, control } => {
+                if depth != 1 {
+                    return Err("Reply controls must be top-level");
+                }
+                self.label(label)?;
+                match control {
+                    Interaction::Select { options, .. } => {
+                        self.interaction_labels(options.iter().map(String::as_str))?;
+                    }
+                    Interaction::Number { min, max, step, value } => {
+                        const LIMIT: i32 = 1_000_000;
+                        if *min < -LIMIT || *max > LIMIT || min >= max
+                            || value < min || value > max || *step <= 0
+                            || (max - min) % step != 0 || (value - min) % step != 0
+                        {
+                            return Err("Invalid numeric range or step");
+                        }
+                    }
+                    Interaction::Panels { items, .. } => {
+                        self.interaction_labels(items.iter().map(|item| item.label.as_str()))?;
+                        for item in items {
+                            if item.text.trim().is_empty() {
+                                return Err("Reply panels require text");
+                            }
+                            self.text(&item.text, MAX_TEXT)?;
                         }
                     }
                 }

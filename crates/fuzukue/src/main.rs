@@ -651,6 +651,9 @@ impl Workbench {
 
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 8).placeholder(tr!("workbench-enter-a-message")));
         composer_markdown::observe(&input, window, cx);
+        cx.subscribe(&input, |this, _, event: &gpui_kit::base::input::InputEditsEvent, _| {
+            this.track_reply_draft_edits(event);
+        }).detach();
         let composer_focus = input.read(cx).focus_handle(cx);
         cx.on_focus(&composer_focus, window, |_, window, cx| TextSelection::clear(window, cx)).detach();
         cx.on_blur(&composer_focus, window, Self::log_composer_blur).detach();

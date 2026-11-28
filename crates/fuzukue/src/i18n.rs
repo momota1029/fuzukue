@@ -4,7 +4,31 @@ use fuzukue_i18n::Locale;
 
 static CURRENT: RwLock<Locale> = RwLock::new(Locale::JAPANESE);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCALE: std::cell::Cell<Option<Locale>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestLocaleGuard(Option<Locale>);
+
+#[cfg(test)]
+pub(crate) fn pin_test_locale(locale: Locale) -> TestLocaleGuard {
+    TestLocaleGuard(TEST_LOCALE.with(|current| current.replace(Some(locale))))
+}
+
+#[cfg(test)]
+impl Drop for TestLocaleGuard {
+    fn drop(&mut self) {
+        TEST_LOCALE.with(|current| current.set(self.0));
+    }
+}
+
 pub(crate) fn current() -> Locale {
+    #[cfg(test)]
+    if let Some(locale) = TEST_LOCALE.with(|current| current.get()) {
+        return locale;
+    }
     *CURRENT.read().unwrap()
 }
 

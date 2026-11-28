@@ -175,3 +175,23 @@ cargo test --locked -p secretaire reply_components
 cargo test --locked --manifest-path crates/fuzukue/Cargo.toml --features headless-shot xml_components_test
 (cd android && ./gradlew :app:testDebugUnitTest --tests dev.labgui.remote.MarkdownComponentsTest)
 ````
+
+## 入力につながる部品
+
+操作部品は返信のトップレベルに置きます。GPUI で操作すると入力欄に一行が入り、送信するまでは下書きとして扱われます。同じ部品を再操作すると、その部品が入れた行だけが更新されます。入力欄にあった文章と、生成後にユーザーが編集した行は残ります。「入力欄から取り消す」で未編集の生成行を取り消せます。送信すると通常のユーザーメッセージとして履歴に残ります。
+
+- `choices` は一つ、`checklist` は複数の選択肢を選びます。選択肢は `<fuzukue:option label="…"/>` で指定します。チェックをすべて外すと「選択なし」が入力欄に反映されます。
+- `number` は `min`、`max`、`step`、`value` を持つ整数の部品です。範囲は −1,000,000 から 1,000,000 までで、上下限は異なり、刻みは正の整数です。上限と初期値は下限から刻み単位で到達できる値を指定します。
+- `tabs` と `disclosure` は `<fuzukue:panel label="…">本文</fuzukue:panel>` を表示します。タブは最初の項目を表示し、開閉部品は閉じた状態から始まります。切り替えで入力欄は変わりません。「この選択を入力」を押すと現在の項目名が入ります。
+- 各部品に `label` が必要です。選択肢とパネルはそれぞれ 1〜12 個で、同じ部品内の項目ラベルは重複できません。ラベルは一行、パネル本文はプレーンテキストです。
+
+~~~xml
+<fuzukue:choices label="形式">
+  <fuzukue:option label="要約"/>
+  <fuzukue:option label="詳細"/>
+</fuzukue:choices>
+
+<fuzukue:number label="例の数" min="1" max="5" step="2" value="3"/>
+~~~
+
+部品は発言本文のデータです。部品の操作で承認を付与したり、ツールを実行したりすることはできません。生成行が残る下書きは、先頭にスラッシュコマンドがあっても通常のメッセージとして送信されます。対応端末は `reply-interactions` バージョン 1 を `reply-blocks` と一緒に通知します。未対応端末にはラベルや選択肢、数値の初期値と範囲を Markdown で届けます。

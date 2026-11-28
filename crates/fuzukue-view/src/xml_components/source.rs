@@ -1,5 +1,5 @@
 use super::{FENCE_LANGUAGE, MAX_BLOCK, parse_component};
-use crate::ui_kit::Component;
+use crate::ui_kit::{Component, Interaction};
 use markdown::{ParseOptions, mdast::Node};
 use std::ops::Range;
 
@@ -181,12 +181,26 @@ fn tag_end(tag: &str) -> Option<usize> {
 
 /// Plain Markdown projection for copying and clients that cannot render the UI.
 pub fn text_fallback(source: &str, streaming: bool) -> String {
-    project_text(source, streaming, false)
+    text_with_interactions(source, streaming, |_, _, _| None)
+}
+
+/// Plain text for copying, with the currently visible state of each control.
+pub fn text_with_interactions(
+    source: &str,
+    streaming: bool,
+    state: impl FnMut(usize, &str, &Interaction) -> Option<String>,
+) -> String {
+    project_text(source, streaming, false, false, state)
 }
 
 /// Readable, inert Markdown for clients without native components.
 pub fn markdown_fallback(source: &str, streaming: bool) -> String {
-    project_text(source, streaming, true)
+    project_text(source, streaming, true, false, |_, _, _| None)
+}
+
+/// Keep stage 1 components native and project interactive controls to Markdown.
+pub fn stage1_markdown_fallback(source: &str, streaming: bool) -> String {
+    project_text(source, streaming, true, true, |_, _, _| None)
 }
 
 fn reply_parse_options() -> ParseOptions {
@@ -218,21 +232,40 @@ pub fn link_card_refs(source: &str) -> String {
     linked
 }
 
-fn project_text(source: &str, streaming: bool, escape: bool) -> String {
+fn project_text(
+    source: &str,
+    streaming: bool,
+    escape: bool,
+    keep_stage1: bool,
+    mut state: impl FnMut(usize, &str, &Interaction) -> Option<String>,
+) -> String {
     let mut text = String::new();
     let mut previous = 0;
+    let mut interaction_index = 0;
     for block in reply_blocks(source, streaming, &reply_parse_options()) {
         text.push_str(&source[previous..block.range.start]);
         previous = block.range.end;
         match block.content {
+            BlockContent::Component(component)
+                if keep_stage1 && !matches!(component, Component::Interaction { .. }) =>
+            {
+                text.push_str(&source[block.range]);
+            }
             BlockContent::Component(component) => {
                 // Encode Markdown punctuation, keeping displayed text inert.
-                let plain = component.plain_text();
+                let plain = if let Component::Interaction { label, control } = &component {
+                    let current = state(interaction_index, label, control);
+                    interaction_index += 1;
+                    current.unwrap_or_else(|| component.plain_text())
+                } else {
+                    component.plain_text()
+                };
                 if !plain.is_empty() {
                     text.push_str("\n\n");
                     for ch in plain.chars() {
                         if escape {
                             match ch {
+                                '&' => { text.push_str("&amp;"); continue; }
                                 '<' => { text.push_str("&lt;"); continue; }
                                 '>' => { text.push_str("&gt;"); continue; }
                                 '\\' | '\x60' | '*' | '_' | '[' | ']' | '#' | '+' | '.' | '~' | '$' | '-' => text.push('\\'),
@@ -257,6 +290,35 @@ fn project_text(source: &str, streaming: bool, escape: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_controls_validate_options_panel_text_and_numeric_bounds() {
+        let valid = r#"<fuzukue:number label="Count" min="-1" max="5" step="2" value="3"/>"#;
+        assert!(text_fallback(valid, false).contains("3 (-1–5, Δ 2)"));
+        for invalid in [
+            valid.replace("value=\"3\"", "value=\"2\""),
+            valid.replace("max=\"5\"", "max=\"4\""),
+            valid.replace("step=\"2\"", "step=\"0\""),
+            valid.replace("min=\"-1\"", "min=\"-2147483648\""),
+            valid.replace("label=\"Count\"", "label=\"Count\" on-click=\"approve\""),
+            r#"<fuzukue:choices label="Choice"><fuzukue:option label="A"/><fuzukue:option label="A"/></fuzukue:choices>"#.into(),
+            r#"<fuzukue:tabs label="Choice"><fuzukue:panel label="A"><b>Text</b></fuzukue:panel></fuzukue:tabs>"#.into(),
+            format!("<fuzukue:card title=\"Nested\">{valid}</fuzukue:card>"),
+            format!("<fuzukue:choices label=\"Count\">{}</fuzukue:choices>",
+                (0..13).map(|index| format!("<fuzukue:option label=\"{index}\"/>")).collect::<String>()),
+        ] {
+            let blocks = reply_blocks(&invalid, false, &reply_parse_options());
+            assert!(matches!(blocks[0].content, BlockContent::Literal), "{invalid}");
+        }
+
+        let choice = r#"<fuzukue:checklist label="Style"><fuzukue:option label="/help"/><fuzukue:option label="&lt;command&gt;"/></fuzukue:checklist>"#;
+        let source = format!("{FLOW}\n\n{choice}");
+        let projected = stage1_markdown_fallback(&source, false);
+        assert!(projected.contains(FLOW));
+        assert!(projected.contains("Style  \n/help  \n&lt;command&gt;"));
+        assert!(!projected.contains("<fuzukue:checklist"));
+        assert!(!markdown_fallback(&source, false).contains("<fuzukue:"));
+    }
 
     const FLOW: &str = r#"<fuzukue:flowchart>
   <fuzukue:step label="Review"/>

@@ -262,6 +262,7 @@ async fn active_queue_refuses_close_and_archived_github_and_held_input_do_not() 
             text: "queued input".into(),
             paths: vec![],
             reply_blocks: false,
+            reply_interactions: false,
         },
     )?;
     assert!(update

@@ -1,5 +1,7 @@
 //! Native chat views for the canonical UI tree.
 
+use std::sync::Arc;
+
 use fuzukue_proto::MathMacro;
 use fuzukue_view::{
     ui_kit::{Component, FlowNode, ListKind, Segment, Severity, Span, StepStatus, TextKind, Tone},
@@ -17,6 +19,8 @@ use gpui_kit::{
 
 use crate::{appearance, icons::Symbol, math, Workbench};
 
+pub(in crate) mod interaction;
+
 const PLUGIN: &str = "xml-component";
 
 pub(super) fn extensions(
@@ -25,6 +29,7 @@ pub(super) fn extensions(
 ) -> MarkdownExtensions {
     math::extensions_with_macros(macros)
         .block_renderer(PLUGIN, move |node, window, cx| render_block(&workbench, node, window, cx))
+        .block_renderer(interaction::PLUGIN, |node, _, _| interaction::fallback(node))
         .source_blocks(|source, options| source_blocks(source, false, options))
 }
 
@@ -37,10 +42,19 @@ fn source_blocks(
     streaming: bool,
     options: &markdown::ParseOptions,
 ) -> Vec<(std::ops::Range<usize>, MarkdownNode)> {
+    let mut interaction_index = 0;
     xml_components::reply_blocks(source, streaming, options).into_iter().filter_map(|block| {
         use xml_components::BlockContent;
         let literal = &source[block.range.clone()];
         let node = match block.content {
+            BlockContent::Component(component @ Component::Interaction { .. }) => {
+                let text = component.plain_text();
+                let Component::Interaction { label, control } = component else { unreachable!() };
+                let index = interaction_index;
+                interaction_index += 1;
+                MarkdownNode::new(interaction::PLUGIN, Arc::new(interaction::Block { index, label, control }))
+                    .text(text).markdown(literal.to_owned())
+            }
             BlockContent::Component(component) => {
                 let text = component.plain_text();
                 MarkdownNode::new(PLUGIN, component).text(text).markdown(literal.to_owned())
@@ -107,6 +121,7 @@ impl UiTree<'_> {
         let id = |tag| format!("xml-component-{tag}-{path}");
         let theme = self.cx.theme();
         match component {
+            Component::Interaction { .. } => div().child(component.plain_text()).into_any_element(),
             Component::Card { title, tone, body } => {
                 let heading = div()
                     .id(id("card-title"))

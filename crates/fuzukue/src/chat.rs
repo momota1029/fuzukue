@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use gpui_kit::base::{Disableable as _, ElementExt as _, ScrollBounce, Selectable, StyledExt as _, TextSelection, TextSelectionScopeId};
-use gpui_kit::base::input::{Enter, MoveDown, MoveUp, RopeExt as _};
+use gpui_kit::base::input::{Enter, InputEditsEvent, MoveDown, MoveUp, RopeExt as _};
 use gpui_kit::base::text::editor_host::{parse_markdown, BlockNode};
 use gpui_kit::base::text::MarkdownExtensions;
 use gpui_kit::component::{
@@ -43,10 +43,12 @@ use fuzukue_proto::{
 use fuzukue_view::chat::{
     is_json_document, paper_batch_failure_summary, tool_result_summary, tool_summary, ChatGrouping,
 };
+use fuzukue_view::{component_draft::ComponentDraft, ui_kit::Interaction, xml_components};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::appearance::{ThemeSurfaces, UI_LINE_HEIGHT};
+use super::chat_components::interaction;
 use super::chat_quote::quote_insertion;
 use super::chat_question::QuestionCard;
 use super::composer_markdown::{command_candidates, continue_line, CommandKey};
@@ -154,6 +156,8 @@ pub(super) struct Chat {
     markdown: MarkdownExtensions,
     streaming_markdown: MarkdownExtensions,
     streaming_replies: HashSet<String>,
+    reply_controls: HashMap<interaction::Key, interaction::State>,
+    reply_draft: ComponentDraft<interaction::Key>,
 }
 
 #[derive(Default)]
@@ -616,8 +620,36 @@ impl Chat {
             math_macros: Vec::new(),
             streaming_markdown: super::chat_components::streaming_extensions(&markdown),
             streaming_replies: HashSet::new(),
+            reply_controls: HashMap::new(),
+            reply_draft: ComponentDraft::default(),
             markdown,
         }
+    }
+
+    fn copy_reply(&self, actor: &Actor, message: &Message) -> String {
+        xml_components::text_with_interactions(&message.text, false, |index, label, control| {
+            let item = message.item.as_ref()?;
+            if !is_partner(actor) || message.superseded || is_worker_message(actor, Some(item)) {
+                return None;
+            }
+            let key = (item.clone(), index);
+            let state = self.reply_controls.get(&key).copied()
+                .unwrap_or_else(|| interaction::State::initial(control));
+            let mut text = state.visible_text(label, control);
+            if let Some(preview) = self.reply_draft.preview(&key) {
+                text.push('\n');
+                text.push_str(&tr!("xml-interaction-preview", preview = preview.to_owned()));
+            }
+            Some(text)
+        })
+    }
+
+    fn has_reply(&self, reply: &interaction::Reply) -> bool {
+        self.by_item.get(&reply.item).and_then(|index| self.rows.get(*index))
+            .is_some_and(|row| {
+                row.id == reply.row && is_partner(&row.actor)
+                    && matches!(&row.content, Content::Message(message) if !message.superseded)
+            })
     }
 
     pub(super) fn codex_selected(&self) -> bool {
@@ -2473,12 +2505,25 @@ impl Workbench {
                         });
                     });
                 let markdown = |part, text: &str| {
-                    let extensions = match &row.content {
-                        Content::Message(message) if message.item.as_ref()
-                            .is_some_and(|item| chat.streaming_replies.contains(item)) => {
-                            chat.streaming_markdown.clone()
-                        }
-                        _ => chat.markdown.clone(),
+                    let message = match &row.content {
+                        Content::Message(message) => Some(message),
+                        _ => None,
+                    };
+                    let item = message.and_then(|message| message.item.as_ref());
+                    let streaming = item.is_some_and(|item| chat.streaming_replies.contains(item));
+                    let extensions = if streaming { &chat.streaming_markdown } else { &chat.markdown };
+                    let reply = item.filter(|item| {
+                        matches!(part, MarkdownPart::Message) && is_partner(&row.actor)
+                            && !is_worker_message(&row.actor, Some(item))
+                            && message.is_some_and(|message| !message.superseded)
+                            && (text.contains("<fuzukue:") || text.contains("~~~fuzukue-v1"))
+                    }).map(|item| interaction::Reply {
+                        session: session.clone(), item: item.clone(), row: row.id,
+                    });
+                    let extensions = if let Some(reply) = reply {
+                        interaction::with_reply(extensions.clone(), entity.downgrade(), reply)
+                    } else {
+                        extensions.clone()
                     };
                     let entity = entity.clone();
                     div().w_full().min_w_0().text_base().line_height(UI_LINE_HEIGHT)
@@ -3058,7 +3103,7 @@ impl Workbench {
                             let text = chat.rows[group.first..=group.last].iter().filter_map(|row| {
                                 match &row.content {
                                     Content::Message(message) if row.kind(show_worker_messages) == RowKind::AssistantText => {
-                                        Some(fuzukue_view::xml_components::text_fallback(&message.text, false))
+                                        Some(chat.copy_reply(&row.actor, message))
                                     }
                                     _ => None,
                                 }
@@ -3066,7 +3111,7 @@ impl Workbench {
                             copy_message_action(&ix.to_string(), &text)
                         } else {
                             let text = if is_partner(&row.actor) {
-                                fuzukue_view::xml_components::text_fallback(&message.text, false)
+                                chat.copy_reply(&row.actor, message)
                             } else {
                                 message.text.clone()
                             };
@@ -4480,6 +4525,60 @@ impl Workbench {
         true
     }
 
+    pub(super) fn track_reply_draft_edits(&mut self, event: &InputEditsEvent) {
+        let Some(chat) = self.chats.get_mut(&self.active) else { return };
+        for (edit, after) in event.edits() {
+            if chat.reply_draft.is_empty() {
+                break;
+            }
+            chat.reply_draft.observe_edit(
+                edit.start_byte..edit.old_end_byte, edit.new_end_byte, &after.to_string(),
+            );
+        }
+    }
+
+    pub(super) fn reply_control_state(
+        &self, reply: &interaction::Reply, key: &interaction::Key, control: &Interaction,
+    ) -> Option<(interaction::State, Option<&str>)> {
+        let chat = self.chats.get(&reply.session).filter(|chat| chat.has_reply(reply))?;
+        let state = chat.reply_controls.get(key).copied()
+            .unwrap_or_else(|| interaction::State::initial(control));
+        Some((state, chat.reply_draft.preview(key)))
+    }
+
+    pub(super) fn operate_reply_control(
+        &mut self, reply: &interaction::Reply, key: &interaction::Key, label: &str,
+        control: &Interaction, action: interaction::Action, window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        if self.active != reply.session || !self.threads_loaded || composing(&self.input, window, cx)
+            || !self.input.read(cx).is_editable()
+        {
+            return;
+        }
+        let Some(chat) = self.chats.get_mut(&reply.session).filter(|chat| chat.has_reply(reply)) else {
+            return;
+        };
+        let state = chat.reply_controls.entry(key.clone())
+            .or_insert_with(|| interaction::State::initial(control));
+        let preview = match state.apply(label, control, action) {
+            interaction::DraftChange::Keep => {
+                cx.notify();
+                return;
+            }
+            interaction::DraftChange::Set(text) => Some(text),
+            interaction::DraftChange::Remove => None,
+        };
+        let draft = self.input.read(cx).value();
+        if let Some((range, replacement)) = chat.reply_draft.update(key.clone(), &draft, preview.as_deref()) {
+            let start = draft[..range.start].encode_utf16().count();
+            let end = start + draft[range].encode_utf16().count();
+            self.input.update(cx, |input, cx| {
+                input.replace_text_in_range(Some(start..end), &replacement, window, cx);
+            });
+        }
+        cx.notify();
+    }
+
     pub(super) fn record_composer_text(&mut self, cx: &mut Context<Self>) {
         let Some(drafts) = self.composer_markdown.drafts.as_mut() else { return };
         let Some((workspace, thread, epoch)) = drafts.shown.as_ref() else { return };
@@ -4629,11 +4728,21 @@ impl Workbench {
         if !self.threads_loaded || composing(&self.input, window, cx) {
             return;
         }
-        let text = self.input.read(cx).value().to_string();
+        let mut text = self.input.read(cx).value().to_string();
+        if self.protocol >= fuzukue_proto::SLASH_COMMAND_PROTOCOL && fuzukue_proto::slash::is_command(&text)
+            && self.chats.get(&self.active).is_some_and(|chat| !chat.reply_draft.is_empty())
+        {
+            // Use the existing literal-slash escape when generated text shares
+            // a draft with a user-written slash command. The server echoes it verbatim.
+            text.insert(0, '/');
+        }
         let command = text.strip_prefix('/').and_then(|body| body.split(char::is_whitespace).next());
         let explicit_escalation = command == Some("escalate") && self.protocol >= fuzukue_proto::LIVE_MODELS_PROTOCOL;
         if self.protocol >= fuzukue_proto::SLASH_COMMAND_PROTOCOL && fuzukue_proto::slash::is_command(&text) && !explicit_escalation {
             if self.out.send(ClientMsg::Prompt { session: self.active.clone(), text }).is_ok() {
+                if let Some(chat) = self.chats.get_mut(&self.active) {
+                    chat.reply_draft = ComponentDraft::default();
+                }
                 self.input.update(cx, |input, cx| input.clean(window, cx));
                 self.record_composer_text(cx);
                 cx.notify();
@@ -4673,6 +4782,7 @@ impl Workbench {
         };
         if self.out.send(msg).is_ok() {
             chat.attachments.clear();
+            chat.reply_draft = ComponentDraft::default();
             self.discard_composer_draft(cx);
             self.input.update(cx, |input, cx| input.clean(window, cx));
             cx.notify();
