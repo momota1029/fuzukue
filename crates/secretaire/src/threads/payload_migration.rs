@@ -214,7 +214,7 @@ pub(super) fn exchange(staged: &Path, live: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     let flag = RenameFlags::EXCHANGE;
     #[cfg(target_vendor = "apple")]
-    let flag = RenameFlags::SWAP;
+    let flag = RenameFlags::EXCHANGE;
     renameat_with(CWD, staged, CWD, live, flag)?;
     Ok(())
 }
