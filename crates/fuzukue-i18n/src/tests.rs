@@ -299,6 +299,7 @@ fn ui_source_has_no_new_japanese_literals() {
             "math/selection_tests.rs"
                 | "cjk_emphasis_tests.rs"
                 | "shot.rs" // Japanese fixture text for headless scenarios.
+                | "shot/navigation_shortcuts_test.rs" // IME preedit test fixture.
                 | "shot/file_browser_test.rs" // Japanese fixture names for the folder-tree layout test.
                 // Japanese fixture text for headless selection/deck tests.
                 | "shot/selection_region.rs"
