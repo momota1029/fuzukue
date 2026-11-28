@@ -77,6 +77,7 @@ struct ActiveTurn {
     records: Vec<String>,
     /// TODO changes in an input whose resumed session has yet to accept it.
     todo_notices: crate::todo::Notices,
+    preference_candidate: Option<String>,
     _payload_hold: crate::hub::PayloadHold,
 }
 
@@ -119,6 +120,8 @@ pub(crate) struct PendingPrompt {
     escalation_images: Vec<PathBuf>,
     #[serde(default)]
     automatic_resume: bool,
+    #[serde(default)]
+    preference_inheritance: crate::preferences::Inheritance,
 }
 
 #[derive(Clone)]
@@ -151,6 +154,7 @@ struct ClaudeProcess {
     child: crate::job_process::JobChild,
     stdin: Option<ChildStdin>,
     settings: ChatSettings,
+    preference_sent: Option<String>,
     stop_reading: Arc<crate::cancellation::Cancellation>,
 }
 
@@ -170,7 +174,7 @@ impl ClaudeProcess {
             .context("failed to spawn claude")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        Ok((Self { job, child, stdin: Some(stdin), settings, stop_reading: Arc::default() }, stdout))
+        Ok((Self { job, child, stdin: Some(stdin), settings, preference_sent: None, stop_reading: Arc::default() }, stdout))
     }
 
     async fn stop(&mut self) {
@@ -357,6 +361,7 @@ pub(crate) fn partner_system(
         "\nClaude 組み込みの Agent は、サブエージェントの許可待ちが止まることがあるため無効。fuzukue の delegate を使う。",
     ));
     system.push_str(crate::mcp::front_desk_instructions());
+    system.push_str(crate::preferences::desk_guidance());
     system.push_str(crate::worker_scope::SHELL_READ_GUIDANCE);
     if !crate::canary() {
         system.push_str(crate::mcp::workspace_read::GUIDANCE);
@@ -660,7 +665,9 @@ impl ClaudeSession {
         Ok(true)
     }
 
-    async fn apply_turn_settings(self: &Arc<Self>, closed: bool, escalation: Option<&ChatSettings>, external: bool) -> Result<()> {
+    async fn apply_turn_settings(
+        self: &Arc<Self>, closed: bool, escalation: Option<&ChatSettings>, external: bool,
+    ) -> Result<()> {
         let (Some(launch), Some(app)) = (&self.launch, self.app.upgrade()) else {
             return Ok(());
         };
@@ -729,8 +736,17 @@ impl ClaudeSession {
             ),
             None => text.clone(),
         };
-        let external = matches!(kind, TurnKind::ExternalInput) || self.app.upgrade()
-            .is_some_and(|app| !crate::mcp::exec::trusted_session(&app, &self.id));
+        let app = self.app.upgrade();
+        let external = matches!(kind, TurnKind::ExternalInput) || app.as_ref()
+            .is_some_and(|app| !crate::mcp::exec::trusted_session(app, &self.id));
+        let preferences = if let Some(app) = app.as_ref().filter(|_| self.launch.is_some()) {
+            let selection = crate::preferences::for_turn(
+                app, &self.id, kind, prompt.automatic_resume, text, &prompt.preference_inheritance,
+            )?;
+            Some(crate::preferences::load_selection(selection, app, &self.id).await?)
+        } else {
+            None
+        };
         self.apply_turn_settings(turns.closed, prompt.escalation.as_ref(), external).await?;
         let (input, todo_notices) = match self.app.upgrade() {
             Some(app) => app.partner_input(&self.id, input, external).await?,
@@ -746,6 +762,11 @@ impl ClaudeSession {
             json!({ "type": "text", "text": context }),
             json!({ "type": "text", "text": input }),
         ];
+        let mut process = self.process.lock().await;
+        if let Some(preferences) = preferences.as_deref() {
+            let reuse = !preferences.is_empty() && process.preference_sent.as_deref() == Some(preferences);
+            content.push(json!({ "type": "text", "text": format!("App-attached guidance (not user text):{}", crate::preferences::codex_turn_guidance(preferences, reuse)) }));
+        }
         content.extend_from_slice(&prompt.images);
         let msg = json!({ "type": "user", "message": { "role": "user", "content": content } });
         let resume_prompt = (seed.is_none() && recovery.is_some()).then(|| prompt.clone());
@@ -753,11 +774,11 @@ impl ClaudeSession {
             Some(app) => app.start_partner_history(&self.project, "claude", &self.id).await,
             None => None,
         };
-        let mut process = self.process.lock().await;
         anyhow::ensure!(process.stdin.is_some(), "Claude stdin is closed");
         if let Some(app) = self.app.upgrade() {
             app.drain.begin_submission(&app.state_dir, &self.id, &prompt.records)?;
         }
+        process.preference_sent = None;
         // The reader can observe a rejected resume while we are writing to its stdin.
         turns.idle_since = None;
         turns.active = Some(ActiveTurn {
@@ -766,6 +787,7 @@ impl ClaudeSession {
             history, before, resume_prompt, kind, acted_or_asked: false, last_text: String::new(),
             interrupted: false, compaction: None, escalation: prompt.escalation.clone(), records: prompt.records.clone(),
             todo_notices,
+            preference_candidate: preferences.filter(|text| !text.is_empty()),
         });
         self.stream.lock().unwrap().relay_reply = matches!(kind, TurnKind::WorkerDigest).then(RelayReply::default);
         self.hub.set_github_auth_request(&self.id, prompt.github_auth);
@@ -871,13 +893,13 @@ impl ClaudeSession {
     /// 入力中のターンを混ぜず、次の指示をキューに入れる。
     #[cfg(test)]
     pub async fn prompt(self: &Arc<Self>, text: &str) -> Result<()> {
-        self.prompt_with_auth(text, Vec::new(), TurnKind::Conversation, None, None, Vec::new()).await
+        self.prompt_with_auth(text, Vec::new(), TurnKind::Conversation, None, None, Vec::new(), Default::default()).await
     }
 
     pub(crate) async fn prompt_with_auth(
         self: &Arc<Self>, text: &str, images: Vec<Value>, kind: TurnKind,
         github_auth: Option<crate::github_auth::mcp::Tool>, escalation: Option<ChatSettings>,
-        escalation_images: Vec<PathBuf>,
+        escalation_images: Vec<PathBuf>, preference_inheritance: crate::preferences::Inheritance,
     ) -> Result<()> {
         let mut turns = self.state.lock().await;
         // Threads recover through Workspace so a missing CLI session can use the project transcript.
@@ -890,7 +912,8 @@ impl ClaudeSession {
                 "Wait for Claude's current turn and queued messages to finish");
         }
         let mut prompt = PendingPrompt { text: text.into(), images, force: false, kind, not_before: None,
-            records: Vec::new(), github_auth, escalation, escalation_images, automatic_resume: false };
+            records: Vec::new(), github_auth, escalation, escalation_images, automatic_resume: false,
+            preference_inheritance };
         if let Some(app) = self.app.upgrade() {
             let id = crate::mail::session_key();
             app.drain.enqueue(&app.state_dir, &self.id, id.clone(), crate::self_update::drain::Work::Claude(prompt.clone()))?;
@@ -907,6 +930,7 @@ impl ClaudeSession {
 
     pub(crate) async fn try_background_prompt(
         self: &Arc<Self>, text: String, kind: TurnKind, report: Option<String>,
+        preference_inheritance: crate::preferences::Inheritance,
     ) -> Result<bool> {
         let mut turns = self.state.lock().await;
         anyhow::ensure!(!turns.closed, "claude session {} exited", self.id);
@@ -921,7 +945,7 @@ impl ClaudeSession {
         }
         let prompt = PendingPrompt { text, images: Vec::new(), force: false, kind,
             not_before: None, records: report.into_iter().collect(), github_auth: None, escalation: None,
-            escalation_images: Vec::new(), automatic_resume: false };
+            escalation_images: Vec::new(), automatic_resume: false, preference_inheritance };
         self.start_turn(&mut turns, &prompt).await?;
         Ok(true)
     }
@@ -996,9 +1020,10 @@ impl ClaudeSession {
             history: None, before: None, resume_prompt: None,
             kind: TurnKind::Conversation, acted_or_asked: false, last_text: String::new(),
             interrupted: false, compaction: Some(Compaction { complete, boundary: None }), escalation: None,
-            records: Vec::new(), todo_notices: Default::default(),
+            records: Vec::new(), todo_notices: Default::default(), preference_candidate: None,
         });
         // SDK slash commands use a bare string instead of the normal prompt preamble.
+        self.process.lock().await.preference_sent = None;
         self.stream.lock().unwrap().compacting = true;
         if let Err(error) = self.write(json!({
             "type": "user", "message": { "role": "user", "content": content }
@@ -1040,6 +1065,7 @@ impl ClaudeSession {
                 not_before: turns.paused_until.map(|until| until + RESUME_SLACK_SECS), records: Vec::new(), github_auth: None, escalation: None,
                 escalation_images: Vec::new(),
                 automatic_resume: true,
+                preference_inheritance: crate::preferences::Inheritance::Captured(crate::preferences::current(app, &self.id)),
             };
             let work = crate::self_update::drain::Work::Claude(prompt);
             if force {
@@ -1153,9 +1179,10 @@ impl ClaudeSession {
         let continuation = harness_text!("(secretaire) The usage window has reset. Continue from where you stopped.", "（secretaire）使用量の枠が空いたので再開する。中断したところから作業を続けて。");
         self.hub.publish(ServerEvent::Resumed { session: self.id.clone() });
         if matches!(interrupted, Some(TurnKind::ExternalInput))
-            || turns.queued.iter().any(|prompt| matches!(prompt.kind, TurnKind::ExternalInput))
+            || turns.queued.iter().any(|prompt| matches!(prompt.kind, TurnKind::ExternalInput)
+                || matches!(prompt.preference_inheritance, crate::preferences::Inheritance::Captured(_)))
         {
-            // A queued user message cannot authorize the continuation of external input.
+            // External and explicitly scoped inputs keep their own turn context.
             for prompt in &mut turns.queued {
                 prompt.force |= force;
             }
@@ -1164,6 +1191,7 @@ impl ClaudeSession {
                     text: continuation.into(), images: Vec::new(), force, kind, not_before: None,
                     records, github_auth: None, escalation: None, escalation_images: Vec::new(),
                     automatic_resume: true,
+                    preference_inheritance: Default::default(),
                 });
             }
             return self.start_pending(&mut turns).await;
@@ -1200,7 +1228,8 @@ impl ClaudeSession {
         }
         if !text.is_empty() {
             turns.queued.push_back(PendingPrompt { text, images, force, kind, not_before: None,
-                records, github_auth, escalation: None, escalation_images, automatic_resume: !has_user_input });
+                records, github_auth, escalation: None, escalation_images, automatic_resume: !has_user_input,
+                preference_inheritance: Default::default() });
         }
         self.start_pending(&mut turns).await
     }
@@ -1214,6 +1243,16 @@ impl ClaudeSession {
         self.hub.cancel_questions(&self.id, &Actor::Claude, None);
         self.cancel_tool_approvals(None);
         let mut active = turns.active.take();
+        if let Some(turn) = active.as_mut() {
+            let accepted = result["is_error"] != true
+                && result["subtype"].as_str().is_none_or(|subtype| subtype == "success")
+                && !turn.interrupted && turns.interrupted.is_none();
+            self.process.lock().await.preference_sent = if accepted {
+                turn.preference_candidate.take()
+            } else {
+                None
+            };
+        }
         if let Some(turn) = active.as_mut().filter(|_| result["is_error"] != true) {
             self.record_todo_delivery(turn);
         }
@@ -1363,6 +1402,7 @@ impl ClaudeSession {
                         text: front_desk::nudge_prompt().into(), images: Vec::new(), force: false, kind: TurnKind::Nudge,
                         not_before: None, records: Vec::new(), github_auth: None, escalation: None,
                         escalation_images: Vec::new(), automatic_resume: false,
+                        preference_inheritance: Default::default(),
                     };
                     return self.start_turn(&mut turns, &nudge).await;
                 }
@@ -1737,7 +1777,13 @@ impl ClaudeSession {
                 self.pause_for_usage(generation).await?;
             }
             Some("system") if v["subtype"] == "compact_boundary" => {
-                if let Some(compaction) = self.state.lock().await.active.as_mut().and_then(|turn| turn.compaction.as_mut()) {
+                let mut turns = self.state.lock().await;
+                self.process.lock().await.preference_sent = None;
+                let compaction = turns.active.as_mut().and_then(|turn| {
+                    turn.preference_candidate = None;
+                    turn.compaction.as_mut()
+                });
+                if let Some(compaction) = compaction {
                     let metadata = &v["compact_metadata"];
                     compaction.boundary = Some((
                         metadata["pre_tokens"].as_u64().or_else(|| metadata["preTokens"].as_u64()),
@@ -2633,6 +2679,111 @@ impl StreamState {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn desk_preferences_change_without_restarting_background_commands() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        std::fs::create_dir_all(root.join(".fuzukue/rules"))?;
+        std::fs::write(root.join(".fuzukue/rules/style.md"), "Private first preference fixture.")?;
+        let fake = root.join("claude-fixture");
+        std::fs::write(&fake, r#"#!/usr/bin/python3
+import json, sys, subprocess
+from pathlib import Path
+args = sys.argv[1:]
+system = args[args.index("--append-system-prompt") + 1]
+assert "Private first preference fixture." not in system
+assert "Private second preference fixture." not in system
+child = subprocess.Popen(["sleep", "300"])
+try:
+    for line in sys.stdin:
+        message = json.loads(line)
+        content = message["message"]["content"]
+        request = content[1]["text"]
+        attached = content[2]["text"]
+        assert child.poll() is None
+        if "First request." in request:
+            assert "Private first preference fixture." in attached
+            print(json.dumps({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"toolu_bg","input":{"command":"sleep 300","run_in_background":True}}]}}), flush=True)
+            print(json.dumps({"type":"system","subtype":"task_started","task_type":"local_bash","task_id":"btest","tool_use_id":"toolu_bg"}), flush=True)
+        elif "Second request." in request:
+            assert "Private second preference fixture." in attached
+            assert "Private first preference fixture." not in attached
+        elif "Failure request." in request:
+            assert "Private second preference fixture." not in attached
+        elif "Retry request." in request:
+            assert "Private second preference fixture." in attached
+        else:
+            assert "External fixture request." in request
+            assert "Private first preference fixture." not in line
+            assert "Private second preference fixture." not in line
+            assert "No personal preferences" in attached
+        print(json.dumps({"type": "system", "subtype": "init", "session_id": "preferences-fixture"}), flush=True)
+        with Path("received-turns").open("a") as log:
+            log.write(str(child.pid) + "\n")
+        print(json.dumps({"type": "result", "result": "failed" if "Failure request." in request else "done", "is_error": "Failure request." in request}), flush=True)
+finally:
+    child.terminate()
+    child.wait()
+"#)?;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700))?;
+        let mut app = Workspace::new(root.into(), String::new(), root.join("state"), Arc::new(Hub::new()));
+        app.claude_program = Some(fake);
+        let app = Arc::new(app);
+        let id = app.hub.edit_threads(|store| store.create(None))?;
+        let session = ClaudeSession::spawn(
+            id, root.into(), "http://127.0.0.1:7878/mcp", None, None,
+            ChatSettings::default(), Box::new(|_| {}), &app,
+        ).await?;
+        for (index, (kind, input)) in [
+            (TurnKind::UserConversation, "First request."),
+            (TurnKind::UserConversation, "Second request."),
+            (TurnKind::UserConversation, "Failure request."),
+            (TurnKind::UserConversation, "Retry request."),
+            (TurnKind::ExternalInput, "External fixture request."),
+        ].into_iter().enumerate() {
+            if index == 1 {
+                std::fs::write(root.join(".fuzukue/rules/style.md"), "Private second preference fixture.")?;
+            }
+            session.prompt_with_auth(input, Vec::new(), kind, None, None, Vec::new(), Default::default()).await?;
+            tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    if session.state.lock().await.active.is_none() {
+                        let calls = std::fs::read_to_string(root.join("received-turns"))?;
+                        anyhow::ensure!(calls.lines().count() == index + 1);
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await??;
+            if index == 1 {
+                let calls = std::fs::read_to_string(root.join("received-turns"))?;
+                assert_eq!(calls.lines().next(), calls.lines().nth(1));
+                assert_eq!(session.background_commands().len(), 1);
+            }
+        }
+        session.process.lock().await.stop().await;
+        Ok(())
+    }
+
+    #[test]
+    fn pending_prompt_preserves_selection_and_loads_older_records() -> Result<()> {
+        let old = json!({
+            "text": "continue", "images": [], "force": false,
+            "kind": "Conversation", "automatic_resume": true
+        });
+        let mut prompt: PendingPrompt = serde_json::from_value(old)?;
+        assert!(matches!(prompt.preference_inheritance, crate::preferences::Inheritance::Desk));
+        let selection = serde_json::from_value(json!({"paper": "papers/example"}))?;
+        prompt.preference_inheritance = crate::preferences::Inheritance::Captured(Some(selection));
+        let saved = serde_json::to_string(&prompt)?;
+        assert!(saved.contains("papers/example"));
+        assert!(!saved.contains("Private preference fixture"));
+        let restored: PendingPrompt = serde_json::from_str(&saved)?;
+        assert!(matches!(restored.preference_inheritance, crate::preferences::Inheritance::Captured(Some(_))));
+        Ok(())
+    }
+
     #[test]
     fn pending_user_input_goes_before_a_worker_digest() {
         let mut turns = TurnState::default();
@@ -2641,6 +2792,7 @@ mod tests {
             text: "A user request".into(), images: Vec::new(), force: false, kind: TurnKind::Conversation, not_before: None, records: Vec::new(), github_auth: None, escalation: None,
             escalation_images: Vec::new(),
             automatic_resume: false,
+            preference_inheritance: Default::default(),
         });
         assert!(!turns.can_start_worker_digest());
         turns.paused_until = Some(100);
@@ -2665,7 +2817,7 @@ mod tests {
         cmd.args(["-c", "while IFS= read -r line; do :; done"]);
         let session = ClaudeSession::spawn_command(cmd, id.into(), root.into(), &app, Box::new(|_| {}))?;
 
-        assert!(session.try_background_prompt("synthetic turn".into(), TurnKind::Conversation, None).await?);
+        assert!(session.try_background_prompt("synthetic turn".into(), TurnKind::Conversation, None, Default::default()).await?);
         // Model the submission window where Claude has an active turn but the
         // Hub has yet to see its explicit running event.
         hub.publish(ServerEvent::TurnActivity { session: id.into(), running: false });
@@ -2689,7 +2841,7 @@ mod tests {
         cmd.args(["-c", "while IFS= read -r line; do :; done"]);
         let session = ClaudeSession::spawn_command(cmd, id.clone(), root.into(), &app, Box::new(|_| {}))?;
 
-        assert!(session.try_background_prompt("update result".into(), TurnKind::ExternalInput, None).await?);
+        assert!(session.try_background_prompt("update result".into(), TurnKind::ExternalInput, None, Default::default()).await?);
         assert!(app.hub.external_approval_input(&id));
         session.finish_turn(&json!({ "is_error": true, "api_error_status": 429 })).await?;
         {
@@ -2700,7 +2852,7 @@ mod tests {
         }
         assert!(app.drain.records(&app.state_dir)?.is_empty());
 
-        session.prompt_with_auth("separate user request", Vec::new(), TurnKind::UserConversation, None, None, Vec::new()).await?;
+        session.prompt_with_auth("separate user request", Vec::new(), TurnKind::UserConversation, None, None, Vec::new(), Default::default()).await?;
         session.resume(true).await?;
         assert!(app.hub.external_approval_input(&id));
         {

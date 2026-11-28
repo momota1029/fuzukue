@@ -285,8 +285,11 @@ async fn execute(app: &Arc<Workspace>, session: &str, spec: Spec, args: &str) ->
             tokio::spawn(async move {
                 let result = async {
                     if planner::current_plan(&app, &session)?.is_some() {
-                        planner::replan(&app, &session, text, false, None).await
+                        planner::replan(&app, &session, text, false, None, None).await
                     } else {
+                        let preferences = crate::preferences::Selection::capture(
+                            &app, &session, true, &text, std::iter::empty::<&str>(),
+                        );
                         planner::start_plan(
                             &app,
                             &session,
@@ -295,6 +298,7 @@ async fn execute(app: &Arc<Workspace>, session: &str, spec: Spec, args: &str) ->
                             false,
                             None,
                             Default::default(),
+                            preferences,
                         )
                         .await
                     }

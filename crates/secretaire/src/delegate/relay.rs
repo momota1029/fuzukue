@@ -28,6 +28,8 @@ pub(crate) struct Digest {
     prose: String,
     paths: BTreeSet<String>,
     failures: VecDeque<String>,
+    preferences: Option<crate::preferences::Selection>,
+    from_plan: bool,
 }
 
 impl Digest {
@@ -51,6 +53,8 @@ impl Digest {
         }
         self.paths.extend(newer.paths);
         self.failures.extend(newer.failures);
+        self.preferences = newer.preferences;
+        self.from_plan = newer.from_plan;
     }
 
     fn render(&self) -> String {
@@ -79,6 +83,18 @@ fn render(digests: &Digests) -> String {
         let heading = if digest.title.is_some() { format!("{title} ({job})") } else { title.into() };
         format!("## {heading}\n{}", digest.render())
     }).collect::<Vec<_>>().join("\n\n")
+}
+
+pub(super) fn preferences(app: &App, session: &str, digests: &Digests) -> Option<crate::preferences::Selection> {
+    use crate::preferences::Selection;
+
+    let captured = Selection::common(digests.values().map(|digest| &digest.preferences));
+    if captured.is_some() && digests.values().any(|digest| digest.from_plan) {
+        let current = crate::planner::preference_selection(app, session).ok().flatten();
+        Selection::common([&captured, &current].into_iter())
+    } else {
+        captured
+    }
 }
 
 pub(super) fn prompt(digests: &Digests) -> String {
@@ -149,6 +165,8 @@ impl Queue {
                 prose: std::mem::take(&mut digest.prose),
                 paths: std::mem::take(&mut digest.paths),
                 failures: failure.into_iter().collect(),
+                preferences: digest.preferences.clone(),
+                from_plan: digest.from_plan,
             };
             if !batch.is_empty() {
                 ready.insert(job.clone(), batch);
@@ -258,6 +276,7 @@ impl Batch {
 
 pub(super) async fn relay_progress(
     app: Arc<App>, session: String, job: String, mut events: tokio::sync::broadcast::Receiver<WorkerEvent>,
+    preferences: Option<crate::preferences::Selection>, from_plan: bool,
 ) {
     let mut batch = Batch::default();
     loop {
@@ -279,6 +298,8 @@ pub(super) async fn relay_progress(
         if !digest.is_empty() {
             digest.title = app.delegates.jobs.get(&job).and_then(|record| record.lock().unwrap().display.label.clone());
             digest.revision = app.delegates.jobs.digest_ready(&job).unwrap_or_default();
+            digest.preferences.clone_from(&preferences);
+            digest.from_plan = from_plan;
             enqueue_desk(&app, &session, DeskTurn::WorkerDigest(Digests::from([(job.clone(), digest)])));
         }
     }

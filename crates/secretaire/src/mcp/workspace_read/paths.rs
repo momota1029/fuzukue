@@ -223,7 +223,7 @@ pub(in crate::mcp) fn check_git_path(path: &Path, root: &Path) -> Result<()> {
 }
 
 /// Open every component without following symlinks, including after a path check.
-pub(in crate::mcp) fn open(path: &Path) -> Result<File> {
+pub(crate) fn open(path: &Path) -> Result<File> {
     let mut parts = path.components().peekable();
     ensure!(
         parts.next() == Some(Component::RootDir),

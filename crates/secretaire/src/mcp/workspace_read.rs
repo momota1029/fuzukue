@@ -7,7 +7,8 @@ pub(crate) mod jq;
 mod paths;
 mod plan_status;
 pub(super) mod range;
-pub(super) use paths::{open as open_no_symlinks, secret as secret_name};
+pub(crate) use paths::open as open_no_symlinks;
+pub(super) use paths::secret as secret_name;
 mod review;
 mod search;
 #[cfg(test)]

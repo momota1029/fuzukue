@@ -425,6 +425,7 @@ assert server['url'].endswith('&job=consult')
 assert server['headers']['Authorization'].startswith('Bearer ')
 assert args[args.index('--allowedTools') + 1] == 'mcp__fuzukue__search_library'
 assert '--no-session-persistence' in args
+assert 'Private consultation fixture' not in ' '.join(args)
 data = json.loads(args[-1])
 assert data['question'] == 'Which way?'
 assert data['context_excerpt'] == 'Only use the smaller change.'
@@ -454,7 +455,12 @@ print(json.dumps({'type':'result', 'result':json.dumps(answer),
             }],
         );
         let app = Arc::new(app);
-        let session = app.hub.edit_threads(|store| store.create(None))?;
+        let root = project.path();
+        fs::create_dir_all(root.join("papers/draft"))?;
+        fs::write(root.join("papers/draft/deck.toml"), "kind = 'paper'\nwriting_memo = 'draft'\n")?;
+        fs::create_dir_all(root.join("memos/draft"))?;
+        fs::write(root.join("memos/draft/card.md"), "---\nid: draft\nkind: memo\n---\nPrivate consultation fixture")?;
+        let session = app.hub.edit_threads(|store| store.create(Some("papers/draft")))?;
         let plan = Plan {
             goal: "Keep the plan".into(),
             done_condition: "Stay put".into(),
@@ -466,7 +472,11 @@ print(json.dumps({'type':'result', 'result':json.dumps(answer),
             question: None,
             verification: None, paused_by_user: false,
         };
-        super::super::write(&app, &session, &plan, false)?;
+        let selection = crate::preferences::Selection::capture(
+            &app, &session, true, &plan.goal, std::iter::empty::<&str>(),
+        );
+        assert!(selection.is_some());
+        super::super::write(&app, &session, &plan, false, selection.as_ref())?;
         let path = super::super::path(&app, &session)?;
         let before = fs::read(&path)?;
         let args = || ConsultArgs {

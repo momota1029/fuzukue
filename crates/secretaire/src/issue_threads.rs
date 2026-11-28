@@ -1774,7 +1774,7 @@ async fn dispatch(app: &Arc<Workspace>) -> Result<()> {
             .lock()
             .unwrap()
             .insert(session.clone(), Response { policy, events, codex: None });
-        let result = crate::delegate_follow_up(app, &session, notice, crate::front_desk::TurnKind::Conversation, None).await;
+        let result = crate::delegate_follow_up(app, &session, notice, crate::front_desk::TurnKind::Conversation, None, crate::preferences::Inheritance::Desk).await;
         app.drain.finish(&app.state_dir, &session, &claim, result.as_ref().err().map(|error| format!("{error:#}")));
         if let Err(error) = result {
             app.issue_threads.finish(&session);

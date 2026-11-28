@@ -209,6 +209,9 @@ pub struct SessionRecord {
     pub codex_thread_id: Option<String>,
     #[serde(default)]
     pub last_partner_codex: bool,
+    /// Paper keys and inheritance markers for queued and resumed front-desk turns.
+    #[serde(default, skip_serializing_if = "crate::preferences::DeskSelection::is_empty")]
+    pub(crate) desk_preferences: crate::preferences::DeskSelection,
     /// A command reset the backend. Start from the seed, if any, on the first turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fresh_context: bool,

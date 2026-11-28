@@ -83,6 +83,20 @@ Claude workers run with user settings and Claude Code's native skills disabled, 
 
 To reuse a skill across workspaces or share it with others, package it with `extension.toml` and `skills/`. Register the extension in `~/.config/fuzukue/extensions.toml` for personal use or in `fuzukue.toml` for a project. Either can use a local path or a Git source. See the [extension guide](docs/extensions.md) for setup and other extension options.
 
+## Personal preferences
+
+Put Markdown preferences in `~/.fuzukue/rules/` on the server for all workspaces, or in `<workspace>/.fuzukue/rules/` for one workspace. Start with the preferences you explicitly want to keep. Fuzukue reads immediate `.md` files in filename order, home first and workspace second. Workspace preferences take precedence where they conflict. Shared policy, approval checks, and publishing checks still apply, including when filenames match.
+
+To set preferences for a paper, create a dedicated memo and set `writing_memo = "2026-11-28-writing-style"` in the paper's deck manifest, using the ID from `memos/<id>/card.md` in the same workspace. Attach the paper to the conversation. Fuzukue uses the memo body when exactly one paper is attached and the task has no other recognizable paper reference. An ordinary delegated job keeps the paper selected for its assignment. A plan keeps its originating paper key and uses the memo only while that paper is the sole paper attachment and still applies to the task. A worker digest uses a paper memo only when all included assignments share that paper selection.
+
+Fuzukue supplies these preferences to front desks and ordinary delegated workers for trusted user turns. External-input turns, GitHub and issue sessions, workshop sessions, and blind reviews receive no new preference text. Codex workers receive it in developer instructions on ephemeral threads.
+
+Claude and the resumable Codex front desk receive current-turn guidance as input. Preference text sent earlier stays in that conversation's context, like the rest of the conversation, including on later automatic turns. Codex also retains that input in its local rollout history. Fuzukue can reference the latest confirmed full block when guidance is unchanged in a live session. It sends the full block again after a failed turn, on a new backend connection, or after compaction. Updated guidance supersedes earlier blocks, and turns outside the trust rules explicitly cancel earlier preferences. A paper memo applies only to the named paper.
+
+Each directory can contain up to 32 Markdown files and supply up to 24 KiB of text. Each file or linked memo can be up to 8 KiB. Missing preference directories are empty. Read failures, symbolic links, and over-limit content produce a warning. Fuzukue skips Git-tracked Markdown preferences and warns in both the home and workspace directories. To keep workspace preferences out of the index, add `/.fuzukue/` to your local Git exclude file.
+
+Both rule directories and linked paper memo folders are protected destinations for delegated Fuzukue file tools. Claude's native file tools check those destinations. A scoped Codex worker treats existing protected directories in its checkout as read-only, and Codex worker patch approval requests are declined when they identify a protected path. Workers with unrestricted shell access can still bypass these protections. Ask the front desk to handle changes that need approval.
+
 ## Connect from another device
 
 For local use, the desktop client can connect over loopback at `ws://127.0.0.1:7878/ws`. Tailscale is optional.

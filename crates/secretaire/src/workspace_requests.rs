@@ -858,6 +858,7 @@ async fn start_one(registry: &Arc<App>, route: &Route) -> Result<()> {
         &route.thread,
         prompt.into(),
         crate::TurnKind::ExternalInput,
+        crate::preferences::Inheritance::Desk,
     )
     .await;
     let phase = if matches!(result, Ok(true)) {

@@ -20,6 +20,7 @@ mod commands;
 mod lean;
 mod library;
 mod memos;
+mod preferences;
 mod mutations;
 mod claude;
 mod codex;
@@ -209,6 +210,7 @@ pub struct Workspace {
     history: Arc<history::History>,
     /// 会話ごとの記録（作業ディレクトリ、Claude のセッション ID）。ディスクにも置く。
     session_records: Arc<std::sync::Mutex<std::collections::BTreeMap<String, state::SessionRecord>>>,
+    preference_warnings: std::sync::Mutex<HashMap<String, std::collections::BTreeSet<String>>>,
     state_dir: PathBuf,
     screenshots: screenshots::Screenshots,
     mail: Option<Arc<mail::Store>>,
@@ -282,6 +284,7 @@ impl Workspace {
             comment_applications: Mutex::new(HashMap::new()),
             human_edits: Default::default(),
             session_records: Arc::new(std::sync::Mutex::new(saved)),
+            preference_warnings: std::sync::Mutex::new(HashMap::new()),
             delegates: delegate::Workers::new(),
             worker_approval_policy: std::sync::Mutex::new(state::load_worker_approval_policy(&state_dir)),
             worker_execution: Default::default(),
@@ -3199,7 +3202,7 @@ async fn prompt_codex(
     app: &Arc<Workspace>, session: String, settings: fuzukue_proto::ChatSettings,
     prompt: String, event: Option<ServerEvent>,
 ) -> anyhow::Result<()> {
-    prompt_codex_with_images(app, session, settings, prompt, event, Vec::new(), TurnKind::Conversation, None).await
+    prompt_codex_with_images(app, session, settings, prompt, event, Vec::new(), TurnKind::Conversation, None, preferences::Inheritance::Desk).await
 }
 
 fn codex_partner_options(app: &Workspace, session: &str, settings: fuzukue_proto::ChatSettings) -> anyhow::Result<codex::PartnerOptions> {
@@ -3240,6 +3243,7 @@ fn github_auth_request(kind: TurnKind, prompt: &str, event: Option<&ServerEvent>
 async fn prompt_codex_with_images(
     app: &Arc<Workspace>, session: String, mut settings: fuzukue_proto::ChatSettings,
     prompt: String, event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind, desk_record: Option<delegate::DeskDelivery>,
+    inheritance: preferences::Inheritance,
 ) -> anyhow::Result<()> {
     let github_auth = github_auth_request(kind, &prompt, event.as_ref());
     let codex = app.codex().await?;
@@ -3288,6 +3292,7 @@ async fn prompt_codex_with_images(
     let request = matches!(kind, TurnKind::UserConversation).then(|| front_desk::Request {
         prompt: prompt.clone(), images: images.clone(),
     });
+    let preference_selection = preferences::for_turn(app, &session, kind, false, &prompt, &inheritance)?;
     let prompt = handover(if switched || fresh { summary } else { None }, &prompt);
     if let Some(event) = event {
         app.hub.publish(event);
@@ -3306,14 +3311,20 @@ async fn prompt_codex_with_images(
             let history = app.start_partner_history(&app.project_dir, "codex", &session).await;
             let result = async {
                 let external = matches!(kind, TurnKind::ExternalInput);
+                let selection = if is_nudge {
+                    preferences::for_turn(&app, &session, kind, false, &prompt, &preferences::Inheritance::Desk)?
+                } else {
+                    preference_selection.clone()
+                };
                 let (mut input, notices) = app.partner_input(&session, prompt, external).await?;
+                let preferences = preferences::load_selection(selection, &app, &session).await?;
                 input.push_str("\n\n");
                 input.push_str(&self_update::RequestingTurn::proof_instruction(&update_proof));
                 let images = if is_nudge { &[][..] } else { &images };
                 if !is_nudge {
                     app.hub.set_github_auth_request(&session, github_auth);
                 }
-                let result = codex.run_turn_with_images(&thread_id, &input, images, kind, || {
+                let result = codex.run_turn_with_images(&thread_id, &input, images, kind, Some(&preferences), || {
                     if let Some(delivery) = delivery.filter(|delivery| delivery.report) {
                         app.drain.begin_submission(&app.state_dir, &session, std::slice::from_ref(&delivery.id))?;
                     }
@@ -3421,8 +3432,8 @@ async fn prompt_escalated_partner(
         ..selection.chat_settings()
     };
     match selection.backend {
-        AgentBackend::Codex => prompt_codex_with_images(app, session.into(), settings, prompt, user_event, images, TurnKind::Escalated, None).await,
-        AgentBackend::Claude => prompt_claude_turn(app, session, prompt, user_event, images, TurnKind::Escalated, None, Some(settings), false).await.map(|_| ()),
+        AgentBackend::Codex => prompt_codex_with_images(app, session.into(), settings, prompt, user_event, images, TurnKind::Escalated, None, preferences::Inheritance::Desk).await,
+        AgentBackend::Claude => prompt_claude_turn(app, session, prompt, user_event, images, TurnKind::Escalated, None, Some(settings), false, preferences::Inheritance::Desk).await.map(|_| ()),
     }
 }
 
@@ -3430,13 +3441,14 @@ async fn prompt_claude_with_images(
     app: &Arc<Workspace>, session: &str, prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind,
     report: Option<String>,
 ) -> anyhow::Result<bool> {
-    prompt_claude_turn(app, session, prompt, user_event, images, kind, report, None, false).await
+    prompt_claude_turn(app, session, prompt, user_event, images, kind, report, None, false, preferences::Inheritance::Desk).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn prompt_claude_turn(
     app: &Arc<Workspace>, session: &str, prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>, kind: TurnKind,
     report: Option<String>, escalation: Option<fuzukue_proto::ChatSettings>, background: bool,
+    inheritance: preferences::Inheritance,
 ) -> anyhow::Result<bool> {
     let is_report = report.is_some();
     let github_auth = github_auth_request(kind, &prompt, user_event.as_ref());
@@ -3469,9 +3481,9 @@ async fn prompt_claude_turn(
         app.hub.publish(event);
     }
     let result = if is_report || background {
-        s.try_background_prompt(prompt, kind, report).await
+        s.try_background_prompt(prompt, kind, report, inheritance).await
     } else {
-        s.prompt_with_auth(&prompt, images, kind, github_auth, escalation, escalation_images).await.map(|()| true)
+        s.prompt_with_auth(&prompt, images, kind, github_auth, escalation, escalation_images, inheritance).await.map(|()| true)
     };
     match result {
         Ok(false) => return Ok(false),
@@ -3494,20 +3506,21 @@ async fn prompt_claude_turn(
 
 async fn delegate_follow_up(
     app: &Arc<Workspace>, session: &str, prompt: String, kind: TurnKind, delivery: Option<delegate::DeskDelivery>,
+    inheritance: preferences::Inheritance,
 ) -> anyhow::Result<()> {
     let settings = app.partner_turn_settings(session);
     let codex = AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex;
     let report = delivery.as_ref().filter(|delivery| delivery.report);
     let result = if codex {
-        prompt_codex_with_images(app, session.into(), settings, prompt, None, Vec::new(), kind, delivery.clone()).await
+        prompt_codex_with_images(app, session.into(), settings, prompt, None, Vec::new(), kind, delivery.clone(), inheritance.clone()).await
     } else if let Some(report) = report {
-        prompt_claude_with_images(app, session, prompt, None, Vec::new(), kind, Some(report.id.clone()))
+        prompt_claude_turn(app, session, prompt, None, Vec::new(), kind, Some(report.id.clone()), None, false, inheritance.clone())
             .await.and_then(|started| {
                 anyhow::ensure!(started, "Claude is busy");
                 Ok(())
             })
     } else {
-        prompt_claude_with_images(app, session, prompt, None, Vec::new(), kind, None).await.map(|_| ())
+        prompt_claude_turn(app, session, prompt, None, Vec::new(), kind, None, None, false, inheritance).await.map(|_| ())
     };
     if let Some(delivery) = delivery {
         match &result {
@@ -3524,17 +3537,21 @@ async fn delegate_follow_up(
     result
 }
 
-async fn delegate_worker_digest(app: &Arc<Workspace>, session: &str, prompt: String) -> anyhow::Result<bool> {
-    delegate_background_turn(app, session, prompt, TurnKind::WorkerDigest).await
+async fn delegate_worker_digest(
+    app: &Arc<Workspace>, session: &str, prompt: String, inheritance: preferences::Inheritance,
+) -> anyhow::Result<bool> {
+    delegate_background_turn(app, session, prompt, TurnKind::WorkerDigest, inheritance).await
 }
 
-async fn delegate_background_turn(app: &Arc<Workspace>, session: &str, prompt: String, kind: TurnKind) -> anyhow::Result<bool> {
+async fn delegate_background_turn(
+    app: &Arc<Workspace>, session: &str, prompt: String, kind: TurnKind, inheritance: preferences::Inheritance,
+) -> anyhow::Result<bool> {
     let settings = app.partner_turn_settings(session);
     if AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex {
-        prompt_codex_with_images(app, session.into(), settings, prompt, None, Vec::new(), kind, None).await?;
+        prompt_codex_with_images(app, session.into(), settings, prompt, None, Vec::new(), kind, None, inheritance).await?;
         Ok(true)
     } else {
-        prompt_claude_turn(app, session, prompt, None, Vec::new(), kind, None, None, true).await
+        prompt_claude_turn(app, session, prompt, None, Vec::new(), kind, None, None, true, inheritance).await
     }
 }
 
@@ -3595,7 +3612,7 @@ async fn rewrite_reply(app: &Arc<Workspace>, session: &str, item: &str) -> anyho
     );
     let settings = app.partner_turn_settings(session);
     if AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex {
-        prompt_codex_with_images(app, session.into(), settings, prompt, None, images, TurnKind::Conversation, None).await
+        prompt_codex_with_images(app, session.into(), settings, prompt, None, images, TurnKind::Conversation, None, preferences::Inheritance::Desk).await
     } else {
         prompt_claude_with_images(app, session, prompt, None, images, TurnKind::Conversation, None).await.map(|_| ())
     }
@@ -3606,7 +3623,7 @@ async fn start_user_prompt(
     prompt: String, user_event: Option<ServerEvent>, images: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     if AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex {
-        return prompt_codex_with_images(app, session, settings, prompt, user_event, images, TurnKind::UserConversation, None).await;
+        return prompt_codex_with_images(app, session, settings, prompt, user_event, images, TurnKind::UserConversation, None, preferences::Inheritance::Desk).await;
     }
 
     prompt_claude_with_images(app, &session, prompt, user_event, images, TurnKind::UserConversation, None).await.map(|_| ())
@@ -3831,7 +3848,7 @@ async fn handle_from_client(
             anyhow::ensure!(app.hub.has_thread(&session), "スレッドが見つからない");
             let app = app.clone();
             tokio::spawn(async move {
-                match planner::replan(&app, &session, reason, false, None).await {
+                match planner::replan(&app, &session, reason, false, None, None).await {
                     Ok(_) => delegate::plan_follow_up(&app, &session),
                     Err(error) => app.hub.publish(ServerEvent::Error { message: format!("方針の見直し: {error:#}") }),
                 }
@@ -3930,7 +3947,9 @@ async fn handle_from_client(
                 let codex = app.running_codex().await.context("Codex が停止した")?;
                 // The hub knows whether the running turn has received external input.
                 let (steering, notices) = app.partner_input(&session, prompt.clone(), false).await?;
-                codex.steer_with_images(&thread, &steering, &images).await?;
+                let selection = preferences::for_turn(app, &session, TurnKind::UserConversation, false, &prompt, &preferences::Inheritance::Desk)?;
+                let preferences = preferences::load_selection(selection, app, &session).await?;
+                codex.steer_desk(&thread, &steering, &images, &preferences).await?;
                 todo::delivered(app, &session, notices);
                 app.hub.set_github_auth_request(&session,
                     github_auth_request(TurnKind::UserConversation, "", user_event.as_ref()));
@@ -4060,7 +4079,7 @@ async fn handle_from_client(
             let settings = app.partner_turn_settings(&session);
             let event = Some(prompt_event(&session, fuzukue_proto::Actor::User, &prompt));
             if AgentBackend::for_model(settings.model.as_deref()) == AgentBackend::Codex {
-                prompt_codex_with_images(app, session, settings, prompt, event, Vec::new(), TurnKind::ExternalInput, None).await?;
+                prompt_codex_with_images(app, session, settings, prompt, event, Vec::new(), TurnKind::ExternalInput, None, preferences::Inheritance::Desk).await?;
             } else {
                 prompt_claude_with_images(app, &session, prompt, event, Vec::new(), TurnKind::ExternalInput, None).await?;
             }

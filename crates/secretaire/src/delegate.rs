@@ -640,20 +640,26 @@ pub struct WorkerLaunch {
     pub tools: Vec<String>,
 }
 
+#[cfg(test)]
 pub async fn start(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, agent: Option<&str>, caller: AgentCaller, routing: TierRequest,
     touches: Option<Vec<String>>,
 ) -> Result<String> {
-    start_with_grants(app, session, prompt, title, None, agent, caller, routing, touches, Vec::new(), None, false).await
+    start_with_grants(app, session, prompt, title, None, agent, caller, routing, touches, Vec::new(), None, false, None).await
 }
 
 pub(crate) async fn start_with_grants(
     app: &Arc<App>, session: &str, prompt: String, title: Option<String>, label: Option<String>, agent: Option<&str>, caller: AgentCaller,
     routing: TierRequest, touches: Option<Vec<String>>, folder_grants: Vec<String>, selection: Option<AgentSelection>, exec_trusted: bool,
+    personal_preferences: Option<crate::preferences::Selection>,
 ) -> Result<String> {
+    let personal_preferences = personal_preferences.map(|selection| {
+        selection.for_task(app, &prompt, title.iter().chain(label.iter()).chain(touches.iter().flatten()))
+    });
     let request = Assignment {
         prompt, title, label, worktree: None, agent: agent.map(str::to_owned),
         selection, caller: Some(caller), adopted: None, routing, touches, issue: None, isolation: None, blind_input: None, folder_grants, exec_trusted,
+        personal_preferences,
     };
     start_assignment(app, session, request).await
 }
@@ -683,6 +689,7 @@ pub async fn start_for_issue(
     let request = Assignment {
         prompt, title, label, worktree: Some(crate::github::worktree_path(&app.project_dir, number)?), agent: agent.map(str::to_owned),
         selection, caller: Some(caller), adopted: None, routing, touches, issue: Some(number), isolation: None, blind_input: None, folder_grants, exec_trusted: false,
+        personal_preferences: None,
     };
     start_assignment(app, session, request).await
 }
@@ -704,6 +711,7 @@ pub(crate) async fn queue_issue_assignment(
     let assignment = Assignment {
         prompt, title: None, label: None, worktree: Some(directory), agent: None, selection: Some(selection),
         caller: None, adopted: None, routing: Default::default(), touches: None, issue: None, isolation: None, blind_input: None, folder_grants: Vec::new(), exec_trusted: false,
+        personal_preferences: None,
     };
     let (_, run) = launch_assignment(app, session, job, assignment, false).await?;
     Ok(run)
@@ -734,7 +742,8 @@ async fn launch(
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
     let _accept = app.admit_work()?;
     let job = format!("{DELEGATE_JOB}{}", mail::session_key());
-    let request = Assignment { prompt, title, label: None, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None, blind_input: None, folder_grants: Vec::new(), exec_trusted: false };
+    let request = Assignment { prompt, title, label: None, worktree, agent: agent.map(str::to_owned), selection, caller, adopted, routing, touches, issue: None, isolation: None, blind_input: None, folder_grants: Vec::new(), exec_trusted: false,
+        personal_preferences: None };
     launch_assignment(app, session, job, request, false).await
 }
 
@@ -762,6 +771,8 @@ pub(crate) struct Assignment {
     folder_grants: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     exec_trusted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    personal_preferences: Option<crate::preferences::Selection>,
 }
 
 impl Assignment {
@@ -790,7 +801,7 @@ pub(crate) async fn restore_assignment(app: &Arc<App>, session: String, id: Stri
 async fn launch_assignment(
     app: &Arc<App>, session: &str, job: String, request: Assignment, restore: bool,
 ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
-    let Assignment { prompt, title, label, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, blind_input, folder_grants, exec_trusted } = request.clone();
+    let Assignment { prompt, title, label, worktree, agent, selection, caller, adopted, mut routing, touches, issue, isolation, blind_input, folder_grants, exec_trusted, personal_preferences } = request.clone();
     let blind = isolation.is_some();
     app.hub.validate_worker_grants(session, &folder_grants)?;
     let is_planner = request.is_planner();
@@ -801,7 +812,8 @@ async fn launch_assignment(
     if blind {
         ensure!(agent.is_none() && worktree.is_none() && adopted.is_none() && issue.is_none()
             && folder_grants.is_empty() && caller == Some(AgentCaller::FrontDesk) && touches.as_ref().is_some_and(Vec::is_empty)
-            && selection.as_ref().and_then(|selection| selection.model.as_deref()).is_some(),
+            && selection.as_ref().and_then(|selection| selection.model.as_deref()).is_some()
+            && personal_preferences.is_none(),
             "Invalid blind review assignment");
     }
     let agent = if let Some(name) = agent {
@@ -1125,6 +1137,10 @@ async fn launch_assignment(
             };
             let state = app.state_dir.clone();
             let workspace = app.project_dir.clone();
+            let preferences = match personal_preferences.clone() {
+                Some(selection) if !is_planner => selection.load(&app, &session).await?,
+                _ => String::new(),
+            };
             let lean_task = role == "lean" || prompt.split(|c: char| !c.is_ascii_alphanumeric())
                 .any(|word| word.eq_ignore_ascii_case("lean") || word.eq_ignore_ascii_case("lean4"));
             let (before, instructions, scope, read_scope, _scratch) = tokio::task::spawn_blocking(move || {
@@ -1137,6 +1153,7 @@ async fn launch_assignment(
                 }).transpose()?;
                 let rules = crate::rules::resolve(&project)?;
                 let mut instructions = rules.policy(&project)?;
+                instructions.push_str(&preferences);
                 if lean_task || crate::lean_reading::is_lean_workspace(&project) {
                     instructions.push_str("\n\n");
                     instructions.push_str(&rules.literate_lean(&project)?);
@@ -1200,11 +1217,13 @@ async fn launch_assignment(
             ));
             *input.job.workspace_write_scope.lock().unwrap() = write_scope.clone();
             let checkout = scope.cwd.clone();
-            let launch = WorkerLaunch { execution, instructions, mcp_url, key, tools, scope: Some(scope) };
+            let mut launch = WorkerLaunch { execution, instructions, mcp_url, key, tools, scope: Some(scope) };
+            let base_instructions = launch.instructions.len();
             let relay_active = relay::enabled();
             let progress = if relay_active {
                 let events = app.hub.subscribe_worker();
-                Some(tokio::spawn(relay::relay_progress(app.clone(), session.clone(), job.clone(), events)))
+                Some(tokio::spawn(relay::relay_progress(app.clone(), session.clone(), job.clone(), events,
+                    personal_preferences.clone(), is_planner)))
             } else if !cfg!(test) {
                 let (_, events) = app.hub.subscribe(u64::MAX);
                 Some(tokio::spawn(summarize_progress(
@@ -1220,6 +1239,20 @@ async fn launch_assignment(
             let mut retry_permit = None;
             let result = loop {
                 let _attempt = retry_permit.take();
+                if is_planner && personal_preferences.is_some() {
+                    let preferences = async {
+                        let current = planner::preference_selection(&app, &session)?;
+                        let selection = crate::preferences::Selection::common([&personal_preferences, &current].into_iter());
+                        crate::preferences::load_selection(selection, &app, &session).await
+                    }.await;
+                    match preferences {
+                        Ok(preferences) => {
+                            launch.instructions.truncate(base_instructions);
+                            launch.instructions.push_str(&preferences);
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
                 let mut metadata = RunMetadata::default();
                 let started = Instant::now();
                 let settings = ChatSettings { permission_mode, ..model.selection.chat_settings() };
@@ -1961,6 +1994,11 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
         }
         // Both kinds record the submission point, so a restart reports instead of resending.
         let report = matches!(turn, DeskTurn::Report { .. }) || turn.is_approval_result();
+        let inheritance = if matches!(turn, DeskTurn::Plan { .. }) {
+            crate::preferences::Inheritance::Captured(planner::preference_selection(&app, &session).ok().flatten())
+        } else {
+            crate::preferences::Inheritance::Desk
+        };
         let prompt = match turn {
             DeskTurn::Durable(_) => unreachable!(),
             DeskTurn::Question { id, job, text, replanned } => {
@@ -1999,14 +2037,15 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
                 );
                 let prompt = format!("{instruction}\n\n{text}");
                 let kind = crate::front_desk::TurnKind::ExternalInput;
-                if let Err(error) = crate::delegate_background_turn(&app, &session, prompt, kind).await {
+                if let Err(error) = crate::delegate_background_turn(&app, &session, prompt, kind, crate::preferences::Inheritance::Desk).await {
                     tracing::warn!(%error, %session, "could not wake the desk for a server update result");
                 }
                 continue;
             }
             DeskTurn::WorkerDigest(digests) => {
                 let prompt = relay::prompt(&digests);
-                match crate::delegate_worker_digest(&app, &session, prompt).await {
+                let inheritance = crate::preferences::Inheritance::Captured(relay::preferences(&app, &session, &digests));
+                match crate::delegate_worker_digest(&app, &session, prompt, inheritance).await {
                     Ok(true) => {
                         let mut desk = app.delegates.desk.lock().unwrap();
                         let relay = &mut desk.get_mut(&session).unwrap().relay;
@@ -2042,7 +2081,7 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
                 match crate::watch::begin_wake(&app, &watch, &session, &mut text) {
                     Ok(Some((name, previous))) => {
                         let prompt = format!("{}\n\n{name}\n\n{text}", crate::front_desk::watch_event_instruction());
-                        match crate::delegate_worker_digest(&app, &session, prompt).await {
+                        match crate::delegate_worker_digest(&app, &session, prompt, crate::preferences::Inheritance::Captured(None)).await {
                             Ok(true) => {}
                             Ok(false) => {
                                 match crate::watch::defer_wake(&app, &watch, &text, previous) {
@@ -2090,7 +2129,8 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
                 let plan = planner::desk_context(&app, &session, false).unwrap_or_default();
                 let prompt = format!("{}\n\n{plan}", crate::front_desk::goal_decision_prompt());
                 let kind = crate::front_desk::TurnKind::GoalDecision(generation);
-                match crate::delegate_background_turn(&app, &session, prompt, kind).await {
+                let inheritance = crate::preferences::Inheritance::Captured(planner::preference_selection(&app, &session).ok().flatten());
+                match crate::delegate_background_turn(&app, &session, prompt, kind, inheritance).await {
                     Ok(true) => {}
                     Ok(false) if planner::decision_current(&app, &session, generation) => {
                         app.delegates.desk.lock().unwrap().get_mut(&session).unwrap()
@@ -2110,7 +2150,7 @@ async fn deliver_desk(app: Arc<App>, session: String, changed: Arc<tokio::sync::
         };
         let delivery = durable.map(|id| DeskDelivery { id, report });
         let kind = crate::front_desk::TurnKind::Conversation;
-        if let Err(error) = crate::delegate_follow_up(&app, &session, prompt, kind, delivery).await {
+        if let Err(error) = crate::delegate_follow_up(&app, &session, prompt, kind, delivery, inheritance).await {
             desk_delivery_notice(&app, &session, &error);
         }
     }
@@ -2678,6 +2718,7 @@ pub async fn run_legacy_codex(
     session: &str,
     parent: Option<String>,
     prompt: &str,
+    personal_preferences: Option<crate::preferences::Selection>,
 ) -> Result<String> {
     let _accept = app.admit_work()?;
     let id = format!("{DELEGATE_JOB}{}", mail::session_key());
@@ -2708,7 +2749,11 @@ pub async fn run_legacy_codex(
             Some(launch) => app.worker_codex(launch, None).await?,
             None => app.codex().await?,
         };
-        let thread = codex.start_thread(&session, parent.clone(), policy).await?;
+        let preferences = match personal_preferences {
+            Some(selection) => selection.load(&app, &session).await?,
+            None => String::new(),
+        };
+        let thread = codex.start_thread(&session, parent.clone(), policy, &preferences).await?;
         let history = app.history.turn(&app.project_dir, "agent:codex".into(), &session, parent).await;
         let before_project = app.project_dir.clone();
         let before = tokio::task::spawn_blocking(move || Files::read(&before_project)).await;

@@ -44,6 +44,8 @@ struct ThreadInfo {
     current_turn: Option<String>,
     exec: Option<(String, Arc<crate::cancellation::Cancellation>)>,
     trusted_approval_turn: bool,
+    desk_preference_hash: Option<[u8; 32]>,
+    pending_preference_hash: Option<[u8; 32]>,
     /// 最後の final_answer
     last_answer: String,
     acted_or_asked: bool,
@@ -240,6 +242,12 @@ struct SkillRoots {
     snapshots: HashMap<[u8; 32], tempfile::TempDir>,
     active: Option<[u8; 32]>,
     unsupported: bool,
+}
+
+fn patch_paths(changes: &Value) -> impl Iterator<Item = &str> {
+    changes.as_array().into_iter().flatten()
+        .flat_map(|change| [&change["path"], &change["kind"]["move_path"], &change["kind"]["movePath"], &change["move_path"]])
+        .filter_map(Value::as_str)
 }
 
 fn approval_result(permissions: Option<Value>, decision: &str) -> Value {
@@ -453,6 +461,7 @@ impl Codex {
             policy.push_str(&crate::agents::directory(&crate::agents::load(&project, &rules)?, &agent_settings, fuzukue_proto::AgentCaller::FrontDesk));
             policy.push_str(&crate::rules::conversation_voice());
             policy.push_str(crate::mcp::front_desk_instructions());
+            policy.push_str(crate::preferences::desk_guidance());
             policy.push_str(crate::worker_scope::SHELL_READ_GUIDANCE);
             if !crate::canary() {
                 policy.push_str(crate::mcp::workspace_read::GUIDANCE);
@@ -538,10 +547,10 @@ impl Codex {
     }
 
     /// 新しいスレッドを作る。作業ディレクトリへの書き込みは許し、それ以外は承認を求めさせる。
-    pub async fn start_thread(&self, session: &str, parent_tool_use: Option<String>, launch: Option<&crate::delegate::WorkerLaunch>) -> Result<String> {
+    pub async fn start_thread(&self, session: &str, parent_tool_use: Option<String>, launch: Option<&crate::delegate::WorkerLaunch>, preferences: &str) -> Result<String> {
         // A legacy worker can start before its parent tool event arrives.
         let parent_tool_use = Some(parent_tool_use.unwrap_or_else(|| format!("codex-run:{}", crate::mail::session_key())));
-        self.start_thread_with_policy(&self.project_dir, session, parent_tool_use, false, None, None, launch).await
+        self.start_thread_with_policy(&self.project_dir, session, parent_tool_use, false, None, None, launch, preferences).await
     }
 
     pub async fn run_worker(
@@ -553,7 +562,7 @@ impl Codex {
         let cancel = steering.cancellation();
         cancel.check()?;
         let thread = self.start_thread_with_policy(
-            cwd, session, Some(job.into()), false, Some(settings), resume, Some(launch),
+            cwd, session, Some(job.into()), false, Some(settings), resume, Some(launch), "",
         ).await?;
         if let Some(thread) = self.threads.lock().unwrap().get_mut(&thread) {
             thread.worker_external_approval = steering.external_approval();
@@ -576,7 +585,7 @@ impl Codex {
             loop {
                 let mut deferred = None;
                 let answer = self.run_turn_with_schema(
-                    &thread, &prompt, &[], None, Some(&cancel), Some((steering, &mut deferred)), TurnKind::Conversation, || Ok(()), || {},
+                    &thread, &prompt, &[], None, Some(&cancel), Some((steering, &mut deferred)), TurnKind::Conversation, None, || Ok(()), || {},
                 ).await?;
                 let Some(next) = deferred.or_else(|| steering.next_or_finish()) else {
                     anyhow::ensure!(!answer.trim().is_empty(), "The Codex worker returned no final report");
@@ -632,9 +641,9 @@ impl Codex {
         launch: Option<&crate::delegate::WorkerLaunch>,
     ) -> Result<String> {
         cancel.check()?;
-        let thread = self.start_thread_with_policy(project, session, None, true, Some(settings), None, launch).await?;
+        let thread = self.start_thread_with_policy(project, session, None, true, Some(settings), None, launch, "").await?;
         let result = self.run_turn_with_schema(
-            &thread, prompt, &[], Some(schema), Some(cancel), None, TurnKind::Conversation, || Ok(()), || {},
+            &thread, prompt, &[], Some(schema), Some(cancel), None, TurnKind::Conversation, None, || Ok(()), || {},
         ).await;
         self.collect_metadata(&thread, metadata);
         self.close_worker(&thread).await;
@@ -648,11 +657,11 @@ impl Codex {
         use std::time::Duration;
         let dir = tempfile::tempdir()?;
         let thread = tokio::time::timeout(Duration::from_secs(10), self.start_thread_with_policy(
-            dir.path(), session, None, true, Some(settings), None, Some(launch),
+            dir.path(), session, None, true, Some(settings), None, Some(launch), "",
         )).await??;
         let mut cleanup = SummaryThread { codex: self.clone(), thread: Some(thread.clone()) };
         let result = tokio::time::timeout(timeout,
-            self.run_turn_with_schema(&thread, evidence, &[], None, None, None, TurnKind::Conversation, || Ok(()), || {}),
+            self.run_turn_with_schema(&thread, evidence, &[], None, None, None, TurnKind::Conversation, None, || Ok(()), || {}),
         ).await;
         if result.is_err() {
             let _ = tokio::time::timeout(Duration::from_secs(5), self.interrupt(&thread)).await;
@@ -705,6 +714,7 @@ impl Codex {
         worker: Option<ChatSettings>,
         saved: Option<&str>,
         launch: Option<&crate::delegate::WorkerLaunch>,
+        preferences: &str,
     ) -> Result<String> {
         let mut skill_roots = self.skill_roots.lock().await;
         let rule_project = if worker.is_some() { project.to_path_buf() } else { self.project_dir.clone() };
@@ -724,6 +734,7 @@ impl Codex {
                 format!("{policy}{}", crate::rules::conversation_voice())
             }
         };
+        instructions.push_str(preferences);
         if workspace_review {
             instructions.push_str(crate::mcp::workspace_read::GUIDANCE);
         }
@@ -742,6 +753,9 @@ impl Codex {
             "approvalPolicy": approval_policy,
             "developerInstructions": instructions,
         });
+        if !preferences.is_empty() {
+            params["ephemeral"] = json!(true);
+        }
         if crate::canary() {
             params["approvalPolicy"] = json!("never");
             params["config"] = json!({
@@ -794,6 +808,11 @@ impl Codex {
             };
             fs.insert(scope.cwd.to_string_lossy().into_owned(), json!(workspace));
             fs.insert(scope.scratch.to_string_lossy().into_owned(), json!("write"));
+            if workspace == "write" {
+                for path in crate::preferences::protected_workspace_dirs(&scope.cwd) {
+                    fs.insert(path.to_string_lossy().into_owned(), json!("read"));
+                }
+            }
             params.as_object_mut().unwrap().remove("sandbox");
             params["permissions"] = json!(WORKER_PERMISSIONS);
             params["runtimeWorkspaceRoots"] = json!([scope.cwd]);
@@ -911,6 +930,8 @@ impl Codex {
                 current_turn: None,
                 exec: None,
                 trusted_approval_turn: false,
+                desk_preference_hash: None,
+                pending_preference_hash: None,
                 last_answer: String::new(),
                 acted_or_asked: false,
                 waiter: None,
@@ -933,15 +954,24 @@ impl Codex {
 
     /// ターンを始め、終わるまで待って最後の答えを返す。途中経過はタイムラインに流れる。
     pub async fn run_turn(&self, thread_id: &str, text: &str) -> Result<String> {
-        self.run_turn_with_images(thread_id, text, &[], TurnKind::Conversation, || Ok(()), || {}).await
+        self.run_turn_with_images(thread_id, text, &[], TurnKind::Conversation, None, || Ok(()), || {}).await
     }
 
     pub(crate) async fn run_turn_with_images(
         &self, thread_id: &str, text: &str, images: &[PathBuf], kind: TurnKind,
-        before_submit: impl FnOnce() -> Result<()>,
+        preferences: Option<&str>, before_submit: impl FnOnce() -> Result<()>,
         after_submit: impl FnOnce(),
     ) -> Result<String> {
-        self.run_turn_with_schema(thread_id, text, images, None, None, None, kind, before_submit, after_submit).await
+        self.run_turn_with_schema(
+            thread_id, text, images, None, None, None, kind, preferences, before_submit, after_submit,
+        ).await
+    }
+
+    fn clear_desk_preference_hash(&self, thread_id: &str) {
+        if let Some(thread) = self.threads.lock().unwrap().get_mut(thread_id) {
+            thread.desk_preference_hash = None;
+            thread.pending_preference_hash = None;
+        }
     }
 
     pub(crate) fn partner_acted_or_asked(&self, thread_id: &str) -> bool {
@@ -958,6 +988,7 @@ impl Codex {
         cancel: Option<&crate::cancellation::Cancellation>,
         steering: Option<(&mut crate::delegate::JobInput, &mut Option<String>)>,
         kind: TurnKind,
+        preferences: Option<&str>,
         before_submit: impl FnOnce() -> Result<()>,
         after_submit: impl FnOnce(),
     ) -> Result<String> {
@@ -971,13 +1002,21 @@ impl Codex {
         }
         let exec = crate::mcp::exec::Turn::default();
         let (tx, mut rx) = oneshot::channel();
-        let overrides = {
+        let (overrides, guidance) = {
             let mut threads = self.threads.lock().unwrap();
             let t = threads.get_mut(thread_id).context("unknown codex thread")?;
             if t.waiter.is_some() || t.compaction.is_some() {
                 bail!("codex thread {thread_id} is already running a turn");
             }
             before_submit()?;
+            let previous = t.desk_preference_hash.take();
+            let guidance = preferences.map(|preferences| {
+                use sha2::{Digest, Sha256};
+
+                let hash = (!preferences.is_empty()).then(|| Sha256::digest(preferences.as_bytes()).into());
+                t.pending_preference_hash = hash;
+                crate::preferences::codex_turn_guidance(preferences, hash.is_some() && hash == previous)
+            });
             t.waiter = Some(tx);
             t.exec = kind.user_conversation().then(|| (exec.id.clone(), exec.cancel.clone()));
             t.trusted_approval_turn = !matches!(kind, TurnKind::ExternalInput);
@@ -985,7 +1024,7 @@ impl Codex {
             t.acted_or_asked = false;
             t.streamed.clear();
             t.relay_reply = matches!(kind, TurnKind::WorkerDigest).then(RelayReply::default);
-            t.partner.as_ref().map(|options| {
+            let overrides = t.partner.as_ref().map(|options| {
                 if let Some(stats) = &mut t.stats {
                     if let Some(model) = &options.settings.model {
                         stats.model.clone_from(model);
@@ -996,14 +1035,16 @@ impl Codex {
                 let restricted = matches!(kind, TurnKind::ExternalInput) || self.hub.external_approval_input(&t.session)
                     || options.mail_enabled && self.hub.desk_automatic(&t.session, options.mode()).unwrap_or(false);
                 options.turn_params(&self.project_dir, restricted)
-            })
+            });
+            (overrides, guidance)
         };
         let started = self
             .request(
                 "turn/start",
                 {
                     let mut input = vec![json!({ "type": "text", "text": self.usage.context_line() })];
-                    input.extend(turn_input(text, images));
+                    let guided = guidance.map(|guidance| format!("{text}{guidance}"));
+                    input.extend(turn_input(guided.as_deref().unwrap_or(text), images));
                     let mut params = json!({ "threadId": thread_id, "input": input });
                     if let Some(overrides) = overrides {
                         params.as_object_mut().unwrap().extend(overrides.as_object().unwrap().clone());
@@ -1020,6 +1061,7 @@ impl Codex {
             Err(error) => {
                 if let Some(t) = self.threads.lock().unwrap().get_mut(thread_id) {
                     t.waiter = None;
+                    t.pending_preference_hash = None;
                     t.trusted_approval_turn = false;
                     t.relay_reply = None;
                 }
@@ -1086,6 +1128,16 @@ impl Codex {
         self.steer_turn(thread_id, &turn, text, images).await
     }
 
+    pub(crate) async fn steer_desk(
+        &self, thread_id: &str, text: &str, images: &[PathBuf], preferences: &str,
+    ) -> Result<()> {
+        // Steering can race with completion of the original turn. Its input uses a full
+        // block and invalidates the original turn's candidate before submitting.
+        self.clear_desk_preference_hash(thread_id);
+        let input = format!("{text}{}", crate::preferences::codex_turn_guidance(preferences, false));
+        self.steer_with_images(thread_id, &input, images).await
+    }
+
     pub(crate) async fn compact(
         self: &Arc<Self>, thread_id: &str, cancel: &Arc<crate::cancellation::Cancellation>,
     ) -> Result<crate::commands::ContextCounts> {
@@ -1096,6 +1148,8 @@ impl Codex {
             let thread = threads.get_mut(thread_id).context("unknown codex thread")?;
             anyhow::ensure!(thread.waiter.is_none() && thread.compaction.is_none() && thread.current_turn.is_none(),
                 "Codex は実行中");
+            thread.desk_preference_hash = None;
+            thread.pending_preference_hash = None;
             thread.compaction = Some(Compaction {
                 complete, cancel: cancel.clone(), before: thread.stats.as_ref().and_then(|stats| stats.context_tokens),
                 after: None, boundary: false,
@@ -1126,6 +1180,7 @@ impl Codex {
     pub async fn interrupt(&self, thread_id: &str) -> Result<()> {
         let turn = self.threads.lock().unwrap().get_mut(thread_id).and_then(|t| {
             t.trusted_approval_turn = false;
+            t.pending_preference_hash = None;
             if let Some((_, cancel)) = &t.exec {
                 cancel.cancel();
             }
@@ -1303,8 +1358,23 @@ impl Codex {
         if matches!(thread, Some((_, _, true))) {
             tracing::debug!(thread_id, method, params = %p, "Codex reviewer request");
         }
+        let guard_input = self.guard_input(thread_id, method, p);
+        if method == "item/fileChange/requestApproval"
+            && matches!(&thread, Some((_, Actor::Codex { parent_tool_use: Some(_), .. }, _)))
+        {
+            let cwd = guard_input["cwd"].as_str().map(Path::new).unwrap_or(&self.project_dir);
+            let protected = patch_paths(&guard_input["changes"]).any(|path| {
+                let path = cwd.join(path);
+                crate::preferences::protected_write(&path)
+                    || crate::worker_scope::resolve(&path).is_ok_and(|path| crate::preferences::protected_write(&path))
+            });
+            if protected {
+                let _ = self.write(json!({"jsonrpc": "2.0", "id": id, "result": {"decision": "decline"}})).await;
+                return;
+            }
+        }
         let mut reason = p["reason"].as_str().map(|reason| format!(" · {reason}")).unwrap_or_default();
-        let guarded = self.hub.guarded(method, &self.guard_input(thread_id, method, p));
+        let guarded = self.hub.guarded(method, &guard_input);
         if method == "item/commandExecution/requestApproval" && guarded.is_some_and(|reason| reason.may_push()) {
             if let Some(state) = self.hub.state_dir() {
                 reason.push_str(&crate::privacy_findings::push_note(&self.project_dir, &state).await);
@@ -1487,6 +1557,11 @@ impl Codex {
         }
         let thread_id = p["threadId"].as_str().unwrap_or("");
         let Some((session, actor, read_only)) = self.thread_context(thread_id) else { return };
+        if matches!(method, "thread/closed" | "thread/compacted" | "thread/reverted")
+            || (method == "item/completed" && p["item"]["type"] == "contextCompaction")
+        {
+            self.clear_desk_preference_hash(thread_id);
+        }
         match method {
             "serverRequest/resolved" => {
                 if let Some(id) = p.get("requestId") {
@@ -1509,9 +1584,7 @@ impl Codex {
         if item["type"] == "fileChange" && !item_id.is_empty() {
             if let Some(thread) = self.threads.lock().unwrap().get_mut(thread_id) {
                 if method == "item/completed" && item["status"] == "completed" {
-                    thread.worker_edits.lock().unwrap().extend(item["changes"].as_array().into_iter().flatten()
-                        .flat_map(|change| [&change["path"], &change["kind"]["move_path"], &change["kind"]["movePath"], &change["move_path"]])
-                        .filter_map(|path| path.as_str().map(str::to_owned)));
+                    thread.worker_edits.lock().unwrap().extend(patch_paths(&item["changes"]).map(str::to_owned));
                 }
                 match method {
                     "item/completed" => thread.file_changes.remove(&item_id),
@@ -1772,6 +1845,8 @@ impl Codex {
                     let mut threads = self.threads.lock().unwrap();
                     threads.get_mut(thread_id).and_then(|t| {
                         t.current_turn = None;
+                        let preference_hash = t.pending_preference_hash.take();
+                        t.desk_preference_hash = preference_hash.filter(|_| p["turn"]["status"] == "completed");
                         t.trusted_approval_turn = false;
                         if let Some((_, cancel)) = t.exec.take() { cancel.cancel(); }
                         if t.stats.is_some() && t.waiter.is_some() {
@@ -1864,7 +1939,7 @@ mod tests {
             tools: crate::mcp::planning_tool_names(true),
         };
         let thread = codex.start_thread_with_policy(project.path(), "owner", None, true,
-            Some(ChatSettings::default()), None, Some(&launch)).await?;
+            Some(ChatSettings::default()), None, Some(&launch), "").await?;
         let requests: Vec<Value> = std::fs::read_to_string(log)?.lines()
             .map(serde_json::from_str).collect::<serde_json::Result<_>>()?;
         let start = &requests.iter().find(|item| item["method"] == "thread/start").context("missing thread/start")?["params"];
@@ -1877,7 +1952,7 @@ mod tests {
         assert!(server.get("default_tools_approval_mode").is_none());
         codex.close_worker(&thread).await;
 
-        let thread = codex.start_thread("owner", Some("delegate:fixture".into()), None).await?;
+        let thread = codex.start_thread("owner", Some("delegate:fixture".into()), None, "").await?;
         let mut events = hub.subscribe(u64::MAX).1;
         let message = "MCP tool call requires approval, but approval policy is never";
         for (error, result, expected) in [
@@ -2050,7 +2125,7 @@ mod tests {
         fixture.env("FUZUKUE_CODEX_FIXTURE_LOG", &log);
         let codex = Codex::spawn_command(fixture, project.path(), hub.clone(),
             Arc::new(Usage::new(hub.clone())), Default::default()).await?;
-        let thread = codex.start_thread("owner", Some("delegate:fixture".into()), None).await?;
+        let thread = codex.start_thread("owner", Some("delegate:fixture".into()), None, "").await?;
         let mut requests = hub.subscribe(u64::MAX).1;
         let action = json!({"threadId": thread, "command": "cat README.md", "cwd": project.path()});
         let method = "item/commandExecution/requestApproval";
@@ -2087,7 +2162,7 @@ mod tests {
         assert!(codex.resolve(&grant, "decline", false).await?);
         codex.close_worker(&thread).await;
 
-        let legacy = codex.start_thread("owner", Some("legacy-tool-use".into()), None).await?;
+        let legacy = codex.start_thread("owner", Some("legacy-tool-use".into()), None, "").await?;
         let mut requests = hub.subscribe(u64::MAX).1;
         codex.on_server_request(method, json!(93), &json!({
             "threadId": legacy, "command": "git push", "cwd": project.path(),
@@ -2105,7 +2180,7 @@ mod tests {
         hub.init_approval_queue("fixture".into(), &project.path().join("state"));
         let change = fuzukue_proto::FullApprovalChange::Full { duration: fuzukue_proto::FullApprovalDuration::OneHour };
         let principal = crate::remote::SettingsPrincipal::fixture();
-        let full = codex.start_thread("owner", Some("delegate:full".into()), None).await?;
+        let full = codex.start_thread("owner", Some("delegate:full".into()), None, "").await?;
         let push = json!({"threadId": full, "command": "cargo build", "cwd": project.path()});
         codex.on_server_request(method, json!(94), &push).await;
         let ServerEvent::ApprovalRequested { request_id: swept, .. } = requests.recv().await?.event else {

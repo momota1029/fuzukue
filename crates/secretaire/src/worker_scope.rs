@@ -105,6 +105,9 @@ impl Scope {
 
     fn allows(&self, base: &Path, path: &Path, write: bool) -> bool {
         resolve(&base.join(path)).is_ok_and(|path| {
+            if write && crate::preferences::protected_write(&path) {
+                return false;
+            }
             self.writable().iter().any(|root| path.starts_with(root))
                 || !write && self.read_roots.iter().any(|root| path.starts_with(root))
         })
@@ -257,7 +260,7 @@ fn decision(behavior: &str, reason: &str) -> Value {
 
 // Resolve existing components before processing '..', and permit missing
 // destinations for Write/Edit. A dangling symlink is never a missing destination.
-fn resolve(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve(path: &Path) -> Result<PathBuf> {
     let mut resolved = PathBuf::new();
     for component in path.components() {
         match component {
@@ -342,6 +345,10 @@ mod tests {
             Some("deny"),
         );
         check("Write", json!({"file_path": scratch.join("new.md")}), None);
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            check(tool, json!({"file_path": worktree.join(".fuzukue/rules/private.md")}), Some("deny"));
+        }
+        check("NotebookEdit", json!({"notebook_path": worktree.join(".fuzukue/rules/private.ipynb")}), Some("deny"));
         check(
             "Edit",
             json!({"file_path": "../project/fuzukue.toml"}),

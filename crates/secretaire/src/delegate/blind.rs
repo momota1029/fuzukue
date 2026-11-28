@@ -64,6 +64,7 @@ pub(crate) async fn start(
             blind_input: Some(input),
             folder_grants: Vec::new(),
             exec_trusted: false,
+            personal_preferences: None,
         },
     )
     .await
@@ -132,34 +133,37 @@ mod tests {
         ));
         let session = app.hub.edit_threads(|store| store.create(None))?;
         let _hold = super::super::hold_all_slots(&app).await;
+        let assignment = super::super::Assignment {
+            prompt: "Read AGENTS.md".into(),
+            title: None,
+            label: None,
+            worktree: None,
+            agent: None,
+            adopted: None,
+            selection: Some(AgentSelection {
+                backend: AgentBackend::Codex,
+                model: Some("fixture".into()),
+                effort: None,
+            }),
+            caller: Some(AgentCaller::FrontDesk),
+            routing: Default::default(),
+            touches: Some(Vec::new()),
+            issue: None,
+            isolation: Some(Isolation::Blind),
+            blind_input: None,
+            folder_grants: Vec::new(),
+            exec_trusted: false,
+            personal_preferences: None,
+        };
+        let mut invalid = assignment.clone();
+        invalid.personal_preferences = Some(serde_json::from_value(json!({"paper": "papers/private"}))?);
+        let result = super::super::launch_assignment(
+            &app, &session, "delegate:blind-private".into(), invalid, false,
+        ).await;
+        assert!(matches!(result, Err(error) if error.to_string() == "Invalid blind review assignment"));
         let (job, task) = super::super::launch_assignment(
-            &app,
-            &session,
-            "delegate:blind-fixture".into(),
-            super::super::Assignment {
-                prompt: "Read AGENTS.md".into(),
-                title: None,
-                label: None,
-                worktree: None,
-                agent: None,
-                adopted: None,
-                selection: Some(AgentSelection {
-                    backend: AgentBackend::Codex,
-                    model: Some("fixture".into()),
-                    effort: None,
-                }),
-                caller: Some(AgentCaller::FrontDesk),
-                routing: Default::default(),
-                touches: Some(Vec::new()),
-                issue: None,
-                isolation: Some(Isolation::Blind),
-                blind_input: None,
-                folder_grants: Vec::new(),
-                exec_trusted: false,
-            },
-            false,
-        )
-        .await?;
+            &app, &session, "delegate:blind-fixture".into(), assignment, false,
+        ).await?;
         let running = app.delegates.running.lock().unwrap()[&job].clone();
         assert!(running.key.is_empty() && running.tools.lock().unwrap().is_empty());
         assert_eq!(

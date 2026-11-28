@@ -23,6 +23,7 @@ use tokio::{
 };
 
 use crate::delegate::admission::{Lane, WaitReason};
+use crate::preferences::Selection as PreferenceSelection;
 use crate::usage::pacing::Cause;
 use crate::{delegate, front_desk::TurnKind, usage, Workspace};
 
@@ -58,6 +59,8 @@ struct Front {
     paused_by_user: bool,
     #[serde(default)]
     stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    personal_preferences: Option<PreferenceSelection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -129,7 +132,9 @@ fn section<T: serde::de::DeserializeOwned>(body: &mut &str, heading: &str) -> Re
     Ok(serde_yaml::from_str(yaml)?)
 }
 
-fn read(app: &Workspace, session: &str) -> Result<Option<(Plan, bool)>> {
+type SavedPlan = (Plan, bool, Option<PreferenceSelection>);
+
+fn read(app: &Workspace, session: &str) -> Result<Option<SavedPlan>> {
     let text = match fs::read_to_string(path(app, session)?) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -138,7 +143,7 @@ fn read(app: &Workspace, session: &str) -> Result<Option<(Plan, bool)>> {
     parse_plan(&text).map(Some)
 }
 
-fn parse_plan(text: &str) -> Result<(Plan, bool)> {
+fn parse_plan(text: &str) -> Result<SavedPlan> {
     let (front, mut body) = fuzukue_cards::split_frontmatter(text).context("方針のヘッダーがない")?;
     let Front {
         goal,
@@ -148,6 +153,7 @@ fn parse_plan(text: &str) -> Result<(Plan, bool)> {
         verification,
         paused_by_user,
         stale,
+        personal_preferences,
     } = serde_yaml::from_str(front)?;
     let mut plan = Plan {
         goal,
@@ -167,10 +173,12 @@ fn parse_plan(text: &str) -> Result<(Plan, bool)> {
             plan.next.push(verification_step(question));
         }
     }
-    Ok((plan, stale))
+    Ok((plan, stale, personal_preferences))
 }
 
-fn write(app: &Workspace, session: &str, plan: &Plan, stale: bool) -> Result<()> {
+fn write(
+    app: &Workspace, session: &str, plan: &Plan, stale: bool, preferences: Option<&PreferenceSelection>,
+) -> Result<()> {
     let path = path(app, session)?;
     let dir = path.parent().context("方針の保存先がない")?;
     fs::create_dir_all(dir)?;
@@ -183,6 +191,7 @@ fn write(app: &Workspace, session: &str, plan: &Plan, stale: bool) -> Result<()>
         verification: plan.verification.clone(),
         paused_by_user: plan.paused_by_user,
         stale,
+        personal_preferences: preferences.cloned(),
     };
     writeln!(tmp, "---\n{}---", serde_yaml::to_string(&front)?)?;
     for (heading, yaml) in [
@@ -216,6 +225,7 @@ struct ThreadPlan {
 struct State {
     plan: Option<Plan>,
     stale: bool,
+    personal_preferences: Option<PreferenceSelection>,
     next_default: Option<AgentSelection>,
     reports: VecDeque<Report>,
     report_updates: ReportUpdates,
@@ -457,12 +467,14 @@ impl Plans {
         if let Some(thread) = threads.get(session) {
             return Ok(thread.clone());
         }
-        let (plan, stale) = read(app, session)?.map_or((None, false), |(plan, stale)| (Some(plan), stale));
+        let (plan, stale, personal_preferences) = read(app, session)?
+            .map_or((None, false, None), |(plan, stale, preferences)| (Some(plan), stale, preferences));
         let thread = Arc::new(ThreadPlan {
             update: Default::default(),
             state: Mutex::new(State {
                 plan,
                 stale,
+                personal_preferences,
                 ..Default::default()
             }),
             changed: watch::channel(()).0,
@@ -480,6 +492,17 @@ pub(crate) fn owns_mcp(app: &Workspace, session: &str, key: &str, consult: bool)
         let access = if consult { &thread.consult_mcp_key } else { &thread.mcp_key };
         access.lock().unwrap().as_deref() == Some(key)
     })
+}
+
+pub(crate) fn preference_selection(app: &Workspace, session: &str) -> Result<Option<PreferenceSelection>> {
+    let thread = app.plans.get(app, session)?;
+    let (selection, goal) = {
+        let state = thread.state.lock().unwrap();
+        (state.personal_preferences.clone(), state.plan.as_ref().map(|plan| plan.goal.clone()))
+    };
+    Ok(selection.zip(goal).map(|(selection, goal)| {
+        selection.for_thread(app, session, &goal, std::iter::empty::<&str>())
+    }))
 }
 
 pub(crate) fn validate_step(app: &Workspace, session: &str, agent: Option<&str>, task: &str) -> Result<fuzukue_proto::PlanStep> {
@@ -524,26 +547,27 @@ impl Drop for McpAccess<'_> {
 const ROLLBACK_QUESTION: &str = "Work is saved for recovery. Open this project in a server that supports draining to resume it.";
 
 pub(crate) fn protect_legacy_rollback(app: &Workspace, session: &str) -> Result<()> {
-    let Some((mut plan, stale)) = read(app, session)?.filter(|(plan, _)| plan.status == PlanStatus::Active) else {
+    let Some((mut plan, stale, preferences)) = read(app, session)?.filter(|(plan, ..)| plan.status == PlanStatus::Active) else {
         return Ok(());
     };
     app.drain.enqueue(&app.state_dir, session, format!("legacy-plan:{session}"),
         crate::self_update::drain::Work::LegacyPlan(plan.clone()))?;
     plan.status = PlanStatus::WaitingForUser;
     plan.question = Some(ROLLBACK_QUESTION.into());
-    write(app, session, &plan, stale)
+    write(app, session, &plan, stale, preferences.as_ref())
 }
 
 pub(crate) fn restore_after_rollback(app: &Workspace, session: &str, original: &Plan) -> Result<()> {
     let mut protected = original.clone();
     protected.status = PlanStatus::WaitingForUser;
     protected.question = Some(ROLLBACK_QUESTION.into());
-    if let Some((_, stale)) = read(app, session)?.filter(|(plan, _)| plan == &protected) {
-        write(app, session, original, stale)?;
+    if let Some((_, stale, preferences)) = read(app, session)?.filter(|(plan, ..)| plan == &protected) {
+        write(app, session, original, stale, preferences.as_ref())?;
         if let Ok(thread) = app.plans.get(app, session) {
             let mut state = thread.state.lock().unwrap();
             state.plan = Some(original.clone());
             state.stale = stale;
+            state.personal_preferences = preferences;
             thread.changed.send_replace(());
         }
     }
@@ -856,7 +880,7 @@ pub(crate) fn block_step(app: &Workspace, session: &str, step: &str, reason: Str
 
 fn save_plan(app: &Workspace, session: &str, thread: &ThreadPlan, state: &mut State, mut plan: Plan) -> Result<()> {
     normalize_steps(&mut plan.next);
-    write(app, session, &plan, state.stale)?;
+    write(app, session, &plan, state.stale, state.personal_preferences.as_ref())?;
     state.plan = Some(plan);
     publish(app, session, state);
     thread.changed.send_replace(());
@@ -1401,6 +1425,7 @@ pub(crate) async fn start_plan(
     long_running: bool,
     pace: Option<GoalPace>,
     routing: fuzukue_proto::TierRequest,
+    personal_preferences: Option<PreferenceSelection>,
 ) -> Result<Plan> {
     drop(app.admit_work()?);
     let goal = trimmed(&goal, 2000);
@@ -1430,11 +1455,12 @@ pub(crate) async fn start_plan(
         verification: None,
         paused_by_user: false,
     };
-    revise(app, session, &thread, plan, &context, false, true, None, Some(AgentCaller::FrontDesk), routing, None).await
+    revise(app, session, &thread, plan, &context, false, true, None, Some(AgentCaller::FrontDesk), routing, None, Some(personal_preferences)).await
 }
 
 pub(crate) async fn replan(
     app: &Arc<Workspace>, session: &str, reason: String, from_desk: bool, pace: Option<GoalPace>,
+    preference_override: Option<Option<PreferenceSelection>>,
 ) -> Result<Plan> {
     drop(app.admit_work()?);
     let thread = app.plans.get(app, session)?;
@@ -1461,7 +1487,7 @@ pub(crate) async fn replan(
         format!("{}\n{}", idle_replan_instruction(), trimmed(&reason, 1400))
     } else { reason };
     let result = revise(app, session, &thread, plan, &reason, false, false, None,
-        Some(AgentCaller::FrontDesk), Default::default(), idle_generation).await;
+        Some(AgentCaller::FrontDesk), Default::default(), idle_generation, preference_override).await;
     if let Some(generation) = idle_generation {
         mark_replanned(&thread, generation);
     }
@@ -1494,7 +1520,7 @@ async fn recover_idle_goal(app: &Arc<Workspace>, session: &str, generation: u64)
             state.plan.clone().unwrap()
         };
         let result = revise(app, session, &thread, plan, idle_replan_instruction(), false, false, None,
-            None, Default::default(), Some(generation)).await;
+            None, Default::default(), Some(generation), None).await;
         mark_replanned(&thread, generation);
         result
     };
@@ -1517,7 +1543,11 @@ async fn dispatch_idle_step(app: &Arc<Workspace>, session: &str, generation: u64
         state.plan.as_ref().and_then(|plan| plan.next.iter().find(|step| step.blocker.is_none())).cloned()
     };
     if let Some(step) = step {
-        delegate::start(app, session, step.task, None, step.agent.as_deref(), AgentCaller::Planner, step.routing, None).await?;
+        let preferences = preference_selection(app, session)?;
+        delegate::start_with_grants(
+            app, session, step.task, None, None, step.agent.as_deref(), AgentCaller::Planner,
+            step.routing, None, Vec::new(), None, false, preferences,
+        ).await?;
     }
     Ok(())
 }
@@ -1640,7 +1670,7 @@ async fn update_reports(app: Arc<Workspace>, session: String, thread: Arc<Thread
                 let older = state.reports.len().saturating_sub(FAILED_REPORT_HISTORY_LIMIT);
                 state.reports.drain(..older);
                 if let Some(plan) = &state.plan {
-                    if let Err(error) = write(&app, &session, plan, true) {
+                    if let Err(error) = write(&app, &session, plan, true, state.personal_preferences.as_ref()) {
                         tracing::warn!(%session, error = %format!("{error:#}"), "could not save stale plan");
                     }
                 }
@@ -1706,6 +1736,7 @@ async fn revise_reports(
         None,
         Default::default(),
         None,
+        None,
     )
     .await;
     let plan = result?;
@@ -1751,7 +1782,7 @@ pub(crate) async fn repeated_question(
     let reason = harness_format!("The same question was asked twice: {}", "同じ質問が二度届いた。質問: {}", trimmed(question, 1000));
     reject(&mut plan, approach, reason.clone());
     save_feedback(app, session, &thread, &plan)?;
-    revise(app, session, &thread, plan, &reason, true, false, None, None, Default::default(), None).await?;
+    revise(app, session, &thread, plan, &reason, true, false, None, None, Default::default(), None, None).await?;
     Ok(true)
 }
 
@@ -1793,8 +1824,12 @@ async fn revise(
     caller: Option<AgentCaller>,
     routing: fuzukue_proto::TierRequest,
     idle_generation: Option<u64>,
+    preference_override: Option<Option<PreferenceSelection>>,
 ) -> Result<Plan> {
     let _work = app.admit_work()?;
+    let personal_preferences = preference_override
+        .unwrap_or_else(|| thread.state.lock().unwrap().personal_preferences.clone())
+        .map(|selection| selection.for_task(app, &plan.goal, [reason]));
     let agents = app.agent_catalog().await?;
     let agent = &agents[ROLE].info;
     let scope = format!("{}\n{reason}", plan.goal);
@@ -1829,15 +1864,9 @@ async fn revise(
         })
     };
     let format = response_format(locale);
-    let launch = delegate::WorkerLaunch {
-        execution: None,
-        scope: None,
-        instructions: format!("{}\n{directory}\n{format}", agent.prompt),
-        mcp_url: Some(url.to_string()),
-        key: crate::mail::session_key(),
-        tools: crate::mcp::planning_tool_names(false),
-    };
-    let access = McpAccess::grant(&thread.mcp_key, &launch.key);
+    let instructions = format!("{}\n{directory}\n{format}", agent.prompt);
+    let key = crate::mail::session_key();
+    let access = McpAccess::grant(&thread.mcp_key, &key);
     let mut invocation = crate::agent_usage::Invocation::new(app, session, caller, ROLE, &job, &plan.goal, Some(selection.clone()));
     let (output, attempts) = run_revision_attempts(make_input(false), || make_input(true),
         (decision.tier, model),
@@ -1846,10 +1875,25 @@ async fn revise(
             (decision.tier, model)
         }),
         |prompt, timeout, selection| {
-            let launch = &launch;
+            let (instructions, url, key, goal) = (&instructions, &url, &key, &plan.goal);
+            let preferences = personal_preferences.clone();
             async move {
                 let mut metadata = crate::agent_usage::RunMetadata::default();
-                let output = delegate::run_one_shot(app, session, &prompt, launch, selection, timeout, &mut metadata).await;
+                let output = async {
+                    let preferences = preferences.map(|preferences| {
+                        preferences.for_thread(app, session, goal, std::iter::empty::<&str>())
+                    });
+                    let preferences = crate::preferences::load_selection(preferences, app, session).await?;
+                    let launch = delegate::WorkerLaunch {
+                        execution: None,
+                        scope: None,
+                        instructions: format!("{instructions}{preferences}"),
+                        mcp_url: Some(url.to_string()),
+                        key: key.clone(),
+                        tools: crate::mcp::planning_tool_names(false),
+                    };
+                    delegate::run_one_shot(app, session, &prompt, &launch, selection, timeout, &mut metadata).await
+                }.await;
                 (output, metadata)
             }
         },
@@ -1975,7 +2019,8 @@ async fn revise(
         if fresh || plan.status != PlanStatus::Active || plan.paused_by_user {
             state.decision = None;
         }
-        write(app, session, &plan, false)?;
+        write(app, session, &plan, false, personal_preferences.as_ref())?;
+        state.personal_preferences = personal_preferences;
         if fresh {
             state.reports.clear();
             state.report_updates.pending.clear();
@@ -2025,7 +2070,7 @@ pub(crate) fn write_test_plan_steps(app: &Workspace, session: &str, next: Vec<fu
         status: PlanStatus::Active,
         pace: Some(GoalPace::Normal),
         done: Vec::new(), next, rejected: Vec::new(), question: None, verification: None, paused_by_user: false,
-    }, false)
+    }, false, None)
 }
 
 pub(crate) fn resume_eligible(app: &Workspace, session: &str) -> Option<bool> {
@@ -2138,14 +2183,14 @@ mod tests {
         app.delegates.set_test_admission(Scheduler::new(Config::default()));
         app.hub.load_threads(directory.path(), &app.state_dir);
         let session = app.hub.edit_threads(|store| store.create(None))?;
-        let (mut original, _) = parse_plan(saved_plan())?;
+        let (mut original, _, _) = parse_plan(saved_plan())?;
         original.pace = Some(GoalPace::Normal);
         original.done.push("Prepared release".into());
         original.next.push(verification_step("Check published release".into()));
         reject(&mut original, "Manual deployment", "Already attempted".into());
-        write(&app, &session, &original, true)?;
+        write(&app, &session, &original, true, None)?;
 
-        let plan = |goal: String, pace| start_plan(&app, &session, goal, String::new(), false, pace, Default::default());
+        let plan = |goal: String, pace| start_plan(&app, &session, goal, String::new(), false, pace, Default::default(), None);
         assert_eq!(plan(original.goal.clone(), None).await?, original);
         assert!(plan("A different goal".into(), Some(GoalPace::Full)).await.unwrap_err()
             .to_string().contains("replan"));
@@ -2171,7 +2216,7 @@ mod tests {
         let mut expected = original;
         expected.pace = Some(GoalPace::Full);
         assert_eq!(plan(expected.goal.clone(), expected.pace).await?, expected);
-        assert_eq!(parse_plan(&fs::read_to_string(path(&app, &session)?)?)?, (expected.clone(), true));
+        assert_eq!(parse_plan(&fs::read_to_string(path(&app, &session)?)?)?, (expected.clone(), true, None));
         assert!(matches!(events.try_recv()?.event,
             ServerEvent::PlanChanged { plan, progress: Some(GoalProgress::Ready), .. } if plan == expected));
         tokio::select! {
@@ -2181,8 +2226,8 @@ mod tests {
         }
 
         expected.pace = Some(GoalPace::Economy);
-        assert_eq!(replan(&app, &session, "Save usage".into(), true, expected.pace).await?, expected);
-        assert_eq!(parse_plan(&fs::read_to_string(path(&app, &session)?)?)?, (expected, true));
+        assert_eq!(replan(&app, &session, "Save usage".into(), true, expected.pace, None).await?, expected);
+        assert_eq!(parse_plan(&fs::read_to_string(path(&app, &session)?)?)?, (expected, true, None));
         Ok(())
     }
 
@@ -2290,10 +2335,10 @@ mod tests {
         app.delegates.set_test_admission(Scheduler::new(Config::load(directory.path(), Default::default())?));
         app.hub.load_threads(directory.path(), &app.state_dir);
         let session = app.hub.edit_threads(|store| store.create(None))?;
-        let (mut plan, _) = parse_plan(saved_plan())?;
+        let (mut plan, _, _) = parse_plan(saved_plan())?;
         plan.pace = Some(GoalPace::Normal);
         plan.next.clear();
-        write(&app, &session, &plan, true)?;
+        write(&app, &session, &plan, true, None)?;
         let reset = usage::now() + 4 * 3600;
         app.usage.update_codex(&json!({"primary": {"usedPercent": 96, "windowDurationMins": 300, "resetsAt": reset}}));
         app.usage.update_claude(&json!({"unifiedWindows": {"five_hour": {"utilization": 0.2, "resetsAt": reset}}}));
@@ -2449,7 +2494,7 @@ null
 
     #[test]
     fn saved_plans_default_to_fresh_and_round_trip_stale() -> Result<()> {
-        let (plan, stale) = parse_plan(saved_plan())?;
+        let (plan, stale, _) = parse_plan(saved_plan())?;
         assert!(!stale);
         let directory = crate::test_support::TestDir::new();
         let app = Workspace::new(directory.path().into(), "127.0.0.1:7878".into(),
@@ -2457,15 +2502,15 @@ null
         app.hub.load_threads(directory.path(), &app.state_dir);
         let session = app.hub.edit_threads(|store| store.create(None))?;
         for stale in [true, false] {
-            write(&app, &session, &plan, stale)?;
-            assert_eq!(read(&app, &session)?, Some((plan.clone(), stale)));
+            write(&app, &session, &plan, stale, None)?;
+            assert_eq!(read(&app, &session)?, Some((plan.clone(), stale, None)));
         }
         Ok(())
     }
 
     #[test]
     fn context_preserves_recent_entries_and_rolls_up_older_history_once() -> Result<()> {
-        let (mut plan, _) = parse_plan(saved_plan())?;
+        let (mut plan, _, _) = parse_plan(saved_plan())?;
         plan.done = (0..45).map(|n| format!("item {n:02} {}。Keep this only in the archive", "あ".repeat(70))).collect();
         plan.rejected = (0..23).map(|n| RejectedApproach { approach: format!("approach {n}"), reason: "fixture".into() }).collect();
         let context = plan_context(&plan, Locale::JAPANESE, false);
@@ -2497,7 +2542,7 @@ null
 
     #[tokio::test(start_paused = true)]
     async fn timeout_retries_once_with_trimmed_context() -> Result<()> {
-        let (mut plan, _) = parse_plan(saved_plan())?;
+        let (mut plan, _, _) = parse_plan(saved_plan())?;
         plan.done = (0..12).map(|n| format!("item {n} {}", "あ".repeat(995))).collect();
         plan.rejected.push(RejectedApproach { approach: "rejected".into(), reason: "fixture".into() });
         let report = "報".repeat(2_000);

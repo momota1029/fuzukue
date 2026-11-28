@@ -375,6 +375,9 @@ pub struct DeckMeta {
     /// 研究のデッキが扱う原稿・本のデッキ（このデッキの根からの相対パス）
     #[serde(default)]
     pub papers: Vec<PathBuf>,
+    /// ID of a workspace memo containing this paper's writing preferences.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writing_memo: Option<String>,
     /// できあがる PDF など（このデッキの根からの相対パス）
     #[serde(default)]
     pub outputs: Vec<PathBuf>,

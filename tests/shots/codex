@@ -195,6 +195,10 @@ for line in sys.stdin:
         turn_id = f"{thread_id}-turn-{next_turn}"
         send(id=request_id, result={"turn": {"id": turn_id}})
         notify("turn/started", thread_id, turn={"id": turn_id})
+        if "desk-preference-test:usage-rejected" in prompt:
+            notify("turn/completed", thread_id, turn={"id": turn_id, "status": "failed",
+                   "error": {"message": "Fixture usage rejection"}})
+            continue
         if "report-delivery-test:disconnect-after-start" in prompt:
             sys.exit(0)
         config = configs[thread_id]

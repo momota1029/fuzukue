@@ -325,7 +325,8 @@ impl Scope {
             "Use a worktree-relative UTF-8 path or an absolute path inside your job scratch without ..");
         let absolute = scratch.map_or_else(|| self.root.join(relative), |_| relative.to_owned());
         ensure!(
-            !denied(&absolute) && (scratch.is_some() || !self.protected.iter().any(|path| absolute.starts_with(path))),
+            !denied(&absolute) && !crate::preferences::protected_write(&absolute)
+                && (scratch.is_some() || !self.protected.iter().any(|path| absolute.starts_with(path))),
             "Access denied to a protected write path"
         );
         let base = scratch.map_or(self.root.as_path(), |scratch| scratch.as_path());
@@ -904,6 +905,26 @@ pub(crate) fn audit_page(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn personal_rules_and_linked_writing_memos_are_protected_inside_touches() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        let state = root.join("state");
+        fs::create_dir_all(root.join("papers/example"))?;
+        fs::write(root.join("papers/example/deck.toml"), "kind = 'paper'\nwriting_memo = 'style'\n")?;
+        let writes = Arc::new(WriteSet::new(&root, Some(vec!["**".into()]), "", || None)?);
+        let scope = Scope::new(root.clone(), writes, &state, "delegate:preferences")?;
+        for path in [".fuzukue/rules/style.md", "memos/style/card.md", "memos/style/notes.md"] {
+            let error = scope.locate(Path::new(path)).unwrap_err();
+            assert!(error.to_string().contains("protected write path"), "{error}");
+        }
+        assert!(scope.locate(Path::new("memos/regular/card.md")).is_ok());
+        let home_rules = root.join("home/.fuzukue/rules/style.md");
+        assert!(crate::preferences::protected_write(&home_rules));
+        assert!(scope.locate(&home_rules).is_err());
+        Ok(())
+    }
 
     #[test]
     fn scope_does_not_follow_links_or_allow_protected_paths() -> Result<()> {

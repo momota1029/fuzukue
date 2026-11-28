@@ -14,7 +14,7 @@ async fn turn(app: &Arc<Workspace>, thread: &str, kind: TurnKind) -> Result<Path
         command, thread.into(), app.project_dir.clone(), app, Box::new(|_| {}),
     )?;
     app.sessions.lock().await.insert(thread.into(), session.clone());
-    assert!(session.try_background_prompt("synthetic turn".into(), kind, None).await?);
+    assert!(session.try_background_prompt("synthetic turn".into(), kind, None, Default::default()).await?);
     Ok(log)
 }
 
@@ -303,7 +303,7 @@ async fn codex_turns_with_external_input_get_no_todos_even_when_steered() -> Res
     // The fixture's question keeps the external turn running.
     let (_, mut live) = app.hub.subscribe(u64::MAX);
     let prompt = "codex-question fixture dismissal external".to_owned();
-    assert!(crate::delegate_background_turn(&app, &thread, prompt, TurnKind::ExternalInput).await?);
+    assert!(crate::delegate_background_turn(&app, &thread, prompt, TurnKind::ExternalInput, Default::default()).await?);
     let question = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let ServerEvent::QuestionAsked { request_id, .. } = live.recv().await?.event {
@@ -325,7 +325,7 @@ async fn codex_turns_with_external_input_get_no_todos_even_when_steered() -> Res
         }
     }).await?;
     let prompt = "synthetic trusted request".to_owned();
-    assert!(crate::delegate_background_turn(&app, &thread, prompt, TurnKind::Conversation).await?);
+    assert!(crate::delegate_background_turn(&app, &thread, prompt, TurnKind::Conversation, Default::default()).await?);
     let trusted = received(&log, "synthetic trusted request").await?;
     assert!(trusted.contains("synthetic second") && trusted.contains(": T1"), "{trusted}");
     tokio::time::timeout(Duration::from_secs(10), async {

@@ -2110,8 +2110,15 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
                 )).await?
             } else {
                 let exec_trusted = exec::trusted_session(app, session) && exec_front_turn(session, claude, codex).await.is_some();
+                let personal_preferences = if !trusted {
+                    None
+                } else if args.plan_step {
+                    crate::planner::preference_selection(app, session)?
+                } else {
+                    crate::preferences::current(app, session)
+                };
                 Box::pin(crate::delegate::start_with_grants(
-                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection, exec_trusted,
+                    app, session, args.prompt, args.title, args.label, args.agent.as_deref(), caller, routing, args.touches, args.folder_grants, selection, exec_trusted, personal_preferences,
                 )).await?
             };
             if claude.is_some() || codex.is_some() {
@@ -2130,12 +2137,16 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         }
         Tool::Plan => {
             let args: PlanArgs = parse_args(args)?;
-            let plan = crate::planner::start_plan(app, session, args.goal, args.context, args.long_running, args.pace, fuzukue_proto::TierRequest { tier: args.tier, min_tier: args.min_tier }).await?;
+            let preferences = trusted.then(|| crate::preferences::current(app, session)).flatten();
+            let plan = crate::planner::start_plan(
+                app, session, args.goal, args.context, args.long_running, args.pace,
+                fuzukue_proto::TierRequest { tier: args.tier, min_tier: args.min_tier }, preferences,
+            ).await?;
             plan_result(app, session, &plan, args.include_history)
         }
         Tool::Replan => {
             let args: ReplanArgs = parse_args(args)?;
-            let plan = crate::planner::replan(app, session, args.reason, true, args.pace).await?;
+            let plan = crate::planner::replan(app, session, args.reason, true, args.pace, (!trusted).then_some(None)).await?;
             plan_result(app, session, &plan, args.include_history)
         }
         Tool::Consult => {
@@ -2170,7 +2181,8 @@ async fn call_tool(app: &Arc<Workspace>, session: &str, claude: Option<&crate::C
         Tool::AskFrontDesk => unreachable!("handled by the worker MCP endpoint"),
         Tool::CodexRun => {
             let args: CodexArgs = parse_args(args)?;
-            let answer = run_codex(app, session, &args.prompt)
+            let user_turn = exec::trusted_session(app, session) && exec_front_turn(session, claude, codex).await.is_some();
+            let answer = run_codex(app, session, &args.prompt, user_turn)
                 .await
                 .context("Codex の実行に失敗した")?;
             return Ok(text_result(answer, false));
@@ -2921,7 +2933,10 @@ fn list_decks(project: &Path) -> Result<Value> {
     Ok(json!({ "decks": decks }))
 }
 
-async fn run_codex(app: &Arc<Workspace>, session: &str, prompt: &str) -> Result<String> {
+async fn run_codex(app: &Arc<Workspace>, session: &str, prompt: &str, user_turn: bool) -> Result<String> {
+    let preferences = crate::preferences::Selection::capture(
+        app, session, user_turn, prompt, std::iter::empty::<&str>(),
+    );
     // Claude の stream-json は、ツールを実行する前に tool_use を含むメッセージを出す。
     // そこで積まれた ID を、呼び出し順に取る（少しだけ待つ）。
     let mut parent = None;
@@ -2937,5 +2952,5 @@ async fn run_codex(app: &Arc<Workspace>, session: &str, prompt: &str) -> Result<
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    crate::delegate::run_legacy_codex(app, session, parent, prompt).await
+    crate::delegate::run_legacy_codex(app, session, parent, prompt, preferences).await
 }
