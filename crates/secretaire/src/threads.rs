@@ -30,6 +30,7 @@ mod save_files;
 #[cfg(test)]
 pub(crate) mod segment_tests;
 mod segments;
+pub(crate) mod split;
 pub(crate) mod timing;
 use entries::Entries;
 use payloads::{Blobs, Record, Refs, Source};
@@ -1384,11 +1385,16 @@ impl DerefMut for TranscriptSlot {
 
 impl TranscriptSource {
     fn read(&self, reason: &'static str) -> Result<Transcript> {
+        self.read_from(&self.path, reason)
+    }
+
+    /// A staged latest file still refers to segments beside the live path.
+    fn read_from(&self, latest: &Path, reason: &'static str) -> Result<Transcript> {
         let mut measure = timing::Load::start(reason);
         if let Some(conflict) = &self.conflict {
             anyhow::bail!("{conflict}");
         }
-        let file = Arc::new(File::open(&self.path)?);
+        let file = Arc::new(File::open(latest)?);
         let mut input = BufReader::new(file.as_ref());
         let (front, layout, offset) = read_front(&mut input)?;
         let mut transcript = Transcript::read_buffered(&mut input, &file, offset)?;
@@ -1400,6 +1406,10 @@ impl TranscriptSource {
             transcript = segments::compose(&self.path, &self.session, &layout, transcript.items.into_vec())?;
         }
         measure.markdown_read(bytes);
+        Ok(self.replay(transcript, measure))
+    }
+
+    fn replay(&self, mut transcript: Transcript, mut measure: timing::Load) -> Transcript {
         let mut recovered = Transcript::default();
         self.timeline.visit_session(&self.session, |mut env, refs, record| {
             measure.journal.add(record.len);
@@ -1444,7 +1454,7 @@ impl TranscriptSource {
             tracing::warn!(%error, "could not compare segmented thread entries");
         }
         measure.succeeded(transcript.items.len());
-        Ok(transcript)
+        transcript
     }
 }
 

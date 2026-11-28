@@ -21,7 +21,7 @@ use super::{entries::Digest, Entry, FileVersion, Front, Transcript, ENTRY};
 
 pub(super) const FORMAT: &str = "segmented-1";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SegmentInfo {
     pub(super) file: String,
@@ -103,12 +103,16 @@ pub(super) fn file_name(number: usize, sha256: &str) -> Option<String> {
 }
 
 /// `threads/<id>/segments`, refusing IDs and directories that lead elsewhere.
-pub(super) fn directory(latest: &Path, id: &str) -> Result<PathBuf> {
+pub(super) fn directory_path(latest: &Path, id: &str) -> Result<PathBuf> {
     ensure!(!id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', '\0']),
         "invalid segmented thread ID");
-    let thread = latest.parent().context("missing thread directory")?.join(id);
-    let segments = thread.join("segments");
-    for dir in [&thread, &segments] {
+    Ok(latest.parent().context("missing thread directory")?.join(id).join("segments"))
+}
+
+pub(super) fn directory(latest: &Path, id: &str) -> Result<PathBuf> {
+    let segments = directory_path(latest, id)?;
+    let thread = segments.parent().context("missing segment parent")?;
+    for dir in [thread, &segments] {
         ensure!(fs::symlink_metadata(dir).with_context(|| format!("thread segments {}", dir.display()))?.is_dir(),
             "invalid thread segment directory {}", dir.display());
     }
@@ -215,7 +219,7 @@ pub(super) fn compose(path: &Path, id: &str, layout: &Layout, latest: Vec<Entry>
             segments.push(segment);
             for (entry, original) in entries {
                 if !unique(&entry, first + offset) {
-                    bail!("thread item {} appears in more than one segment", entry.meta.item);
+                    bail!("duplicate thread item ID {} appears in more than one segment", entry.meta.item);
                 }
                 originals.push(original);
                 sealed.push(entry);
@@ -237,7 +241,7 @@ pub(super) fn compose(path: &Path, id: &str, layout: &Layout, latest: Vec<Entry>
     let latest: Vec<_> = latest.collect();
     for entry in &latest {
         ensure!(unique(entry, layout.segments.len()),
-            "thread item {} appears in both a segment and the latest file", entry.meta.item);
+            "duplicate thread item ID {} appears in both a segment and the latest file", entry.meta.item);
     }
     let mut transcript = Transcript::default();
     for entry in sealed.into_iter().chain(latest) {

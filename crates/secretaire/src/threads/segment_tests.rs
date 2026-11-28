@@ -1,5 +1,8 @@
 //! Segmented threads, tested with synthetic records only.
 
+#[path = "split_tests.rs"]
+mod split_tests;
+
 use super::*;
 use fuzukue_proto::{
     CommentApplication, CommentApplicationState, DelegateNameChange, Envelope, GitHubActivityKind,

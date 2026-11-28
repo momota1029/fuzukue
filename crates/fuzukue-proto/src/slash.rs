@@ -15,6 +15,7 @@ pub enum Command {
     Goal,
     Pace,
     Join,
+    Split,
     Stop,
     Help,
 }

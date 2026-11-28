@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use fuzukue_proto::{Actor, CachedSession, DelegateReport, Envelope, Question, QuestionAnswer, QuestionOutcome,
     SelfUpdateBlocker, SelfUpdateBlockerKind as BlockerKind, ServerEvent};
 use serde_json::Value;
@@ -1108,6 +1109,55 @@ impl Hub {
             Ok(()) => tracing::info!(target: PAYLOAD_CONVERSION_LOG, thread = %id, elapsed_ms, "idle payload conversion finished"),
             Err(error) => tracing::warn!(target: PAYLOAD_CONVERSION_LOG, thread = %id, elapsed_ms, %error, "idle payload conversion aborted"),
         }
+    }
+
+    fn split_candidate(inner: &Inner, session: &str) -> anyhow::Result<crate::threads::split::SplitCandidate> {
+        if let Some(reason) = inner.payload_busy(session) {
+            anyhow::bail!("busy: {reason}");
+        }
+        let threads = inner.threads.as_ref().context("transcript store is unavailable")?;
+        threads.prepare_split(session)
+    }
+
+    /// Test split eligibility without saving or staging files.
+    pub(crate) async fn check_split_thread(
+        self: &Arc<Self>, session: &str,
+        check_previous: impl Fn() -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        check_previous()?;
+        let candidate = Self::split_candidate(&self.inner.lock().unwrap(), session)?;
+        let hub = self.clone();
+        tokio::task::spawn_blocking(move || {
+            candidate.check()?;
+            let inner = hub.inner.lock().unwrap();
+            let current = Self::split_candidate(&inner, &candidate.id)?;
+            candidate.ensure_same(&current)?;
+            check_previous()
+        }).await?
+    }
+
+    /// Seal old entries of an idle thread, retaining the previous build as a reader.
+    pub(crate) async fn split_thread(
+        self: &Arc<Self>, session: &str,
+        check_previous: impl Fn() -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<crate::threads::split::SplitStats> {
+        use crate::threads::split::Step;
+
+        check_previous()?;
+        let candidate = Self::split_candidate(&self.inner.lock().unwrap(), session)?;
+        let hub = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut checkpoint = |_: Step| {};
+            let mut staged = candidate.stage(&mut checkpoint)?;
+            staged.mark(&mut checkpoint)?;
+            let mut inner = hub.inner.lock().unwrap();
+            if let Some(reason) = inner.payload_busy(&staged.candidate.id) {
+                anyhow::bail!("busy: {reason}");
+            }
+            check_previous()?;
+            let threads = inner.threads.as_mut().context("transcript store is unavailable")?;
+            threads.publish_split(staged, &mut checkpoint)
+        }).await?
     }
 
     /// Rewrite an idle segmented thread as a single file. Staging runs without

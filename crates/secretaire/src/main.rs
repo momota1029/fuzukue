@@ -2950,6 +2950,8 @@ fn prepare_prompt_thread(app: &Workspace, prompt: &mut ClientMsg) -> anyhow::Res
     if !session.is_empty() {
         return Ok(None);
     }
+    anyhow::ensure!(!matches!(commands::parse(text), commands::Input::Command { name: "split", .. }),
+        "/split は既存のスレッドで実行する");
     let _work = app.admit_work()?;
     anyhow::ensure!(!text.trim().is_empty() || !paths.is_empty(), "メッセージを入力する");
     anyhow::ensure!(paths.len() <= fuzukue_proto::MAX_ATTACHMENTS, "添付が多すぎます");

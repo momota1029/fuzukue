@@ -45,16 +45,66 @@ pub(crate) struct StagedJoin {
 
 /// The number of entries, their IDs in order, and the digest of the body the
 /// single-file format would write.
-fn summary(transcript: &Transcript) -> Result<(Vec<String>, [u8; 32])> {
+pub(super) fn summary(transcript: &Transcript) -> Result<(Vec<String>, [u8; 32])> {
     let mut digest = Sha256::new();
     transcript.write_markdown(&mut digest)?;
     Ok((transcript.items.iter().map(|entry| entry.meta.item.clone()).collect(), digest.finalize().into()))
 }
 
-fn open_regular(path: &Path) -> Result<File> {
+pub(super) fn open_regular(path: &Path) -> Result<File> {
     let file = File::from(open(path, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?);
     ensure!(file.metadata()?.is_file(), "not a regular file: {}", path.display());
     Ok(file)
+}
+
+/// A nonblocking lock shared by split and join until publication finishes.
+pub(super) fn segmentation_scratch(threads: &Path) -> Result<(PathBuf, File)> {
+    let private = threads.join(fuzukue_proto::THREAD_SAVE_DIR);
+    drop(save_files::private_dir(&private)?);
+    let path = private.join("segmentation");
+    durable::create_dir_all(&path)?;
+    let scratch = lock_segmentation_scratch(&path)?.context("missing segmentation scratch directory")?;
+    Ok((path, scratch))
+}
+
+/// Probe the same lock without creating the scratch directory.
+pub(super) fn check_segmentation_scratch(threads: &Path) -> Result<Option<File>> {
+    let private = threads.join(fuzukue_proto::THREAD_SAVE_DIR);
+    match fs::symlink_metadata(&private) {
+        Ok(metadata) => ensure!(metadata.is_dir(), "invalid thread save directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    lock_segmentation_scratch(&private.join("segmentation"))
+}
+
+fn lock_segmentation_scratch(path: &Path) -> Result<Option<File>> {
+    let scratch = match open(path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error).context("open segmentation scratch directory"),
+    };
+    flock(&scratch, FlockOperation::NonBlockingLockExclusive)
+        .context("busy: another thread split or join is running")?;
+    Ok(Some(scratch))
+}
+
+/// Retain the replaced generation beyond the next save's `.previous`.
+pub(super) fn retain_original(path: &Path, scratch: &Path, digest: [u8; 32]) -> Result<()> {
+    let original = scratch.join(format!("{:x}.original", sha2::digest::Output::<Sha256>::from(digest)));
+    if fs::symlink_metadata(&original).is_err() && fs::hard_link(path, &original).is_err() {
+        let mut copy = NamedTempFile::new_in(scratch)?;
+        std::io::copy(&mut open_regular(path)?, &mut copy)?;
+        copy.as_file().sync_all()?;
+        copy.persist_noclobber(&original).map_err(|error| error.error)?;
+    }
+    let kept = open_regular(&original)?;
+    ensure!(hash(&kept)? == digest, "kept thread generation failed verification");
+    kept.sync_all()?;
+    durable::sync_dir(scratch)?;
+    durable::sync_dir(scratch.parent().context("missing thread save directory")?)?;
+    Ok(())
 }
 
 impl JoinCandidate {
@@ -62,16 +112,7 @@ impl JoinCandidate {
     /// the thread, so `publish_join` has to confirm that nothing changed.
     pub(crate) fn stage(self) -> Result<StagedJoin> {
         let threads = self.path.parent().context("missing thread directory")?;
-        let private = threads.join(fuzukue_proto::THREAD_SAVE_DIR);
-        // Create the private directory and its ignore rule, then release it.
-        drop(save_files::private_dir(&private)?);
-        let scratch_path = private.join("segmentation");
-        durable::create_dir_all(&scratch_path)?;
-        let scratch = File::from(open(&scratch_path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?);
-        // Held until publication, which needs the store. Waiting here while the
-        // caller holds the store would deadlock, so a second join fails instead.
-        flock(&scratch, FlockOperation::NonBlockingLockExclusive).context("another thread join is running")?;
+        let (scratch_path, scratch) = segmentation_scratch(threads)?;
 
         let file = Arc::new(open_regular(&self.path)?);
         ensure!(FileVersion::read(file.metadata()?)? == self.version, "thread changed before joining");
@@ -135,19 +176,7 @@ impl JoinCandidate {
         ensure!(!after.items.is_sealed() && summary(&after)? == before,
             "joined thread differs from the segmented thread");
 
-        // Keep the replaced generation beyond the next save's `.previous`.
-        let original = scratch_path.join(format!("{:x}.original", sha2::digest::Output::<Sha256>::from(latest_digest)));
-        if fs::symlink_metadata(&original).is_err() && fs::hard_link(&self.path, &original).is_err() {
-            let mut copy = NamedTempFile::new_in(&scratch_path)?;
-            std::io::copy(&mut open_regular(&self.path)?, &mut copy)?;
-            copy.as_file().sync_all()?;
-            copy.persist_noclobber(&original).map_err(|error| error.error)?;
-        }
-        let kept = open_regular(&original)?;
-        ensure!(hash(&kept)? == latest_digest, "kept thread generation failed verification");
-        kept.sync_all()?;
-        durable::sync_dir(&scratch_path)?;
-        durable::sync_dir(&private)?;
+        retain_original(&self.path, &scratch_path, latest_digest)?;
 
         // Hash the live inode after all other I/O, including the hard link.
         let live = open_regular(&self.path)?;

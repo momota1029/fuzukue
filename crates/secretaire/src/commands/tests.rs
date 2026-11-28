@@ -203,6 +203,29 @@ async fn local_commands_keep_history_and_settings_and_never_start_a_model() -> R
 }
 
 #[tokio::test]
+async fn split_command_requires_a_previous_reader() -> Result<()> {
+    let (_project, _state, app) = workspace();
+    let app = Arc::new(app);
+    let id = thread(&app)?;
+    let (_, mut events) = app.hub.subscribe(u64::MAX);
+    send(&app, &id, "/split too many arguments").await?;
+    assert!(wait_notice(&mut events, "command-usage").await?.contains("/split"));
+    send(&app, &id, "/split").await?;
+    assert!(wait_notice(&mut events, "command-failed").await?.contains("previous server build"));
+    send(&app, &id, "/split check").await?;
+    let checked = wait_event(&mut events, |event| matches!(event,
+        ServerEvent::LocalNotice { localized: Some(message), .. } if message.key == "command-failed")).await?;
+    assert!(matches!(&checked, ServerEvent::LocalNotice { item, text, .. }
+        if item == fuzukue_proto::COMPOSER_NOTICE_ITEM && text.contains("previous server build")));
+    let (history, _) = app.hub.subscribe(0);
+    assert!(!history.iter().any(|env| matches!(&env.event,
+        ServerEvent::LocalNotice { localized: Some(message), .. } if message.key == "command-failed")
+        || matches!(&env.event, ServerEvent::TextDelta { text, .. } if text == "/split check")));
+    assert!(!app.hub.read_threads(|store| store.is_segmented(&id)));
+    Ok(())
+}
+
+#[tokio::test]
 async fn join_rewrites_only_a_segmented_thread() -> Result<()> {
     let project = TestDir::new();
     let shared = TestDir::new();

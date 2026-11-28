@@ -13,6 +13,15 @@ use crate::{planner, Workspace};
 
 pub(crate) const CONTEXT_NOTICE_PERCENT: u64 = 80;
 
+/// A maintenance command invoked explicitly after the operator's backup.
+const SPLIT: Spec = Spec {
+    command: Command::Split,
+    name: "split",
+    arguments: " [check]",
+    description: "",
+    backends: &AgentBackend::ALL,
+};
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Input<'a> {
     Prompt(&'a str),
@@ -51,22 +60,25 @@ pub(crate) fn notice_with_id(
     item: String,
     message: LocalizedMessage,
 ) {
-    let text = crate::l10n::render(fuzukue_i18n::Locale::JAPANESE, &message);
-    hub.publish(ServerEvent::LocalNotice {
-        session: session.into(),
-        item,
-        text,
-        localized: Some(message),
-    });
+    hub.publish(notice_event(session, item, message));
 }
 
-fn echo(app: &Workspace, session: &str, text: &str) {
-    app.hub.publish(ServerEvent::TextDelta {
+fn notice_event(session: &str, item: String, message: LocalizedMessage) -> ServerEvent {
+    let text = crate::l10n::render(fuzukue_i18n::Locale::JAPANESE, &message);
+    ServerEvent::LocalNotice { session: session.into(), item, text, localized: Some(message) }
+}
+
+fn echo_event(session: &str, text: &str) -> ServerEvent {
+    ServerEvent::TextDelta {
         session: session.into(),
         item: format!("{}{}", slash::ECHO, crate::user_item()),
         actor: Actor::User,
         text: text.into(),
-    });
+    }
+}
+
+fn echo(app: &Workspace, session: &str, text: &str) {
+    app.hub.publish(echo_event(session, text));
 }
 
 fn current_backend(app: &Workspace, session: &str) -> AgentBackend {
@@ -78,9 +90,14 @@ pub(crate) async fn dispatch(app: &Arc<Workspace>, session: &str, text: &str) ->
         return None;
     };
     if app.hub.has_thread(session) {
-        echo(app, session, text);
+        if name == SPLIT.name {
+            // An ordinary slash echo saves the thread before eligibility is checked.
+            app.hub.publish_snapshot(echo_event(session, text));
+        } else {
+            echo(app, session, text);
+        }
     }
-    let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) else {
+    let Some(spec) = COMMANDS.iter().chain(std::iter::once(&SPLIT)).find(|spec| spec.name == name) else {
         notice(
             &app.hub,
             session,
@@ -89,6 +106,15 @@ pub(crate) async fn dispatch(app: &Arc<Workspace>, session: &str, text: &str) ->
         return None;
     };
     let result = execute(app, session, *spec, args).await;
+    if spec.command == Command::Split {
+        let message = match result {
+            Ok(Outcome::Notice(message)) => message,
+            Err(error) => failure(spec, error),
+            _ => unreachable!("split returns a notice"),
+        };
+        app.hub.publish_snapshot(notice_event(session, fuzukue_proto::COMPOSER_NOTICE_ITEM.into(), message));
+        return None;
+    }
     match result {
         Ok(Outcome::Created(id)) => {
             if session.is_empty() {
@@ -168,7 +194,7 @@ async fn execute(app: &Arc<Workspace>, session: &str, spec: Spec, args: &str) ->
     if spec.command == Compact {
         return request_compaction(app, session, args).await;
     }
-    if app.hub.thread_running(session) && !matches!(spec.command, Model | Effort) {
+    if app.hub.thread_running(session) && !matches!(spec.command, Model | Effort | Split) {
         return Ok(message("command-busy"));
     }
     if invalid_arguments {
@@ -196,6 +222,30 @@ async fn execute(app: &Arc<Workspace>, session: &str, spec: Spec, args: &str) ->
             message("command-pinned")
         }
         Escalate => usage(spec),
+        Split => {
+            if !matches!(args, "" | "check") {
+                return Ok(usage(spec));
+            }
+            anyhow::ensure!(!app.delegates.is_running(session), "busy: the thread has a running worker job");
+            let update = app.update().context(
+                "splitting requires an installed previous server build that reads segmented threads")?;
+            let permit = update.admit()?;
+            drop(_start);
+            let check_previous = move || {
+                let _keep_admission = &permit;
+                update.ensure_previous_reads_threads()
+            };
+            if args == "check" {
+                app.hub.check_split_thread(session, check_previous).await?;
+                return Ok(message("command-split-eligible"));
+            }
+            let split = app.hub.split_thread(session, check_previous).await?;
+            Outcome::Notice(LocalizedMessage::new("command-split-done", [
+                ("segments", split.segments.to_string()),
+                ("bytes", split.latest_bytes.to_string()),
+                ("overrides", split.overrides.to_string()),
+            ]))
+        }
         Join => {
             if !app.hub.read_threads(|store| store.is_segmented(session)) {
                 return Ok(message("command-not-segmented"));

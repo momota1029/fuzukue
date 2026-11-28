@@ -70,6 +70,18 @@ impl Entries {
         }));
     }
 
+    /// Model a split in memory before its new segment files exist.
+    pub(super) fn extend_sealed_prefix(&mut self, originals: Vec<Digest>) {
+        let sealed = self.sealed.get_or_insert_with(|| Box::new(Sealed {
+            segments: Vec::new(),
+            originals: Vec::new(),
+            touched: BTreeSet::new(),
+            overrides: BTreeSet::new(),
+        }));
+        sealed.originals.extend(originals);
+        assert!(sealed.originals.len() <= self.items.len());
+    }
+
     pub(super) fn is_sealed(&self) -> bool {
         self.sealed.is_some()
     }

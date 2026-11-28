@@ -1384,6 +1384,14 @@ impl Update {
         self.status.send_modify(|status| fail(status, error));
     }
 
+    pub(crate) fn ensure_previous_reads_threads(&self) -> Result<()> {
+        let previous = self.previous().context("splitting requires an installed previous server build that reads segmented threads")?;
+        ensure!(drain::contains_marker(&previous, crate::threads::rollback_marker::FORMAT_MARKER)
+            .context("could not check whether the previous server build reads segmented threads")?,
+            "the previous server build cannot read segmented threads; install the compatible reader before splitting");
+        Ok(())
+    }
+
     fn previous(&self) -> Option<PathBuf> {
         let current = fs::canonicalize(self.root.join("current")).ok()?;
         let previous = fs::canonicalize(self.root.join("previous")).ok()?;
@@ -1615,6 +1623,28 @@ mod tests {
             root,
             PathBuf::new(),
         ))
+    }
+
+    #[test]
+    fn split_requires_the_managed_previous_build_to_read_segmented_threads() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let current = root.join("running");
+        fs::write(&current, b"running")?;
+        std::os::unix::fs::symlink(&current, root.join("current"))?;
+        let update = Update::with_paths(
+            Config::default(), None, root.clone(), root.clone(), current,
+        );
+        assert!(update.ensure_previous_reads_threads().is_err());
+
+        let previous = root.join("old");
+        fs::write(&previous, b"old format")?;
+        std::os::unix::fs::symlink(&previous, root.join("previous"))?;
+        assert!(update.ensure_previous_reads_threads().is_err());
+
+        fs::write(previous, crate::threads::rollback_marker::FORMAT_MARKER)?;
+        update.ensure_previous_reads_threads()?;
+        Ok(())
     }
 
     fn begin(update: &Update) {
